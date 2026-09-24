@@ -2,6 +2,7 @@ pub mod commands;
 pub mod models;
 pub mod archive;
 pub mod utils;
+pub mod sources;
 
 use std::path::PathBuf;
 

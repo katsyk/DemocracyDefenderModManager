@@ -3,10 +3,23 @@ import { join } from "@tauri-apps/api/path";
 import type { Manifest } from "./manifest";
 import { convertFileSrc } from "@tauri-apps/api/core";
 
+/** Where a {@link ResolvedSource} came from. */
+export type SourceOrigin = "Manifest" | "Install";
+
+/** A {@link import("./manifest").Source} resolved into something directly renderable. */
+export type ResolvedSource = {
+    readonly Provider: string;
+    readonly DisplayName: string;
+    readonly PageUrl?: string;
+    readonly Version?: string;
+    readonly Origin: SourceOrigin;
+};
+
 export class Mod {
     constructor(
         public readonly Manifest: Manifest,
-        public readonly Directory: string
+        public readonly Directory: string,
+        public readonly Sources: ResolvedSource[] = []
     ) {}
 
     get guid(): UUID {

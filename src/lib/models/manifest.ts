@@ -1,5 +1,17 @@
 import type { UUID } from "$lib/types/uuid";
 
+/**
+ * A single, provider-neutral declaration of where a mod can be found.
+ * `Provider` is free-form (well-known values: "nexus", "modworkshop",
+ * "github", "gamebanana", "url"), but any other site name is accepted.
+ */
+export type Source = {
+    readonly Provider: string;
+    readonly Id?: string;
+    readonly Url?: string;
+    readonly Version?: string;
+};
+
 export namespace legacy {
     export type Manifest = {
         readonly Guid: UUID;
@@ -19,6 +31,7 @@ export namespace v1 {
         readonly IconPath?: string;
         readonly Options?: Option[];
         readonly NexusData?: NexusData;
+        readonly Sources?: Source[];
     };
 
     export type Option = {
@@ -53,6 +66,7 @@ export namespace v2 {
         readonly Categories?: Category[];
         readonly Tags?: string[];
         readonly NexusData?: NexusData;
+        readonly Sources?: Source[];
     };
 
     export type Option = {

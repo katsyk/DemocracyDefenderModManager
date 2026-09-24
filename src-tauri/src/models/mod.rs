@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use manifest::Manifest;
 
+use crate::sources::{self, ResolvedSource};
 use crate::utils::fix_path_casing;
 
 #[derive(Debug, Clone, Copy)]
@@ -59,6 +60,8 @@ impl<'de, const N: u64> Deserialize<'de> for Version<N> {
 pub struct Mod {
     pub manifest: Manifest,
     pub directory: PathBuf,
+    #[serde(default)]
+    pub sources: Vec<ResolvedSource>,
 }
 
 impl Mod {
@@ -68,6 +71,48 @@ impl Mod {
             Manifest::V1(m) => m.guid,
             Manifest::V2(m) => m.guid,
         }
+    }
+
+    /// (Re)compute [`Mod::sources`] from the manifest's declared sources,
+    /// its legacy `NexusData` (if any), and the `.hd2mm-origin.json`
+    /// sidecar (if the manager recorded one when this mod was installed).
+    ///
+    /// Never fails: a missing or malformed sidecar just means no
+    /// install-origin sources are added.
+    pub async fn resolve_sources(&mut self) {
+        let (declared, legacy_nexus): (Option<Vec<manifest::Source>>, Option<manifest::Source>) =
+            match &self.manifest {
+                Manifest::Legacy(_) => (None, None),
+                Manifest::V1(m) => (
+                    m.sources.clone(),
+                    m.nexus_data.as_ref().map(|n| manifest::Source {
+                        provider: "nexus".to_string(),
+                        id: Some(n.mod_id.to_string()),
+                        url: None,
+                        version: Some(n.version.clone()),
+                    }),
+                ),
+                Manifest::V2(m) => (
+                    m.sources.clone(),
+                    m.nexus_data.as_ref().map(|n| manifest::Source {
+                        provider: "nexus".to_string(),
+                        id: Some(n.mod_id.to_string()),
+                        url: None,
+                        version: None,
+                    }),
+                ),
+            };
+
+        let install_sources = sources::load_origin_sidecar(&self.directory)
+            .await
+            .map(|sidecar| sidecar.sources)
+            .unwrap_or_default();
+
+        self.sources = sources::merge_sources(
+            declared.as_deref(),
+            legacy_nexus,
+            &install_sources,
+        );
     }
 
     pub async fn normalize_paths(&mut self) -> anyhow::Result<()> {
@@ -98,7 +143,27 @@ impl Mod {
                     }
                 }
             }
-            Manifest::V2(manifest) => todo!()
+            Manifest::V2(manifest) => {
+                if let Some(icon_path) = manifest.icon_path.as_ref() {
+                    manifest.icon_path = Some(fix_path_casing(&self.directory, icon_path).await?);
+                }
+
+                if let Some(options) = manifest.options.as_mut() {
+                    for opt in options {
+                        if let Some(image) = opt.image.as_ref() {
+                            opt.image = Some(fix_path_casing(&self.directory, image).await?);
+                        }
+
+                        if let Some(sub_options) = opt.sub_options.as_mut() {
+                            for sub in sub_options {
+                                if let Some(image) = sub.image.as_ref() {
+                                    sub.image = Some(fix_path_casing(&self.directory, image).await?);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         Ok(())
