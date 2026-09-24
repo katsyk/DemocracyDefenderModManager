@@ -14,6 +14,7 @@
     const { show: showPopup } = usePopup();
     
     let gamePath = $state<string>("");
+    let downloadsPath = $state<string>("");
     let skipList = $state<SkipEntry[]>([]);
     let selectedSkipIndex = $state<number>(-1);
     let gamePathErrors = $state<string[]>([]);
@@ -75,7 +76,8 @@
         await saveSettings({
             Version: "V1",
             GamePath: gamePath,
-            SkipList: skipList
+            SkipList: skipList,
+            DownloadsPath: downloadsPath
         });
     })
 
@@ -85,6 +87,7 @@
             case "V1":
                 gamePath = settings.GamePath;
                 skipList = settings.SkipList;
+                downloadsPath = settings.DownloadsPath;
                 break;
         }
     }
@@ -96,6 +99,15 @@
         });
         if (!path) return;
         gamePath = path;
+    }
+
+    async function onBrowseDownloads() {
+        const path = await open({
+            directory: true,
+            multiple: false,
+        });
+        if (!path) return;
+        downloadsPath = path;
     }
 
     async function onAddSkipEntry() {
@@ -158,6 +170,29 @@
                         <li>{error}</li>
                     {/each}
                 </ul>
+            </div>
+            <div class="flex flex-col gap-1">
+                <h2 class="text-zinc-300 text-xl">{t("pages.settings.downloads_path.title")}</h2>
+                <p class="text-zinc-400 text-sm">{t("pages.settings.downloads_path.description")}</p>
+                <div class="flex flex-row gap-1">
+                    <input
+                        bind:value={downloadsPath}
+                        id="downloadspath"
+                        class="hd2mm-input flex-1"
+                        placeholder={t("pages.settings.downloads_path.placeholder")}
+                        autocomplete="off"
+                        autocorrect="off"
+                        autocapitalize="off"
+                        spellcheck="false"
+                    />
+                    <button
+                        class="hd2mm-button"
+                        title={t("pages.settings.downloads_path.browse_button.tip")}
+                        onclick={onBrowseDownloads}
+                    >
+                        <ThreeDots class="m-auto block" />
+                    </button>
+                </div>
             </div>
             <div class="flex flex-col gap-1 self-start">
                 <h2 class="text-zinc-300 text-xl">{t("pages.settings.skip_list.title")}</h2>

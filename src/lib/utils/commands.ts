@@ -12,18 +12,18 @@ type RawInstalledMod = RawMod & { Warning?: string };
 
 export type InstalledMod = { mod: Mod, warning?: string };
 
-function toMod(raw: RawMod): Mod {
+export function rawModToMod(raw: RawMod): Mod {
     return new Mod(raw.Manifest, raw.Directory, raw.Sources ?? []);
 }
 
 function toInstalledMod(raw: RawInstalledMod): InstalledMod {
-    return { mod: toMod(raw), warning: raw.Warning };
+    return { mod: rawModToMod(raw), warning: raw.Warning };
 }
 
 export async function getMods(): Promise<Mod[]> {
     log.debug("Invoking `get_mods`.");
     const mods = await invoke<RawMod[]>("get_mods");
-    return mods.map(toMod);
+    return mods.map(rawModToMod);
 }
 
 export async function deleteMod(guid: UUID): Promise<void> {
@@ -72,6 +72,35 @@ export async function addPaths(paths: string[]): Promise<RustResult<InstalledMod
 export async function addModFromUrl(url: string): Promise<InstalledMod> {
     log.debug("Invoking `add_mod_from_url`.");
     const mod = await invoke<RawInstalledMod>("add_mod_from_url", { url });
+    return toInstalledMod(mod);
+}
+
+export type UrlClassification = {
+    Provider: string,
+    DisplayName: string,
+    RequiresHandoff: boolean
+};
+
+/** Classify a pasted URL before deciding whether to try a direct download
+ * or go straight to a browser handoff. Never touches the network. */
+export async function classifyDownloadUrl(url: string): Promise<UrlClassification> {
+    log.debug("Invoking `classify_download_url`.");
+    return await invoke<UrlClassification>("classify_download_url", { url });
+}
+
+export async function startHandoff(pageUrl: string, existingGuid?: UUID): Promise<void> {
+    log.debug("Invoking `start_handoff`.");
+    await invoke<void>("start_handoff", { pageUrl, existingGuid: existingGuid ?? null });
+}
+
+export async function cancelHandoff(): Promise<void> {
+    log.debug("Invoking `cancel_handoff`.");
+    await invoke<void>("cancel_handoff");
+}
+
+export async function installHandoffFile(file: string, pageUrl: string, existingGuid?: UUID): Promise<InstalledMod> {
+    log.debug("Invoking `install_handoff_file`.");
+    const mod = await invoke<RawInstalledMod>("install_handoff_file", { file, pageUrl, existingGuid: existingGuid ?? null });
     return toInstalledMod(mod);
 }
 

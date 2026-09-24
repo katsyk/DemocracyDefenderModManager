@@ -5,7 +5,10 @@ pub mod utils;
 pub mod sources;
 pub mod download;
 
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{atomic::AtomicBool, Arc},
+};
 
 use log::LevelFilter;
 use tauri_plugin_log::{Target, TargetKind};
@@ -16,6 +19,9 @@ use crate::models::Mod;
 pub struct AppState {
     base_path: PathBuf,
     mods: Mutex<Option<Vec<Mod>>>,
+    /// Cancellation flag for the single in-flight browser handoff, if any.
+    /// `commands::handoff` is the only thing that touches this.
+    handoff_cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl AppState {
@@ -23,6 +29,7 @@ impl AppState {
         Self {
             base_path,
             mods: Mutex::default(),
+            handoff_cancel: Mutex::default(),
         }
     }
 }
@@ -67,6 +74,10 @@ pub fn run() {
             commands::mods::add_mod_folder,
             commands::mods::add_paths,
             commands::mods::add_mod_from_url,
+            commands::handoff::start_handoff,
+            commands::handoff::cancel_handoff,
+            commands::handoff::install_handoff_file,
+            commands::handoff::classify_download_url,
             commands::profiles::load_profiles,
             commands::profiles::save_profiles,
             commands::settings::load_settings,

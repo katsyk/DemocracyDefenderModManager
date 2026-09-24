@@ -6,9 +6,11 @@ import NotificationPopupComponent from "$lib/components/popups/NotificationPopup
 import ErrorPopupComponent from "$lib/components/popups/ErrorPopup.svelte";
 import AddResultPopupComponent from "$lib/components/popups/AddResultPopup.svelte";
 import ModConfigPopupComponent from "$lib/components/popups/ModConfigPopup.svelte";
+import HandoffPopupComponent from "$lib/components/popups/HandoffPopup.svelte";
 import type { ModAddResult } from "./results";
 import type { Config } from "$lib/models/profile";
 import type { Mod } from "$lib/models/mod";
+import type { UUID } from "./uuid";
 
 export abstract class Popup<T = void> {
     abstract component: Component<any, any, any>;
@@ -43,7 +45,8 @@ export class InputPopup extends Popup<string | null> {
         public readonly allowEmpty: boolean = false,
         public readonly minLength?: number,
         public readonly maxLength?: number,
-        public readonly format?: RegExp
+        public readonly format?: RegExp,
+        public readonly description?: string
     ) {
         super();
     }
@@ -93,6 +96,30 @@ export class ModConfigPopup extends Popup<Config | null> {
     constructor(
         public readonly mod: Mod,
         public readonly config: Config
+    ) {
+        super();
+    }
+}
+
+export type HandoffResult =
+    | { status: "Done"; mod: Mod; warning?: string }
+    | { status: "Cancelled" }
+    | { status: "TimedOut" }
+    | { status: "Error"; message: string };
+
+/**
+ * Shown while the browser handoff (see `commands::handoff` on the Rust
+ * side) opens a login-gated mod page and watches the Downloads folder for
+ * the archive to land.
+ */
+export class HandoffPopup extends Popup<HandoffResult> {
+    component = HandoffPopupComponent;
+
+    constructor(
+        public readonly pageUrl: string,
+        public readonly siteName: string,
+        public readonly downloadsPath: string,
+        public readonly existingGuid?: UUID
     ) {
         super();
     }

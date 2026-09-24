@@ -23,7 +23,8 @@ export function tryToSkipEntry(value: string): SkipEntry | null {
 export type SettingsV1 = {
     Version: "V1",
     GamePath: string,
-    SkipList: SkipEntry[]
+    SkipList: SkipEntry[],
+    DownloadsPath: string
 };
 
 export type Settings = SettingsV1 /* | SettingsV2 */;

@@ -7,12 +7,18 @@ use crate::{AppState, models::settings::Settings};
 
 const SETTINGS_FILE: &'static str = "settings.json";
 
+/// The OS Downloads directory, if one can be determined. Used as the
+/// default `downloads_path` for the browser handoff (`commands::handoff`).
+pub fn default_downloads_path() -> PathBuf {
+    dirs::download_dir().unwrap_or_default()
+}
+
 pub async fn do_load_settings(base_path: &Path) -> anyhow::Result<Settings> {
     log::info!("Loading settings...");
     let settings_file = base_path.join(SETTINGS_FILE);
 
     log::info!("Looking for {:?}", &settings_file);
-    let settings = if tokio::fs::try_exists(&settings_file).await? {
+    let mut settings = if tokio::fs::try_exists(&settings_file).await? {
         log::info!("Opening...");
         let data = tokio::fs::read(&settings_file).await?;
 
@@ -23,9 +29,17 @@ pub async fn do_load_settings(base_path: &Path) -> anyhow::Result<Settings> {
 
         Settings::V1 {
             game_path: PathBuf::new(),
-            skip_list: vec![]
+            skip_list: vec![],
+            downloads_path: default_downloads_path(),
         }
     };
+
+    // Settings files written before `downloads_path` existed deserialize it
+    // as an empty path (`#[serde(default)]`); fill in the OS default rather
+    // than leaving it unusable.
+    if settings.downloads_path().as_os_str().is_empty() {
+        settings.set_downloads_path(default_downloads_path());
+    }
 
     log::info!("Settings loaded.");
     Ok(settings)

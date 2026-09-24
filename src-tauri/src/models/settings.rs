@@ -37,7 +37,14 @@ pub enum Settings {
     V1 {
         game_path: PathBuf,
         #[serde(with = "ascii_string")]
-        skip_list: Vec<[u8; 16]>
+        skip_list: Vec<[u8; 16]>,
+        /// Where the browser handoff (see `commands::handoff`) watches for a
+        /// freshly-downloaded archive. Defaults to the OS Downloads
+        /// directory; `#[serde(default)]` so settings.json files written
+        /// before this field existed still load, and `do_load_settings`
+        /// fills in the OS default if it comes back empty.
+        #[serde(default)]
+        downloads_path: PathBuf,
     }
 }
 
@@ -78,6 +85,18 @@ impl Settings {
             Settings::V1 { game_path, .. } => {
                 game_path.as_path()
             },
+        }
+    }
+
+    pub fn downloads_path(&self) -> &Path {
+        match self {
+            Settings::V1 { downloads_path, .. } => downloads_path.as_path(),
+        }
+    }
+
+    pub fn set_downloads_path(&mut self, path: PathBuf) {
+        match self {
+            Settings::V1 { downloads_path, .. } => *downloads_path = path,
         }
     }
 

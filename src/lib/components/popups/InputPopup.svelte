@@ -53,6 +53,9 @@
 </script>
 
 <PopupBase>
+    {#if popup.description}
+        <p class="text-sm text-zinc-400 max-w-80">{popup.description}</p>
+    {/if}
     <input
         class="hd2mm-input w-80"
         id="input"

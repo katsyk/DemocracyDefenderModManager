@@ -32,6 +32,10 @@
                     "delete": {
                         "title": "Delete",
                         "question": "Are you sure you want to delete this mod?"
+                    },
+                    "offer_handoff": {
+                        "title": "Open in Browser Instead?",
+                        "question": "That link didn't serve a downloadable archive directly. Open it on {site} in your browser and let DDMM install it automatically once it downloads?"
                     }
                 },
                 "input": {
@@ -39,7 +43,8 @@
                         "placeholder": "Profile name"
                     },
                     "add_url": {
-                        "placeholder": "https://example.com/mod.zip"
+                        "placeholder": "https://example.com/mod.zip",
+                        "description": "Paste a mod page or download link from AyakaMods, Nexus Mods, ModWorkshop, GameBanana, GitHub, or any direct download link."
                     }
                 },
                 "wait": {
@@ -155,7 +160,11 @@
                     "tip": "Update"
                 }
             },
-            "drop_message": "Drop archives or folders to add"
+            "drop_message": "Drop archives or folders to add",
+            "empty_state": {
+                "title": "No mods yet",
+                "works_with": "Works with AyakaMods, Nexus Mods, ModWorkshop, GameBanana, GitHub and more."
+            }
         },
         "settings": {
             "popup": {
@@ -180,6 +189,14 @@
             "game_path": {
                 "title": "Game Path",
                 "placeholder": "eg. Steam/steamapps/common/Helldivers 2/",
+                "browse_button": {
+                    "tip": "Browse..."
+                }
+            },
+            "downloads_path": {
+                "title": "Downloads Folder",
+                "description": "Where DDMM watches for a mod you download from a site it can't fetch directly (e.g. AyakaMods, Nexus Mods).",
+                "placeholder": "eg. Downloads",
                 "browse_button": {
                     "tip": "Browse..."
                 }
@@ -244,6 +261,22 @@
         "config": {
             "ok_button": {
                 "text": "OK"
+            }
+        },
+        "handoff": {
+            "title": "Browser Handoff",
+            "message": "Download the mod in the browser tab that just opened for {site}. DDMM installs it automatically as soon as it lands in {downloadsPath}.",
+            "error_message": "Something went wrong watching for the download from {site}.",
+            "timed_out_message": "Gave up waiting for the download after 15 minutes.",
+            "status": {
+                "waiting": "Waiting for the download...",
+                "installing": "Installing..."
+            },
+            "cancel_button": {
+                "text": "Cancel"
+            },
+            "choose_file_button": {
+                "text": "I already downloaded it -- choose file"
             }
         }
     }

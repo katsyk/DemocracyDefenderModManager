@@ -9,7 +9,7 @@ use crate::{AppState, commands::settings::{do_load_settings, load_settings}, mod
 pub mod mods;
 pub mod profiles;
 pub mod settings;
-// pub mod handoff; // TODO(part C)
+pub mod handoff;
 // pub mod updates; // TODO(part D)
 
 static INDEX_REGEX: OnceLock<Regex> = OnceLock::new();

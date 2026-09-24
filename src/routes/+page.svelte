@@ -10,7 +10,7 @@
     import { useLocalization } from "$lib/state/localization.svelte";
     import { Mod } from "$lib/models/mod";
     import type {Config, Profile, ProfilesConfig} from "$lib/models/profile";
-    import { addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles, deploy, purge, checkSettings } from "$lib/utils/commands";
+    import { addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles, loadSettings, deploy, purge, checkSettings, classifyDownloadUrl } from "$lib/utils/commands";
     import type { UUID } from "$lib/types/uuid";
     import { usePopup } from "$lib/state/popup.svelte";
     import {
@@ -20,7 +20,8 @@
         NotificationPopup,
         ErrorPopup,
         AddResultPopup,
-        ModConfigPopup
+        ModConfigPopup,
+        HandoffPopup
     } from "$lib/types/popup";
     import ToggleSwitch from "$lib/components/ToggleSwitch.svelte";
     import PopupMenuButton from "$lib/components/PopupMenuButton.svelte";
@@ -42,6 +43,7 @@
     let libraryVisible = $state<boolean>(false);
     let isDragging = $state<boolean>(false);
     let initPromise = $state<Promise<void>>();
+    let downloadsPath = $state<string>("");
 
     let currentProfile = $derived<Profile | undefined>(profiles[activeProfile]);
     let profileMods = $derived<Mod[]>(profileConfigs.map(config => mods.find(m => m.guid === config.Guid)).filter((m): m is Mod => m !== undefined));
@@ -143,6 +145,9 @@
         mods = loadedMods;
         profiles = loadedConfig.Profiles;
         activeProfile = loadedConfig.Active;
+
+        const settings = await loadSettings();
+        if (settings.Version === "V1") downloadsPath = settings.DownloadsPath;
 
         log.info("Initialization complete.");
     }
@@ -368,10 +373,54 @@
             } else {
                 message = "Unknown error!";
             }
+            wait.close();
+
+            // The site didn't serve the archive directly (login/JS-gated
+            // download, or just an HTML page) -- offer a browser handoff
+            // instead of a bare error.
+            if (message.includes("not a supported archive")) {
+                const classification = await classifyDownloadUrl(url);
+                const tryHandoff = await showPopup(new ConfirmPopup(
+                    t("pages.mods.popup.confirm.offer_handoff.title"),
+                    t("pages.mods.popup.confirm.offer_handoff.question", { site: classification.DisplayName }),
+                ));
+                if (tryHandoff) {
+                    await doStartHandoff(url, classification.DisplayName);
+                    return;
+                }
+            }
+
             const hint = t("pages.mods.popup.error.add_url.hint");
             showPopup(new ErrorPopup(t("pages.mods.popup.error.add_url.message"), `${message}\n\n${hint}`));
-        } finally {
-            wait.close();
+            return;
+        }
+        wait.close();
+    }
+
+    async function doStartHandoff(pageUrl: string, siteName: string, existingGuid?: UUID) {
+        const result = await showPopup(new HandoffPopup(pageUrl, siteName, downloadsPath, existingGuid));
+        switch (result.status) {
+            case "Done":
+                if (!existingGuid) {
+                    mods.push(result.mod);
+                } else {
+                    const i = mods.findIndex(m => m.guid === existingGuid || m.guid === result.mod.guid);
+                    if (i === -1) {
+                        mods.push(result.mod);
+                    } else {
+                        mods[i] = result.mod;
+                    }
+                }
+                if (result.warning) showPopup(new NotificationPopup("warning", result.warning));
+                break;
+            case "TimedOut":
+                showPopup(new NotificationPopup("warning", t("popup.handoff.timed_out_message")));
+                break;
+            case "Error":
+                showPopup(new ErrorPopup(t("pages.mods.popup.error.add_url.message"), result.message));
+                break;
+            case "Cancelled":
+                break;
         }
     }
 
@@ -547,10 +596,16 @@
             undefined,
             undefined,
             /^https:\/\//,
+            t("pages.mods.popup.input.add_url.description"),
         ));
         if (!url) return;
 
-        await doAddModFromUrl(url);
+        const classification = await classifyDownloadUrl(url);
+        if (classification.RequiresHandoff) {
+            await doStartHandoff(url, classification.DisplayName);
+        } else {
+            await doAddModFromUrl(url);
+        }
     }
 
     async function onPurge() {
@@ -682,6 +737,12 @@
         <div class="flex-1 flex flex-row relative min-h-0">
             <!-- Mod List -->
             <div class="flex-1 mr-7 pr-1 overflow-y-scroll h-full">
+                {#if mods.length === 0}
+                    <div class="h-full flex flex-col items-center justify-center gap-1 text-center px-4">
+                        <span class="text-zinc-400 text-lg">{t("pages.mods.empty_state.title")}</span>
+                        <span class="text-zinc-500 text-sm max-w-100">{t("pages.mods.empty_state.works_with")}</span>
+                    </div>
+                {/if}
                 <SortableList.Root
                     ondragend={onDragEnd}
                     isLocked={!allowReorder}

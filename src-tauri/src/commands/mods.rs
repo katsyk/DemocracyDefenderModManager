@@ -185,7 +185,7 @@ pub async fn add_mod(state: State<'_, AppState>, archive_file: PathBuf) -> TARes
 /// single install, and from callers (like `add_paths`) that lock once per
 /// item without ever calling back into another `#[tauri::command]` while
 /// holding the mutex.
-async fn install_from_archive(state: &AppState, mods: &mut Vec<Mod>, archive_file: &Path) -> TAResult<(Mod, Option<String>)> {
+pub(crate) async fn install_from_archive(state: &AppState, mods: &mut Vec<Mod>, archive_file: &Path) -> TAResult<(Mod, Option<String>)> {
     log::info!("Adding mod from {:?}...", archive_file);
 
     log::debug!("Opening archive...");
@@ -670,4 +670,307 @@ pub async fn add_mod_from_url(state: State<'_, AppState>, url: String) -> TAResu
     }
 
     Ok(InstalledMod { r#mod, warning })
+}
+/// Install `archive_path` as an update of the existing mod `existing_guid`,
+/// used by both the browser handoff and the "Update from {site}" flow.
+///
+/// The new content is fully staged (extracted, manifest resolved, patch
+/// layout detected) in a throwaway directory under the mods folder before
+/// anything about the existing mod is touched. Only once that succeeds is
+/// the old mod directory swapped out for the new one; on any failure before
+/// the swap the old mod is left completely untouched, and the staging
+/// directory is always cleaned up.
+///
+/// GUID handling: if the newly-installed manifest is one this manager
+/// generated itself (no manifest.json in the update), the *old* GUID is
+/// kept so existing profile configs referencing this mod keep working. If
+/// the update ships its own manifest with its own GUID, that GUID is kept
+/// instead (even if it differs from the old one) and the change is logged
+/// -- profile configs are not migrated in that case.
+pub(crate) async fn install_update_from_archive(
+    state: &AppState,
+    mods: &mut Vec<Mod>,
+    archive_path: &Path,
+    existing_guid: Uuid,
+) -> TAResult<(Mod, Option<String>)> {
+    let old_mod = mods
+        .iter()
+        .find(|m| m.guid() == existing_guid)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("mod with GUID {{{}}} not found", existing_guid))
+        .into_ta_result()?;
+    let old_dir = old_mod.directory.clone();
+
+    let staging_dir = state
+        .base_path
+        .join(MODS_DIRECTORY)
+        .join(format!(".update-{}", Uuid::new_v4()));
+    tokio::fs::create_dir_all(&staging_dir).await.into_ta_result()?;
+
+    let staged = stage_update(&staging_dir, archive_path).await;
+
+    let (mut manifest, warning) = match staged {
+        Ok(ok) => ok,
+        Err(e) => {
+            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            return Err(e);
+        }
+    };
+
+    let final_guid = if is_local_generated(&manifest) {
+        if let Manifest::Legacy(legacy) = &mut manifest {
+            legacy.guid = existing_guid;
+        }
+        existing_guid
+    } else {
+        let new_guid = match &manifest {
+            Manifest::Legacy(m) => m.guid,
+            Manifest::V1(m) => m.guid,
+            Manifest::V2(m) => m.guid,
+        };
+        if new_guid != existing_guid {
+            log::info!(
+                "Update for mod {{{}}} ships its own GUID {{{}}}; keeping the new one (profile entries referencing the old GUID will no longer match).",
+                existing_guid, new_guid
+            );
+        }
+        new_guid
+    };
+
+    // Persist the (possibly GUID-rewritten) manifest into staging before the swap.
+    let manifest_data = match serde_json::to_vec_pretty(&manifest) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            return Err(e).into_ta_result();
+        }
+    };
+    if let Err(e) = tokio::fs::write(staging_dir.join(MANIFEST_FILE), manifest_data).await {
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        return Err(e).into_ta_result();
+    }
+
+    log::info!("Swapping in updated content for mod {{{}}}...", final_guid);
+    let backup_dir = state
+        .base_path
+        .join(MODS_DIRECTORY)
+        .join(format!(".update-backup-{}", Uuid::new_v4()));
+
+    if let Err(e) = tokio::fs::rename(&old_dir, &backup_dir).await {
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        return Err(e).into_ta_result();
+    }
+
+    if let Err(e) = tokio::fs::rename(&staging_dir, &old_dir).await {
+        // Roll back: put the old content back where it was.
+        let _ = tokio::fs::rename(&backup_dir, &old_dir).await;
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        return Err(e).into_ta_result();
+    }
+
+    let _ = tokio::fs::remove_dir_all(&backup_dir).await;
+
+    let mut new_mod = Mod {
+        manifest,
+        directory: old_dir,
+        sources: Vec::new(),
+    };
+
+    if let Err(e) = new_mod.normalize_paths().await {
+        log::error!("Path normalization failed: {}", e);
+    }
+    new_mod.resolve_sources().await;
+
+    mods.retain(|m| m.guid() != existing_guid);
+    mods.push(new_mod.clone());
+
+    log::info!("Mod {{{}}} updated successfully.", new_mod.guid());
+    Ok((new_mod, warning))
+}
+
+/// Extract `archive_path` into `staging_dir` and resolve its manifest
+/// (generating a local one, with patch-layout auto-detection, if it ships
+/// none), without touching anything outside `staging_dir`.
+async fn stage_update(staging_dir: &Path, archive_path: &Path) -> TAResult<(Manifest, Option<String>)> {
+    let archive = Archive::open(archive_path)?;
+    let manifest_file = staging_dir.join(MANIFEST_FILE);
+    let name = archive_path
+        .file_prefix()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "update".to_string());
+
+    let (archive, mut manifest) = resolve_manifest(archive, name, manifest_file).await?;
+
+    extract_archive(archive, staging_dir.to_path_buf()).await?;
+
+    let warning = apply_patch_layout(staging_dir, &mut manifest).await.into_ta_result()?;
+
+    Ok((manifest, warning))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::manifest::legacy;
+    use std::io::Write;
+
+    fn make_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, data) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(data).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    fn patch_file_name() -> String {
+        "0123456789abcdef.patch_0".to_string()
+    }
+
+    async fn make_existing_mod(base: &Path, name: &str) -> (Uuid, PathBuf) {
+        let mod_dir = base.join(MODS_DIRECTORY).join(name);
+        tokio::fs::create_dir_all(&mod_dir).await.unwrap();
+        tokio::fs::write(mod_dir.join(patch_file_name()), b"old content")
+            .await
+            .unwrap();
+
+        let mut guid_bytes = [0u8; 16];
+        guid_bytes[..5].copy_from_slice(b"LOCAL");
+        guid_bytes[5] = 1;
+        let guid = Uuid::from_bytes(guid_bytes);
+
+        let manifest = Manifest::Legacy(legacy::Manifest {
+            guid,
+            name: name.to_string(),
+            description: String::new(),
+            icon_path: None,
+            options: None,
+        });
+        let data = serde_json::to_vec_pretty(&manifest).unwrap();
+        tokio::fs::write(mod_dir.join(MANIFEST_FILE), data)
+            .await
+            .unwrap();
+
+        (guid, mod_dir)
+    }
+
+    #[tokio::test]
+    async fn install_update_keeps_old_guid_when_new_manifest_is_local_generated() {
+        let base = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(base.path().join(MODS_DIRECTORY))
+            .await
+            .unwrap();
+
+        let (old_guid, old_dir) = make_existing_mod(base.path(), "CoolMod").await;
+        let mut mods = vec![Mod {
+            manifest: Manifest::Legacy(legacy::Manifest {
+                guid: old_guid,
+                name: "CoolMod".to_string(),
+                description: String::new(),
+                icon_path: None,
+                options: None,
+            }),
+            directory: old_dir.clone(),
+            sources: Vec::new(),
+        }];
+
+        let update_zip = base.path().join("update.zip");
+        make_zip(&update_zip, &[(&patch_file_name(), b"new content")]);
+
+        let state = AppState::new(base.path().to_path_buf());
+        let (updated, warning) = install_update_from_archive(&state, &mut mods, &update_zip, old_guid)
+            .await
+            .unwrap();
+
+        assert!(warning.is_none());
+        assert_eq!(updated.guid(), old_guid);
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].guid(), old_guid);
+
+        let content = tokio::fs::read(old_dir.join(patch_file_name())).await.unwrap();
+        assert_eq!(content, b"new content");
+    }
+
+    #[tokio::test]
+    async fn install_update_keeps_new_guid_when_manifest_declares_its_own() {
+        let base = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(base.path().join(MODS_DIRECTORY))
+            .await
+            .unwrap();
+
+        let (old_guid, _old_dir) = make_existing_mod(base.path(), "CoolMod").await;
+        let mut mods = vec![Mod {
+            manifest: Manifest::Legacy(legacy::Manifest {
+                guid: old_guid,
+                name: "CoolMod".to_string(),
+                description: String::new(),
+                icon_path: None,
+                options: None,
+            }),
+            directory: base.path().join(MODS_DIRECTORY).join("CoolMod"),
+            sources: Vec::new(),
+        }];
+
+        let new_manifest = serde_json::json!({
+            "Guid": "11111111-1111-1111-1111-111111111111",
+            "Name": "CoolMod",
+            "Description": "shipped manifest",
+        });
+        let update_zip = base.path().join("update.zip");
+        make_zip(
+            &update_zip,
+            &[
+                (MANIFEST_FILE, serde_json::to_vec_pretty(&new_manifest).unwrap().as_slice()),
+                (&patch_file_name(), b"new content"),
+            ],
+        );
+
+        let state = AppState::new(base.path().to_path_buf());
+        let (updated, _warning) = install_update_from_archive(&state, &mut mods, &update_zip, old_guid)
+            .await
+            .unwrap();
+
+        let new_guid = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        assert_eq!(updated.guid(), new_guid);
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].guid(), new_guid);
+    }
+
+    #[tokio::test]
+    async fn install_update_leaves_old_mod_untouched_on_failure() {
+        let base = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(base.path().join(MODS_DIRECTORY))
+            .await
+            .unwrap();
+
+        let (old_guid, old_dir) = make_existing_mod(base.path(), "CoolMod").await;
+        let mut mods = vec![Mod {
+            manifest: Manifest::Legacy(legacy::Manifest {
+                guid: old_guid,
+                name: "CoolMod".to_string(),
+                description: String::new(),
+                icon_path: None,
+                options: None,
+            }),
+            directory: old_dir.clone(),
+            sources: Vec::new(),
+        }];
+
+        // Not a real archive: Archive::open will fail on the unsupported/invalid content.
+        let bad_path = base.path().join("update.exe");
+        tokio::fs::write(&bad_path, b"not an archive").await.unwrap();
+
+        let state = AppState::new(base.path().to_path_buf());
+        let result = install_update_from_archive(&state, &mut mods, &bad_path, old_guid).await;
+
+        assert!(result.is_err());
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].guid(), old_guid);
+        assert!(old_dir.join(patch_file_name()).is_file());
+        let content = tokio::fs::read(old_dir.join(patch_file_name())).await.unwrap();
+        assert_eq!(content, b"old content");
+    }
 }
