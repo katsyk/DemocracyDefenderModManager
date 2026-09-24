@@ -91,6 +91,10 @@ pub fn resolve(source: &Source) -> ResolvedSource {
             .id
             .as_ref()
             .map(|id| format!("https://gamebanana.com/mods/{id}")),
+        "ayakamods" => source
+            .id
+            .as_ref()
+            .map(|id| format!("https://ayakamods.com/mods/{id}/")),
         _ => None,
     };
 
@@ -99,6 +103,7 @@ pub fn resolve(source: &Source) -> ResolvedSource {
         "modworkshop" => "ModWorkshop".to_string(),
         "github" => "GitHub".to_string(),
         "gamebanana" => "GameBanana".to_string(),
+        "ayakamods" => "AyakaMods".to_string(),
         "url" => "Link".to_string(),
         _ => source.provider.clone(),
     };
@@ -151,8 +156,91 @@ pub fn provider_from_url(url: &str) -> String {
         "github".to_string()
     } else if host == "gamebanana.com" || host.ends_with(".gamebanana.com") {
         "gamebanana".to_string()
+    } else if host == "ayakamods.com" || host.ends_with(".ayakamods.com") {
+        "ayakamods".to_string()
     } else {
         "url".to_string()
+    }
+}
+
+/// Extract a structured [`Source`] from a mod *page* URL (as opposed to a
+/// direct download link) for the sites this manager knows the page-URL
+/// shape of. Returns `None` for anything else -- callers fall back to a
+/// bare `url` source in that case.
+///
+/// Query strings and fragments are ignored, trailing slashes don't matter,
+/// and non-numeric/garbage ids are rejected rather than guessed at.
+pub fn source_from_page_url(url: &str) -> Option<Source> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    let segments: Vec<&str> = parsed
+        .path_segments()
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let is_numeric = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+
+    match host {
+        "ayakamods.com" => {
+            // /mods/<slug>.<id>/ or /mods/<id>/
+            let last = segments.get(1).filter(|_| segments.first() == Some(&"mods"))?;
+            let id = last.rsplit('.').next()?;
+            is_numeric(id).then(|| Source {
+                provider: "ayakamods".to_string(),
+                id: Some(id.to_string()),
+                url: None,
+                version: None,
+            })
+        }
+        "nexusmods.com" => {
+            // /helldivers2/mods/<id>
+            if segments.first() != Some(&"helldivers2") || segments.get(1) != Some(&"mods") {
+                return None;
+            }
+            let id = segments.get(2)?;
+            is_numeric(id).then(|| Source {
+                provider: "nexus".to_string(),
+                id: Some(id.to_string()),
+                url: None,
+                version: None,
+            })
+        }
+        "modworkshop.net" => {
+            let id = segments.get(1).filter(|_| segments.first() == Some(&"mod"))?;
+            (!id.is_empty()).then(|| Source {
+                provider: "modworkshop".to_string(),
+                id: Some(id.to_string()),
+                url: None,
+                version: None,
+            })
+        }
+        "gamebanana.com" => {
+            let id = segments.get(1).filter(|_| segments.first() == Some(&"mods"))?;
+            is_numeric(id).then(|| Source {
+                provider: "gamebanana".to_string(),
+                id: Some(id.to_string()),
+                url: None,
+                version: None,
+            })
+        }
+        "github.com" => {
+            let owner = segments.first()?;
+            let repo = segments.get(1)?;
+            (!owner.is_empty() && !repo.is_empty()).then(|| Source {
+                provider: "github".to_string(),
+                id: Some(format!("{owner}/{repo}")),
+                url: None,
+                version: None,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -423,5 +511,128 @@ mod tests {
             .unwrap();
         let loaded = load_origin_sidecar(dir.path()).await;
         assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn resolve_ayakamods_builds_template_url() {
+        let s = source("ayakamods", Some("4084"), None);
+        let r = resolve(&s);
+        assert_eq!(r.display_name, "AyakaMods");
+        assert_eq!(
+            r.page_url.as_deref(),
+            Some("https://ayakamods.com/mods/4084/")
+        );
+    }
+
+    #[test]
+    fn provider_from_url_detects_ayakamods() {
+        assert_eq!(
+            provider_from_url("https://ayakamods.com/mods/hd2-auto-reload.4084/"),
+            "ayakamods"
+        );
+        assert_eq!(
+            provider_from_url("https://www.ayakamods.com/mods/hd2-auto-reload.4084/"),
+            "ayakamods"
+        );
+    }
+
+    #[test]
+    fn source_from_page_url_ayakamods_slug_and_id() {
+        let s = source_from_page_url("https://ayakamods.com/mods/hd2-auto-reload.4084/").unwrap();
+        assert_eq!(s.provider, "ayakamods");
+        assert_eq!(s.id.as_deref(), Some("4084"));
+    }
+
+    #[test]
+    fn source_from_page_url_ayakamods_bare_id_no_trailing_slash() {
+        let s = source_from_page_url("https://ayakamods.com/mods/4084").unwrap();
+        assert_eq!(s.provider, "ayakamods");
+        assert_eq!(s.id.as_deref(), Some("4084"));
+    }
+
+    #[test]
+    fn source_from_page_url_ayakamods_with_query_and_fragment() {
+        let s = source_from_page_url(
+            "https://www.ayakamods.com/mods/hd2-auto-reload.4084/?utm_source=x#reviews",
+        )
+        .unwrap();
+        assert_eq!(s.provider, "ayakamods");
+        assert_eq!(s.id.as_deref(), Some("4084"));
+    }
+
+    #[test]
+    fn source_from_page_url_ayakamods_rejects_non_numeric_id() {
+        assert!(source_from_page_url("https://ayakamods.com/mods/hd2-auto-reload.abc/").is_none());
+        assert!(source_from_page_url("https://ayakamods.com/mods/not-a-number/").is_none());
+    }
+
+    #[test]
+    fn source_from_page_url_ayakamods_download_subpath_still_resolves() {
+        let s =
+            source_from_page_url("https://ayakamods.com/mods/hd2-auto-reload.4084/download")
+                .unwrap();
+        assert_eq!(s.id.as_deref(), Some("4084"));
+    }
+
+    #[test]
+    fn source_from_page_url_nexus() {
+        let s =
+            source_from_page_url("https://www.nexusmods.com/helldivers2/mods/123?tab=files")
+                .unwrap();
+        assert_eq!(s.provider, "nexus");
+        assert_eq!(s.id.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn source_from_page_url_nexus_rejects_non_numeric() {
+        assert!(source_from_page_url("https://www.nexusmods.com/helldivers2/mods/abc").is_none());
+    }
+
+    #[test]
+    fn source_from_page_url_modworkshop() {
+        let s = source_from_page_url("https://modworkshop.net/mod/12345/").unwrap();
+        assert_eq!(s.provider, "modworkshop");
+        assert_eq!(s.id.as_deref(), Some("12345"));
+    }
+
+    #[test]
+    fn source_from_page_url_gamebanana() {
+        let s = source_from_page_url("https://gamebanana.com/mods/999999").unwrap();
+        assert_eq!(s.provider, "gamebanana");
+        assert_eq!(s.id.as_deref(), Some("999999"));
+    }
+
+    #[test]
+    fn source_from_page_url_gamebanana_rejects_non_numeric() {
+        assert!(source_from_page_url("https://gamebanana.com/mods/abc").is_none());
+    }
+
+    #[test]
+    fn source_from_page_url_github() {
+        let s = source_from_page_url("https://github.com/someone/example-mod").unwrap();
+        assert_eq!(s.provider, "github");
+        assert_eq!(s.id.as_deref(), Some("someone/example-mod"));
+    }
+
+    #[test]
+    fn source_from_page_url_github_with_extra_path_segments() {
+        let s = source_from_page_url("https://github.com/someone/example-mod/releases/latest")
+            .unwrap();
+        assert_eq!(s.id.as_deref(), Some("someone/example-mod"));
+    }
+
+    #[test]
+    fn source_from_page_url_unknown_host_is_none() {
+        assert!(source_from_page_url("https://example.com/downloads/mod.zip").is_none());
+    }
+
+    #[test]
+    fn source_from_page_url_rejects_non_http_scheme() {
+        assert!(source_from_page_url("ftp://ayakamods.com/mods/4084/").is_none());
+    }
+
+    #[test]
+    fn source_from_page_url_rejects_garbage() {
+        assert!(source_from_page_url("not a url at all").is_none());
     }
 }
