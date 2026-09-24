@@ -34,6 +34,7 @@ futures = "0.3"
 regex = "1.12"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
 percent-encoding = "2.3.2"
+dirs = "6"
 
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"

@@ -4,13 +4,14 @@ use anyhow_tauri::{IntoTAResult, TAResult};
 use regex::Regex;
 use tauri::State;
 
-use crate::{AppState, commands::settings::{do_load_settings, load_settings}, models::{manifest::Manifest, profile::Config}};
+use crate::{AppState, commands::settings::{do_load_settings, load_settings}, models::{manifest::Manifest, profile::Config}, utils::is_patch_filename};
 
 pub mod mods;
 pub mod profiles;
 pub mod settings;
+// pub mod handoff; // TODO(part C)
+// pub mod updates; // TODO(part D)
 
-static PATCH_REGEX: OnceLock<Regex> = OnceLock::new();
 static INDEX_REGEX: OnceLock<Regex> = OnceLock::new();
 
 struct PatchFileTriplet {
@@ -20,8 +21,6 @@ struct PatchFileTriplet {
 }
 
 async fn get_patch_files_from_dir(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let patch_regex = PATCH_REGEX.get_or_init(|| Regex::new(r"^[0-9a-f]{16}\.patch_\d+(?:\.gpu_resources|\.stream)?$").unwrap());
-
     log::info!("Collecting patch files of directory {:?}...", dir);
 
     let mut entries = Vec::new();
@@ -36,7 +35,7 @@ async fn get_patch_files_from_dir(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
         let path = entry.path();
         if !path.file_name()
             .and_then(|n| n.to_str())
-            .map(|n| patch_regex.is_match(n))
+            .map(is_patch_filename)
             .unwrap_or(false) {
             continue;
         }

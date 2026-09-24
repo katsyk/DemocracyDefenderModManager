@@ -1,4 +1,166 @@
-use std::path::{Path, PathBuf};
+use std::{path::{Path, PathBuf}, sync::OnceLock};
+
+use regex::Regex;
+
+static PATCH_FILE_REGEX: OnceLock<Regex> = OnceLock::new();
+
+/// Whether a bare file name looks like a Helldivers 2 patch file
+/// (`<16 hex chars>.patch_<n>`, optionally `.gpu_resources` or `.stream`).
+/// Shared between deploy's file grouping (`commands/mod.rs`) and archive
+/// layout auto-detection (below).
+pub fn is_patch_filename(name: &str) -> bool {
+    PATCH_FILE_REGEX
+        .get_or_init(|| Regex::new(r"^[0-9a-f]{16}\.patch_\d+(?:\.gpu_resources|\.stream)?$").unwrap())
+        .is_match(name)
+}
+
+/// The result of scanning a freshly-installed, manifest-less mod directory
+/// for where its Helldivers 2 patch files actually live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatchLayout {
+    /// The mod root directly contains patch files -- the layout the manager
+    /// has always assumed.
+    RootHasFiles,
+    /// One or more directories (up to 4 levels deep, relative paths using
+    /// `/`, naturally sorted) directly contain patch files, but the root
+    /// doesn't. Covers both a single wrapper folder (`ModName/`) and
+    /// several variant folders (`Red/`, `Blue/`, ...) -- either way the
+    /// generated legacy manifest's `Options` list is set to these paths, so
+    /// the existing option picker (already defaulting to index 0) handles
+    /// both cases without new UI.
+    Options(Vec<String>),
+    /// No patch files found anywhere in the first 4 levels.
+    NoneFound,
+}
+
+/// Scan `mod_dir` for Helldivers 2 patch files: first the root itself, then
+/// (if the root has none) every directory up to 4 levels deep that
+/// *directly* contains at least one. A qualifying directory is not
+/// recursed into further -- its contents are that option's file tree, not a
+/// place to look for more nested variants. Symlinked directories are never
+/// followed.
+pub async fn detect_patch_layout(mod_dir: &Path) -> anyhow::Result<PatchLayout> {
+    if dir_has_patch_files(mod_dir).await? {
+        return Ok(PatchLayout::RootHasFiles);
+    }
+
+    let mut found = Vec::new();
+    collect_patch_dirs(mod_dir, mod_dir, 1, 4, &mut found).await?;
+
+    if found.is_empty() {
+        Ok(PatchLayout::NoneFound)
+    } else {
+        found.sort_by(|a, b| natural_cmp(a, b));
+        Ok(PatchLayout::Options(found))
+    }
+}
+
+async fn dir_has_patch_files(dir: &Path) -> anyhow::Result<bool> {
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let file_type = entry.file_type().await?;
+        if !file_type.is_file() {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            if is_patch_filename(name) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn collect_patch_dirs<'a>(
+    root: &'a Path,
+    dir: &'a Path,
+    depth: u32,
+    max_depth: u32,
+    found: &'a mut Vec<String>,
+) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+    Box::pin(async move {
+        let mut subdirs = Vec::new();
+        let mut entries = tokio::fs::read_dir(dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            // Never follow symlinks while searching.
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            subdirs.push(entry.path());
+        }
+
+        for sub in subdirs {
+            if dir_has_patch_files(&sub).await? {
+                let rel = sub.strip_prefix(root)?;
+                found.push(path_to_rel_string(rel));
+            } else if depth < max_depth {
+                collect_patch_dirs(root, &sub, depth + 1, max_depth, found).await?;
+            }
+        }
+
+        Ok(())
+    })
+}
+
+/// Render a relative path as a `/`-separated string regardless of the host
+/// platform's native separator, so generated manifests are portable.
+fn path_to_rel_string(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Compare two strings "naturally": runs of ASCII digits compare by numeric
+/// value rather than character-by-character, so `"Option 2"` sorts before
+/// `"Option 10"`. Non-digit runs compare case-insensitively.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let mut ai = a.chars().peekable();
+    let mut bi = b.chars().peekable();
+
+    loop {
+        match (ai.peek().copied(), bi.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(ca), Some(cb)) => {
+                if ca.is_ascii_digit() && cb.is_ascii_digit() {
+                    let na = take_number(&mut ai);
+                    let nb = take_number(&mut bi);
+                    match na.cmp(&nb) {
+                        Ordering::Equal => continue,
+                        other => return other,
+                    }
+                } else {
+                    match ca.to_ascii_lowercase().cmp(&cb.to_ascii_lowercase()) {
+                        Ordering::Equal => {
+                            ai.next();
+                            bi.next();
+                            continue;
+                        }
+                        other => return other,
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn take_number(it: &mut std::iter::Peekable<std::str::Chars>) -> u64 {
+    let mut n: u64 = 0;
+    while let Some(&c) = it.peek() {
+        if let Some(d) = c.to_digit(10) {
+            n = n.saturating_mul(10).saturating_add(d as u64);
+            it.next();
+        } else {
+            break;
+        }
+    }
+    n
+}
 
 /// Recursively copy the contents of `src` into `dst`, creating directories
 /// as needed. Symlinks are never followed (skipped outright); entries whose
@@ -128,5 +290,111 @@ mod tests {
 
             assert!(!dst.path().join("link.txt").exists());
         }
+    }
+
+    fn patch_file_name(index: u32) -> String {
+        format!("0123456789abcdef.patch_{}", index)
+    }
+
+    async fn touch(path: &Path) {
+        tokio::fs::write(path, b"").await.unwrap();
+    }
+
+    #[test]
+    fn is_patch_filename_matches_hd2_patch_files() {
+        assert!(is_patch_filename("0123456789abcdef.patch_0"));
+        assert!(is_patch_filename("0123456789abcdef.patch_12.gpu_resources"));
+        assert!(is_patch_filename("0123456789abcdef.patch_12.stream"));
+        assert!(!is_patch_filename("readme.txt"));
+        assert!(!is_patch_filename("0123456789abcdef.patch_"));
+    }
+
+    #[test]
+    fn natural_cmp_orders_numeric_runs_numerically() {
+        let mut v = vec!["Option 10", "Option 2", "Option 1"];
+        v.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(v, vec!["Option 1", "Option 2", "Option 10"]);
+    }
+
+    #[test]
+    fn natural_cmp_is_case_insensitive_for_text() {
+        assert_eq!(natural_cmp("blue", "Red"), std::cmp::Ordering::Less);
+    }
+
+    #[tokio::test]
+    async fn detect_patch_layout_root_has_files() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join(patch_file_name(0))).await;
+
+        let layout = detect_patch_layout(dir.path()).await.unwrap();
+        assert_eq!(layout, PatchLayout::RootHasFiles);
+    }
+
+    #[tokio::test]
+    async fn detect_patch_layout_single_wrapper_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = dir.path().join("ModName");
+        tokio::fs::create_dir(&wrapper).await.unwrap();
+        touch(&wrapper.join(patch_file_name(0))).await;
+
+        let layout = detect_patch_layout(dir.path()).await.unwrap();
+        assert_eq!(layout, PatchLayout::Options(vec!["ModName".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn detect_patch_layout_multiple_variant_folders_sorted_naturally() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["Option 10", "Option 2", "Option 1"] {
+            let d = dir.path().join(name);
+            tokio::fs::create_dir(&d).await.unwrap();
+            touch(&d.join(patch_file_name(0))).await;
+        }
+
+        let layout = detect_patch_layout(dir.path()).await.unwrap();
+        assert_eq!(
+            layout,
+            PatchLayout::Options(vec![
+                "Option 1".to_string(),
+                "Option 2".to_string(),
+                "Option 10".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_patch_layout_nested_within_depth_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("Variants").join("Red");
+        tokio::fs::create_dir_all(&nested).await.unwrap();
+        touch(&nested.join(patch_file_name(0))).await;
+
+        let layout = detect_patch_layout(dir.path()).await.unwrap();
+        assert_eq!(
+            layout,
+            PatchLayout::Options(vec!["Variants/Red".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_patch_layout_none_found() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("readme.txt")).await;
+
+        let layout = detect_patch_layout(dir.path()).await.unwrap();
+        assert_eq!(layout, PatchLayout::NoneFound);
+    }
+
+    #[tokio::test]
+    async fn detect_patch_layout_does_not_recurse_into_qualifying_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = dir.path().join("ModName");
+        let nested = wrapper.join("NestedIgnored");
+        tokio::fs::create_dir_all(&nested).await.unwrap();
+        touch(&wrapper.join(patch_file_name(0))).await;
+        touch(&nested.join(patch_file_name(1))).await;
+
+        let layout = detect_patch_layout(dir.path()).await.unwrap();
+        // Only the top-level wrapper is reported, not the nested dir inside it.
+        assert_eq!(layout, PatchLayout::Options(vec!["ModName".to_string()]));
     }
 }

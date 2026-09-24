@@ -8,9 +8,16 @@ import type { UUID } from '$lib/types/uuid';
 import type { Settings } from '$lib/models/settings';
 
 type RawMod = { Manifest: Manifest, Directory: string, Sources?: ResolvedSource[] };
+type RawInstalledMod = RawMod & { Warning?: string };
+
+export type InstalledMod = { mod: Mod, warning?: string };
 
 function toMod(raw: RawMod): Mod {
     return new Mod(raw.Manifest, raw.Directory, raw.Sources ?? []);
+}
+
+function toInstalledMod(raw: RawInstalledMod): InstalledMod {
+    return { mod: toMod(raw), warning: raw.Warning };
 }
 
 export async function getMods(): Promise<Mod[]> {
@@ -24,48 +31,48 @@ export async function deleteMod(guid: UUID): Promise<void> {
     await invoke<void>("delete_mod", { guid });
 }
 
-export async function addMod(archiveFile: string): Promise<Mod> {
+export async function addMod(archiveFile: string): Promise<InstalledMod> {
     log.debug("Invoking `add_mod`.");
-    const mod = await invoke<RawMod>("add_mod", { archiveFile });
-    return toMod(mod);
+    const mod = await invoke<RawInstalledMod>("add_mod", { archiveFile });
+    return toInstalledMod(mod);
 }
 
-export async function addMods(archiveFiles: string[]): Promise<RustResult<Mod>[]> {
+export async function addMods(archiveFiles: string[]): Promise<RustResult<InstalledMod>[]> {
     log.debug("Invoking `add_mods`.");
-    const results = await invoke<RustResult<RawMod>[]>("add_mods", { archiveFiles });
+    const results = await invoke<RustResult<RawInstalledMod>[]>("add_mods", { archiveFiles });
     return results.map(result => {
         if ("Ok" in result) {
             return {
-                Ok: toMod(result.Ok)
+                Ok: toInstalledMod(result.Ok)
             };
         }
         return result;
     });
 }
 
-export async function addModFolder(folder: string): Promise<Mod> {
+export async function addModFolder(folder: string): Promise<InstalledMod> {
     log.debug("Invoking `add_mod_folder`.");
-    const mod = await invoke<RawMod>("add_mod_folder", { folder });
-    return toMod(mod);
+    const mod = await invoke<RawInstalledMod>("add_mod_folder", { folder });
+    return toInstalledMod(mod);
 }
 
-export async function addPaths(paths: string[]): Promise<RustResult<Mod>[]> {
+export async function addPaths(paths: string[]): Promise<RustResult<InstalledMod>[]> {
     log.debug("Invoking `add_paths`.");
-    const results = await invoke<RustResult<RawMod>[]>("add_paths", { paths });
+    const results = await invoke<RustResult<RawInstalledMod>[]>("add_paths", { paths });
     return results.map(result => {
         if ("Ok" in result) {
             return {
-                Ok: toMod(result.Ok)
+                Ok: toInstalledMod(result.Ok)
             };
         }
         return result;
     });
 }
 
-export async function addModFromUrl(url: string): Promise<Mod> {
+export async function addModFromUrl(url: string): Promise<InstalledMod> {
     log.debug("Invoking `add_mod_from_url`.");
-    const mod = await invoke<RawMod>("add_mod_from_url", { url });
-    return toMod(mod);
+    const mod = await invoke<RawInstalledMod>("add_mod_from_url", { url });
+    return toInstalledMod(mod);
 }
 
 export async function loadProfiles(): Promise<ProfilesConfig> {

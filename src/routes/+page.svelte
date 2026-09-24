@@ -228,8 +228,9 @@
         const wait = new WaitPopup(t("pages.mods.popup.wait.add.message"));
         showPopup(wait);
         try {
-            const mod = await addMod(filename);
+            const { mod, warning } = await addMod(filename);
             mods.push(mod);
+            if (warning) showPopup(new NotificationPopup("warning", warning));
         } catch(ex: unknown) {
             let message: string;
             if (ex instanceof Error) {
@@ -256,7 +257,8 @@
                 if ("Ok" in r) {
                     return {
                         success: true,
-                        archiveFile: filenames[i]
+                        archiveFile: filenames[i],
+                        warning: r.Ok.warning
                     };
                 } else {
                     return {
@@ -268,8 +270,8 @@
             });
             const popup = new AddResultPopup(addResults);
             showPopup(popup);
-            
-            const modsToAdd = results.filter(r => "Ok" in r).map(r => r.Ok);
+
+            const modsToAdd = results.filter(r => "Ok" in r).map(r => r.Ok.mod);
             mods.push(...modsToAdd);
         } catch(ex: unknown) {
             let message: string;
@@ -290,8 +292,9 @@
         const wait = new WaitPopup(t("pages.mods.popup.wait.add.message"));
         showPopup(wait);
         try {
-            const mod = await addModFolder(folder);
+            const { mod, warning } = await addModFolder(folder);
             mods.push(mod);
+            if (warning) showPopup(new NotificationPopup("warning", warning));
         } catch(ex: unknown) {
             let message: string;
             if (ex instanceof Error) {
@@ -318,7 +321,8 @@
                 if ("Ok" in r) {
                     return {
                         success: true,
-                        archiveFile: paths[i]
+                        archiveFile: paths[i],
+                        warning: r.Ok.warning
                     };
                 } else {
                     return {
@@ -331,7 +335,7 @@
             const popup = new AddResultPopup(addResults);
             showPopup(popup);
 
-            const modsToAdd = results.filter(r => "Ok" in r).map(r => r.Ok);
+            const modsToAdd = results.filter(r => "Ok" in r).map(r => r.Ok.mod);
             mods.push(...modsToAdd);
         } catch(ex: unknown) {
             let message: string;
@@ -352,8 +356,9 @@
         const wait = new WaitPopup(t("pages.mods.popup.wait.add_url.message"));
         showPopup(wait);
         try {
-            const mod = await addModFromUrl(url);
+            const { mod, warning } = await addModFromUrl(url);
             mods.push(mod);
+            if (warning) showPopup(new NotificationPopup("warning", warning));
         } catch(ex: unknown) {
             let message: string;
             if (ex instanceof Error) {

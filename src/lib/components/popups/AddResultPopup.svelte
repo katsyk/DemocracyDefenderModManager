@@ -27,6 +27,8 @@
                 </div>
                 {#if !result.success}
                     <pre class="font-mono ml-6 bg-zinc-700 rounded px-1 whitespace-pre-wrap break-normal">{result.errorMessage}</pre>
+                {:else if result.warning}
+                    <pre class="font-mono ml-6 bg-yellow-900/40 text-yellow-300 rounded px-1 whitespace-pre-wrap break-normal">{result.warning}</pre>
                 {/if}
             </li>
         {/each}
