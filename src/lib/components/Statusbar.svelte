@@ -6,7 +6,7 @@
 <script lang="ts">
     import { useLocalization } from "$lib/state/localization.svelte";
     import { openUrl } from "@tauri-apps/plugin-opener";
-    import { Discord, Globe, HeartFill } from "svelte-bootstrap-icons";
+    import { Discord, Globe, HeartFill, Github } from "svelte-bootstrap-icons";
 
     const { t } = useLocalization();
     
@@ -58,5 +58,14 @@
     >
         <Globe class="text-yellow-300" />
         <span class="underline">hd2mm.io</span>
+    </a>
+    <a
+        class="flex flex-row gap-1 text-zinc-100 bg-zinc-900 rounded-xs px-1.5 items-center hover:text-blue-300"
+        href="https://github.com/katsyk/Helldivers2ModManager"
+        title="https://github.com/katsyk/Helldivers2ModManager"
+        onclick={clickHandler}
+    >
+        <Github class="text-zinc-300" />
+        <span class="underline">GitHub</span>
     </a>
 </div>
