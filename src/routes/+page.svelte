@@ -1,7 +1,8 @@
 <script lang="ts">
     import { SvelteMap } from "svelte/reactivity";
-    import { Plus, Dash, Backspace, ArrowBarRight, ArrowBarLeft, Arrow90degLeft, ArrowReturnLeft, PencilSquare, Download, ThreeDotsVertical, CaretUpFill, CaretDownFill, Trash3, ArrowBarUp, ArrowBarDown, CaretUp, CaretDown, Eraser } from "svelte-bootstrap-icons";
+    import { Plus, Dash, Backspace, ArrowBarRight, ArrowBarLeft, Arrow90degLeft, ArrowReturnLeft, PencilSquare, Download, ThreeDotsVertical, CaretUpFill, CaretDownFill, Trash3, ArrowBarUp, ArrowBarDown, CaretUp, CaretDown, Eraser, FolderPlus, Link45deg, BoxArrowUpRight } from "svelte-bootstrap-icons";
     import { getCurrentWindow } from "@tauri-apps/api/window";
+    import { getCurrentWebview } from "@tauri-apps/api/webview";
     import { openUrl } from "@tauri-apps/plugin-opener";
     import { open } from "@tauri-apps/plugin-dialog";
     import * as log from "@tauri-apps/plugin-log";
@@ -9,7 +10,7 @@
     import { useLocalization } from "$lib/state/localization.svelte";
     import { Mod } from "$lib/models/mod";
     import type {Config, Profile, ProfilesConfig} from "$lib/models/profile";
-    import { addMod, addMods, deleteMod, getMods, loadProfiles, saveProfiles, deploy, purge, checkSettings } from "$lib/utils/commands";
+    import { addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles, deploy, purge, checkSettings } from "$lib/utils/commands";
     import type { UUID } from "$lib/types/uuid";
     import { usePopup } from "$lib/state/popup.svelte";
     import {
@@ -90,8 +91,25 @@
             await doSaveProfiles();
         });
 
+        const unlistenDragDrop = getCurrentWebview().onDragDropEvent(async (e) => {
+            switch (e.payload.type) {
+                case "enter":
+                case "over":
+                    isDragging = true;
+                    break;
+                case "drop":
+                    isDragging = false;
+                    await doAddPaths(...e.payload.paths);
+                    break;
+                case "leave":
+                    isDragging = false;
+                    break;
+            }
+        });
+
         return () => {
             unlisten.then(f => f());
+            unlistenDragDrop.then(f => f());
         };
     });
 
@@ -268,6 +286,90 @@
         }
     }
 
+    async function doAddModFolder(folder: string) {
+        const wait = new WaitPopup(t("pages.mods.popup.wait.add.message"));
+        showPopup(wait);
+        try {
+            const mod = await addModFolder(folder);
+            mods.push(mod);
+        } catch(ex: unknown) {
+            let message: string;
+            if (ex instanceof Error) {
+                message = ex.message;
+            } else if (typeof ex === "string") {
+                message = ex;
+            } else {
+                message = "Unknown error!";
+            }
+            showPopup(new ErrorPopup(t("pages.mods.popup.error.add.message"), message));
+        } finally {
+            wait.close();
+        }
+    }
+
+    async function doAddPaths(...paths: string[]) {
+        const wait = new WaitPopup(t("pages.mods.popup.wait.add_multiple.message"));
+        showPopup(wait);
+
+        try {
+            const results = await addPaths(paths);
+
+            const addResults = results.map<ModAddResult>((r, i) => {
+                if ("Ok" in r) {
+                    return {
+                        success: true,
+                        archiveFile: paths[i]
+                    };
+                } else {
+                    return {
+                        success: false,
+                        archiveFile: paths[i],
+                        errorMessage: r.Err
+                    }
+                }
+            });
+            const popup = new AddResultPopup(addResults);
+            showPopup(popup);
+
+            const modsToAdd = results.filter(r => "Ok" in r).map(r => r.Ok);
+            mods.push(...modsToAdd);
+        } catch(ex: unknown) {
+            let message: string;
+            if (ex instanceof Error) {
+                message = ex.message;
+            } else if (typeof ex === "string") {
+                message = ex;
+            } else {
+                message = "Unknown error!";
+            }
+            showPopup(new ErrorPopup(t("pages.mods.popup.error.add.message"), message));
+        } finally {
+            wait.close();
+        }
+    }
+
+    async function doAddModFromUrl(url: string) {
+        const wait = new WaitPopup(t("pages.mods.popup.wait.add_url.message"));
+        showPopup(wait);
+        try {
+            const mod = await addModFromUrl(url);
+            mods.push(mod);
+        } catch(ex: unknown) {
+            let message: string;
+            if (ex instanceof Error) {
+                message = ex.message;
+            } else if (typeof ex === "string") {
+                message = ex;
+            } else {
+                message = "Unknown error!";
+            }
+            const hint = t("pages.mods.popup.error.add_url.hint");
+            showPopup(new ErrorPopup(t("pages.mods.popup.error.add_url.message"), `${message}\n\n${hint}`));
+        } finally {
+            wait.close();
+        }
+    }
+
     async function doSaveProfiles(): Promise<boolean> {
         const wait = new WaitPopup(t("pages.mods.popup.wait.saving.message"));
         showPopup(wait);
@@ -417,6 +519,33 @@
         } else {
             await doAddMods(...filenames);
         }
+    }
+
+    async function onAddFolder() {
+        const folders = await open({
+            multiple: true,
+            directory: true
+        });
+        if (!folders) return;
+
+        if (folders.length == 1) {
+            await doAddModFolder(folders[0]);
+        } else {
+            await doAddPaths(...folders);
+        }
+    }
+
+    async function onAddUrl() {
+        const url = await showPopup(new InputPopup(
+            t("pages.mods.popup.input.add_url.placeholder"),
+            false,
+            undefined,
+            undefined,
+            /^https:\/\//,
+        ));
+        if (!url) return;
+
+        await doAddModFromUrl(url);
     }
 
     async function onPurge() {
@@ -628,6 +757,15 @@
                                         <ArrowBarDown />
                                         <span>To Bottom</span>
                                     </button>
+                                    {#if mod.Sources.some((s) => s.PageUrl)}
+                                        <hr>
+                                        {#each mod.Sources.filter((s) => s.PageUrl) as source}
+                                            <button onclick={() => openUrl(source.PageUrl!)}>
+                                                <BoxArrowUpRight />
+                                                <span>{t("pages.mods.open_source_page", { name: source.DisplayName })}</span>
+                                            </button>
+                                        {/each}
+                                    {/if}
                                 </PopupMenuButton>
                             </div>
                         </SortableList.Item>
@@ -702,6 +840,22 @@
                 onclick={onAddMod}
             >
                 {t("pages.mods.add_button.text")}
+            </button>
+            <button
+                class="hd2mm-button flex flex-row gap-1 items-center"
+                title={t("pages.mods.add_folder_button.tip")}
+                onclick={onAddFolder}
+            >
+                <FolderPlus />
+                {t("pages.mods.add_folder_button.text")}
+            </button>
+            <button
+                class="hd2mm-button flex flex-row gap-1 items-center"
+                title={t("pages.mods.add_url_button.tip")}
+                onclick={onAddUrl}
+            >
+                <Link45deg />
+                {t("pages.mods.add_url_button.text")}
             </button>
             <div class="flex-1"></div>
             <button

@@ -37,6 +37,9 @@
                 "input": {
                     "add_profile": {
                         "placeholder": "Profile name"
+                    },
+                    "add_url": {
+                        "placeholder": "https://example.com/mod.zip"
                     }
                 },
                 "wait": {
@@ -45,6 +48,9 @@
                     },
                     "add_multiple": {
                         "message": "Adding mods..."
+                    },
+                    "add_url": {
+                        "message": "Downloading mod..."
                     },
                     "saving": {
                         "message": "Saving profiles..."
@@ -77,6 +83,10 @@
                     "add": {
                         "message": "Mod adding failed!"
                     },
+                    "add_url": {
+                        "message": "Adding mod from URL failed!",
+                        "hint": "Use a direct download link, or download the file and add it manually."
+                    },
                     "purge": {
                         "message": "Purging failed!"
                     },
@@ -107,6 +117,15 @@
                 "text": "Add",
                 "tip": "Add a mod to the library."
             },
+            "add_folder_button": {
+                "text": "Add Folder",
+                "tip": "Add a mod from a plain folder."
+            },
+            "add_url_button": {
+                "text": "Add URL",
+                "tip": "Add a mod from a direct download link."
+            },
+            "open_source_page": "Open on {name}",
             "purge_button": {
                 "text": "Purge",
                 "tip": "Uninstall all mods from the game."
@@ -136,7 +155,7 @@
                     "tip": "Update"
                 }
             },
-            "drop_message": "Drop archives to add"
+            "drop_message": "Drop archives or folders to add"
         },
         "settings": {
             "popup": {

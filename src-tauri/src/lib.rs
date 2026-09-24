@@ -3,6 +3,7 @@ pub mod models;
 pub mod archive;
 pub mod utils;
 pub mod sources;
+pub mod download;
 
 use std::path::PathBuf;
 
@@ -63,6 +64,9 @@ pub fn run() {
             commands::mods::delete_mod,
             commands::mods::add_mod,
             commands::mods::add_mods,
+            commands::mods::add_mod_folder,
+            commands::mods::add_paths,
+            commands::mods::add_mod_from_url,
             commands::profiles::load_profiles,
             commands::profiles::save_profiles,
             commands::settings::load_settings,

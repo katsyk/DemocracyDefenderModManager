@@ -1,16 +1,22 @@
 import { invoke } from '@tauri-apps/api/core';
 import * as log from '@tauri-apps/plugin-log';
-import { Mod } from '../models/mod';
+import { Mod, type ResolvedSource } from '../models/mod';
 import type { Config, ProfilesConfig } from '$lib/models/profile';
 import type { Manifest } from '$lib/models/manifest';
 import type { RustResult } from '$lib/types/results';
 import type { UUID } from '$lib/types/uuid';
 import type { Settings } from '$lib/models/settings';
 
+type RawMod = { Manifest: Manifest, Directory: string, Sources?: ResolvedSource[] };
+
+function toMod(raw: RawMod): Mod {
+    return new Mod(raw.Manifest, raw.Directory, raw.Sources ?? []);
+}
+
 export async function getMods(): Promise<Mod[]> {
     log.debug("Invoking `get_mods`.");
-    const mods = await invoke<{ Manifest: Manifest, Directory: string }[]>("get_mods");
-    return mods.map(m => new Mod(m.Manifest, m.Directory));
+    const mods = await invoke<RawMod[]>("get_mods");
+    return mods.map(toMod);
 }
 
 export async function deleteMod(guid: UUID): Promise<void> {
@@ -20,21 +26,46 @@ export async function deleteMod(guid: UUID): Promise<void> {
 
 export async function addMod(archiveFile: string): Promise<Mod> {
     log.debug("Invoking `add_mod`.");
-    const mod = await invoke<{ Manifest: Manifest, Directory: string }>("add_mod", { archiveFile });
-    return new Mod(mod.Manifest, mod.Directory);
+    const mod = await invoke<RawMod>("add_mod", { archiveFile });
+    return toMod(mod);
 }
 
 export async function addMods(archiveFiles: string[]): Promise<RustResult<Mod>[]> {
     log.debug("Invoking `add_mods`.");
-    const results = await invoke<RustResult<{ Manifest: Manifest, Directory: string }>[]>("add_mods", { archiveFiles });
+    const results = await invoke<RustResult<RawMod>[]>("add_mods", { archiveFiles });
     return results.map(result => {
         if ("Ok" in result) {
             return {
-                Ok: new Mod(result.Ok.Manifest, result.Ok.Directory)
+                Ok: toMod(result.Ok)
             };
         }
         return result;
     });
+}
+
+export async function addModFolder(folder: string): Promise<Mod> {
+    log.debug("Invoking `add_mod_folder`.");
+    const mod = await invoke<RawMod>("add_mod_folder", { folder });
+    return toMod(mod);
+}
+
+export async function addPaths(paths: string[]): Promise<RustResult<Mod>[]> {
+    log.debug("Invoking `add_paths`.");
+    const results = await invoke<RustResult<RawMod>[]>("add_paths", { paths });
+    return results.map(result => {
+        if ("Ok" in result) {
+            return {
+                Ok: toMod(result.Ok)
+            };
+        }
+        return result;
+    });
+}
+
+export async function addModFromUrl(url: string): Promise<Mod> {
+    log.debug("Invoking `add_mod_from_url`.");
+    const mod = await invoke<RawMod>("add_mod_from_url", { url });
+    return toMod(mod);
 }
 
 export async function loadProfiles(): Promise<ProfilesConfig> {
