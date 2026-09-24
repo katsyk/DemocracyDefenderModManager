@@ -1,5 +1,9 @@
 # Democracy Defender Mod Manager
 
+**Works with:** AyakaMods · Nexus Mods · ModWorkshop · GameBanana · GitHub · any direct link
+
+**Docs: https://katsyk.github.io/DemocracyDefenderModManager/**
+
 DDMM is a source-neutral mod manager for Helldivers 2: install mods from any site, a direct download link, an
 archive, or a plain folder — no site is privileged, and no account with any mod site is ever required.
 
