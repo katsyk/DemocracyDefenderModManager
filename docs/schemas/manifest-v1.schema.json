@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://katsyk.github.io/DemocracyDefenderModManager/schemas/manifest-v1.schema.json",
+  "title": "DDMM manifest.json (V1)",
+  "description": "Schema for a Helldivers 2 mod manifest.json using the V1 format, matching src-tauri/src/models/manifest.rs::v1::Manifest.",
+  "type": "object",
+  "required": ["Version", "Guid", "Name", "Description"],
+  "properties": {
+    "Version": {
+      "const": 1,
+      "description": "Manifest format version. Must be the integer 1."
+    },
+    "Guid": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The mod's stable, unique identifier. Keep this the same across versions of the mod."
+    },
+    "Name": {
+      "type": "string"
+    },
+    "Description": {
+      "type": "string"
+    },
+    "IconPath": {
+      "type": "string",
+      "description": "Path to an icon image, relative to the mod's root folder. Matched case-insensitively on disk."
+    },
+    "Options": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Option" }
+    },
+    "NexusData": {
+      "$ref": "#/$defs/NexusData",
+      "description": "Legacy Nexus Mods identification, still read for backwards compatibility. Prefer Sources for new manifests."
+    },
+    "Sources": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Source" },
+      "description": "Provider-neutral declarations of where this mod can be found. See docs/authors/sources.md."
+    }
+  },
+  "$defs": {
+    "Option": {
+      "type": "object",
+      "required": ["Name", "Description"],
+      "properties": {
+        "Name": { "type": "string" },
+        "Description": { "type": "string" },
+        "Include": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Paths (relative to the mod root) whose patch files are deployed when this option is toggled on."
+        },
+        "Image": {
+          "type": "string",
+          "description": "Path to a preview image, relative to the mod's root folder."
+        },
+        "SubOptions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SubOption" }
+        }
+      }
+    },
+    "SubOption": {
+      "type": "object",
+      "required": ["Name", "Description", "Include"],
+      "properties": {
+        "Name": { "type": "string" },
+        "Description": { "type": "string" },
+        "Include": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "Image": { "type": "string" }
+      }
+    },
+    "NexusData": {
+      "type": "object",
+      "required": ["ModId", "Version"],
+      "properties": {
+        "ModId": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "Version": { "type": "string" }
+      }
+    },
+    "Source": {
+      "type": "object",
+      "required": ["Provider"],
+      "properties": {
+        "Provider": {
+          "type": "string",
+          "description": "Free-form, lowercase-normalized. Well-known values: nexus, modworkshop, github, gamebanana, url. Any other string is accepted."
+        },
+        "Id": {
+          "type": "string",
+          "description": "Provider-specific mod ID, used to build that provider's page URL when Url is absent."
+        },
+        "Url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Explicit page URL. Always takes precedence over an auto-generated one when present."
+        },
+        "Version": {
+          "type": "string",
+          "description": "The version of the mod available at this source, if known."
+        }
+      }
+    }
+  }
+}

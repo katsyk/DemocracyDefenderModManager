@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://katsyk.github.io/DemocracyDefenderModManager/schemas/manifest-v2.schema.json",
+  "title": "DDMM manifest.json (V2)",
+  "description": "Schema for a Helldivers 2 mod manifest.json using the V2 format, matching src-tauri/src/models/manifest.rs::v2::Manifest. V2 manifests can be read by DDMM, but deploying a V2-manifest mod is not implemented yet.",
+  "type": "object",
+  "required": ["Version", "Guid", "Name", "Description"],
+  "properties": {
+    "Version": {
+      "const": 2,
+      "description": "Manifest format version. Must be the integer 2."
+    },
+    "Guid": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The mod's stable, unique identifier. Keep this the same across versions of the mod."
+    },
+    "Name": {
+      "type": "string"
+    },
+    "Description": {
+      "type": "string"
+    },
+    "IconPath": {
+      "type": "string",
+      "description": "Path to an icon image, relative to the mod's root folder. Matched case-insensitively on disk."
+    },
+    "Options": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Option" }
+    },
+    "Categories": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Category" }
+    },
+    "Tags": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "NexusData": {
+      "$ref": "#/$defs/NexusData",
+      "description": "Legacy Nexus Mods identification, still read for backwards compatibility. Prefer Sources for new manifests. Unlike the V1 NexusData, V2's carries no Version field."
+    },
+    "Sources": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Source" },
+      "description": "Provider-neutral declarations of where this mod can be found. See docs/authors/sources.md."
+    }
+  },
+  "$defs": {
+    "Option": {
+      "type": "object",
+      "required": ["Guid", "Name", "Description"],
+      "properties": {
+        "Guid": { "type": "string", "format": "uuid" },
+        "Name": { "type": "string" },
+        "CategoryRef": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Guid of an entry in the manifest's Categories, if this option belongs to one."
+        },
+        "Description": { "type": "string" },
+        "Include": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Paths (relative to the mod root) whose patch files are deployed when this option is toggled on."
+        },
+        "Image": {
+          "type": "string",
+          "description": "Path to a preview image, relative to the mod's root folder."
+        },
+        "SubOptions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SubOption" }
+        }
+      }
+    },
+    "SubOption": {
+      "type": "object",
+      "required": ["Guid", "Name", "Description", "Include"],
+      "properties": {
+        "Guid": { "type": "string", "format": "uuid" },
+        "Name": { "type": "string" },
+        "Description": { "type": "string" },
+        "Include": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "Image": { "type": "string" }
+      }
+    },
+    "Category": {
+      "type": "object",
+      "required": ["Guid", "Name", "Description"],
+      "properties": {
+        "Guid": { "type": "string", "format": "uuid" },
+        "Name": { "type": "string" },
+        "Description": { "type": "string" }
+      }
+    },
+    "NexusData": {
+      "type": "object",
+      "required": ["ModId"],
+      "properties": {
+        "ModId": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "Source": {
+      "type": "object",
+      "required": ["Provider"],
+      "properties": {
+        "Provider": {
+          "type": "string",
+          "description": "Free-form, lowercase-normalized. Well-known values: nexus, modworkshop, github, gamebanana, url. Any other string is accepted."
+        },
+        "Id": {
+          "type": "string",
+          "description": "Provider-specific mod ID, used to build that provider's page URL when Url is absent."
+        },
+        "Url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Explicit page URL. Always takes precedence over an auto-generated one when present."
+        },
+        "Version": {
+          "type": "string",
+          "description": "The version of the mod available at this source, if known."
+        }
+      }
+    }
+  }
+}

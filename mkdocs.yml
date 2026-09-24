@@ -1,0 +1,117 @@
+site_name: Democracy Defender Mod Manager
+site_description: Documentation for DDMM, a source-neutral mod manager for Helldivers 2.
+site_url: https://katsyk.github.io/DemocracyDefenderModManager/
+repo_name: katsyk/DemocracyDefenderModManager
+repo_url: https://github.com/katsyk/DemocracyDefenderModManager
+edit_uri: edit/main/docs/
+docs_dir: docs
+
+copyright: >
+  DDMM is derived from Helldivers 2 Mod Manager by teutinsa, licensed under Apache-2.0.
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: amber
+      accent: amber
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: amber
+      accent: amber
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
+  font:
+    text: Roboto
+    code: Roboto Mono
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - navigation.instant
+    - navigation.tracking
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - def_list
+  - footnotes
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - getting-started/index.md
+      - Download & install: getting-started/download.md
+      - First-time setup: getting-started/setup.md
+      - Your first mod: getting-started/first-mod.md
+      - Updating DDMM: getting-started/updating.md
+      - Uninstalling: getting-started/uninstalling.md
+  - Using DDMM:
+      - using/index.md
+      - Adding mods: using/adding-mods.md
+      - Mod sites: using/mod-sites.md
+      - Profiles: using/profiles.md
+      - Mod options & variants: using/options-variants.md
+      - Deploy & purge: using/deploy-purge.md
+      - Checking for updates: using/updates.md
+      - Settings reference: using/settings.md
+  - For Mod Authors:
+      - authors/index.md
+      - Packaging your mod: authors/packaging.md
+      - Manifest reference: authors/manifest.md
+      - The Sources field: authors/sources.md
+  - Help:
+      - help/index.md
+      - FAQ: help/faq.md
+      - Troubleshooting: help/troubleshooting.md
+      - Logs: help/logs.md
+      - Reporting bugs: help/bugs.md
+      - Security: help/security.md
+  - Development:
+      - development/index.md
+      - Building from source: development/building.md
+      - Project structure: development/project-structure.md
+      - Contributing: development/contributing.md
+  - About: about.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/katsyk/DemocracyDefenderModManager
