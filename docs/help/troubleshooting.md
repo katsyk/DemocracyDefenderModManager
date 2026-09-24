@@ -48,9 +48,10 @@ example, a patch file the mod claims to include that doesn't actually exist in i
 
 ## A specific mod won't deploy, or deploying it errors out
 
-If the mod uses a `V2` manifest, this is expected — see
-[Mod options & variants](../using/options-variants.md#v1-v2-manifests-toggle-sub-options): `V2` deploy support
-isn't implemented in this codebase yet.
+`V1` and `V2` manifests deploy the same way. If an enabled option (or the selected sub-option) doesn't actually
+contribute any files, check the [log file](logs.md) for a warning naming the mod and an out-of-range option/
+sub-option index, or an `Include` folder that doesn't exist in the mod's own directory — deploy skips that
+option rather than failing the whole deploy, but it also means nothing gets installed for it.
 
 ## Browser handoff fails immediately with a Downloads-folder error
 

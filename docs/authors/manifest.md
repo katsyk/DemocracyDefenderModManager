@@ -114,10 +114,12 @@ with any JSON Schema (2020-12) validator.
 
 `"Version": 2`. Adds `Categories` (to group options) and `Tags` (shown on the mod's card).
 
-!!! danger "V2 mods can't be deployed yet"
-    DDMM can read and display `V2` manifests, but **deploying** a `V2`-manifest mod is not implemented in this
-    codebase yet (`todo!("V2 manifest mods not supported yet")` in the deploy command). Ship your mod as `V1` if
-    it needs to actually install today.
+!!! note "V2 deploy semantics"
+    `V2` deploys the same way `V1` does: each toggled-on option contributes its own `Include` directories, plus
+    the selected sub-option's `Include` directories for any option that declares `SubOptions`. `CategoryRef` and
+    `Categories` only affect how options are grouped in the options editor (see
+    [Mod options & variants](../using/options-variants.md#v2-categories)) — they have no effect on what gets
+    deployed.
 
 ```json
 {

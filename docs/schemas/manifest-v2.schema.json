@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://katsyk.github.io/DemocracyDefenderModManager/schemas/manifest-v2.schema.json",
   "title": "DDMM manifest.json (V2)",
-  "description": "Schema for a Helldivers 2 mod manifest.json using the V2 format, matching src-tauri/src/models/manifest.rs::v2::Manifest. V2 manifests can be read by DDMM, but deploying a V2-manifest mod is not implemented yet.",
+  "description": "Schema for a Helldivers 2 mod manifest.json using the V2 format, matching src-tauri/src/models/manifest.rs::v2::Manifest.",
   "type": "object",
   "required": ["Version", "Guid", "Name", "Description"],
   "properties": {

@@ -21,9 +21,10 @@ GitHub, a direct link, and a local folder.
 
 ### I installed a mod with options, but nothing happens when I deploy it
 
-Check whether the mod uses a `V2` manifest. DDMM can display `V2` options, but deploying a `V2`-manifest mod isn't
-implemented yet — see [Mod options & variants](../using/options-variants.md#v1-v2-manifests-toggle-sub-options).
-A `V1` or Legacy manifest deploys normally.
+Check that at least one option is toggled on in the options editor (pencil button) — an option with no `Include`
+folders of its own, and no sub-option selected, contributes nothing. See
+[Mod options & variants](../using/options-variants.md#v1-v2-manifests-toggle-sub-options); this applies the same
+way to `V1` and `V2` manifests.
 
 ### My game shows a "files may be corrupt" / fatal error after a game update
 

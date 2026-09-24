@@ -26,11 +26,14 @@ option:
 Click the pencil button to open the options editor and set these per mod, per profile. The edit button only
 appears when the mod actually declares `Options`; otherwise it's hidden.
 
-!!! warning "V2 deploy support"
-    DDMM can read `V2` manifests, show their options, and let you configure them — but deploying a `V2`-manifest
-    mod is **not implemented yet** in this codebase (it's a `todo!()` in the deploy command, which currently
-    causes deploying that mod to fail/panic rather than install its files). Use `V1` for a mod you need to
-    actually deploy today; see [Manifest reference](../authors/manifest.md) for the version differences.
+### V2 categories
+
+A `V2` mod can additionally declare `Categories`. If it does, the options editor groups its options under a
+heading per category (in the order the manifest declares them), with any option that has no `CategoryRef` (or one
+that doesn't match a declared category) falling into a trailing, unheaded group. A `V2` mod with no `Categories`
+declared — or a `V1` mod, which has no concept of categories at all — shows the same flat list either way.
+Grouping only changes how options are laid out in the editor; deploy behaves identically either way (see
+[Manifest reference](../authors/manifest.md)).
 
 ## Mods without declared options
 

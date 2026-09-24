@@ -78,9 +78,9 @@ my-mod/
 ```
 
 !!! note "V2 manifests"
-    `V2` uses the same `Options`/`SubOptions`/`Include` shape (plus `Categories` and `Tags` for organizing
-    options), but deploying a `V2`-manifest mod isn't implemented in this codebase yet — see
-    [Manifest reference](manifest.md#v2). Package against `V1` if you need your mod to actually deploy today.
+    `V2` uses the same `Options`/`SubOptions`/`Include` shape and deploys identically to `V1` — it just adds
+    `Categories` and `Tags` for organizing options in the editor and on the mod's card. See
+    [Manifest reference](manifest.md#v2).
 
 ## Icons and option images
 

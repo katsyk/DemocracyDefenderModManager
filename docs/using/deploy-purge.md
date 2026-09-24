@@ -17,8 +17,10 @@ Clicking **Deploy** (tip: "Install the current selection of mods."):
    a previous one.
 3. Walks your active profile's mod list, skipping any mod whose toggle is switched off.
 4. For each enabled mod, collects its patch files — from the mod's root, from the selected legacy option's
-   subfolder, or from each toggled `V1` option's (and selected sub-option's) `Include` folders, depending on its
-   [manifest](../authors/packaging.md#folder-layout-by-manifest-type) — grouped by their 16-character patch name.
+   subfolder, or from each toggled `V1`/`V2` option's (and selected sub-option's) `Include` folders, depending on
+   its [manifest](../authors/packaging.md#folder-layout-by-manifest-type) — grouped by their 16-character patch
+   name. `V1` and `V2` collect identically; `V2`'s `Categories`/`CategoryRef` only affect how options are grouped
+   in the options editor, not what gets deployed.
 5. Copies each group's patch/`.gpu_resources`/`.stream` files into `<Game Path>/data/`, numbering them
    `.patch_0`, `.patch_1`, and so on in your profile's mod order. If a triplet is missing its `.gpu_resources` or
    `.stream` file, DDMM writes an empty placeholder for it instead of skipping it, so the numbering for later
@@ -26,11 +28,6 @@ Clicking **Deploy** (tip: "Install the current selection of mods."):
 
 Deploying an empty profile (no mods, or none enabled — same list of `Configs`) shows an error instead of purging
 your game folder for nothing: "Can not deploy empty profile!"
-
-!!! danger "V2 manifests can't be deployed yet"
-    See [Mod options & variants](options-variants.md#v1-v2-manifests-toggle-sub-options) — a `V2`-manifest mod
-    included (and enabled) in the profile you deploy will currently fail deployment rather than install its
-    files, because `V2` deploy support isn't implemented yet.
 
 ### The Skip List and patch numbering
 

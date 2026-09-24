@@ -19,3 +19,4 @@ src-tauri/log/
 src-tauri/mods/
 src-tauri/profiles.json
 src-tauri/settings.json
+/site/
