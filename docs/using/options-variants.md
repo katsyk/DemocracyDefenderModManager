@@ -34,10 +34,15 @@ appears when the mod actually declares `Options`; otherwise it's hidden.
 
 ## Mods without declared options
 
-A mod with no `Options` at all (including every auto-generated manifest for a mod added without its own
-`manifest.json`) has nothing to choose — its files deploy as-is, no dropdown or edit button shown.
+A mod with no `Options` at all has nothing to choose — its files deploy as-is, no dropdown or edit button shown.
+This includes any auto-generated manifest (a mod added without its own `manifest.json`) whose patch files sit
+directly at the mod's root.
 
-!!! info "Variant folders without a manifest"
-    Detecting multiple top-level folders in a manifestless archive (e.g. `Red/`, `Blue/`) and turning them into
-    selectable options automatically is a landing feature — see the note in
-    [Adding mods](adding-mods.md#archives-without-a-manifestjson).
+## Variant folders without a manifest
+
+An auto-generated manifest *can* end up with `Options` too: if a manifest-less mod's patch files aren't at its
+root, DDMM looks for directories that directly contain them (a single wrapper folder, or several variant folders
+like `Red/`/`Blue/`) and turns them into a Legacy-style dropdown automatically — the first one (after natural
+sorting) is selected by default. See
+[Archives without a manifest.json](adding-mods.md#archives-without-a-manifestjson) for exactly how that detection
+works.

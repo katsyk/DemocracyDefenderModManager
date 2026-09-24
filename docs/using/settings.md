@@ -4,7 +4,7 @@ title: Settings reference
 
 # Settings reference
 
-The Settings page currently has two settings, stored in `settings.json` next to the DDMM executable.
+The Settings page currently has three settings, stored in `settings.json` next to the DDMM executable.
 
 ## Game Path
 
@@ -15,6 +15,21 @@ validation rules and error messages. This is required: DDMM won't let you leave 
 - **Label:** Game Path
 - **Placeholder:** `eg. Steam/steamapps/common/Helldivers 2/`
 - **Browse... button:** opens a folder picker
+
+## Downloads Folder
+
+The folder DDMM watches during a [browser handoff](mod-sites.md#how-the-browser-handoff-works) — its own
+description reads: "Where DDMM watches for a mod you download from a site it can't fetch directly (e.g. AyakaMods,
+Nexus Mods)." Defaults to your OS's normal Downloads folder.
+
+- **Label:** Downloads Folder
+- **Placeholder:** `eg. Downloads`
+- **Browse... button:** opens a folder picker
+
+Unlike Game Path, this field isn't validated on the Settings page itself — an invalid or missing folder only
+surfaces as an error at the moment you actually start a handoff ("the downloads folder isn't set or doesn't
+exist -- check it in Settings"). Only the browser handoff uses this setting; every other install method (Add,
+Add Folder, Add URL for a direct link) is unaffected by it.
 
 ## Skip List
 
@@ -30,13 +45,6 @@ doesn't collide with — or overwrite the slot used by — that DLC content. See
 - Select an entry in the list and use the **-** button to remove it.
 
 You won't normally need to touch this unless a specific mod's documentation tells you to add an entry for it.
-
-## Downloads folder
-
-!!! info "Landing feature"
-    A setting for the folder DDMM watches during the [browser handoff](mod-sites.md#how-the-browser-handoff-works)
-    (defaulting to your OS's normal Downloads folder) is part of the AyakaMods/Nexus Mods support landing
-    alongside this documentation, and isn't present in this codebase's Settings page yet.
 
 ## Where settings live
 

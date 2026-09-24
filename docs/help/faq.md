@@ -33,9 +33,27 @@ know are up to date for the current game version; see [Deploy & purge](../using/
 
 ### "Add URL" failed
 
-The link has to serve the archive file directly. A mod **page** (Nexus Mods, AyakaMods, etc.) generally isn't a
-direct link — see [Mod sites](../using/mod-sites.md) for how those sites are meant to be added instead, or
-download the archive yourself and add it with [Add](../using/adding-mods.md#add-archive-files).
+An AyakaMods or Nexus Mods **mod page** link shouldn't hit this — DDMM recognizes both and goes straight to the
+[browser handoff](../using/mod-sites.md#how-the-browser-handoff-works) instead of attempting a direct download.
+For any other site, this means the link didn't serve a downloadable archive directly (and either you weren't
+offered the "Open in Browser Instead?" handoff, or you declined it, or the handoff itself failed/timed out too).
+Download the archive yourself and add it with [Add](../using/adding-mods.md#add-archive-files), or try
+[Add URL](../using/adding-mods.md#add-url) again.
+
+### The browser handoff is stuck on "Waiting for the download..."
+
+Make sure your [Downloads Folder](../using/settings.md#downloads-folder) setting actually points at where your
+browser saves files — the handoff only notices a file that lands in that exact folder, ignores files it considers
+still in progress, and gives up after 15 minutes. If you already have the file (saved somewhere else, or from
+before the handoff started), use **"I already downloaded it -- choose file"** instead of waiting.
+
+### "Check for Updates" doesn't show a badge for a mod I know has a new version
+
+Update checks only cover mods with a recognized, [supported](../using/updates.md#which-sites-are-supported)
+source (AyakaMods or GitHub) *and* a recorded installed version to compare against — see
+[How DDMM knows a mod's installed version](../using/updates.md#how-ddmm-knows-a-mods-installed-version). A mod
+installed manually, with no `Sources` declared, or sourced only from Nexus Mods or an unsupported site, has
+nothing for DDMM to check.
 
 ### Where do I ask questions or get help that isn't a bug report?
 

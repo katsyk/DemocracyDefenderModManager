@@ -52,6 +52,17 @@ If the mod uses a `V2` manifest, this is expected — see
 [Mod options & variants](../using/options-variants.md#v1-v2-manifests-toggle-sub-options): `V2` deploy support
 isn't implemented in this codebase yet.
 
+## Browser handoff fails immediately with a Downloads-folder error
+
+"the downloads folder isn't set or doesn't exist -- check it in Settings" means your
+[Downloads Folder](../using/settings.md#downloads-folder) setting is empty or points at a folder that no longer
+exists — fix it in Settings, then retry.
+
+## "a handoff is already in progress"
+
+Only one [browser handoff](../using/mod-sites.md#how-the-browser-handoff-works) can run at a time. Cancel or wait
+for the current one (Waiting/Installing popup) to finish before starting another.
+
 ## Still stuck?
 
 See [Reporting bugs](bugs.md).

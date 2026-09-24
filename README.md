@@ -9,17 +9,18 @@ archive, or a plain folder — no site is privileged, and no account with any mo
 
 ## Source-neutral by design
 
-Mods from any site — Nexus Mods, ModWorkshop, GameBanana, GitHub, or a direct download link — or from a local
-archive or a plain folder, are all first-class.
+Mods from any site — AyakaMods, Nexus Mods, ModWorkshop, GameBanana, GitHub, or a direct download link — or from a
+local archive or a plain folder, are all first-class.
 
 Concretely, that means:
 
 - **Any archive** (`.zip`, `.7z`, `.rar`) can be added regardless of where it came from.
 - **Plain folders** can be added directly, with no archive step, via "Add Folder" or by dragging a folder in.
-- **Direct download links** can be added via "Add URL" — the manager downloads the archive itself. This only works
-  for links that serve the archive directly; sites that gate downloads behind a login page or JavaScript (Nexus's
-  mod page, for example, as opposed to its direct file link) aren't supported this way, but the archive can still be
-  downloaded manually and added like any other file.
+- **Direct download links** can be added via "Add URL" — the manager downloads the archive itself.
+- **Login-gated sites** (AyakaMods, Nexus Mods) never have their credentials asked for or stored. Pasting a mod
+  page link from one of these instead opens it in your browser and watches your Downloads folder for the finished
+  file, installing it automatically once it lands — the same "browser handoff" also kicks in for any other site
+  whose link doesn't serve a downloadable archive directly.
 - **Where a mod came from** is tracked without ever assuming or requiring a particular site.
 - **Archive extraction is hardened** against path traversal and symlink entries: every entry is validated before
   extraction, and the result is double-checked afterward, regardless of which site an archive came from.
@@ -27,9 +28,9 @@ Concretely, that means:
 ### The `Sources` manifest field
 
 A mod's `manifest.json` may declare an optional, provider-neutral `Sources` array. Each entry names a `Provider`
-(well-known values are `nexus`, `modworkshop`, `github`, and `gamebanana`, but any other site name is accepted) and
-either an `Id` (used to build that provider's normal mod-page URL) or an explicit `Url` (which always takes
-precedence over the generated one):
+(well-known values are `ayakamods`, `nexus`, `modworkshop`, `github`, and `gamebanana`, but any other site name is
+accepted) and either an `Id` (used to build that provider's normal mod-page URL) or an explicit `Url` (which
+always takes precedence over the generated one):
 
 ```json
 {
@@ -38,6 +39,7 @@ precedence over the generated one):
   "Name": "Example Mod",
   "Description": "...",
   "Sources": [
+    { "Provider": "ayakamods", "Id": "4084", "Version": "2026-09-24" },
     { "Provider": "nexus", "Id": "123" },
     { "Provider": "github", "Id": "someone/example-mod" },
     { "Provider": "coolmodsite", "Url": "https://coolmodsite.example/mods/example" }
@@ -53,10 +55,10 @@ is never removed or rewritten.
 
 ### The `.hd2mm-origin.json` sidecar
 
-When a mod is installed from a direct URL, the manager records that install origin in a small
-`.hd2mm-origin.json` file next to the mod's own `manifest.json` — it never edits or overwrites the mod author's
-manifest. The filename keeps its original `hd2mm` prefix for compatibility with manifests and tooling written
-against it; it isn't user-visible and renaming it would just be churn. It looks like:
+When a mod is installed from a direct URL, or through a browser handoff, the manager records that install origin
+in a small `.hd2mm-origin.json` file next to the mod's own `manifest.json` — it never edits or overwrites the mod
+author's manifest. The filename keeps its original `hd2mm` prefix for compatibility with manifests and tooling
+written against it; it isn't user-visible and renaming it would just be churn. It looks like:
 
 ```json
 {

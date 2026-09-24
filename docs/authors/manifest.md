@@ -140,6 +140,7 @@ with any JSON Schema (2020-12) validator.
     }
   ],
   "Sources": [
+    { "Provider": "ayakamods", "Id": "4084", "Version": "2026-09-24" },
     { "Provider": "nexus", "Id": "123" },
     { "Provider": "github", "Id": "someone/example-mod" }
   ]

@@ -35,6 +35,14 @@ my-mod/
 └── 0cf14e223de06a26.patch_0.stream
 ```
 
+!!! tip "Shipping without a manifest.json"
+    If you don't ship a `manifest.json` at all, DDMM still finds your patch files even when they're one level
+    down in a single wrapper folder, or split across several top-level variant folders (like the Legacy example
+    below) — it auto-detects the layout and builds the equivalent `Options` dropdown itself. Root-level files are
+    still simplest and require no detection at all. See
+    [Archives without a manifest.json](../using/adding-mods.md#archives-without-a-manifestjson) for exactly how
+    that works, including its 4-level depth limit and what happens if no patch files are found anywhere.
+
 ### Legacy manifest with `Options`
 
 Each entry in `Options` is a plain string naming a subfolder under the mod root; the user picks exactly one from a

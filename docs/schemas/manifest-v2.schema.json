@@ -114,7 +114,7 @@
       "properties": {
         "Provider": {
           "type": "string",
-          "description": "Free-form, lowercase-normalized. Well-known values: nexus, modworkshop, github, gamebanana, url. Any other string is accepted."
+          "description": "Free-form, lowercase-normalized. Well-known values: ayakamods, nexus, modworkshop, github, gamebanana, url. Any other string is accepted."
         },
         "Id": {
           "type": "string",

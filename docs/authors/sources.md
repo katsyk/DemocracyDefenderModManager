@@ -26,23 +26,34 @@ These get a display name and, given just an `Id`, an automatically generated pag
 
 | `Provider` | Display name | Generated URL (given `Id`) |
 | --- | --- | --- |
+| `ayakamods` | AyakaMods | `https://ayakamods.com/mods/<Id>/` |
 | `nexus` | Nexus Mods | `https://www.nexusmods.com/helldivers2/mods/<Id>` |
 | `modworkshop` | ModWorkshop | `https://modworkshop.net/mod/<Id>` |
 | `github` | GitHub | `https://github.com/<Id>` |
 | `gamebanana` | GameBanana | `https://gamebanana.com/mods/<Id>` |
 | `url` | Link | (no template — give an explicit `Url`) |
 
-Any other `Provider` string (including `ayakamods`) is shown using that exact string as its display name, and
-needs an explicit `Url` to produce a link, unless your DDMM version has since added a built-in template for it —
-check the [manifest.rs source](https://github.com/katsyk/DemocracyDefenderModManager/blob/main/src-tauri/src/sources.rs)
-for the current list.
+Any other `Provider` string is shown using that exact string as its display name, and needs an explicit `Url` to
+produce a link.
+
+### AyakaMods
+
+`Id` for `ayakamods` is the mod's **numeric resource id** — the trailing number in its page URL
+(`https://ayakamods.com/mods/hd2-auto-reload.4084/` → `Id: "4084"`; a bare `https://ayakamods.com/mods/4084/`
+works too). Set `Version` to match what AyakaMods publishes for your mod (its page's own listed version) so
+[update checks](../using/updates.md) work immediately for anyone installing your mod with this source already
+declared, rather than only after DDMM records a version itself at install time:
+
+```json
+{ "Provider": "ayakamods", "Id": "4084", "Version": "2026-09-24" }
+```
 
 ## Examples, per site
 
 ```json
 {
   "Sources": [
-    { "Provider": "ayakamods", "Url": "https://ayakamods.com/mods/example-mod" },
+    { "Provider": "ayakamods", "Id": "4084", "Version": "2026-09-24" },
     { "Provider": "nexus", "Id": "123", "Version": "1.2.0" },
     { "Provider": "modworkshop", "Id": "456" },
     { "Provider": "gamebanana", "Id": "789" },
@@ -52,7 +63,7 @@ for the current list.
 }
 ```
 
-A mod can declare more than one source — for example, mirrored on both Nexus Mods and GitHub — and DDMM shows an
+A mod can declare more than one source — for example, mirrored on both AyakaMods and GitHub — and DDMM shows an
 "Open on &lt;site&gt;" entry for each one that resolves to a link.
 
 ## Legacy `NexusData`
@@ -66,9 +77,10 @@ entry in `Sources` with the same `Id`, DDMM shows only one "Open on Nexus Mods" 
 
 ## The `.hd2mm-origin.json` sidecar
 
-When you (the user, not the mod author) install a mod from a direct URL through
-[Add URL](../using/adding-mods.md#add-url), DDMM records that as an install-time source in a small
-`.hd2mm-origin.json` file written next to the mod's `manifest.json` — **never** into the manifest itself:
+When you (the user, not the mod author) install a mod from a direct URL, or through a
+[browser handoff](../using/mod-sites.md#how-the-browser-handoff-works), DDMM records that as an install-time
+source in a small `.hd2mm-origin.json` file written next to the mod's `manifest.json` — **never** into the
+manifest itself:
 
 ```json
 {
@@ -78,6 +90,10 @@ When you (the user, not the mod author) install a mod from a direct URL through
   "InstalledAt": 1745020800
 }
 ```
+
+For a mod installed from AyakaMods, this sidecar's `Source` also gets a `Version` filled in automatically (DDMM
+fetches the mod page's published version at install time) — see
+[Checking for updates](../using/updates.md#how-ddmm-knows-a-mods-installed-version).
 
 This is DDMM's own bookkeeping, not something mod authors write. It merges into the same "Open on &lt;site&gt;"
 menu as manifest-declared sources, keeps the historical `hd2mm` filename prefix for compatibility with tooling

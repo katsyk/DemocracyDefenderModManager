@@ -47,7 +47,15 @@ Installing a mod from a plain folder (["Add Folder"](../using/adding-mods.md#add
 files in; it never follows symlinks found inside the source folder, so a symlink pointing outside it can't be used
 to pull in files you didn't intend to share.
 
-## Update checks are opt-in
+## The browser handoff only watches, never reads
+
+During a [browser handoff](../using/mod-sites.md#how-the-browser-handoff-works), DDMM polls your configured
+Downloads folder for a new file to appear — it never opens, uploads, or inspects the contents of anything else
+already in that folder, only file names and sizes. A candidate that turns out to be a symlink is refused, the
+same as any other archive install.
+
+## Update checks are opt-in and size-capped
 
 DDMM never checks for updates in the background — only when you explicitly click
-[Check for updates](../using/updates.md).
+[Check for updates](../using/updates.md). Each request (an AyakaMods mod page, or the GitHub releases API) is
+`https://` only and capped at 5 MB, the same belt-and-braces size-limit approach used for archive downloads.

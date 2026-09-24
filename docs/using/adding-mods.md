@@ -5,7 +5,8 @@ title: Adding mods
 # Adding mods
 
 DDMM treats an archive, a folder, and a direct link as equally first-class ways to add a mod. All of them end up
-as an entry in your mod Library.
+as an entry in your mod Library. Before you've added anything, the mod list itself says so: "No mods yet — Works
+with AyakaMods, Nexus Mods, ModWorkshop, GameBanana, GitHub and more."
 
 ## Add (archive files)
 
@@ -20,15 +21,20 @@ unpacked — no archive step needed. You can pick multiple folders at once. DDMM
 
 ## Add URL
 
-Click **Add URL** (tip: "Add a mod from a direct download link.") and paste a link. This only works for links that
-serve the archive file directly over `https://` — DDMM downloads it itself, with a 2 GiB size cap, and checks
-that what comes back is actually a zip/7z/rar archive (by file signature, not just the URL's extension) before
-installing it. If a site instead serves an HTML page (a login wall, a page with a JavaScript-driven download
-button), the download is rejected with:
+Click **Add URL** (tip: "Add a mod from a direct download link.") and paste a mod page or download link — its
+popup describes itself as: "Paste a mod page or download link from AyakaMods, Nexus Mods, ModWorkshop,
+GameBanana, GitHub, or any direct download link."
+
+A **direct** link (serving the archive file itself over `https://`) downloads and installs immediately, with a
+2 GiB size cap, and a check that what comes back is actually a zip/7z/rar archive (by file signature, not just the
+URL's extension). A mod **page** on a site that requires being logged in (AyakaMods, Nexus Mods) skips the direct
+download attempt entirely and goes straight to a **browser handoff**; a page on another site that turns out not to
+serve an archive directly gets offered the same handoff instead of just failing. See
+[Mod sites](mod-sites.md) for exactly how that's decided and how the handoff works.
+
+If a direct download attempt fails outright and no handoff is offered/accepted, you see:
 
 > Adding mod from URL failed! — Use a direct download link, or download the file and add it manually.
-
-Many mod sites don't expose a direct link at all; see [Mod sites](mod-sites.md) for how DDMM handles those instead.
 
 ## Drag & drop
 
@@ -44,24 +50,34 @@ Every install goes through the same steps:
 2. If the archive/folder contains a `manifest.json`, that becomes the mod's manifest (see
    [Manifest reference](../authors/manifest.md) for the formats DDMM understands).
 3. If there's no `manifest.json`, DDMM generates a minimal one automatically: a random ID, the archive/folder name
-   as the mod's name, an empty description, and no options — so the mod still shows up and can be deployed.
-4. The mod is added to your Library, from where you can drag or insert it into a profile.
+   as the mod's name, an empty description — and, for this auto-generated manifest only, DDMM also scans the mod's
+   files to fill in `Options` if needed; see [Archives without a manifest.json](#archives-without-a-manifestjson)
+   below.
+4. The mod is added to your Library, from where you can drag or insert it into a profile. If DDMM couldn't find
+   any Helldivers 2 patch files anywhere in it, you'll see a non-fatal warning: "no Helldivers 2 patch files found
+   in this archive" — the mod is still added, it just won't do anything when deployed.
 
 If a mod with the same ID (`Guid`) is already installed, adding it again fails with a "mod with GUID ... already
 exists" error rather than silently overwriting it.
 
 ## Archives without a manifest.json
 
-DDMM locates Helldivers 2 patch files (`<16 hex chars>.patch_N`, plus their `.gpu_resources`/`.stream`
-counterparts) directly inside a mod folder even when there's no `manifest.json` at all — that's how an
-unmanifested mod still deploys correctly.
+For a mod installed with no `manifest.json` of its own (an auto-generated manifest — an author-supplied manifest
+is never touched this way), DDMM scans the installed files to work out where its Helldivers 2 patch files
+(`<16 hex chars>.patch_N`, plus `.gpu_resources`/`.stream` counterparts) actually live:
 
-!!! info "Landing feature"
-    Support for treating multiple top-level variant folders (e.g. `Red/`, `Blue/`) inside such an archive as
-    selectable options, and for warning (rather than silently installing nothing) when no patch files are found,
-    is landing alongside this documentation — check the
-    [release notes](https://github.com/katsyk/DemocracyDefenderModManager/releases) for whether it's shipped in
-    your version.
+- **Patch files directly at the mod's root** — the common case — deploy as-is, no options.
+- **No patch files at the root**, but one or more directories (up to 4 levels deep) directly contain some — each
+  such directory becomes an entry in a Legacy-style `Options` list (the same single-choice dropdown described in
+  [Mod options & variants](options-variants.md)), naturally sorted (so "Option 2" sorts before "Option 10") and
+  defaulting to the first one. This covers both a **single wrapper folder** (e.g. everything nested one level down
+  under a folder named after the mod) and **several variant folders** (e.g. `Red/`, `Blue/`) the same way — pick
+  the one you want from the dropdown before deploying.
+- **No patch files found anywhere** in the first 4 levels — the mod installs anyway, with the warning shown above,
+  rather than silently doing nothing.
+
+A directory that qualifies as an option isn't searched any further inside itself — whatever's in it is that
+option's whole file tree, not a place to look for more nested variants.
 
 ## Batch adds and partial failures
 
