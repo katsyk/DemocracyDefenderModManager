@@ -68,6 +68,9 @@
                     },
                     "deploy": {
                         "message": "Deploying mods..."
+                    },
+                    "check_updates": {
+                        "message": "Checking for updates..."
                     }
                 },
                 "notification": {
@@ -79,6 +82,12 @@
                     },
                     "deploy_success": {
                         "message": "Deployment successful."
+                    },
+                    "updates_available": {
+                        "message": "{count} update(s) available."
+                    },
+                    "updates_none": {
+                        "message": "Everything is up to date."
                     }
                 },
                 "error": {
@@ -97,6 +106,9 @@
                     },
                     "deploy": {
                         "message": "Deployment failed!"
+                    },
+                    "check_updates": {
+                        "message": "Checking for updates failed!"
                     }
                 }
             },
@@ -131,6 +143,14 @@
                 "tip": "Add a mod from a direct download link."
             },
             "open_source_page": "Open on {name}",
+            "update_available_badge": {
+                "tip": "Update available"
+            },
+            "update_from_site": "Update from {name}",
+            "check_updates_button": {
+                "text": "Check for Updates",
+                "tip": "Check installed mods against their source site for a newer version."
+            },
             "purge_button": {
                 "text": "Purge",
                 "tip": "Uninstall all mods from the game."

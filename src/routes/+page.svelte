@@ -1,6 +1,6 @@
 <script lang="ts">
     import { SvelteMap } from "svelte/reactivity";
-    import { Plus, Dash, Backspace, ArrowBarRight, ArrowBarLeft, Arrow90degLeft, ArrowReturnLeft, PencilSquare, Download, ThreeDotsVertical, CaretUpFill, CaretDownFill, Trash3, ArrowBarUp, ArrowBarDown, CaretUp, CaretDown, Eraser, FolderPlus, Link45deg, BoxArrowUpRight } from "svelte-bootstrap-icons";
+    import { Plus, Dash, Backspace, ArrowBarRight, ArrowBarLeft, Arrow90degLeft, ArrowReturnLeft, PencilSquare, Download, ThreeDotsVertical, CaretUpFill, CaretDownFill, Trash3, ArrowBarUp, ArrowBarDown, CaretUp, CaretDown, Eraser, FolderPlus, Link45deg, BoxArrowUpRight, ArrowRepeat, CloudArrowDownFill } from "svelte-bootstrap-icons";
     import { getCurrentWindow } from "@tauri-apps/api/window";
     import { getCurrentWebview } from "@tauri-apps/api/webview";
     import { openUrl } from "@tauri-apps/plugin-opener";
@@ -10,7 +10,7 @@
     import { useLocalization } from "$lib/state/localization.svelte";
     import { Mod } from "$lib/models/mod";
     import type {Config, Profile, ProfilesConfig} from "$lib/models/profile";
-    import { addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles, loadSettings, deploy, purge, checkSettings, classifyDownloadUrl } from "$lib/utils/commands";
+    import { addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles, loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, type UpdateStatusEntry } from "$lib/utils/commands";
     import type { UUID } from "$lib/types/uuid";
     import { usePopup } from "$lib/state/popup.svelte";
     import {
@@ -44,6 +44,7 @@
     let isDragging = $state<boolean>(false);
     let initPromise = $state<Promise<void>>();
     let downloadsPath = $state<string>("");
+    let updateStatuses = $state<UpdateStatusEntry[]>([]);
 
     let currentProfile = $derived<Profile | undefined>(profiles[activeProfile]);
     let profileMods = $derived<Mod[]>(profileConfigs.map(config => mods.find(m => m.guid === config.Guid)).filter((m): m is Mod => m !== undefined));
@@ -170,6 +171,14 @@
                     break;
             }
         });
+    }
+
+    function updatesFor(guid: UUID): UpdateStatusEntry[] {
+        return updateStatuses.filter(u => u.Guid === guid);
+    }
+
+    function hasUpdateAvailable(guid: UUID): boolean {
+        return updatesFor(guid).some(u => u.Status.Kind === "UpdateAvailable");
     }
 
     function makeConfigForMod(mod: Mod): Config {
@@ -550,9 +559,42 @@
         await doDeleteMod(mod.guid);
     }
 
+    async function onUpdateFrom(mod: Mod, entry: UpdateStatusEntry) {
+        if (!entry.PageUrl) return;
+        await doStartHandoff(entry.PageUrl, entry.DisplayName, mod.guid);
+    }
+
     function onUpdate(i: number) {
         const mod = libraryMods[i];
-        //TODO
+        const entry = updatesFor(mod.guid).find(u => u.Status.Kind === "UpdateAvailable");
+        if (entry) onUpdateFrom(mod, entry);
+    }
+
+    async function onCheckUpdates() {
+        const wait = new WaitPopup(t("pages.mods.popup.wait.check_updates.message"));
+        showPopup(wait);
+        try {
+            updateStatuses = await checkUpdates();
+            const available = updateStatuses.filter(u => u.Status.Kind === "UpdateAvailable").length;
+            showPopup(new NotificationPopup(
+                "info",
+                available > 0
+                    ? t("pages.mods.popup.notification.updates_available.message", { count: available })
+                    : t("pages.mods.popup.notification.updates_none.message"),
+            ));
+        } catch(ex: unknown) {
+            let message: string;
+            if (ex instanceof Error) {
+                message = ex.message;
+            } else if (typeof ex === "string") {
+                message = ex;
+            } else {
+                message = "Unknown error!";
+            }
+            showPopup(new ErrorPopup(t("pages.mods.popup.error.check_updates.message"), message));
+        } finally {
+            wait.close();
+        }
     }
 
     async function onAddMod() {
@@ -761,7 +803,12 @@
                                     alt="Mod icon"
                                 />
                                 <div class="flex-1 flex flex-col gap-0.5 justify-between min-w-0">
-                                    <span class="text-2xl truncate">{mod.name}</span>
+                                    <span class="text-2xl truncate flex flex-row items-center gap-1">
+                                        {mod.name}
+                                        {#if hasUpdateAvailable(mod.guid)}
+                                            <span title={t("pages.mods.update_available_badge.tip")}><CloudArrowDownFill class="text-yellow-300 shrink-0" width="16" height="16" /></span>
+                                        {/if}
+                                    </span>
                                     {#if "Version" in mod.Manifest && mod.Manifest.Version === 2 && mod.Manifest.Tags}
                                         <div class="flex flex-row gap-1 overflow-hidden">
                                             {#each mod.Manifest.Tags as tag}
@@ -832,6 +879,15 @@
                                             </button>
                                         {/each}
                                     {/if}
+                                    {#if updatesFor(mod.guid).some(u => u.Status.Kind === "UpdateAvailable")}
+                                        <hr>
+                                        {#each updatesFor(mod.guid).filter(u => u.Status.Kind === "UpdateAvailable" && u.PageUrl) as entry}
+                                            <button onclick={() => onUpdateFrom(mod, entry)}>
+                                                <CloudArrowDownFill />
+                                                <span>{t("pages.mods.update_from_site", { name: entry.DisplayName })}</span>
+                                            </button>
+                                        {/each}
+                                    {/if}
                                 </PopupMenuButton>
                             </div>
                         </SortableList.Item>
@@ -868,7 +924,12 @@
                                 >
                                     <Arrow90degLeft class="block m-auto" width="16" height="16" />
                                 </button>
-                                <span class="text-2xl truncate">{mod.name}</span>
+                                <span class="text-2xl truncate flex flex-row items-center gap-1">
+                                    {mod.name}
+                                    {#if hasUpdateAvailable(mod.guid)}
+                                        <span title={t("pages.mods.update_available_badge.tip")}><CloudArrowDownFill class="text-yellow-300 shrink-0" width="16" height="16" /></span>
+                                    {/if}
+                                </span>
                                 <button
                                     class="hd2mm-button-nop p-1"
                                     title={t("pages.mods.library.delete_button.tip")}
@@ -888,7 +949,7 @@
                                     class="hd2mm-button-nop p-1"
                                     title={t("pages.mods.library.update_button.tip")}
                                     onclick={() => onUpdate(i)}
-                                    disabled
+                                    disabled={!hasUpdateAvailable(mod.guid)}
                                 >
                                     <Download class="block m-auto" width="16" height="16" />
                                 </button>
@@ -922,6 +983,14 @@
             >
                 <Link45deg />
                 {t("pages.mods.add_url_button.text")}
+            </button>
+            <button
+                class="hd2mm-button flex flex-row gap-1 items-center"
+                title={t("pages.mods.check_updates_button.tip")}
+                onclick={onCheckUpdates}
+            >
+                <ArrowRepeat />
+                {t("pages.mods.check_updates_button.text")}
             </button>
             <div class="flex-1"></div>
             <button

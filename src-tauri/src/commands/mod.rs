@@ -10,7 +10,7 @@ pub mod mods;
 pub mod profiles;
 pub mod settings;
 pub mod handoff;
-// pub mod updates; // TODO(part D)
+pub mod updates;
 
 static INDEX_REGEX: OnceLock<Regex> = OnceLock::new();
 

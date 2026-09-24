@@ -78,6 +78,7 @@ pub fn run() {
             commands::handoff::cancel_handoff,
             commands::handoff::install_handoff_file,
             commands::handoff::classify_download_url,
+            commands::updates::check_updates,
             commands::profiles::load_profiles,
             commands::profiles::save_profiles,
             commands::settings::load_settings,

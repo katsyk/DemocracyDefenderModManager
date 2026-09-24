@@ -104,6 +104,26 @@ export async function installHandoffFile(file: string, pageUrl: string, existing
     return toInstalledMod(mod);
 }
 
+export type UpdateStateKind = "UpToDate" | "UpdateAvailable" | "Unknown" | "Unsupported" | "Error";
+export type UpdateState = { Kind: UpdateStateKind, message?: string };
+
+export type UpdateStatusEntry = {
+    Guid: UUID,
+    Provider: string,
+    DisplayName: string,
+    InstalledVersion?: string,
+    LatestVersion?: string,
+    Status: UpdateState,
+    PageUrl?: string
+};
+
+/** Only ever call this in direct response to the user clicking "Check for
+ * updates" -- never on a timer, never at startup. */
+export async function checkUpdates(): Promise<UpdateStatusEntry[]> {
+    log.debug("Invoking `check_updates`.");
+    return await invoke<UpdateStatusEntry[]>("check_updates");
+}
+
 export async function loadProfiles(): Promise<ProfilesConfig> {
     log.debug("Invoking `load_profiles`.");
     return await invoke<ProfilesConfig>("load_profiles");
