@@ -2,8 +2,8 @@ name: Build
 
 on:
   push:
-    tags: [ 'v*_preview*' ]
-  workflow_dispatch: 
+    tags: [ 'v*_preview*', 'v*' ]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -43,10 +43,10 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          name: Release Preview
+          name: DDMM Preview
           draft: true
           prerelease: true
-          files: src-tauri/target/release/hd2mm.exe
+          files: src-tauri/target/release/ddmm.exe
 
   
   build-linux:
@@ -88,7 +88,7 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          name: Release Preview
+          name: DDMM Preview
           draft: true
           prerelease: true
-          files: src-tauri/target/release/hd2mm
+          files: src-tauri/target/release/ddmm

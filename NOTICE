@@ -1,3 +1,8 @@
-Helldivers 2 Mod Manager — original work Copyright teutinsa (https://github.com/teutinsa/Helldivers2ModManager).
+Democracy Defender Mod Manager (DDMM) — https://github.com/katsyk/DemocracyDefenderModManager
 
-This fork (https://github.com/katsyk/Helldivers2ModManager) contains modifications: source-agnostic mod sources, folder installs, direct-URL installs.
+This is a derivative work of Helldivers 2 Mod Manager, original work Copyright teutinsa
+(https://github.com/teutinsa/Helldivers2ModManager), licensed under Apache-2.0.
+
+Modifications made in DDMM: source-neutral mod sources, folder installs, direct-URL installs,
+archive path-traversal/symlink extraction hardening, and the rebrand from Helldivers2ModManager
+to Democracy Defender Mod Manager.

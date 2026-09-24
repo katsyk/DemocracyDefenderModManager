@@ -1,7 +1,7 @@
 {
-  "name": "hd2mm",
+  "name": "ddmm",
   "version": "2.0.0-preview3",
-  "description": "",
+  "description": "Democracy Defender Mod Manager — a source-neutral mod manager for Helldivers 2.",
   "type": "module",
   "scripts": {
     "dev": "vite dev",

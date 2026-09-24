@@ -1,15 +1,12 @@
-# Helldivers2ModManager
+# Democracy Defender Mod Manager
 
-A simple mod manager for the game Helldivers 2.
+DDMM is a source-neutral mod manager for Helldivers 2: install mods from any site, a direct download link, an
+archive, or a plain folder — no site is privileged, and no account with any mod site is ever required.
 
-Read more about it on the [website](https://teutinsa.github.io/hd2mm-site/index.html).
+## Source-neutral by design
 
-## About this fork
-
-This fork ([katsyk/Helldivers2ModManager](https://github.com/katsyk/Helldivers2ModManager)) is source-neutral by design:
-mods from any site — Nexus Mods, ModWorkshop, GameBanana, GitHub, or a direct download link — or from a local
-archive or a plain folder, are all first-class. No account with any mod site is required to use this manager, and
-none ever will be.
+Mods from any site — Nexus Mods, ModWorkshop, GameBanana, GitHub, or a direct download link — or from a local
+archive or a plain folder, are all first-class.
 
 Concretely, that means:
 
@@ -20,6 +17,8 @@ Concretely, that means:
   mod page, for example, as opposed to its direct file link) aren't supported this way, but the archive can still be
   downloaded manually and added like any other file.
 - **Where a mod came from** is tracked without ever assuming or requiring a particular site.
+- **Archive extraction is hardened** against path traversal and symlink entries: every entry is validated before
+  extraction, and the result is double-checked afterward, regardless of which site an archive came from.
 
 ### The `Sources` manifest field
 
@@ -52,7 +51,8 @@ is never removed or rewritten.
 
 When a mod is installed from a direct URL, the manager records that install origin in a small
 `.hd2mm-origin.json` file next to the mod's own `manifest.json` — it never edits or overwrites the mod author's
-manifest. It looks like:
+manifest. The filename keeps its original `hd2mm` prefix for compatibility with manifests and tooling written
+against it; it isn't user-visible and renaming it would just be churn. It looks like:
 
 ```json
 {
@@ -65,3 +65,29 @@ manifest. It looks like:
 
 This is purely local bookkeeping so the manager can show where a mod was fetched from; it's safe to delete and has
 no effect on how the mod itself works.
+
+## Installing / building
+
+Prerequisites: [pnpm](https://pnpm.io/), a stable [Rust toolchain](https://rustup.rs/), and (Linux only) the Tauri
+system dependencies:
+
+```sh
+sudo apt install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+```
+
+Then:
+
+```sh
+pnpm install
+pnpm tauri build
+```
+
+For local development, `pnpm tauri dev` runs the app with hot reload. The built binary is named `ddmm` (`ddmm.exe`
+on Windows).
+
+## Credits & license
+
+DDMM is derived from Helldivers 2 Mod Manager by teutinsa
+(https://github.com/teutinsa/Helldivers2ModManager), licensed under Apache-2.0.
+
+Original project: https://teutinsa.github.io/hd2mm-site · support the original author: https://ko-fi.com/teutinsa

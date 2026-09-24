@@ -36,7 +36,7 @@ pub async fn download_archive(url: &str) -> anyhow::Result<DownloadedArchive> {
     }
 
     let temp_dir = std::env::temp_dir()
-        .join("hd2mm-downloads")
+        .join("ddmm-downloads")
         .join(uuid::Uuid::new_v4().to_string());
     tokio::fs::create_dir_all(&temp_dir).await?;
 
@@ -51,7 +51,7 @@ pub async fn download_archive(url: &str) -> anyhow::Result<DownloadedArchive> {
 
 async fn download_archive_into(url: &reqwest::Url, temp_dir: &Path) -> anyhow::Result<PathBuf> {
     let client = reqwest::Client::builder()
-        .user_agent(format!("hd2mm-fork/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("ddmm/{}", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::limited(10))
         .timeout(Duration::from_secs(10 * 60))
         .connect_timeout(Duration::from_secs(20))

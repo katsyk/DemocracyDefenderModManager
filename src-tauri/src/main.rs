@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    hd2mm_lib::run()
+    ddmm_lib::run()
 }

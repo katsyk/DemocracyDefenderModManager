@@ -1,12 +1,12 @@
 [package]
-name = "hd2mm"
+name = "ddmm"
 version = "2.0.0-preview3"
-description = "A simple mod manager for Helldivers 2."
-authors = ["you"]
+description = "Democracy Defender Mod Manager — a source-neutral mod manager for Helldivers 2."
+authors = ["katsyk"]
 edition = "2021"
 
 [lib]
-name = "hd2mm_lib"
+name = "ddmm_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
