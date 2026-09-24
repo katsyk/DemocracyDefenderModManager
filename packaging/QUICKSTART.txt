@@ -1,0 +1,15 @@
+Democracy Defender Mod Manager (DDMM) -- Quick Start
+=====================================================
+
+1. Run the DDMM executable in this folder.
+2. DDMM looks for your Helldivers 2 install automatically (via Steam). If it
+   can't find it, open Settings and click "Auto-detect", or set the game
+   folder yourself.
+3. Add a mod -- drag in an archive or folder, or click "Add URL" and paste a
+   link -- then click "Deploy".
+
+Works with AyakaMods, Nexus Mods, ModWorkshop, GameBanana, GitHub, any direct
+download link, or files already on your disk.
+
+Full docs:      https://katsyk.github.io/DemocracyDefenderModManager/
+Report a bug:   https://github.com/katsyk/DemocracyDefenderModManager/issues

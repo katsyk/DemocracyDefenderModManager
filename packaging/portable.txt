@@ -1,0 +1,12 @@
+This file marks this DDMM install as portable.
+
+DDMM keeps all of its data (mods, settings.json, profiles.json, logs) in this
+same folder instead of your system's per-user application data directory --
+as long as this folder stays writable. That makes the whole thing movable:
+copy the folder to a USB drive, another PC, wherever, and your mods and
+settings come with it.
+
+To switch to a normal, per-user installation instead, just delete this file.
+(Move this folder's contents into your regular DDMM data directory first if
+you want to keep your mods and settings -- see "Data Folder" in Settings, or
+the docs: https://katsyk.github.io/DemocracyDefenderModManager/getting-started/setup/)
