@@ -16,9 +16,10 @@ by step, what you were doing right before the problem happened.
 
 ## Helpful details to attach
 
-- Your DDMM version (shown in the app; matches the `2.0.0-preview3`-style tag on the release you downloaded).
+- Your DDMM version (shown in the app; matches the `2.0.0-rc.3`-style tag on the release you downloaded).
 - Your OS (Windows/Linux, and distribution if Linux).
-- The [log file](logs.md) from the run where it happened — it lives right next to the DDMM executable.
+- The [log file](logs.md) from the run where it happened — **Data Folder → Open Folder** in Settings, then
+  `logs/`, gets you there.
 - Whether it's specific to one mod: if so, say which one, and share its `manifest.json` if you can.
 
 You never need to attach any personal or account information — DDMM doesn't have any of yours to begin with (see

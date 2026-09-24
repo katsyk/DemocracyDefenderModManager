@@ -4,9 +4,12 @@ title: Logs
 
 # Logs
 
-DDMM writes a rotating log file named after the application (e.g. `Democracy Defender Mod Manager.log`) into the
-**same folder as the DDMM executable** — the same portable folder that holds `mods/`, `settings.json`, and
-`profiles.json`. There's no separate app-data or system log directory to hunt for.
+DDMM writes a rotating log file named after the application (e.g. `Democracy Defender Mod Manager.log`) into a
+`logs/` folder inside its [data folder](../getting-started/download.md#data-location) — the same place that holds
+`mods/`, `settings.json`, and `profiles.json`. Which directory that actually is (portable, next to the
+executable, or your OS's per-user app data directory) depends on how you're running DDMM; open **Settings** and
+use **Open Folder** next to **Data Folder** to jump straight there without having to work it out yourself. The
+very first lines of the log, on every startup, say which one was chosen and why.
 
 The log level is `Debug` in development builds and `Info` in released builds, so a released build's log captures
 warnings, errors, and the high-level step-by-step of what DDMM did (loading mods, adding a mod, deploying,

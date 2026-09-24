@@ -4,56 +4,84 @@ title: Download & install
 
 # Download & install
 
-DDMM is **portable**: there is no installer, and nothing is written outside the folder you put it in. The
-download is a single executable — `ddmm.exe` on Windows, `ddmm` on Linux — plus, once you run it, a few small
-files it creates next to itself (`settings.json`, `profiles.json`, a `mods/` folder, and its log file).
-
-!!! warning "Preview software"
-    Releases are marked as pre-releases (`2.0.0-preview3` and similar). Expect bugs, and back up any manually
-    edited mod files before updating.
-
 ## Get the download
 
 All releases are published on the
 [GitHub Releases page](https://github.com/katsyk/DemocracyDefenderModManager/releases).
 
+!!! warning "Release candidate"
+    Releases are marked as pre-releases (`2.0.0-rc.3` and similar). Expect some rough edges, and back up any
+    manually edited mod files before updating.
+
 === "Windows"
 
-    1. Open the [releases page](https://github.com/katsyk/DemocracyDefenderModManager/releases) and download the
-       latest `ddmm.exe`.
-    2. Put it in its own folder — anywhere you like, as long as you (and DDMM) have write access to that folder.
-       DDMM will store your mods and settings next to the executable.
-    3. Run `ddmm.exe`. Windows SmartScreen may warn about an unrecognized publisher on unsigned preview builds;
-       this is expected for a preview release.
+    Two options — pick one:
+
+    - **Installer** (`DDMM-<version>-windows-x64-setup.exe`): a normal per-user install with a Start Menu
+      shortcut and a proper uninstaller. No administrator prompt — it installs for your user account only.
+    - **Portable** (`DDMM-<version>-windows-x64-portable.zip`): unzip it anywhere and run `ddmm.exe` directly, no
+      install step. See [Data location](#data-location) below for what "portable" actually means here.
+
+    Windows SmartScreen will likely warn about an unrecognized publisher the first time you run either one — these
+    builds aren't code-signed yet. Click **"More info" → "Run anyway"**; this is expected for an unsigned
+    community build, see [Troubleshooting](../help/troubleshooting.md#windows-smartscreen-warns-about-an-unknown-publisher).
+
+    Either way, DDMM needs [WebView2](https://developer.microsoft.com/microsoft-edge/webview2/) at runtime, which
+    ships with Windows 11 and most up-to-date Windows 10 installs already. If it's missing, the installer offers
+    to download it automatically.
 
 === "Linux"
 
-    1. Open the [releases page](https://github.com/katsyk/DemocracyDefenderModManager/releases) and download the
-       latest `ddmm` binary.
-    2. Put it in its own folder, and make it executable:
+    Three options:
 
-       ```sh
-       chmod +x ddmm
-       ```
+    - **AppImage** (`DDMM-<version>-linux-x86_64.AppImage`): works on most distributions without installing
+      anything. Make it executable and run it:
 
-    3. Run it: `./ddmm`.
-    4. DDMM is a [Tauri](https://tauri.app/) application and needs WebKitGTK at runtime. If it fails to launch,
-       install your distribution's WebKitGTK package (Debian/Ubuntu: `libwebkit2gtk-4.1-0`) — see
-       [Troubleshooting](../help/troubleshooting.md).
+      ```sh
+      chmod +x DDMM-*-linux-x86_64.AppImage
+      ./DDMM-*-linux-x86_64.AppImage
+      ```
 
-## Where things are stored
+    - **.deb** (`DDMM-<version>-linux-amd64.deb`): for Debian/Ubuntu-based distributions.
 
-Because DDMM is portable, everything it manages lives next to the executable you run:
+      ```sh
+      sudo apt install ./DDMM-*-linux-amd64.deb
+      ```
 
-| Path (relative to the DDMM executable) | What it is |
-| --- | --- |
-| `mods/` | Every mod you've added, one subfolder per mod, each with its own `manifest.json` |
-| `settings.json` | Your [settings](../using/settings.md) (game path, skip list) |
-| `profiles.json` | Your [profiles](../using/profiles.md) and mod ordering |
-| a rolling `*.log` file | DDMM's [log file](../help/logs.md) |
+    - **tar.gz** (`DDMM-<version>-linux-x64.tar.gz`): just the `ddmm` binary plus a quick-start text file. Extract
+      it, make the binary executable, and run it.
 
-Moving the DDMM folder moves all of this with it. Deleting the folder removes DDMM and everything it manages —
-your actual Helldivers 2 installation is untouched either way.
+    DDMM is a [Tauri](https://tauri.app/) application and needs WebKitGTK at runtime. If it fails to launch,
+    install your distribution's WebKitGTK package (Debian/Ubuntu: `libwebkit2gtk-4.1-0`) — see
+    [Troubleshooting](../help/troubleshooting.md).
+
+Check `SHA256SUMS.txt` on the release page if you want to verify your download.
+
+## Data location
+
+Where DDMM keeps your mods, settings, profiles and logs depends on how you're running it:
+
+- **Installed** (the Windows installer, the `.deb`, or an AppImage run from a location that isn't writable) —
+  DDMM uses your OS's normal per-user application data directory: `%APPDATA%\io.github.katsyk.ddmm` on Windows,
+  `~/.local/share/io.github.katsyk.ddmm` on Linux.
+- **Portable** — DDMM keeps everything in the same folder as its own executable instead. This is used
+  automatically when either is true, *and* that folder is writable:
+    - a `portable.txt` file sits next to the executable (already the case if you downloaded the Windows portable
+      zip — it's included inside), or
+    - the folder already has a `mods/` directory or `settings.json` file in it, from an older portable-only
+      release.
+
+  For an AppImage, "the same folder as its own executable" means the folder containing the `.AppImage` file
+  itself, not the temporary location it's mounted at while running.
+
+You can always check which one is active, and where, without guessing: open **Settings** and look at
+**Data Folder** — it's read-only, and has an **Open Folder** button. The choice (and why) is also written to the
+[log file](../help/logs.md) every time DDMM starts.
+
+Moving to portable mode later: create an empty `portable.txt` next to the executable (or copy the one from a
+portable download) and restart DDMM — it'll start using that folder from then on. Note this does *not* move your
+existing mods/settings for you; do that by hand first if you want to keep them (see **Open Folder** in Settings
+to find where they currently are).
 
 ## Next step
 

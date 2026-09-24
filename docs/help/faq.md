@@ -11,8 +11,10 @@ download hand the actual download off to your own browser session — see [Mod s
 
 ### Where does DDMM store my mods and settings?
 
-Everything lives next to the DDMM executable: mods in `mods/`, settings in `settings.json`, profiles in
-`profiles.json`. See [Download & install](../getting-started/download.md#where-things-are-stored).
+Depends on how you're running DDMM — either right next to its own executable ("portable") or your OS's normal
+per-user application data directory. Either way: mods in `mods/`, settings in `settings.json`, profiles in
+`profiles.json`, logs in `logs/`. Open **Settings** and check **Data Folder** to see exactly which one, or see
+[Data location](../getting-started/download.md#data-location) for the full rules.
 
 ### Can I mix mods from different sites in one profile?
 

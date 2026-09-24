@@ -68,6 +68,6 @@ teutinsa, built on [Tauri 2](https://tauri.app/) (a Rust backend with a SvelteKi
 - **Archive extraction is hardened** against path traversal and symlink entries, regardless of which site an
   archive came from.
 
-!!! warning "Preview software"
-    DDMM is preview software (currently versioned `2.0.0-preview3`). Expect rough edges, and please
-    [report bugs](help/bugs.md) you run into.
+!!! warning "Release candidate"
+    DDMM is release-candidate software (currently versioned `2.0.0-rc.3`) — the first release candidate from this
+    community fork. Expect some rough edges, and please [report bugs](help/bugs.md) you run into.

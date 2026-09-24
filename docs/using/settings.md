@@ -4,16 +4,20 @@ title: Settings reference
 
 # Settings reference
 
-The Settings page currently has three settings, stored in `settings.json` next to the DDMM executable.
+The Settings page has three actual settings, stored in `settings.json` in DDMM's
+[data folder](../getting-started/download.md#data-location), plus a read-only line showing where that data
+folder is.
 
 ## Game Path
 
 The folder your Helldivers 2 install lives in — see [First-time setup](../getting-started/setup.md) for the
-validation rules and error messages. This is required: DDMM won't let you leave the Settings page, and refuses to
-[deploy or purge](deploy-purge.md), until it's valid.
+validation rules, error messages, and how automatic detection works. This is required: DDMM won't let you leave
+the Settings page, and refuses to [deploy or purge](deploy-purge.md), until it's valid.
 
 - **Label:** Game Path
 - **Placeholder:** `eg. Steam/steamapps/common/Helldivers 2/`
+- **Auto-detect button:** looks for Helldivers 2 via Steam (the same check DDMM runs automatically on startup
+  when the path is invalid) and fills in the field if it finds a valid install
 - **Browse... button:** opens a folder picker
 
 ## Downloads Folder
@@ -46,7 +50,16 @@ doesn't collide with — or overwrite the slot used by — that DLC content. See
 
 You won't normally need to touch this unless a specific mod's documentation tells you to add an entry for it.
 
+## Data Folder
+
+Read-only — shows the folder DDMM is currently keeping `mods/`, `settings.json`, `profiles.json` and its logs in.
+Which folder that actually is depends on how you installed DDMM; see
+[Data location](../getting-started/download.md#data-location) for the full rules.
+
+- **Label:** Data Folder
+- **Open Folder button:** opens that folder in your system's file manager
+
 ## Where settings live
 
-Settings are saved to `settings.json` in the same folder as the DDMM executable, in a versioned format (currently
-`V1`). You generally shouldn't need to hand-edit this file — use the Settings page instead.
+Settings are saved to `settings.json` in DDMM's data folder (see **Data Folder** above), in a versioned format
+(currently `V1`). You generally shouldn't need to hand-edit this file — use the Settings page instead.

@@ -13,11 +13,21 @@ systems that's `libwebkit2gtk-4.1-0` (the project's own CI installs `libwebkit2g
 on Ubuntu — see [Building from source](../development/building.md) — but just running a pre-built binary only
 needs the WebKitGTK runtime library itself).
 
+## Windows SmartScreen warns about an unknown publisher
+
+Expected for these builds — they aren't code-signed. Click **"More info"**, then **"Run anyway"**. This applies to
+both the installer and the app itself the first time you run it.
+
 ## DDMM opens straight to Settings
 
-This is expected, not a bug: DDMM checks your [Game Path](../using/settings.md#game-path) on startup, and sends
-you to Settings whenever it isn't valid yet — including on a completely fresh install. Fix the path (see
-[First-time setup](../getting-started/setup.md)) and navigate back to Mods.
+On startup DDMM checks your [Game Path](../using/settings.md#game-path); if it's invalid or empty (including on a
+completely fresh install), it first tries to auto-detect your Helldivers 2 install via Steam and, if that
+succeeds, fills in and saves the path for you automatically — you'll see a "Found Helldivers 2 at ..." message
+and DDMM continues straight to Mods, no trip to Settings needed.
+
+You only land on Settings when auto-detection also fails (Steam isn't installed, or the game isn't). Set the path
+yourself, or click **Auto-detect** again after installing/moving the game — see
+[First-time setup](../getting-started/setup.md).
 
 ## "Loading failed!" on the Mods page
 
@@ -26,7 +36,9 @@ missing a required field), loading the whole list fails with this error and its 
 
 To fix it:
 
-1. Open the `mods/` folder next to the DDMM executable.
+1. Open the `mods/` folder — click **Open Folder** next to **Data Folder** in Settings to find it, then go into
+   `mods/` from there (see [Data location](../getting-started/download.md#data-location) if you're not sure
+   which folder that is).
 2. Move mod subfolders out one at a time (or check the error text — it often reports which file the failure came
    from) until DDMM loads successfully again.
 3. Fix or re-download the offending mod, then move it back in — or leave it out and re-add it through DDMM
