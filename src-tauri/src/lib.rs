@@ -57,9 +57,9 @@ pub fn run() {
     // plugin (which needs this same `log_dir`) is up, so it actually lands
     // in the log file and not just stdout.
     let startup_message = format!(
-        "Using {} data directory: {:?} ({})",
+        "Using {} directory: {:?} ({})",
         match decision.kind {
-            data_dir::BaseDirKind::Portable => "portable",
+            data_dir::BaseDirKind::Portable => "portable data",
             data_dir::BaseDirKind::AppData => "app data",
         },
         base_path,
