@@ -4,7 +4,7 @@ use anyhow_tauri::{IntoTAResult, TAResult};
 use regex::Regex;
 use tauri::State;
 
-use crate::{AppState, commands::settings::{do_load_settings, load_settings}, models::{manifest::Manifest, profile::Config}, utils::is_patch_filename};
+use crate::{AppState, commands::settings::{do_load_settings, load_settings}, models::{manifest::Manifest, profile::Config, Mod}, utils::is_patch_filename};
 
 pub mod mods;
 pub mod profiles;
@@ -113,6 +113,152 @@ async fn do_purge(data_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Pair each config with the installed mod it refers to (by GUID),
+/// dropping any config whose GUID doesn't match an installed mod. A
+/// user-edited (or stale) `profiles.json` can easily reference a mod that
+/// no longer exists; that's not an error, the entry is just skipped.
+fn pair_mods_with_configs<'a>(mods: &'a [Mod], configs: &'a [Config]) -> Vec<(&'a Mod, &'a Config)> {
+    let by_guid = mods.iter()
+        .map(|m| (m.guid(), m))
+        .collect::<HashMap<_, _>>();
+
+    configs.iter()
+        .filter_map(|c| {
+            let r#mod = by_guid.get(c.uuid()).copied();
+            if r#mod.is_none() {
+                log::warn!("skipping config for unknown mod GUID {{{}}}", c.uuid());
+            }
+            r#mod.map(|m| (m, c))
+        })
+        .collect()
+}
+
+/// Collect the enabled option (and, for options with sub-options, the
+/// selected sub-option's) include directories for one mod into `groups`.
+/// Skips a disabled mod. Never panics: a version mismatch between the
+/// manifest and its config (which should never happen from the app's own
+/// UI, but can from a hand-edited `profiles.json`), an out-of-range
+/// selected index, or an unknown GUID are all just logged and skipped.
+///
+/// Factored out of `deploy` so it's testable without going through
+/// `State`/`AppState` at all -- just a `Mod` and a `Config`.
+async fn collect_files_for_mod(
+    r#mod: &Mod,
+    config: &Config,
+    groups: &mut HashMap<String, Vec<PatchFileTriplet>>,
+) -> anyhow::Result<()> {
+    if !config.enabled() {
+        return Ok(());
+    }
+
+    match (&r#mod.manifest, config) {
+        (Manifest::Legacy(manifest), Config::Legacy { selected, .. }) => {
+            let base = &r#mod.directory;
+
+            if let Some(options) = manifest.options.as_ref() {
+                if let Some(opt) = options.get(*selected) {
+                    let dir = base.join(opt);
+                    add_files_from_dir(&dir, groups).await?;
+                } else {
+                    log::warn!(
+                        "mod {{{}}}: selected option index {} out of range",
+                        r#mod.guid(), selected
+                    );
+                }
+            } else {
+                add_files_from_dir(base, groups).await?;
+            }
+        }
+        (Manifest::V1(manifest), Config::V1 { selected, toggled, .. }) => {
+            let base = &r#mod.directory;
+
+            if let Some(options) = manifest.options.as_ref() {
+                for (i, opt) in options.iter().enumerate() {
+                    if !toggled.get(i).copied().unwrap_or(false) {
+                        continue;
+                    }
+
+                    if let Some(includes) = opt.include.as_ref() {
+                        for inc in includes {
+                            let dir = base.join(inc);
+                            add_files_from_dir(&dir, groups).await?;
+                        }
+                    }
+
+                    if let Some(sub_options) = opt.sub_options.as_ref() {
+                        if let Some(idx) = selected.get(i).cloned() {
+                            if let Some(sub) = sub_options.get(idx) {
+                                for inc in &sub.include {
+                                    let dir = base.join(inc);
+                                    add_files_from_dir(&dir, groups).await?;
+                                }
+                            } else {
+                                log::warn!(
+                                    "mod {{{}}}: selected sub-option index {} out of range for option {}",
+                                    r#mod.guid(), idx, i
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                add_files_from_dir(base, groups).await?;
+            }
+        }
+        // V2's Option/SubOption shapes are structurally the same as V1's
+        // (plus a Guid/CategoryRef that deploy doesn't need), and
+        // Config::V2's Toggled/Selected are index-keyed exactly like
+        // Config::V1's -- see ModConfigPopup / makeConfigForMod on the
+        // frontend, which is what this is derived from (the upstream v2
+        // draft doesn't specify config shape at all). So V2 deploys
+        // identically to V1.
+        (Manifest::V2(manifest), Config::V2 { selected, toggled, .. }) => {
+            let base = &r#mod.directory;
+
+            if let Some(options) = manifest.options.as_ref() {
+                for (i, opt) in options.iter().enumerate() {
+                    if !toggled.get(i).copied().unwrap_or(false) {
+                        continue;
+                    }
+
+                    if let Some(includes) = opt.include.as_ref() {
+                        for inc in includes {
+                            let dir = base.join(inc);
+                            add_files_from_dir(&dir, groups).await?;
+                        }
+                    }
+
+                    if let Some(sub_options) = opt.sub_options.as_ref() {
+                        if let Some(idx) = selected.get(i).cloned() {
+                            if let Some(sub) = sub_options.get(idx) {
+                                for inc in &sub.include {
+                                    let dir = base.join(inc);
+                                    add_files_from_dir(&dir, groups).await?;
+                                }
+                            } else {
+                                log::warn!(
+                                    "mod {{{}}}: selected sub-option index {} out of range for option {}",
+                                    r#mod.guid(), idx, i
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                add_files_from_dir(base, groups).await?;
+            }
+        }
+        _ => {
+            log::warn!(
+                "mod {{{}}}: manifest version and config version don't match, skipping",
+                r#mod.guid()
+            );
+        }
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn deploy(state: State<'_, AppState>, configs: Vec<Config>) -> TAResult<()> {
     let mods = state.inner().mods.lock().await;
@@ -126,14 +272,7 @@ pub async fn deploy(state: State<'_, AppState>, configs: Vec<Config>) -> TAResul
         return anyhow::anyhow!("invalid settings: {}", e).into_ta_result();
     }
 
-    let mods = mods.iter()
-        .map(|m| (m.guid(), m))
-        .collect::<HashMap<_, _>>();
-    let mods = configs.iter()
-        .filter_map(|c| {
-            mods.get(c.uuid()).map(|m| (*m, c))
-        })
-        .collect::<Vec<_>>();
+    let mods = pair_mods_with_configs(mods, &configs);
 
     let data_dir = settings.game_path().join("data");
 
@@ -149,59 +288,7 @@ pub async fn deploy(state: State<'_, AppState>, configs: Vec<Config>) -> TAResul
     log::info!("Grouping files...");
     let mut groups: HashMap<String, Vec<PatchFileTriplet>> = HashMap::new();
     for (r#mod, config) in mods {
-        if !config.enabled() {
-            continue;
-        }
-
-        match (&r#mod.manifest, config) {
-            (Manifest::Legacy(manifest), Config::Legacy { selected, .. }) => {
-                let base = &r#mod.directory;
-
-                if let Some(options) = manifest.options.as_ref() {
-                    if let Some(opt) = options.get(*selected) {
-                        let dir = base.join(opt);
-                        add_files_from_dir(&dir, &mut groups).await?;
-                    }
-                } else {
-                    add_files_from_dir(base, &mut groups).await?;
-                }
-            }
-            (Manifest::V1(manifest), Config::V1 { selected, toggled, .. }) => {
-                let base = &r#mod.directory;
-
-                if let Some(options) = manifest.options.as_ref() {
-                    for (i, opt) in options.iter().enumerate() {
-                        if !toggled.get(i).copied().unwrap_or(false) {
-                            continue;
-                        }
-
-                        if let Some(includes) = opt.include.as_ref() {
-                            for inc in includes {
-                                let dir = base.join(inc);
-                                add_files_from_dir(&dir, &mut groups).await?;
-                            }
-                        }
-
-                        if let Some(sub_options) = opt.sub_options.as_ref() {
-                            if let Some(idx) = selected.get(i).cloned() {
-                                if let Some(sub) = sub_options.get(idx) {
-                                    for inc in &sub.include {
-                                        let dir = base.join(inc);
-                                        add_files_from_dir(&dir, &mut groups).await?;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    add_files_from_dir(base, &mut groups).await?;
-                }
-            }
-            (Manifest::V2(_manifest), Config::V2 { .. }) => {
-                todo!("V2 manifest mods not supported yet");
-            }
-            _ => unreachable!("manifest and config version should always match")
-        }
+        collect_files_for_mod(r#mod, config, &mut groups).await?;
     }
 
     log::info!("Collected files into {} groups.", groups.len());
@@ -251,4 +338,170 @@ pub async fn purge(state: State<'_, AppState>) -> TAResult<()> {
 
     let data_dir = settings.game_path().join("data");
     do_purge(&data_dir).await.into_ta_result()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::manifest::legacy;
+    use uuid::Uuid;
+
+    const V2_FIXTURE: &str = include_str!("../../tests/fixtures/v2_manifest_fixture.json");
+
+    fn v2_fixture_manifest() -> Manifest {
+        serde_json::from_str(V2_FIXTURE).expect("fixture should parse as a manifest")
+    }
+
+    fn patch_file_name(index: u32) -> String {
+        format!("0123456789abcdef.patch_{}", index)
+    }
+
+    async fn write_patch_file(dir: &std::path::Path, index: u32) {
+        tokio::fs::create_dir_all(dir).await.unwrap();
+        tokio::fs::write(dir.join(patch_file_name(index)), b"data").await.unwrap();
+    }
+
+    /// Lays out the fixture's expected directories (Base, Variants/Red,
+    /// Variants/Blue), each with one distinguishable patch file, under a
+    /// fresh temp dir, and returns a Mod pointing at it with the fixture
+    /// manifest.
+    async fn v2_fixture_mod() -> (tempfile::TempDir, Mod) {
+        let dir = tempfile::tempdir().unwrap();
+        write_patch_file(&dir.path().join("Base"), 0).await;
+        write_patch_file(&dir.path().join("Variants/Red"), 1).await;
+        write_patch_file(&dir.path().join("Variants/Blue"), 2).await;
+
+        let r#mod = Mod {
+            manifest: v2_fixture_manifest(),
+            directory: dir.path().to_path_buf(),
+            sources: Vec::new(),
+        };
+        (dir, r#mod)
+    }
+
+    fn v2_guid() -> Uuid {
+        Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap()
+    }
+
+    #[tokio::test]
+    async fn v2_deploy_collects_enabled_option_files() {
+        let (_dir, r#mod) = v2_fixture_mod().await;
+        let config = Config::V2 {
+            guid: v2_guid(),
+            enabled: true,
+            toggled: vec![true, false], // Base Option on, Color Variant off
+            selected: vec![0, 0],
+        };
+
+        let mut groups = HashMap::new();
+        collect_files_for_mod(&r#mod, &config, &mut groups).await.unwrap();
+
+        assert_eq!(groups.len(), 1, "only the Base option's patch file should be grouped");
+        assert!(groups.contains_key("0123456789abcdef"));
+    }
+
+    #[tokio::test]
+    async fn v2_deploy_collects_selected_sub_option_files() {
+        let (_dir, r#mod) = v2_fixture_mod().await;
+        // Both options on; Color Variant's selected sub-option is index 1 (Blue).
+        let config = Config::V2 {
+            guid: v2_guid(),
+            enabled: true,
+            toggled: vec![true, true],
+            selected: vec![0, 1],
+        };
+
+        let mut groups = HashMap::new();
+        collect_files_for_mod(&r#mod, &config, &mut groups).await.unwrap();
+
+        // Base + Blue both write into the same 16-hex-char group name here
+        // (fixture reuses the name for simplicity), so assert via patch count instead.
+        let total_patches: usize = groups.values().map(|v| v.len()).sum();
+        assert_eq!(total_patches, 2, "Base + Blue, but not Red");
+    }
+
+    #[tokio::test]
+    async fn v2_deploy_skips_disabled_mod() {
+        let (_dir, r#mod) = v2_fixture_mod().await;
+        let config = Config::V2 {
+            guid: v2_guid(),
+            enabled: false,
+            toggled: vec![true, true],
+            selected: vec![0, 0],
+        };
+
+        let mut groups = HashMap::new();
+        collect_files_for_mod(&r#mod, &config, &mut groups).await.unwrap();
+
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn unknown_guid_in_config_is_skipped_not_panicked() {
+        let (guid, manifest) = (v2_guid(), v2_fixture_manifest());
+        let r#mod = Mod {
+            manifest,
+            directory: PathBuf::from("/nonexistent"),
+            sources: Vec::new(),
+        };
+        let mods = vec![r#mod];
+
+        let unrelated_guid = Uuid::parse_str("99999999-9999-9999-9999-999999999999").unwrap();
+        assert_ne!(unrelated_guid, guid);
+
+        let configs = vec![Config::V2 {
+            guid: unrelated_guid,
+            enabled: true,
+            toggled: vec![true],
+            selected: vec![0],
+        }];
+
+        let paired = pair_mods_with_configs(&mods, &configs);
+        assert!(paired.is_empty(), "a config for an unknown GUID must be dropped, not matched");
+    }
+
+    #[tokio::test]
+    async fn mismatched_manifest_and_config_versions_do_not_panic() {
+        let (_dir, r#mod) = v2_fixture_mod().await; // Manifest::V2
+        let config = Config::V1 {
+            guid: v2_guid(),
+            enabled: true,
+            toggled: vec![true],
+            selected: vec![0],
+        };
+
+        let mut groups = HashMap::new();
+        // Must not panic (no todo!/unreachable!) and must not collect anything.
+        let result = collect_files_for_mod(&r#mod, &config, &mut groups).await;
+
+        assert!(result.is_ok());
+        assert!(groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_manifest_config_mismatch_also_does_not_panic() {
+        let guid = Uuid::parse_str("77777777-7777-7777-7777-777777777777").unwrap();
+        let r#mod = Mod {
+            manifest: Manifest::Legacy(legacy::Manifest {
+                guid,
+                name: "Legacy Mod".to_string(),
+                description: String::new(),
+                icon_path: None,
+                options: None,
+            }),
+            directory: PathBuf::from("/nonexistent"),
+            sources: Vec::new(),
+        };
+        let config = Config::V2 {
+            guid,
+            enabled: true,
+            toggled: vec![],
+            selected: vec![],
+        };
+
+        let mut groups = HashMap::new();
+        let result = collect_files_for_mod(&r#mod, &config, &mut groups).await;
+
+        assert!(result.is_ok());
+        assert!(groups.is_empty());
+    }
 }
