@@ -85,3 +85,40 @@ pub async fn save_settings(state: State<'_, AppState>, settings: Settings) -> TA
 pub  async fn check_settings(state: State<'_, AppState>) -> TAResult<bool> {
     do_check_settings(&state.base_path).await.into_ta_result()
 }
+
+/// The directory DDMM is currently keeping `mods/`, `settings.json`,
+/// `profiles.json` and logs in -- shown read-only in Settings with an
+/// "Open folder" button.
+#[tauri::command]
+pub fn get_data_dir(state: State<'_, AppState>) -> String {
+    state.base_path.to_string_lossy().into_owned()
+}
+
+/// Look for a Helldivers 2 install via Steam, without touching settings.
+/// Backs the "Auto-detect" button in Settings.
+#[tauri::command]
+pub async fn detect_game_path() -> Option<String> {
+    crate::steam::detect_game_path()
+        .await
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Detect a Helldivers 2 install and, if found, save it as the game path
+/// immediately. Used on first run (and whenever settings are otherwise
+/// invalid) so a new player never has to open Settings by hand. Returns the
+/// detected path, if any, so the caller can tell the user where it found
+/// it.
+#[tauri::command]
+pub async fn auto_detect_and_save_game_path(state: State<'_, AppState>) -> TAResult<Option<String>> {
+    let Some(path) = crate::steam::detect_game_path().await else {
+        return Ok(None);
+    };
+
+    let mut settings = do_load_settings(&state.base_path).await.into_ta_result()?;
+    settings.set_game_path(path.clone());
+
+    let data = serde_json::to_vec_pretty(&settings).into_ta_result()?;
+    tokio::fs::write(state.base_path.join(SETTINGS_FILE), data).await.into_ta_result()?;
+
+    Ok(Some(path.to_string_lossy().into_owned()))
+}

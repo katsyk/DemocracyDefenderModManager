@@ -10,7 +10,7 @@
     import { useLocalization } from "$lib/state/localization.svelte";
     import { Mod } from "$lib/models/mod";
     import type {Config, Profile, ProfilesConfig} from "$lib/models/profile";
-    import { addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles, loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, type UpdateStatusEntry } from "$lib/utils/commands";
+    import { addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles, loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath, type UpdateStatusEntry } from "$lib/utils/commands";
     import type { UUID } from "$lib/types/uuid";
     import { usePopup } from "$lib/state/popup.svelte";
     import {
@@ -124,8 +124,22 @@
         log.info("Initializing...");
 
         if (!await checkSettings()) {
-            goto("/settings");
-            return;
+            log.info("Settings invalid or missing; trying to auto-detect Helldivers 2...");
+            const detected = await autoDetectAndSaveGamePath();
+            if (detected) {
+                log.info(`Auto-detected Helldivers 2 at ${detected}.`);
+                showPopup(new NotificationPopup(
+                    "info",
+                    t("pages.mods.popup.notification.game_path_detected.message", { path: detected }),
+                ));
+            } else {
+                showPopup(new NotificationPopup(
+                    "warning",
+                    t("pages.mods.popup.notification.game_path_not_found.message"),
+                ));
+                goto("/settings");
+                return;
+            }
         }
 
         const [loadedMods, loadedConfig]: [Mod[], ProfilesConfig] = await Promise.all<Promise<Mod[]> | Promise<ProfilesConfig>>([

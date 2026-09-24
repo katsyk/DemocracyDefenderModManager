@@ -88,6 +88,12 @@ impl Settings {
         }
     }
 
+    pub fn set_game_path(&mut self, path: PathBuf) {
+        match self {
+            Settings::V1 { game_path, .. } => *game_path = path,
+        }
+    }
+
     pub fn downloads_path(&self) -> &Path {
         match self {
             Settings::V1 { downloads_path, .. } => downloads_path.as_path(),

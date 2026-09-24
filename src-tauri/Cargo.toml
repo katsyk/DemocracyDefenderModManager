@@ -1,6 +1,6 @@
 [package]
 name = "ddmm"
-version = "2.0.0-preview3"
+version = "2.0.0-rc.3"
 description = "Democracy Defender Mod Manager — a source-neutral mod manager for Helldivers 2."
 authors = ["katsyk"]
 edition = "2021"
@@ -38,6 +38,9 @@ dirs = "6"
 
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
+
+[target."cfg(windows)".dependencies]
+winreg = "0.56.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"

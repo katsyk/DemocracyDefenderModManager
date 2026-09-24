@@ -149,6 +149,25 @@ export async function checkSettings(): Promise<boolean> {
     return await invoke<boolean>("check_settings");
 }
 
+/** The directory DDMM is currently keeping mods/settings/profiles/logs in. */
+export async function getDataDir(): Promise<string> {
+    log.debug("Invoking `get_data_dir`.");
+    return await invoke<string>("get_data_dir");
+}
+
+/** Look for a Helldivers 2 install via Steam, without touching settings. */
+export async function detectGamePath(): Promise<string | null> {
+    log.debug("Invoking `detect_game_path`.");
+    return await invoke<string | null>("detect_game_path");
+}
+
+/** Detect a Helldivers 2 install and, if found, save it as the game path
+ * immediately. Returns the detected path, if any. */
+export async function autoDetectAndSaveGamePath(): Promise<string | null> {
+    log.debug("Invoking `auto_detect_and_save_game_path`.");
+    return await invoke<string | null>("auto_detect_and_save_game_path");
+}
+
 export async function deploy(configs: Config[]): Promise<void> {
     log.debug("Invoking `deploy`.");
     await invoke<void>("deploy", { configs });

@@ -1,23 +1,25 @@
 <script lang="ts">
     import * as fs from "@tauri-apps/plugin-fs";
     import { open } from "@tauri-apps/plugin-dialog";
+    import { openPath } from "@tauri-apps/plugin-opener";
     import { beforeNavigate, onNavigate } from "$app/navigation";
     import { toSkipEntry, type SkipEntry } from "$lib/models/settings";
     import { useLocalization } from "$lib/state/localization.svelte";
-    import { loadSettings, saveSettings } from "$lib/utils/commands";
-    import { Dash, Plus, ThreeDots } from "svelte-bootstrap-icons";
+    import { loadSettings, saveSettings, detectGamePath, getDataDir } from "$lib/utils/commands";
+    import { Dash, Plus, ThreeDots, Search, Folder2Open } from "svelte-bootstrap-icons";
     import { usePopup } from "$lib/state/popup.svelte";
     import { InputPopup, NotificationPopup } from "$lib/types/popup";
     import { path } from "@tauri-apps/api";
 
     const { t } = useLocalization();
     const { show: showPopup } = usePopup();
-    
+
     let gamePath = $state<string>("");
     let downloadsPath = $state<string>("");
     let skipList = $state<SkipEntry[]>([]);
     let selectedSkipIndex = $state<number>(-1);
     let gamePathErrors = $state<string[]>([]);
+    let dataDir = $state<string>("");
     let initPromise = $state<Promise<void>>(init());
 
     $effect(() => {
@@ -82,7 +84,7 @@
     })
 
     async function init() {
-        const settings = await loadSettings();
+        const [settings, resolvedDataDir] = await Promise.all([loadSettings(), getDataDir()]);
         switch (settings.Version) {
             case "V1":
                 gamePath = settings.GamePath;
@@ -90,6 +92,7 @@
                 downloadsPath = settings.DownloadsPath;
                 break;
         }
+        dataDir = resolvedDataDir;
     }
 
     async function onBrowse() {
@@ -99,6 +102,22 @@
         });
         if (!path) return;
         gamePath = path;
+    }
+
+    async function onAutoDetect() {
+        const detected = await detectGamePath();
+        if (detected) {
+            gamePath = detected;
+        } else {
+            showPopup(new NotificationPopup(
+                "warning",
+                t("pages.settings.popup.notification.game_path_not_found.message"),
+            ));
+        }
+    }
+
+    async function onOpenDataDir() {
+        await openPath(dataDir);
     }
 
     async function onBrowseDownloads() {
@@ -164,12 +183,40 @@
                     >
                         <ThreeDots class="m-auto block" />
                     </button>
+                    <button
+                        class="hd2mm-button flex flex-row gap-1 items-center"
+                        title={t("pages.settings.game_path.detect_button.tip")}
+                        onclick={onAutoDetect}
+                    >
+                        <Search />
+                        {t("pages.settings.game_path.detect_button.text")}
+                    </button>
                 </div>
                 <ul class="ml-6 text-red-500 list-disc">
                     {#each gamePathErrors as error}
                         <li>{error}</li>
                     {/each}
                 </ul>
+            </div>
+            <div class="flex flex-col gap-1">
+                <h2 class="text-zinc-300 text-xl">{t("pages.settings.data_dir.title")}</h2>
+                <p class="text-zinc-400 text-sm">{t("pages.settings.data_dir.description")}</p>
+                <div class="flex flex-row gap-1">
+                    <input
+                        value={dataDir}
+                        id="datadir"
+                        class="hd2mm-input flex-1"
+                        readonly
+                    />
+                    <button
+                        class="hd2mm-button flex flex-row gap-1 items-center"
+                        title={t("pages.settings.data_dir.open_button.tip")}
+                        onclick={onOpenDataDir}
+                    >
+                        <Folder2Open />
+                        {t("pages.settings.data_dir.open_button.text")}
+                    </button>
+                </div>
             </div>
             <div class="flex flex-col gap-1">
                 <h2 class="text-zinc-300 text-xl">{t("pages.settings.downloads_path.title")}</h2>

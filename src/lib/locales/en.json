@@ -88,6 +88,12 @@
                     },
                     "updates_none": {
                         "message": "Everything is up to date."
+                    },
+                    "game_path_detected": {
+                        "message": "Found Helldivers 2 at {path}"
+                    },
+                    "game_path_not_found": {
+                        "message": "Couldn't find Helldivers 2 automatically. Set the game path in Settings."
                     }
                 },
                 "error": {
@@ -191,6 +197,9 @@
                 "notification": {
                     "validation_error": {
                         "message": "Invalid settings values!"
+                    },
+                    "game_path_not_found": {
+                        "message": "Couldn't find Helldivers 2 automatically. You can still set the path by hand."
                     }
                 },
                 "input": {
@@ -211,6 +220,10 @@
                 "placeholder": "eg. Steam/steamapps/common/Helldivers 2/",
                 "browse_button": {
                     "tip": "Browse..."
+                },
+                "detect_button": {
+                    "text": "Auto-detect",
+                    "tip": "Look for a Helldivers 2 install via Steam."
                 }
             },
             "downloads_path": {
@@ -219,6 +232,14 @@
                 "placeholder": "eg. Downloads",
                 "browse_button": {
                     "tip": "Browse..."
+                }
+            },
+            "data_dir": {
+                "title": "Data Folder",
+                "description": "Where DDMM keeps your mods, settings, profiles and logs.",
+                "open_button": {
+                    "text": "Open Folder",
+                    "tip": "Open this folder in your file manager."
                 }
             },
             "skip_list": {

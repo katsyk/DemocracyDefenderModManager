@@ -4,6 +4,8 @@ pub mod archive;
 pub mod utils;
 pub mod sources;
 pub mod download;
+pub mod data_dir;
+pub mod steam;
 
 use std::{
     path::PathBuf,
@@ -36,11 +38,33 @@ impl AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let exe_dir = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
+    let exe_dir = data_dir::resolve_exe_dir();
+    let app_data_dir = data_dir::platform_app_data_dir().unwrap_or_else(|e| {
+        eprintln!("warning: {e}; falling back to the executable directory for app data");
+        exe_dir.clone()
+    });
+
+    let decision = data_dir::decide_base_dir(&exe_dir, &app_data_dir);
+    if let Err(e) = std::fs::create_dir_all(&decision.path) {
+        eprintln!("warning: failed to create data directory {:?}: {}", decision.path, e);
+    }
+
+    let base_path = decision.path.clone();
+    let log_dir = base_path.join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    // The base-directory decision itself is logged again once the log
+    // plugin (which needs this same `log_dir`) is up, so it actually lands
+    // in the log file and not just stdout.
+    let startup_message = format!(
+        "Using {} data directory: {:?} ({})",
+        match decision.kind {
+            data_dir::BaseDirKind::Portable => "portable",
+            data_dir::BaseDirKind::AppData => "app data",
+        },
+        base_path,
+        decision.reason
+    );
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -57,15 +81,18 @@ pub fn run() {
                 .targets([
                     Target::new(TargetKind::Stdout),
                     Target::new(TargetKind::Webview),
-                    //#[cfg(not(debug_assertions))]
                     Target::new(TargetKind::Folder {
-                        path: exe_dir.clone(),
+                        path: log_dir,
                         file_name: None
                     })
                 ])
                 .build()
         )
-        .manage(AppState::new(exe_dir))
+        .setup(move |_app| {
+            log::info!("{}", startup_message);
+            Ok(())
+        })
+        .manage(AppState::new(base_path))
         .invoke_handler(tauri::generate_handler![
             commands::mods::get_mods,
             commands::mods::delete_mod,
@@ -84,6 +111,9 @@ pub fn run() {
             commands::settings::load_settings,
             commands::settings::save_settings,
             commands::settings::check_settings,
+            commands::settings::get_data_dir,
+            commands::settings::detect_game_path,
+            commands::settings::auto_detect_and_save_game_path,
             commands::purge,
             commands::deploy
         ])
