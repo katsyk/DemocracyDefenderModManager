@@ -295,9 +295,19 @@ fn strip_trailing_separators(path: &Path) -> PathBuf {
 
 /// `/run/user/<uid>/doc/...` -- where the xdg-desktop-portal document
 /// portal exposes files it shares with sandboxed apps.
+/// Linux-only: always `false` elsewhere, so no Windows/macOS path is ever
+/// classified as one.
 pub fn is_portal_document_path(path: &Path) -> bool {
-    let s = path.to_string_lossy();
-    s.starts_with("/run/user/") && s.split('/').nth(4) == Some("doc")
+    #[cfg(target_os = "linux")]
+    {
+        let s = path.to_string_lossy();
+        s.starts_with("/run/user/") && s.split('/').nth(4) == Some("doc")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 #[cfg(test)]
@@ -436,6 +446,7 @@ mod tests {
         assert_eq!(resolve_blocking(&data), Err(GamePathProblem::MissingTools));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn detects_portal_document_paths() {
         assert!(is_portal_document_path(Path::new("/run/user/1000/doc/abcd1234/Helldivers 2")));
@@ -444,6 +455,17 @@ mod tests {
         assert_eq!(
             resolve_blocking(Path::new("/run/user/1000/doc/deadbeef/Helldivers 2")),
             Err(GamePathProblem::PortalPath)
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn portal_paths_are_never_detected_off_linux() {
+        assert!(!is_portal_document_path(Path::new("/run/user/1000/doc/abcd1234/Helldivers 2")));
+        assert!(!is_portal_document_path(Path::new(r"C:\run\user\1000\doc\x")));
+        assert_eq!(
+            resolve_blocking(Path::new("/run/user/1000/doc/deadbeef/Helldivers 2")),
+            Err(GamePathProblem::NotFound)
         );
     }
 
