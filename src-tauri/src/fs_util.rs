@@ -10,7 +10,7 @@
 //! so it falls back to copy + remove instead of failing.
 
 use std::io;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::Context;
 
@@ -102,10 +102,131 @@ async fn copy_then_remove(from: &Path, to: &Path) -> anyhow::Result<()> {
 /// Recursive copy that, unlike `utils::copy_dir_recursive`, keeps
 /// everything (no skip list) and refuses to overwrite: `to` must not exist.
 async fn copy_tree(from: &Path, to: &Path) -> anyhow::Result<()> {
+    // Checked before the existence test so a move of a folder into its own
+    // subtree reports the real problem, not "already exists".
+    ensure_no_overlap(from, to)?;
     if tokio::fs::try_exists(to).await.unwrap_or(false) {
         anyhow::bail!("destination {:?} already exists", to);
     }
     crate::utils::copy_dir_recursive(from, to, &[]).await
+}
+
+/// How two paths relate on disk once symlinks, `.`/`..`, and (on Windows
+/// and macOS) letter case are resolved. See [`path_overlap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathOverlap {
+    /// Both paths name the same folder.
+    Same,
+    /// The first path is somewhere inside the second.
+    FirstInsideSecond,
+    /// The second path is somewhere inside the first.
+    SecondInsideFirst,
+}
+
+/// Resolve `path` to an absolute path with no symlinks and no `.`/`..`,
+/// even when (the tail of) it doesn't exist yet: the longest existing
+/// prefix is canonicalized (which also gives it its on-disk letter case on
+/// Windows), and the missing rest is appended with `..` applied lexically.
+pub fn resolve_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut resolved = PathBuf::new();
+    let mut exists = true;
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => resolved.push(component),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // `resolved` has no symlinks left in it, so its lexical
+                // parent is its real parent.
+                resolved.pop();
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                if exists {
+                    match std::fs::canonicalize(&resolved) {
+                        Ok(canonical) => resolved = canonical,
+                        // Missing (or unreadable): keep the rest as written.
+                        Err(_) => exists = false,
+                    }
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// Whether two already-[`resolve_path`]d paths name the same folder.
+fn same_resolved(a: &Path, b: &Path) -> bool {
+    let (mut ca, mut cb) = (a.components(), b.components());
+    let names_equal = loop {
+        match (ca.next(), cb.next()) {
+            (None, None) => break true,
+            (Some(x), Some(y)) if component_eq(x.as_os_str(), y.as_os_str()) => continue,
+            _ => break false,
+        }
+    };
+    // File identity (device + inode, or volume + file index) catches the
+    // aliases a name comparison can't: bind mounts, 8.3 short names, a
+    // case-insensitive macOS volume, a second drive letter for one volume.
+    names_equal || same_file::is_same_file(a, b).unwrap_or(false)
+}
+
+fn component_eq(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    if a == b {
+        return true;
+    }
+    // Windows and (by default) macOS filesystems ignore letter case. Only
+    // the not-yet-existing tail of a path can still differ in case here
+    // (existing parts were canonicalized); treating those as equal only
+    // ever makes the overlap check stricter, never looser.
+    if cfg!(any(windows, target_os = "macos")) {
+        return a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase();
+    }
+    false
+}
+
+/// Whether resolved path `child` is `parent` or anywhere below it.
+fn is_within(child: &Path, parent: &Path) -> bool {
+    child.ancestors().any(|ancestor| same_resolved(ancestor, parent))
+}
+
+/// Answer "are `a` and `b` the same folder, or is one inside the other?"
+/// after resolving symlinks, `..`, and letter case on case-insensitive
+/// platforms. Neither path has to exist. `None` means they don't overlap.
+///
+/// Every copy, move and import of a folder goes through this: copying a
+/// folder into its own subtree re-reads what it just wrote and nests the
+/// folder inside itself over and over until the disk fills up.
+pub fn path_overlap(a: &Path, b: &Path) -> io::Result<Option<PathOverlap>> {
+    let (a, b) = (resolve_path(a)?, resolve_path(b)?);
+    Ok(match (is_within(&a, &b), is_within(&b, &a)) {
+        (true, true) => Some(PathOverlap::Same),
+        (true, false) => Some(PathOverlap::FirstInsideSecond),
+        (false, true) => Some(PathOverlap::SecondInsideFirst),
+        (false, false) => None,
+    })
+}
+
+/// Fail with a readable error if copying/moving `src` to `dst` would put
+/// one inside the other (see [`path_overlap`]).
+pub fn ensure_no_overlap(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    let overlap = path_overlap(src, dst)
+        .with_context(|| format!("couldn't check whether {:?} and {:?} overlap", src, dst))?;
+    match overlap {
+        None => Ok(()),
+        Some(PathOverlap::Same) => {
+            anyhow::bail!("can't copy {:?} onto itself ({:?} is the same folder)", src, dst)
+        }
+        Some(PathOverlap::SecondInsideFirst) => anyhow::bail!(
+            "can't copy {:?} into {:?}: the destination is inside the folder being copied, \
+             so it would copy itself into itself over and over",
+            src, dst
+        ),
+        Some(PathOverlap::FirstInsideSecond) => anyhow::bail!(
+            "can't copy {:?} into {:?}: the folder being copied is inside the destination",
+            src, dst
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -175,6 +296,90 @@ mod tests {
             tokio::fs::read(to.join("Options/Red/0123456789abcdef.patch_0")).await.unwrap(),
             b"p"
         );
+    }
+
+    #[test]
+    fn overlap_same_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(path_overlap(dir.path(), dir.path()).unwrap(), Some(PathOverlap::Same));
+    }
+
+    #[test]
+    fn overlap_destination_inside_source_even_if_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let inside = dir.path().join("mods").join("not-created-yet");
+        assert_eq!(path_overlap(dir.path(), &inside).unwrap(), Some(PathOverlap::SecondInsideFirst));
+        assert_eq!(path_overlap(&inside, dir.path()).unwrap(), Some(PathOverlap::FirstInsideSecond));
+    }
+
+    #[test]
+    fn overlap_ignores_siblings_that_share_a_name_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("mods")).unwrap();
+        std::fs::create_dir_all(dir.path().join("mods2")).unwrap();
+        assert_eq!(path_overlap(&dir.path().join("mods"), &dir.path().join("mods2")).unwrap(), None);
+        assert_eq!(path_overlap(&dir.path().join("mods"), &dir.path().join("mods2/x")).unwrap(), None);
+    }
+
+    #[test]
+    fn overlap_resolves_dot_and_dotdot_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let mods = dir.path().join("mods");
+        std::fs::create_dir_all(mods.join("ModA")).unwrap();
+        let roundabout = mods.join("ModA").join("..").join(".");
+        assert_eq!(path_overlap(&roundabout, &mods).unwrap(), Some(PathOverlap::Same));
+        // `..` in a part that doesn't exist yet is applied too.
+        let missing = mods.join("new").join("..").join("other");
+        assert_eq!(path_overlap(&mods, &missing).unwrap(), Some(PathOverlap::SecondInsideFirst));
+        let outside = mods.join("..").join("elsewhere");
+        assert_eq!(path_overlap(&mods, &outside).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlap_sees_through_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("mods")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(path_overlap(&link, &real).unwrap(), Some(PathOverlap::Same));
+        assert_eq!(path_overlap(&link, &real.join("mods/new")).unwrap(), Some(PathOverlap::SecondInsideFirst));
+        assert_eq!(path_overlap(&real, &link.join("mods")).unwrap(), Some(PathOverlap::SecondInsideFirst));
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn overlap_ignores_letter_case_on_case_insensitive_platforms() {
+        let dir = tempfile::tempdir().unwrap();
+        let mods = dir.path().join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        let upper = dir.path().join("MODS");
+        assert_eq!(path_overlap(&upper, &mods).unwrap(), Some(PathOverlap::Same));
+        assert_eq!(path_overlap(&mods, &upper.join("Missing")).unwrap(), Some(PathOverlap::SecondInsideFirst));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn overlap_respects_letter_case_on_linux() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("mods")).unwrap();
+        std::fs::create_dir_all(dir.path().join("MODS")).unwrap();
+        assert_eq!(path_overlap(&dir.path().join("MODS"), &dir.path().join("mods")).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn cross_device_move_into_own_subtree_is_refused_and_source_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("MyMod");
+        tokio::fs::create_dir_all(&from).await.unwrap();
+        tokio::fs::write(from.join("0123456789abcdef.patch_0"), b"p").await.unwrap();
+        let to = from.join("nested");
+
+        let err = move_path_with(&from, &to, |_, _| async { Err(exdev()) }).await.unwrap_err();
+        assert!(format!("{err:#}").contains("inside"), "{err:#}");
+        assert!(from.join("0123456789abcdef.patch_0").is_file());
+        assert!(!to.exists());
     }
 
     #[tokio::test]
