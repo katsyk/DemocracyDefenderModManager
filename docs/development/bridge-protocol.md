@@ -146,11 +146,23 @@ from `downloadUrl` host detection never has an id and always installs as a new m
 **Which `pageUrl` the extension sends.** The page the user is on is only context, since a link on mod A's page can be
 mod B's file. The extension therefore attributes every download to the mod the *file's* URL names:
 
-- The download/link URL is a mod URL of the page's own mod: the page URL, plus the page's scraped `pageVersion`.
-- The download/link URL is some *other* mod's URL: that URL, with no `pageVersion`.
+A URL "names" a mod when it's a mod page URL, or a Nexus Mods file URL
+(`https://<host>.nexusmods.com/cdn/<gameId>/<modId>/<file>` or `https://<host>.nexus-cdn.com/<gameId>/<modId>/<file>`),
+whose mod id is in its path. A Helldivers 2 file (`gameId` 6119) names `https://www.nexusmods.com/helldivers2/mods/<modId>`;
+a file of another game names a mod with no page.
+
+- The download/link URL names the page's own mod: the page URL, plus the page's scraped `pageVersion`.
+- The download/link URL names some *other* mod: that mod's page URL (or `null` when it has none), with no `pageVersion`.
 - The download/link URL names no mod (CDN, bare file):
   - right-click installs send `pageUrl: null`, so the app falls back to host detection with no id;
   - armed/auto capture send the page the download was started from, with no `pageVersion`.
+
+**Capture doesn't depend on how a download starts.** Armed capture (the button on a site with no direct file link)
+takes the next archive the browser downloads from that site's hosts (its pages, or its CDN hosts) within 10 minutes,
+whichever tab it's in and whatever started it: the site's own button, a download manager or a userscript. The extension
+never clicks, skips or times anything on the site itself. A download that finished up to 5 minutes *before* the click is
+also taken, but only when it provably belongs to the page's mod (its URL names that mod, or it names no mod and its
+referrer is that mod's page). The armed state is kept in `storage.session`, so a restarted MV3 service worker keeps it.
 
 `downloadUrl` is the URL the user chose (the right-clicked link or the page's download link).
 

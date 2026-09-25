@@ -91,3 +91,52 @@ describe('providerFromUrl', () => {
     expect(providerFromUrl(url)).toBe(expected);
   });
 });
+
+describe('Nexus file-download URLs', () => {
+  const { nexusFileFromUrl, modFromDownloadUrl, attributeDownload } = globalThis.DDMM.sources;
+
+  it.each([
+    ['https://cf-files.nexusmods.com/cdn/6119/123/Cool Mod-123-1-0-1700000000.zip?md5=a&expires=1&user_id=2', '6119', '123'],
+    ['https://supporter-files.nexus-cdn.com/6119/4567/X-4567-2-0.7z?key=a&expires=1', '6119', '4567'],
+    ['https://premium-files.nexus-cdn.com/1704/9/y.rar', '1704', '9'],
+  ])('reads game and mod id from %s', (url, gameId, modId) => {
+    expect(nexusFileFromUrl(url)).toEqual({ gameId, modId });
+  });
+
+  it.each([
+    'https://www.nexusmods.com/helldivers2/mods/123',
+    'https://cf-files.nexusmods.com/cdn/abc/123/x.zip',
+    'https://files.nexus-cdn.com/x.zip',
+    'https://evil.example/6119/123/x.zip',
+    'not a url',
+  ])('rejects %s', (url) => {
+    expect(nexusFileFromUrl(url)).toBeNull();
+  });
+
+  it('maps a Helldivers 2 file to its canonical mod page', () => {
+    expect(modFromDownloadUrl('https://supporter-files.nexus-cdn.com/6119/123/x.zip')).toEqual({
+      source: { provider: 'nexus', id: '123' },
+      pageUrl: 'https://www.nexusmods.com/helldivers2/mods/123',
+    });
+  });
+
+  it("never gives another game's file a page", () => {
+    expect(modFromDownloadUrl('https://supporter-files.nexus-cdn.com/1704/123/x.zip').pageUrl).toBeNull();
+  });
+
+  it('attributes a same-mod CDN file to the page the user was on (so its version may be sent)', () => {
+    expect(attributeDownload({
+      contextPageUrl: 'https://www.nexusmods.com/helldivers2/mods/123?tab=files',
+      downloadUrl: 'https://supporter-files.nexus-cdn.com/6119/123/x.zip',
+      trustPage: true,
+    })).toEqual({ pageUrl: 'https://www.nexusmods.com/helldivers2/mods/123?tab=files', sameModAsPage: true });
+  });
+
+  it("attributes another mod's CDN file to that mod, even when the page is trusted", () => {
+    expect(attributeDownload({
+      contextPageUrl: 'https://www.nexusmods.com/helldivers2/mods/123',
+      downloadUrl: 'https://supporter-files.nexus-cdn.com/6119/999/x.zip',
+      trustPage: true,
+    })).toEqual({ pageUrl: 'https://www.nexusmods.com/helldivers2/mods/999', sameModAsPage: false });
+  });
+});

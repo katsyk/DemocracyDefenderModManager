@@ -1,0 +1,10 @@
+{
+    "Version": 1,
+    "Guid": "5b1c7a3e-6f0b-4b43-9a55-0d7f1c2e8a11",
+    "Name": "Fixture Mod",
+    "Description": "",
+    "IconPath": "Images\\icon.png",
+    "Options": [
+        { "Name": "Red", "Description": "", "Include": ["Variants\\Red"], "Image": "Images\\red.png" }
+    ]
+}

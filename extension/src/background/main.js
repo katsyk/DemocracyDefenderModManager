@@ -36,6 +36,31 @@
   const client = new DDMM.ProtocolClient();
   const captureRegistry = new DDMM.capture.CaptureRegistry();
 
+  /**
+   * Chrome shuts an idle MV3 service worker down after ~30 s, and nothing
+   * keeps it awake while the user waits on a download -- so the armed
+   * capture (and recent unclaimed downloads) are mirrored into
+   * `storage.session` and restored on the next wake-up. Memory-only where
+   * `storage.session` doesn't exist.
+   */
+  const SESSION_KEY = 'ddmmCapture';
+  const registryReady = (async () => {
+    if (!api.storage.session) return;
+    try {
+      const data = await api.storage.session.get(SESSION_KEY);
+      captureRegistry.restore(data && data[SESSION_KEY]);
+    } catch {
+      // Best effort: a fresh registry still works for this wake-up.
+    }
+  })();
+
+  function persistRegistry() {
+    if (!api.storage.session) return;
+    api.storage.session.set({ [SESSION_KEY]: captureRegistry.serialize() }).catch(() => {
+      // Best effort, see registryReady.
+    });
+  }
+
   /** downloadId -> context for downloads *we* triggered via `downloads.download()`. */
   const directDownloads = new Map();
   /** site -> timer that fires if an armed capture never matches. */
@@ -206,27 +231,15 @@
     }
 
     // Not something we initiated -- check armed (manual) capture, then
-    // per-site auto-capture.
+    // per-site auto-capture. However the download was started (Nexus's own
+    // button, a userscript, a download manager, another tab), only where it
+    // came from matters.
+    await registryReady;
     const armed = captureRegistry.match(normalized);
     if (armed) {
+      persistRegistry();
       clearArmTimer(armed.site);
-      const contextPageUrl = armed.pageUrl || normalized.referrer;
-      const attribution = DDMM.sources.attributeDownload({
-        contextPageUrl,
-        downloadUrl: normalized.finalUrl,
-        trustPage: true,
-      });
-      const reply = await runInstall({
-        file: normalized.filename,
-        pageUrl: attribution.pageUrl,
-        downloadUrl: normalized.finalUrl,
-        pageVersion: sendableVersion(attribution, contextPageUrl, armed.pageVersion),
-      });
-      if (armed.tabId != null) {
-        sendToTab(armed.tabId, { type: 'ddmm:installResult', reply });
-      } else {
-        broadcastToSiteTabs(armed.site, { type: 'ddmm:installResult', reply });
-      }
+      await installCaptured(normalized, armed);
       return;
     }
 
@@ -247,9 +260,40 @@
           pageVersion: sendableVersion(attribution, normalized.referrer),
         });
         broadcastToSiteTabs(site, { type: 'ddmm:installResult', reply });
+        return;
       }
-      return;
+      break;
     }
+
+    // Nobody wanted it (yet). If the user clicks "Install with DDMM" on
+    // this mod's page within a few minutes, it's picked up then.
+    captureRegistry.remember(normalized);
+    persistRegistry();
+  }
+
+  /**
+   * Install a download claimed by an armed capture, and keep the tab that
+   * armed it informed.
+   * @param {object} normalized - A normalized download item.
+   * @param {{site: string, pageUrl: string|null, pageVersion: string|null, tabId: number|null}} armed
+   */
+  async function installCaptured(normalized, armed) {
+    const notifyTab = (message) =>
+      armed.tabId != null ? sendToTab(armed.tabId, message) : broadcastToSiteTabs(armed.site, message);
+    notifyTab({ type: 'ddmm:captureStarted', site: armed.site });
+    const contextPageUrl = armed.pageUrl || normalized.referrer;
+    const attribution = DDMM.sources.attributeDownload({
+      contextPageUrl,
+      downloadUrl: normalized.finalUrl,
+      trustPage: true,
+    });
+    const reply = await runInstall({
+      file: normalized.filename,
+      pageUrl: attribution.pageUrl,
+      downloadUrl: normalized.finalUrl,
+      pageVersion: sendableVersion(attribution, contextPageUrl, armed.pageVersion),
+    });
+    notifyTab({ type: 'ddmm:installResult', reply });
   }
 
   /** @param {string} site */
@@ -388,12 +432,26 @@
 
       case 'ddmm:armCapture': {
         const tabId = sender.tab ? sender.tab.id : null;
-        captureRegistry.arm(message.site, {
-          tabId,
-          pageUrl: message.pageUrl ?? null,
-          pageVersion: message.pageVersion ?? null,
-        });
+        const pageUrl = message.pageUrl ?? null;
+        const pageVersion = message.pageVersion ?? null;
+        await registryReady;
         clearArmTimer(message.site);
+
+        // Already downloaded? (A userscript or download manager may have
+        // fetched the file before the user got to this button.) Only a file
+        // that provably is this page's mod is taken.
+        const early = captureRegistry.claimRecent(message.site, pageUrl);
+        if (early) {
+          captureRegistry.disarm(message.site);
+          persistRegistry();
+          installCaptured(early, { site: message.site, pageUrl, pageVersion, tabId }).catch(() => {
+            // Surfaced via notify()/installResult inside installCaptured.
+          });
+          return { ok: true, claimed: true };
+        }
+
+        captureRegistry.arm(message.site, { tabId, pageUrl, pageVersion });
+        persistRegistry();
         armTimers.set(
           message.site,
           setTimeout(() => {
@@ -403,11 +461,13 @@
             }
           }, DDMM.capture.DEFAULT_ARM_WINDOW_MS),
         );
-        return { ok: true };
+        return { ok: true, claimed: false };
       }
 
       case 'ddmm:disarmCapture':
+        await registryReady;
         captureRegistry.disarm(message.site);
+        persistRegistry();
         clearArmTimer(message.site);
         return { ok: true };
 

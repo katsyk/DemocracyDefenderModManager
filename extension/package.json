@@ -9,6 +9,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "node scripts/build.mjs --test && node test/e2e/smoke.mjs",
+    "test:e2e:nexus": "node scripts/build.mjs && node test/e2e/nexus-capture.mjs",
     "build": "node scripts/build.mjs",
     "build:test": "node scripts/build.mjs --test",
     "lint": "node scripts/lint.mjs"

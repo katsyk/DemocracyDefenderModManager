@@ -18,8 +18,10 @@
   const SVG_NS = 'http://www.w3.org/2000/svg';
 
   /**
-   * Builds a small inline version of the shield-and-chevrons emblem, DDMM
-   * yellow on transparent, as real SVG DOM nodes (not `innerHTML`, so
+   * Builds a small inline version of the shield-and-chevrons emblem, drawn
+   * in `currentColor` so it always matches the button's label color (dark
+   * on the yellow/green/blue/red buttons, yellow on the dark "Get DDMM"
+   * one), as real SVG DOM nodes (not `innerHTML`, so
    * there's nothing here for a store reviewer -- or `web-ext lint` -- to
    * flag as an unsanitized dynamic-markup assignment, even though every
    * value involved is a static constant).
@@ -32,17 +34,18 @@
     svg.setAttribute('height', '14');
     svg.setAttribute('aria-hidden', 'true');
     svg.setAttribute('focusable', 'false');
+    svg.setAttribute('class', 'ddmm-emblem');
 
     const shield = document.createElementNS(SVG_NS, 'path');
     shield.setAttribute('d', 'M256 40 L440 100 V250 C440 362 358 436 256 478 C154 436 72 362 72 250 V100 Z');
     shield.setAttribute('fill', 'none');
-    shield.setAttribute('stroke', '#FFC61A');
+    shield.setAttribute('stroke', 'currentColor');
     shield.setAttribute('stroke-width', '28');
     svg.appendChild(shield);
 
     const chevrons = document.createElementNS(SVG_NS, 'g');
     chevrons.setAttribute('fill', 'none');
-    chevrons.setAttribute('stroke', '#FFC61A');
+    chevrons.setAttribute('stroke', 'currentColor');
     chevrons.setAttribute('stroke-width', '30');
     chevrons.setAttribute('stroke-linejoin', 'miter');
     chevrons.setAttribute('stroke-linecap', 'butt');
@@ -74,6 +77,7 @@
       user-select: none;
       box-shadow: 0 1px 0 rgba(0,0,0,0.4);
     }
+    .ddmm-emblem { flex: none; color: inherit; }
     .ddmm-btn:hover { background: #ffd24d; }
     .ddmm-btn:active { background: #e6b117; }
     .ddmm-btn[data-state="installing"],
@@ -284,11 +288,10 @@
       }
       if (!state.clickable) return;
 
-      state.startInstalling();
-      render();
-
       const directUrl = adapter.findDirectDownloadUrl ? adapter.findDirectDownloadUrl(document) : null;
       if (directUrl) {
+        state.startInstalling();
+        render();
         await send({
           type: 'ddmm:installDirect',
           url: directUrl,
@@ -300,13 +303,49 @@
         return;
       }
 
-      await send({ type: 'ddmm:armCapture', site: adapter.name, pageUrl: location.href, pageVersion });
-      widget.setHint('Click Download on this page. DDMM will take it from there.');
+      // No direct link: arm capture. The label changes right away -- the
+      // user can start the download at once, and however it's started
+      // (the site's own button or any tool of theirs), the next archive
+      // from this site is the one installed.
+      state.waitForDownload();
+      render();
+      clearTimeout(armExpiryTimer);
+      armExpiryTimer = setTimeout(releaseArm, DDMM_NS.capture.DEFAULT_ARM_WINDOW_MS);
+      const reply = await send({ type: 'ddmm:armCapture', site: adapter.name, pageUrl: location.href, pageVersion });
+      if (reply && reply.claimed && state.state === 'waiting') {
+        // The file had already finished downloading; it's installing now.
+        state.startInstalling();
+        render();
+      }
     });
+
+    /** @type {ReturnType<typeof setTimeout>|undefined} */
+    let armExpiryTimer;
+
+    /**
+     * The armed install never happened; release the button and re-check.
+     * Also driven from here (not only by the background's
+     * `ddmm:captureExpired`), because a restarted service worker has lost
+     * its timers.
+     */
+    function releaseArm() {
+      clearTimeout(armExpiryTimer);
+      if (state.state !== 'waiting') return;
+      state.reset();
+      render();
+      refresh();
+    }
 
     DDMM_NS.browserApi.runtime.onMessage.addListener((message) => {
       if (!message) return;
-      if (message.type === 'ddmm:installResult') {
+      if (message.type === 'ddmm:captureStarted' && message.site === adapter.name) {
+        clearTimeout(armExpiryTimer);
+        if (state.state === 'waiting') {
+          state.startInstalling();
+          render();
+        }
+      } else if (message.type === 'ddmm:installResult') {
+        clearTimeout(armExpiryTimer);
         if (message.reply && message.reply.ok) {
           state.setInstalled();
         } else {
@@ -315,10 +354,7 @@
         }
         render();
       } else if (message.type === 'ddmm:captureExpired' && message.site === adapter.name) {
-        // The armed install never happened; release the button and re-check.
-        state.reset();
-        render();
-        refresh();
+        releaseArm();
       }
     });
 

@@ -1,7 +1,6 @@
 import type { UUID } from "$lib/types/uuid";
-import { join } from "@tauri-apps/api/path";
 import type { Manifest } from "./manifest";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { modImageSrc } from "$lib/utils/modImages";
 
 /** Where a {@link ResolvedSource} came from. */
 export type SourceOrigin = "Manifest" | "Install";
@@ -36,6 +35,6 @@ export class Mod {
 
     async iconPath(): Promise<string | null> {
         if (!this.Manifest.IconPath) return null;
-        return convertFileSrc(await join(this.Directory, this.Manifest.IconPath));
+        return modImageSrc(this.Directory, this.Manifest.IconPath);
     }
 }

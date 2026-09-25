@@ -14,6 +14,10 @@
  *                       the install launches it)
  *   - `installed`    -> "Installed ✓" (click -> reinstall/open)
  *   - `update`       -> "Update with DDMM"
+ *   - `waiting`      -> "Click Download on this page…" (capture armed:
+ *                       whatever archive this site downloads next -- via
+ *                       the site's own button or any other tool the user
+ *                       runs -- is installed; still clickable to re-arm)
  *   - `installing`   -> "Installing…"
  *   - `error`        -> the error's friendly message
  */
@@ -31,10 +35,14 @@
     update: 'Update with DDMM',
     installing: 'Installing…',
     starting: 'Starting DDMM…',
+    waiting: 'Click Download on this page…',
   };
 
   /** Shown under "Install with DDMM" when DDMM isn't running. */
   const NOT_RUNNING_HINT = 'DDMM will start';
+
+  /** Shown under "Click Download on this page…" while capture is armed. */
+  const WAITING_HINT = 'DDMM installs the next mod file this site downloads.';
 
   /** Finite state machine for one button instance. Framework-agnostic. */
   class ButtonState {
@@ -55,6 +63,7 @@
 
     /** @returns {string|null} A hint to show under the button, if any. */
     get hint() {
+      if (this.state === 'waiting') return WAITING_HINT;
       return this.state === 'install' && !this.appRunning ? NOT_RUNNING_HINT : null;
     }
 
@@ -112,9 +121,22 @@
       this.errorMessage = null;
     }
 
-    /** @returns {boolean} Whether an install is in flight. */
+    /**
+     * Capture is armed: waiting for the site's download, which the user
+     * starts (on the page, or with whatever tool they use). Shown right
+     * away -- never gated on the site's own countdown.
+     */
+    waitForDownload() {
+      this.state = 'waiting';
+      this.errorMessage = null;
+    }
+
+    /**
+     * @returns {boolean} Whether an install is in flight (or armed and
+     *   waiting for its download), so a late DDMM check mustn't relabel it.
+     */
     get busy() {
-      return this.state === 'installing' || this.state === 'starting';
+      return this.state === 'installing' || this.state === 'starting' || this.state === 'waiting';
     }
 
     /** Install (or reinstall/update) finished successfully. */
@@ -146,5 +168,5 @@
 
   DDMM.ButtonState = ButtonState;
   DDMM.buttonLabels = LABELS;
-  DDMM.buttonHints = { NOT_RUNNING_HINT };
+  DDMM.buttonHints = { NOT_RUNNING_HINT, WAITING_HINT };
 })(typeof globalThis !== 'undefined' ? globalThis : this);
