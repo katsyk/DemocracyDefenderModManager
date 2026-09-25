@@ -18,11 +18,13 @@ Helldivers2ModManager/       (repository root — the folder name is historical)
 │       └── locales/           UI strings (en.json)
 ├── src-tauri/                Rust/Tauri backend
 │   ├── src/
-│   │   ├── commands/           #[tauri::command] entry points: mods.rs, profiles.rs, settings.rs, plus deploy/purge in mod.rs
+│   │   ├── commands/           #[tauri::command] entry points: mods.rs, profiles.rs, settings.rs, updates.rs, nexus.rs, plus deploy/purge in mod.rs
 │   │   ├── models/              manifest.rs, profile.rs, settings.rs, and the shared Mod type
 │   │   ├── archive/             zip/7z/rar handling and extraction hardening
 │   │   ├── sources.rs            provider-neutral Source resolution and the .hd2mm-origin.json sidecar
 │   │   ├── download.rs           direct-URL archive downloading
+│   │   ├── providers/            per-site update checks (AyakaMods, GitHub, GameBanana, ModWorkshop, Nexus Mods)
+│   │   ├── secrets.rs            the optional Nexus API key: OS keychain / Linux 0600-file fallback, redaction
 │   │   ├── utils.rs              small filesystem helpers (recursive copy, case-insensitive path matching)
 │   │   └── lib.rs                Tauri app setup: plugins, app state, command registration
 │   └── Cargo.toml

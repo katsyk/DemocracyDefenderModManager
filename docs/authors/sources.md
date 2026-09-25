@@ -41,7 +41,7 @@ produce a link.
 `Id` for `ayakamods` is the mod's **numeric resource id** — the trailing number in its page URL
 (`https://ayakamods.com/mods/hd2-auto-reload.4084/` → `Id: "4084"`; a bare `https://ayakamods.com/mods/4084/`
 works too). Set `Version` to match what AyakaMods publishes for your mod (its page's own listed version) so
-[update checks](../using/updates.md) work immediately for anyone installing your mod with this source already
+[update checks](../using/updating-mods.md) work immediately for anyone installing your mod with this source already
 declared, rather than only after DDMM records a version itself at install time:
 
 ```json
@@ -93,7 +93,7 @@ manifest itself:
 
 For a mod installed from AyakaMods, this sidecar's `Source` also gets a `Version` filled in automatically (DDMM
 fetches the mod page's published version at install time) — see
-[Checking for updates](../using/updates.md#how-ddmm-knows-a-mods-installed-version).
+[Checking for updates](../using/updating-mods.md#how-ddmm-knows-a-mods-installed-version).
 
 This is DDMM's own bookkeeping, not something mod authors write. It merges into the same "Open on &lt;site&gt;"
 menu as manifest-declared sources, keeps the historical `hd2mm` filename prefix for compatibility with tooling

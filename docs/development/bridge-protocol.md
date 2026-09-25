@@ -9,7 +9,8 @@ If you change the protocol, change this page in the same pull request and bump `
 - **One click from any mod site.** AyakaMods, Nexus Mods, ModWorkshop, GameBanana, GitHub and any other site are
   equal. No site is special-cased in a way that makes another site second-class.
 - **The browser downloads, DDMM installs.** Login-gated downloads work because the *browser* fetches the file with the
-  user's own session. DDMM never sees, asks for, or stores credentials, cookies or API keys for any site.
+  user's own session. No credentials, cookies or API keys for any site cross the bridge. (The only credential DDMM
+  itself can hold is the user's optional Nexus Mods API key for update checks, which stays inside the app.)
 - **Web pages can't drive DDMM.** Only the extension (via native messaging) can hand DDMM a file. `ddmm://` links, which
   any page can trigger, always require explicit confirmation in DDMM.
 
@@ -190,7 +191,11 @@ Reply:
 { "id": "3", "ok": true, "type": "queryResult", "installed": true,
   "mod": { "guid": "…", "name": "Cool Mod", "installedVersion": "1.0" }, "updateAvailable": true }
 ```
-`updateAvailable` is `null` when either version is unknown. It is never guessed.
+`updateAvailable` compares `pageVersion` with the installed version (the same comparison as DDMM's update checks:
+a leading `v` and `-`/`.` differences are ignored, and a numerically *older* page version isn't an update). When
+the page has no version (for example Nexus Mods pages), it is `true` if DDMM's own most recent update check this
+session found an update for this mod from this site, so the extension can show "Update with DDMM" there too.
+Otherwise it is `null` when either version is unknown. It is never guessed.
 
 ### `status`
 

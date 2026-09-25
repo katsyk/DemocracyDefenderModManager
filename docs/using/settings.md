@@ -50,6 +50,22 @@ doesn't collide with — or overwrite the slot used by — that DLC content. See
 
 You won't normally need to touch this unless a specific mod's documentation tells you to add an entry for it.
 
+## Mod updates
+
+Update checks never run unless you ask: click **Check for Updates** on the Mods page, or turn on automatic checks
+here. See [Updating mods](updating-mods.md).
+
+- **Check for mod updates when DDMM starts** — off by default. When on, DDMM checks shortly after it starts and
+  shows a notice plus the update badges if something can be updated. It never downloads or installs by itself.
+- **then every N hours while DDMM is open** — off by default, and only available with the option above. Accepts
+  1 to 168 hours.
+- **Nexus Mods API key (optional)** — only used to check Nexus Mods mods for updates; never required. Paste your
+  personal key (Nexus Mods account → API Keys → Personal API Key; **Get a key** opens that page) and click
+  **Save & verify**: DDMM checks it with Nexus and shows the account name. It's stored in your system keychain
+  (or, on Linux without one, an owner-only file in the data folder, which Settings points out), never in
+  `settings.json`. **Remove key** deletes it. See
+  [the optional API key](updating-mods.md#nexus-mods-and-the-optional-api-key).
+
 ## After a Browser Install
 
 What happens once a mod installed through the [browser extension or a `ddmm://` link](one-click-install.md)
@@ -59,6 +75,9 @@ finishes downloading:
 - **Add to active profile** — installed and added to your currently active profile.
 - **Add to active profile and deploy** (the default) — installed, added to your active profile, and deployed
   immediately, so a browser install really is one click end to end.
+
+The same setting decides what happens after DDMM [updates mods](updating-mods.md#after-updating-redeploy): with
+*deploy*, it redeploys by itself; otherwise it asks.
 
 If Helldivers 2 is currently running, DDMM skips the deploy step (the mod is still installed and added to your
 profile) rather than risk writing into the game's files while it's open — deploy it yourself once you've closed

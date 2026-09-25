@@ -4,12 +4,23 @@ title: Security
 
 # Security
 
-## No credentials, ever
+## No logins, and one optional key
 
-DDMM never asks for, stores, or transmits a username, password, or API key for any mod site. Sites that require
-being logged in to download hand the actual download off to your own browser, where your own session (and your
-own login) does the work — see [Mod sites](../using/mod-sites.md). Update checks work the same way: they read
-public page/release information, never anything gated behind your account.
+DDMM never asks for, stores, or transmits a username or password for any mod site. Sites that require being
+logged in to download hand the actual download off to your own browser, where your own session (and your own
+login) does the work — see [Mod sites](../using/mod-sites.md). Update checks read public page/API information.
+
+The single exception is optional: you can add your own **personal Nexus Mods API key** so DDMM can check Nexus
+mods for updates. It is never required, and:
+
+- it's stored in your OS keychain (Windows Credential Manager, macOS Keychain, Linux Secret Service), or, on a
+  Linux desktop without one, in an owner-only (`0600`) file in DDMM's data folder, and Settings tells you which;
+- it's never written to `settings.json` and never logged (errors that could contain it are scrubbed first);
+- it's only ever sent to `https://api.nexusmods.com` (redirects are not followed, so it can't be forwarded
+  elsewhere), and never crosses the browser bridge;
+- it's never used to download anything. Nexus updates always go through your browser.
+
+See [Updating mods](../using/updating-mods.md#nexus-mods-and-the-optional-api-key).
 
 ## Archive extraction hardening
 
@@ -80,12 +91,18 @@ nothing installs silently.
 "always allow" — and only ever accepts an `https://` target; anything else in the link is ignored. See
 [One-click install](../using/one-click-install.md#ddmminstall-links) for what the user sees.
 
-As with every other install path, no credentials, cookies, or API keys for any mod site ever cross the bridge —
+As with every other install path, no credentials, cookies, or API keys for any mod site ever cross the bridge (the
+optional Nexus key included) —
 the browser extension downloads using your own logged-in session, the same as the
 [browser handoff](../using/mod-sites.md#how-the-browser-handoff-works) does.
 
 ## Update checks are opt-in and size-capped
 
-DDMM never checks for updates in the background — only when you explicitly click
-[Check for updates](../using/updates.md). Each request (an AyakaMods mod page, or the GitHub releases API) is
-`https://` only and capped at 5 MB, the same belt-and-braces size-limit approach used for archive downloads.
+Update checks never run unless you ask: when you click [Check for Updates](../using/updating-mods.md), or, if you
+turned it on in Settings (off by default), when DDMM starts and optionally every N hours while it's open. Each
+request (an AyakaMods mod page, or the GitHub, GameBanana, ModWorkshop or Nexus Mods APIs) is `https://` only,
+times out, is spaced out per site, and is capped at 5 MB, the same belt-and-braces size-limit approach used for
+archive downloads.
+
+One-click updates only start a download from the site's own hosts (GitHub, GameBanana and ModWorkshop download
+hosts), and the file then goes through the same archive checks as every other install.
