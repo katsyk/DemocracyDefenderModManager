@@ -133,15 +133,29 @@ pub(crate) async fn ensure_mods_loaded<'a>(
                 continue;
             }
 
-            let manifest_data = tokio::fs::read(manifest_file).await.into_ta_result()?;
-            let manifest: Manifest = serde_json::from_slice(&manifest_data).into_ta_result()?;
+            // One unreadable manifest must not take the whole library down
+            // with it (every later install would then fail with "mods not
+            // read"): log it with the reason and skip that mod.
+            let manifest = match tokio::fs::read(&manifest_file).await {
+                Ok(data) => Manifest::parse(&data, &manifest_file.to_string_lossy()),
+                Err(e) => Err(anyhow::anyhow!("can't read {:?}: {}", manifest_file, e)),
+            };
+            let manifest = match manifest {
+                Ok(m) => m,
+                Err(e) => {
+                    log::error!("Skipping mod in {:?}: {:#}", mod_dir, e);
+                    continue;
+                }
+            };
 
             let mut r#mod = Mod {
                 manifest,
                 directory: mod_dir,
                 sources: Vec::new(),
             };
-            r#mod.normalize_paths().await?;
+            if let Err(e) = r#mod.normalize_paths().await {
+                log::error!("Path normalization failed for {:?}: {:#}", r#mod.directory, e);
+            }
             r#mod.resolve_sources().await;
 
             mods.push(r#mod);
@@ -486,7 +500,8 @@ fn generate_local_manifest(name: String) -> anyhow::Result<Manifest> {
 async fn resolve_manifest(mut archive: Archive, name: String, manifest_file: PathBuf) -> TAResult<(Archive, Manifest)> {
     if let Some(entry) = archive.find_root_file_ci(MANIFEST_FILE)? {
         let manifest_data = archive.read_path(&entry)?;
-        let manifest = serde_json::from_slice(&manifest_data).into_ta_result()?;
+        let origin = format!("{} in archive \"{}\"", entry.display(), name);
+        let manifest = Manifest::parse(&manifest_data, &origin).into_ta_result()?;
         Ok((archive, manifest))
     } else {
         let manifest = generate_local_manifest(name).into_ta_result()?;
@@ -508,7 +523,7 @@ async fn resolve_manifest_for_dir(source_dir: &Path, name: String, manifest_file
     let source_manifest = find_manifest_file(source_dir).await;
     if let Some(source_manifest) = source_manifest {
         let manifest_data = tokio::fs::read(&source_manifest).await.into_ta_result()?;
-        let manifest: Manifest = serde_json::from_slice(&manifest_data).into_ta_result()?;
+        let manifest = Manifest::parse(&manifest_data, &source_manifest.to_string_lossy()).into_ta_result()?;
         Ok(manifest)
     } else {
         let manifest = generate_local_manifest(name).into_ta_result()?;

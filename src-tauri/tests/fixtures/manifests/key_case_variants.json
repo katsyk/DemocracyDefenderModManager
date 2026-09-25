@@ -1,0 +1,12 @@
+{
+    "version": 1,
+    "GUID": "{5B1C7A3E-6F0B-4B43-9A55-0D7F1C2E8A11}",
+    "name": "Fixture Mod",
+    "description": "",
+    "iconPath": "icon.png",
+    "options": [
+        { "NAME": "Red", "description": "", "include": ["Red"], "sub_options": [
+            { "name": "Dark", "Description": "", "INCLUDE": ["Red/Dark"] }
+        ] }
+    ]
+}
