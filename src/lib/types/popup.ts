@@ -7,10 +7,13 @@ import ErrorPopupComponent from "$lib/components/popups/ErrorPopup.svelte";
 import AddResultPopupComponent from "$lib/components/popups/AddResultPopup.svelte";
 import ModConfigPopupComponent from "$lib/components/popups/ModConfigPopup.svelte";
 import HandoffPopupComponent from "$lib/components/popups/HandoffPopup.svelte";
+import BridgeConsentPopupComponent from "$lib/components/popups/BridgeConsentPopup.svelte";
+import AutoImportPopupComponent from "$lib/components/popups/AutoImportPopup.svelte";
 import type { ModAddResult } from "./results";
 import type { Config } from "$lib/models/profile";
 import type { Mod } from "$lib/models/mod";
 import type { UUID } from "./uuid";
+import type { BridgeConsentDecision } from "$lib/utils/commands";
 
 export abstract class Popup<T = void> {
     abstract component: Component<any, any, any>;
@@ -121,6 +124,36 @@ export class HandoffPopup extends Popup<HandoffResult> {
         public readonly downloadsPath: string,
         public readonly existingGuid?: UUID
     ) {
+        super();
+    }
+}
+
+/**
+ * "Allow the DDMM browser extension to install mods from **site**?" -- the
+ * per-site consent prompt the bridge asks the first time a site tries to
+ * install through the extension. See `docs/development/bridge-protocol.md`.
+ */
+export class BridgeConsentPopup extends Popup<BridgeConsentDecision> {
+    component = BridgeConsentPopupComponent;
+
+    constructor(public readonly site: string) {
+        super();
+    }
+}
+
+export type AutoImportDecision = "Install" | "InstallAndDeploy" | "Ignore";
+
+/**
+ * A new archive appeared in the Downloads folder while
+ * [auto-import](../../../docs/using/one-click-install.md) was on and
+ * looked like a Helldivers 2 mod -- asks what to do with it. Never
+ * triggered without this confirmation, however it looks; "auto" only
+ * means "auto-detected", not "auto-installed".
+ */
+export class AutoImportPopup extends Popup<AutoImportDecision> {
+    component = AutoImportPopupComponent;
+
+    constructor(public readonly file: string) {
         super();
     }
 }

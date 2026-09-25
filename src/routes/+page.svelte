@@ -3,6 +3,7 @@
     import { Plus, Dash, Backspace, ArrowBarRight, ArrowBarLeft, Arrow90degLeft, ArrowReturnLeft, PencilSquare, Download, ThreeDotsVertical, CaretUpFill, CaretDownFill, Trash3, ArrowBarUp, ArrowBarDown, CaretUp, CaretDown, Eraser, FolderPlus, Link45deg, BoxArrowUpRight, ArrowRepeat, CloudArrowDownFill } from "svelte-bootstrap-icons";
     import { getCurrentWindow } from "@tauri-apps/api/window";
     import { getCurrentWebview } from "@tauri-apps/api/webview";
+    import { listen } from "@tauri-apps/api/event";
     import { openUrl } from "@tauri-apps/plugin-opener";
     import { open } from "@tauri-apps/plugin-dialog";
     import * as log from "@tauri-apps/plugin-log";
@@ -10,9 +11,16 @@
     import { useLocalization } from "$lib/state/localization.svelte";
     import { Mod } from "$lib/models/mod";
     import type {Config, Profile, ProfilesConfig} from "$lib/models/profile";
-    import { addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles, loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath, forceExit, ackCloseRequested, type UpdateStatusEntry } from "$lib/utils/commands";
+    import {
+        addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles,
+        loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath,
+        resolveBridgeConsent, resolveBridgeInstallCompletion, isGameRunning, forceExit, ackCloseRequested,
+        setBridgeFrontendReady,
+        type UpdateStatusEntry, type BridgeConsentDecision, type BridgeSoftError
+    } from "$lib/utils/commands";
     import type { UUID } from "$lib/types/uuid";
     import { usePopup } from "$lib/state/popup.svelte";
+    import { useToast } from "$lib/state/toast.svelte";
     import {
         ConfirmPopup,
         InputPopup,
@@ -21,7 +29,9 @@
         ErrorPopup,
         AddResultPopup,
         ModConfigPopup,
-        HandoffPopup
+        HandoffPopup,
+        BridgeConsentPopup,
+        AutoImportPopup
     } from "$lib/types/popup";
     import ToggleSwitch from "$lib/components/ToggleSwitch.svelte";
     import PopupMenuButton from "$lib/components/PopupMenuButton.svelte";
@@ -32,6 +42,7 @@
 
     const { t } = useLocalization();
     const { show: showPopup } = usePopup();
+    const { show: showToast } = useToast();
     const appWindow = getCurrentWindow();
 
     /** How long to wait for the on-close profile save before giving up and
@@ -155,9 +166,46 @@
             }
         });
 
+        // Browser bridge: the backend pushes these when a browser install
+        // needs a consent decision or has finished (see bridge::server on
+        // the Rust side). See docs/development/bridge-protocol.md.
+        const unlistenBridgeConsent = listen<{ requestId: string; site: string }>(
+            "bridge://consent-request",
+            (e) => onBridgeConsentRequest(e.payload),
+        );
+        const unlistenBridgeInstalled = listen<BridgeModInstalledPayload>(
+            "bridge://mod-installed",
+            (e) => onBridgeModInstalled(e.payload),
+        );
+        // ddmm:// deep links (see deep_link.rs on the Rust side).
+        const unlistenDeepLinkInstall = listen<{ url: string }>(
+            "deep-link://install-request",
+            (e) => onDeepLinkInstallRequest(e.payload),
+        );
+        // Auto-import from Downloads (see auto_import.rs on the Rust side;
+        // opt-in, off by default).
+        const unlistenAutoImport = listen<{ file: string }>(
+            "auto-import://candidate",
+            (e) => onAutoImportCandidate(e.payload),
+        );
+
+        // Only now can a browser install's consent prompt / afterInstall
+        // step actually be handled; the backend holds them until then (on a
+        // cold start the install arrives before this page has loaded).
+        Promise.all([initPromise, unlistenBridgeConsent, unlistenBridgeInstalled])
+            .then(() => {
+                if (profilesLoaded) return setBridgeFrontendReady(true);
+            })
+            .catch((ex: unknown) => log.error(`Failed to mark the bridge frontend ready: ${errorMessage(ex)}`));
+
         return () => {
+            setBridgeFrontendReady(false).catch(() => {});
             unlisten.then(f => f());
             unlistenDragDrop.then(f => f());
+            unlistenBridgeConsent.then(f => f());
+            unlistenBridgeInstalled.then(f => f());
+            unlistenDeepLinkInstall.then(f => f());
+            unlistenAutoImport.then(f => f());
         };
     });
 
@@ -190,7 +238,7 @@
             }
         }
 
-        const [loadedMods, loadedConfig]: [Mod[], ProfilesConfig] = await Promise.all<Promise<Mod[]> | Promise<ProfilesConfig>>([
+        const [loadedMods, loadedConfig]: [Mod[], ProfilesConfig] = await Promise.all([
             getMods(),
             loadProfiles()
         ]);
@@ -301,13 +349,14 @@
         }
     }
 
-    async function doAddMod(filename: string) {
+    async function doAddMod(filename: string): Promise<Mod | undefined> {
         const wait = new WaitPopup(t("pages.mods.popup.wait.add.message"));
         showPopup(wait);
         try {
             const { mod, warning } = await addMod(filename);
             mods.push(mod);
             if (warning) showPopup(new NotificationPopup("warning", warning));
+            return mod;
         } catch(ex: unknown) {
             let message: string;
             if (ex instanceof Error) {
@@ -318,6 +367,7 @@
                 message = "Unknown error!";
             }
             showPopup(new ErrorPopup(t("pages.mods.popup.error.add.message"), message));
+            return undefined;
         } finally {
             wait.close();
         }
@@ -493,6 +543,142 @@
                 break;
             case "Cancelled":
                 break;
+        }
+    }
+
+    /** Shared by the manual "Add URL" button and a `ddmm://install` deep
+     * link: classify the URL and either open a browser handoff or add it
+     * directly. */
+    async function installFromUrl(url: string) {
+        const classification = await classifyDownloadUrl(url);
+        if (classification.RequiresHandoff) {
+            await doStartHandoff(url, classification.DisplayName);
+        } else {
+            await doAddModFromUrl(url);
+        }
+    }
+
+    /** `bridge://consent-request` -- the first time a site tries to
+     * install through the browser extension, ask the user, per
+     * docs/development/bridge-protocol.md. */
+    async function onBridgeConsentRequest(payload: { requestId: string; site: string }) {
+        const decision: BridgeConsentDecision = await showPopup(new BridgeConsentPopup(payload.site));
+        await resolveBridgeConsent(payload.requestId, decision);
+    }
+
+    type BridgeModInstalledPayload = {
+        requestId: string;
+        mod: { guid: UUID; name: string };
+        afterInstall: "library" | "profile" | "deploy";
+    };
+
+    /** `bridge://mod-installed` -- the backend already installed the mod
+     * (it doesn't touch profiles.json itself); this does the
+     * `afterInstall` step (add to the active profile, and/or deploy) with
+     * the same logic "Insert" and "Deploy" already use, then reports back
+     * what happened so the extension gets an accurate reply. */
+    async function onBridgeModInstalled(payload: BridgeModInstalledPayload) {
+        // The bridge installed this behind the frontend's back; refresh
+        // before touching it.
+        mods = await getMods();
+        const mod = mods.find(m => m.guid === payload.mod.guid);
+
+        let addedToProfile: string | undefined;
+        let deployed = false;
+        let softError: BridgeSoftError | undefined;
+        const warnings: string[] = [];
+
+        if (mod && payload.afterInstall !== "library" && currentProfile) {
+            if (!profileConfigs.some(c => c.Guid === mod.guid)) {
+                profileConfigs.push(makeConfigForMod(mod));
+            }
+            if ((await doSaveProfiles()).ok) {
+                addedToProfile = currentProfile.Name;
+            } else {
+                warnings.push(t("toast.bridge_install.profile_save_failed"));
+            }
+
+            if (payload.afterInstall === "deploy") {
+                if (await isGameRunning()) {
+                    softError = { code: "DEPLOY_FAILED", message: t("toast.bridge_install.game_running") };
+                } else {
+                    deploying = true;
+                    try {
+                        await deploy(currentProfile.Configs);
+                        deployed = true;
+                    } catch (ex: unknown) {
+                        const message = errorMessage(ex);
+                        softError = {
+                            code: message.includes("invalid settings") ? "GAME_NOT_FOUND" : "DEPLOY_FAILED",
+                            message,
+                        };
+                    } finally {
+                        deploying = false;
+                    }
+                }
+            }
+        }
+
+        await resolveBridgeInstallCompletion(payload.requestId, addedToProfile, deployed, warnings, softError);
+
+        const name = payload.mod.name;
+        if (softError) {
+            showToast("warning", t("toast.bridge_install.installed_with_issue", { name, message: softError.message }));
+        } else if (deployed) {
+            showToast("info", t("toast.bridge_install.deployed", { name }));
+        } else if (addedToProfile) {
+            showToast("info", t("toast.bridge_install.added_to_profile", { name, profile: addedToProfile }));
+        } else {
+            showToast("info", t("toast.bridge_install.added_to_library", { name }));
+        }
+    }
+
+    /** `deep-link://install-request` -- a `ddmm://install?url=` link.
+     * Always confirms (no "always allow"), then runs the same flow as
+     * manually pasting the URL into "Add URL". */
+    async function onDeepLinkInstallRequest(payload: { url: string }) {
+        let site: string;
+        try {
+            site = new URL(payload.url).hostname;
+        } catch {
+            site = payload.url;
+        }
+
+        const confirmed = await showPopup(new ConfirmPopup(
+            t("pages.mods.popup.confirm.deep_link_install.title"),
+            t("pages.mods.popup.confirm.deep_link_install.question", { site }),
+        ));
+        if (!confirmed) return;
+
+        await installFromUrl(payload.url);
+    }
+
+    /** `auto-import://candidate` -- a new, finished archive appeared in
+     * Downloads and looked like a Helldivers 2 mod (opt-in, off by
+     * default; see auto_import.rs). Never installs without this click. */
+    async function onAutoImportCandidate(payload: { file: string }) {
+        const decision = await showPopup(new AutoImportPopup(payload.file));
+        if (decision === "Ignore") return;
+
+        const mod = await doAddMod(payload.file);
+        if (!mod) return;
+
+        if (decision === "InstallAndDeploy" && currentProfile) {
+            if (!profileConfigs.some(c => c.Guid === mod.guid)) {
+                profileConfigs.push(makeConfigForMod(mod));
+            }
+            const saved = await doSaveProfiles();
+            if (!saved.ok) log.warn(`Failed to save profiles after auto-import: ${saved.error}`);
+
+            deploying = true;
+            try {
+                await deploy(currentProfile.Configs);
+                showToast("info", t("toast.auto_import.deployed", { name: mod.name }));
+            } catch (ex: unknown) {
+                showToast("warning", t("toast.auto_import.deploy_failed", { message: errorMessage(ex) }));
+            } finally {
+                deploying = false;
+            }
         }
     }
 
@@ -794,12 +980,7 @@
         ));
         if (!url) return;
 
-        const classification = await classifyDownloadUrl(url);
-        if (classification.RequiresHandoff) {
-            await doStartHandoff(url, classification.DisplayName);
-        } else {
-            await doAddModFromUrl(url);
-        }
+        await installFromUrl(url);
     }
 
     async function onPurge() {

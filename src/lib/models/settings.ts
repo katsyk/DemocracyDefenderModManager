@@ -20,11 +20,17 @@ export function tryToSkipEntry(value: string): SkipEntry | null {
     return value as SkipEntry;
 }
 
+/** What a one-click browser install does once the mod is downloaded. */
+export type AfterBrowserInstall = "library" | "profile" | "deploy";
+
 export type SettingsV1 = {
     Version: "V1",
     GamePath: string,
     SkipList: SkipEntry[],
-    DownloadsPath: string
+    DownloadsPath: string,
+    AfterBrowserInstall: AfterBrowserInstall,
+    BridgeAllowedSites: string[],
+    AutoImportEnabled: boolean
 };
 
 export type Settings = SettingsV1 /* | SettingsV2 */;

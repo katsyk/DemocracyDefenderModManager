@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>DDMM</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="ddmm-header">
+    <img src="../../icons/icon32.png" alt="" width="20" height="20" />
+    <div>
+      <div class="ddmm-title">DDMM</div>
+      <div class="ddmm-tagline">Your mods. Your democracy. Defended.</div>
+    </div>
+  </header>
+
+  <section id="connection" class="ddmm-card">
+    <div id="connection-status" class="ddmm-status">Checking…</div>
+    <div id="connection-help" class="ddmm-help" hidden>
+      <a id="connection-help-link" href="#" target="_blank" rel="noopener">Get DDMM</a>
+    </div>
+    <div id="connection-start" class="ddmm-help" hidden>
+      <button type="button" id="start-ddmm-button">Start DDMM</button>
+    </div>
+    <div id="game-status" class="ddmm-substatus" hidden></div>
+  </section>
+
+  <section class="ddmm-card">
+    <h2>Auto-capture on this site</h2>
+    <p class="ddmm-note">Off by default. When on, every archive download from this site installs automatically -- no button click needed.</p>
+    <label class="ddmm-toggle-row">
+      <span id="site-name">Not on a known mod site</span>
+      <input type="checkbox" id="auto-capture-toggle" disabled />
+    </label>
+  </section>
+
+  <section class="ddmm-card">
+    <h2>After install</h2>
+    <select id="after-install-select">
+      <option value="">Use DDMM's setting</option>
+      <option value="library">Add to library</option>
+      <option value="profile">Add to profile</option>
+      <option value="deploy">Add &amp; deploy</option>
+    </select>
+  </section>
+
+  <section class="ddmm-card">
+    <h2>Recent installs</h2>
+    <ul id="recent-installs" class="ddmm-list">
+      <li class="ddmm-empty">No installs yet.</li>
+    </ul>
+  </section>
+
+  <script src="../lib/browser-shim.js"></script>
+  <script src="../lib/sources.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -60,6 +60,30 @@ Downloads folder for a new file to appear — it never opens, uploads, or inspec
 already in that folder, only file names and sizes. A candidate that turns out to be a symlink is refused, the
 same as any other archive install.
 
+## Browser bridge & deep links
+
+The [browser extension](../using/one-click-install.md) talks to DDMM over a TCP connection bound to
+`127.0.0.1` only — never reachable from the network — on a random port chosen at startup. A fresh 256-bit token,
+regenerated every launch, is required before DDMM accepts anything on that connection; it's compared in constant
+time to avoid leaking timing information, and it's written (alongside the port) to `bridge.json` in DDMM's data
+folder with owner-only file permissions, deleted again on clean exit.
+
+Only the two DDMM browser extensions — identified by extension ID, never by anything a web page could spoof — are
+accepted callers; a message from anything else is rejected outright. Message sizes are capped at 1 MB each way,
+and an install still goes through every one of the archive checks above (path traversal, symlinks, magic bytes,
+the 2 GiB size cap) — the bridge changes *how* a file arrives, not what DDMM is willing to do with it once it
+does. The first time a given site asks to install through the extension, DDMM always asks permission first
+(see [Settings → Sites Allowed to Install Through the Extension](../using/settings.md#sites-allowed-to-install-through-the-extension));
+nothing installs silently.
+
+`ddmm://` links work differently: **any** web page can trigger one, so DDMM always shows a confirmation — with no
+"always allow" — and only ever accepts an `https://` target; anything else in the link is ignored. See
+[One-click install](../using/one-click-install.md#ddmminstall-links) for what the user sees.
+
+As with every other install path, no credentials, cookies, or API keys for any mod site ever cross the bridge —
+the browser extension downloads using your own logged-in session, the same as the
+[browser handoff](../using/mod-sites.md#how-the-browser-handoff-works) does.
+
 ## Update checks are opt-in and size-capped
 
 DDMM never checks for updates in the background — only when you explicitly click

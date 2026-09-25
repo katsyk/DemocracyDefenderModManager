@@ -97,47 +97,59 @@ impl<S, E, T> ZipResult<S, E, T> for Result<S, E> {
 #[tauri::command]
 pub async fn get_mods(state: State<'_, AppState>) -> TAResult<Vec<Mod>> {
     let mut state_mods = state.mods.lock().await;
-
     log::info!("Loading mods...");
+    let mods = ensure_mods_loaded(&mut state_mods, &state.base_path).await?;
+    Ok(mods.clone())
+}
 
-    if let Some(mods) = state_mods.as_ref() {
+/// Read every installed mod from disk into `state_mods` the first time it's
+/// needed (a no-op once loaded) and return it. Shared by `get_mods` and by
+/// the browser bridge, which can receive an install before the frontend
+/// has ever called `get_mods` -- e.g. a first run still on the Settings
+/// page, or DDMM just launched by the native-messaging host.
+pub(crate) async fn ensure_mods_loaded<'a>(
+    state_mods: &'a mut Option<Vec<Mod>>,
+    base_path: &Path,
+) -> TAResult<&'a mut Vec<Mod>> {
+    if state_mods.is_some() {
         log::info!("Mods already loaded.");
-        return Ok(mods.clone());
+        return Ok(state_mods.as_mut().unwrap());
     }
 
-    let mods_dir = state.base_path.join(MODS_DIRECTORY);
-    if !mods_dir.is_dir() {
-        tokio::fs::create_dir(mods_dir).await.into_ta_result()?;
-        return Ok(vec![]);
-    }
-
+    let mods_dir = base_path.join(MODS_DIRECTORY);
     let mut mods = Vec::new();
-    let mut mods_dir = tokio::fs::read_dir(mods_dir).await.into_ta_result()?;
-    while let Some(entry) = mods_dir.next_entry().await.into_ta_result()? {
-        let mod_dir = entry.path();
+    if !mods_dir.is_dir() {
+        // First run: nothing installed yet. Still record the (empty) list
+        // as loaded, or every install command would fail with "mods not
+        // read" until something called get_mods a second time.
+        tokio::fs::create_dir_all(&mods_dir).await.into_ta_result()?;
+    } else {
+        let mut mods_dir = tokio::fs::read_dir(mods_dir).await.into_ta_result()?;
+        while let Some(entry) = mods_dir.next_entry().await.into_ta_result()? {
+            let mod_dir = entry.path();
 
-        let manifest_file = mod_dir.join(MANIFEST_FILE);
-        if !manifest_file.is_file() {
-            continue;
+            let manifest_file = mod_dir.join(MANIFEST_FILE);
+            if !manifest_file.is_file() {
+                continue;
+            }
+
+            let manifest_data = tokio::fs::read(manifest_file).await.into_ta_result()?;
+            let manifest: Manifest = serde_json::from_slice(&manifest_data).into_ta_result()?;
+
+            let mut r#mod = Mod {
+                manifest,
+                directory: mod_dir,
+                sources: Vec::new(),
+            };
+            r#mod.normalize_paths().await?;
+            r#mod.resolve_sources().await;
+
+            mods.push(r#mod);
         }
-
-        let manifest_data = tokio::fs::read(manifest_file).await.into_ta_result()?;
-        let manifest: Manifest = serde_json::from_slice(&manifest_data).into_ta_result()?;
-
-        let mut r#mod = Mod {
-            manifest,
-            directory: mod_dir,
-            sources: Vec::new(),
-        };
-        r#mod.normalize_paths().await?;
-        r#mod.resolve_sources().await;
-
-        mods.push(r#mod);
     }
 
-    *state_mods = Some(mods.clone());
     log::info!("Mods loaded.");
-    Ok(mods)
+    Ok(state_mods.insert(mods))
 }
 
 #[tauri::command]
@@ -207,26 +219,44 @@ pub(crate) async fn install_from_archive(state: &AppState, mods: &mut Vec<Mod>, 
     let manifest_file = mod_dir.join(MANIFEST_FILE);
     prepare_mod_dir(mod_dir.clone(), manifest_file.clone(), name.clone()).await.into_ta_result()?;
 
-    log::info!("Resolving manifest...");
-    let (archive, manifest) = resolve_manifest(archive, name.clone(), manifest_file.clone()).await.into_ta_result()?;
+    // From here on `mod_dir` is ours (prepare_mod_dir just created it), so
+    // a failure must remove it again: a half-written directory with a
+    // manifest.json would otherwise show up as an empty "ghost" mod on the
+    // next launch and block retrying the same file with "mod directory
+    // already exists" (e.g. after an archive was rejected as unsafe).
+    let prepared: TAResult<(Mod, Option<String>)> = async {
+        log::info!("Resolving manifest...");
+        let (archive, manifest) = resolve_manifest(archive, name.clone(), manifest_file.clone()).await.into_ta_result()?;
 
-    let mut r#mod = Mod {
-        manifest,
-        directory: mod_dir.clone(),
-        sources: Vec::new(),
-    };
+        let mut r#mod = Mod {
+            manifest,
+            directory: mod_dir.clone(),
+            sources: Vec::new(),
+        };
 
-    log::info!("Checking for duplicate...");
-    if mods.iter().any(|m| m.guid() == r#mod.guid()) {
-        return anyhow::anyhow!("mod with GUID {{{}}} already exists", r#mod.guid())
-            .into_ta_result();
+        log::info!("Checking for duplicate...");
+        if mods.iter().any(|m| m.guid() == r#mod.guid()) {
+            return anyhow::anyhow!("mod with GUID {{{}}} already exists", r#mod.guid())
+                .into_ta_result();
+        }
+
+        log::info!("Extracting archive...");
+        extract_archive(archive, mod_dir.clone()).await?;
+
+        log::debug!("Detecting patch file layout...");
+        let warning = apply_patch_layout(&mod_dir, &mut r#mod.manifest).await.into_ta_result()?;
+        Ok((r#mod, warning))
     }
-
-    log::info!("Extracting archive...");
-    extract_archive(archive, mod_dir.clone()).await?;
-
-    log::debug!("Detecting patch file layout...");
-    let warning = apply_patch_layout(&mod_dir, &mut r#mod.manifest).await.into_ta_result()?;
+    .await;
+    let (mut r#mod, warning) = match prepared {
+        Ok(v) => v,
+        Err(e) => {
+            if let Err(cleanup) = tokio::fs::remove_dir_all(&mod_dir).await {
+                log::error!("Failed to clean up {:?} after a failed install: {}", mod_dir, cleanup);
+            }
+            return Err(e);
+        }
+    };
 
     log::debug!("Normalizing paths...");
     if let Err(e) = r#mod.normalize_paths().await {
@@ -855,6 +885,28 @@ mod tests {
             .unwrap();
 
         (guid, mod_dir)
+    }
+
+    #[tokio::test]
+    async fn ensure_mods_loaded_marks_first_run_as_loaded() {
+        let base = tempfile::tempdir().unwrap();
+        let mut state_mods = None;
+        let mods = ensure_mods_loaded(&mut state_mods, base.path()).await.unwrap();
+        assert!(mods.is_empty());
+        assert!(base.path().join(MODS_DIRECTORY).is_dir());
+        // Previously the empty first-run list was returned but never stored,
+        // so installs failed with "mods not read" until get_mods ran again.
+        assert!(state_mods.is_some());
+    }
+
+    #[tokio::test]
+    async fn ensure_mods_loaded_reads_existing_mods_once() {
+        let base = tempfile::tempdir().unwrap();
+        let (guid, _) = make_existing_mod(base.path(), "CoolMod").await;
+        let mut state_mods = None;
+        let mods = ensure_mods_loaded(&mut state_mods, base.path()).await.unwrap();
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].guid(), guid);
     }
 
     #[tokio::test]
