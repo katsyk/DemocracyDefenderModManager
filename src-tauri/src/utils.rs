@@ -202,20 +202,59 @@ pub async fn copy_dir_recursive(src: &Path, dst: &Path, skip_names: &[&str]) -> 
     Ok(())
 }
 
+/// Resolve a manifest-relative path (an icon, an option image, an option's
+/// `Include` folder) against the files that actually exist under `base`,
+/// returning the relative path with each component's real on-disk casing.
+///
+/// Manifests are mostly written on Windows, where neither casing nor the
+/// separator matter. On Linux both do, so this:
+/// - treats `\` as a separator (`"Options\Red"` means `Options/Red`),
+/// - matches each component case-insensitively (`options/red` finds
+///   `Options/Red`),
+/// - drops `.`/`..`/root components, so the result always stays inside
+///   `base`,
+/// - never fails just because something is missing: from the first
+///   component that doesn't exist on disk, the rest are kept as written,
+///   and the caller's own "not found" error names the path.
 pub async fn fix_path_casing(base: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
+    let normalized = relative.to_string_lossy().replace('\\', "/");
+
     let mut current = base.to_path_buf();
-    'components: for components in relative.components() {
-        let component_str = components.as_os_str().to_string_lossy();
-        
-        let mut entries = tokio::fs::read_dir(&current).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.file_name().to_string_lossy().to_lowercase() == component_str.to_lowercase() {
-                current.push(entry.file_name());
-                continue 'components;
+    let mut matching = true;
+    for component in normalized.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            continue;
+        }
+        // A Windows drive prefix such as `C:` has no meaning here.
+        if component.len() == 2 && component.ends_with(':') {
+            continue;
+        }
+
+        if matching {
+            if current.join(component).exists() {
+                current.push(component);
+                continue;
+            }
+            let wanted = component.to_lowercase();
+            let mut found = None;
+            if let Ok(mut entries) = tokio::fs::read_dir(&current).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    if entry.file_name().to_string_lossy().to_lowercase() == wanted {
+                        found = Some(entry.file_name());
+                        break;
+                    }
+                }
+            }
+            match found {
+                Some(name) => {
+                    current.push(name);
+                    continue;
+                }
+                None => matching = false,
             }
         }
 
-        current.push(components.as_os_str());
+        current.push(component);
     }
 
     Ok(current.strip_prefix(base)?.to_path_buf())
@@ -224,6 +263,30 @@ pub async fn fix_path_casing(base: &Path, relative: &Path) -> anyhow::Result<Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fix_path_casing_handles_backslashes_and_case() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base.path().join("Options/Red")).unwrap();
+        std::fs::write(base.path().join("Options/Red/icon.png"), b"").unwrap();
+
+        for written in ["Options\\Red\\icon.png", "options/red/ICON.png", "./Options/Red/icon.png"] {
+            let fixed = fix_path_casing(base.path(), Path::new(written)).await.unwrap();
+            assert_eq!(fixed, PathBuf::from("Options/Red/icon.png"), "{written}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fix_path_casing_never_fails_on_missing_paths_or_escapes_base() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base.path().join("Options")).unwrap();
+
+        let fixed = fix_path_casing(base.path(), Path::new("options/Missing/deeper/x.png")).await.unwrap();
+        assert_eq!(fixed, PathBuf::from("Options/Missing/deeper/x.png"));
+
+        let fixed = fix_path_casing(base.path(), Path::new("..\\..\\etc")).await.unwrap();
+        assert_eq!(fixed, PathBuf::from("etc"));
+    }
 
     #[tokio::test]
     async fn copy_dir_recursive_copies_nested_files() {

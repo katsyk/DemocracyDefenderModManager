@@ -22,10 +22,6 @@
       ]
     },
     "dialog:allow-open",
-    "dialog:allow-save",
-    {
-      "identifier": "fs:allow-exists",
-      "allow": [{ "path": "**" }]
-    }
+    "dialog:allow-save"
   ]
 }
