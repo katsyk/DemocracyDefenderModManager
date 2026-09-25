@@ -13,11 +13,13 @@ import UpdatesPopupComponent from "$lib/components/popups/UpdatesPopup.svelte";
 import UpdateFilePickPopupComponent from "$lib/components/popups/UpdateFilePickPopup.svelte";
 import UpdateDownloadPopupComponent from "$lib/components/popups/UpdateDownloadPopup.svelte";
 import BrowserUpdatePopupComponent from "$lib/components/popups/BrowserUpdatePopup.svelte";
+import DataFolderMovePopupComponent from "$lib/components/popups/DataFolderMovePopup.svelte";
+import DataFolderProgressPopupComponent from "$lib/components/popups/DataFolderProgressPopup.svelte";
 import type { ModAddResult } from "./results";
 import type { Config } from "$lib/models/profile";
 import type { Mod } from "$lib/models/mod";
 import type { UUID } from "./uuid";
-import type { BridgeConsentDecision, UpdateCheckReport, UpdateFile, UpdateStatusEntry } from "$lib/utils/commands";
+import type { BridgeConsentDecision, UpdateCheckReport, UpdateFile, UpdateStatusEntry, DataFolderMovePlan, DataFolderMoveResult } from "$lib/utils/commands";
 
 export abstract class Popup<T = void> {
     abstract component: Component<any, any, any>;
@@ -226,6 +228,38 @@ export type BrowserUpdateDecision = "Done" | "Handoff" | "Skip" | "Stop";
  * the extension's "Update with DDMM" button finishes it; otherwise (or on
  * request) it falls back to the Downloads-folder handoff.
  */
+/** "move": copy the data there. "adopt": use the DDMM data already there. */
+export type DataFolderMoveDecision = "move" | "adopt" | null;
+
+/** Confirms a data folder move (or adopting existing data) with the plan's
+ * sizes and free space. */
+export class DataFolderMovePopup extends Popup<DataFolderMoveDecision> {
+    component = DataFolderMovePopupComponent;
+
+    constructor(public readonly plan: DataFolderMovePlan) {
+        super();
+    }
+}
+
+export type DataFolderProgressResult =
+    | { ok: true; result: DataFolderMoveResult }
+    | { ok: false; message: string };
+
+/** Runs the move with a progress bar. Only closes on failure: on success
+ * the app restarts by itself. */
+export class DataFolderProgressPopup extends Popup<DataFolderProgressResult> {
+    component = DataFolderProgressPopupComponent;
+    started = false;
+
+    constructor(
+        public readonly destination: string | null,
+        public readonly reset: boolean,
+        public readonly totalBytes: number
+    ) {
+        super();
+    }
+}
+
 export class BrowserUpdatePopup extends Popup<BrowserUpdateDecision> {
     component = BrowserUpdatePopupComponent;
 

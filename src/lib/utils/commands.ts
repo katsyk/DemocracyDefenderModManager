@@ -279,6 +279,74 @@ export async function getDataDir(): Promise<string> {
     return await invoke<string>("get_data_dir");
 }
 
+/** Where the data folder is and how it was chosen (see
+ * `commands::data_folder` on the Rust side). `Problem` is set when the
+ * chosen folder is missing and DDMM started in its recovery screen. */
+export type DataFolderInfo = {
+    Path: string;
+    DefaultPath: string;
+    IsCustom: boolean;
+    Portable: boolean;
+    PointerFile: string;
+    Problem: "missing" | "bad_pointer" | null;
+    ProblemDetail: string | null;
+};
+
+/** What moving the data folder would do (`data_move::MovePlan`). */
+export type DataFolderMovePlan = {
+    Source: string;
+    Picked: string;
+    Target: string;
+    IsReset: boolean;
+    UsedSubfolder: boolean;
+    ExistingData: boolean;
+    TotalBytes: number;
+    TotalFiles: number;
+    FreeBytes: number | null;
+};
+
+export type DataFolderMoveProgress = {
+    Phase: "copying" | "verifying" | "finishing";
+    DoneBytes: number;
+    TotalBytes: number;
+    DoneFiles: number;
+    TotalFiles: number;
+};
+
+export type DataFolderMoveResult = { Target: string; Leftovers: string[] };
+
+export async function getDataFolderInfo(): Promise<DataFolderInfo> {
+    return await invoke<DataFolderInfo>("get_data_folder_info");
+}
+
+export async function planDataFolderMove(destination: string | null, reset: boolean): Promise<DataFolderMovePlan> {
+    return await invoke<DataFolderMovePlan>("plan_data_folder_move", { destination, reset });
+}
+
+/** Moves the data, then the app restarts by itself. */
+export async function moveDataFolder(destination: string | null, reset: boolean): Promise<DataFolderMoveResult> {
+    log.info(`Moving the data folder (${reset ? "back to the default location" : destination}).`);
+    return await invoke<DataFolderMoveResult>("move_data_folder", { destination, reset });
+}
+
+/** Uses existing DDMM data at the destination as is, then restarts. */
+export async function adoptDataFolder(destination: string | null, reset: boolean): Promise<string> {
+    log.info(`Using the existing data folder at ${reset ? "the default location" : destination}.`);
+    return await invoke<string>("adopt_data_folder", { destination, reset });
+}
+
+export async function retryDataFolder(): Promise<void> {
+    await invoke<void>("retry_data_folder");
+}
+
+export async function locateDataFolder(folder: string): Promise<void> {
+    await invoke<void>("locate_data_folder", { folder });
+}
+
+export async function resetDataFolderLocation(): Promise<void> {
+    await invoke<void>("reset_data_folder_location");
+}
+
 /** Result of checking a game path on the backend (see `game_path.rs`). */
 export type GamePathReport = {
     valid: boolean;
