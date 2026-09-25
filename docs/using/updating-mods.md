@@ -12,13 +12,14 @@ DDMM can tell you when a mod you installed has a newer version on the site it ca
 ## Checking for updates
 
 - **Check for Updates** (Mods page, next to Add / Add Folder / Add URL) checks every installed mod right away and
-  shows the results: each mod and site with its state (update available, up to date, skipped, unknown, needs a
-  Nexus API key, or the error if the site couldn't be reached).
+  shows the results: each mod and site with its state (update available, up to date, skipped, unknown, "optional:
+  sign in or add a key to check" for Nexus, or the error if the site couldn't be reached).
 - **Automatic checks are off by default.** In [Settings → Mod updates](settings.md#mod-updates) you can turn on
   **Check for mod updates when DDMM starts**, and optionally **then every N hours while DDMM is open** (1–168
   hours; also off by default). An automatic check only shows a small notice and the update badges; it never
   downloads or installs anything by itself.
-- **Automatic checks skip Nexus Mods.** Nexus only allows your API key to be used for things you start yourself,
+- **Automatic checks skip Nexus Mods.** Nexus only allows your sign-in or API key to be used for things you
+  start yourself,
   so Nexus mods are checked only when you click **Check for Updates**. After an automatic check they show
   *Click Check for Updates to check Nexus mods* (or the result of the last check you ran this session). Every
   other site is still checked automatically.
@@ -34,7 +35,7 @@ becomes clickable, and **Update all (N)** appears next to Check for Updates.
 | GameBanana | The mod's public API entry (version and files, no key) | **One click**: DDMM downloads the new file itself |
 | ModWorkshop | The mod's public API entry (version and files, no key) | **One click**: DDMM downloads the new file itself (a mod whose download is an external link goes through the browser) |
 | AyakaMods | The version published on the mod page | **In your browser** (downloads need your login) |
-| Nexus Mods | The Nexus Mods API, **only if you add your own optional API key**, and only when you click Check for Updates | **In your browser**, always |
+| Nexus Mods | The Nexus Mods API, **only if you (optionally) sign in to Nexus Mods or add your own API key**, and only when you click Check for Updates | **In your browser**, always |
 | Anything else | Not checked | — |
 
 A mod can have more than one source (for example, declared by its author and recorded by DDMM); each is checked.
@@ -93,27 +94,52 @@ your profile's enabled state, options and position for it stay as they were. If 
 manifest with its own `Guid`, that GUID is used instead, and profile entries that point at the old GUID no longer
 match it (DDMM doesn't migrate them).
 
-## Nexus Mods and the optional API key
+## Nexus Mods: optional sign-in or API key { #nexus-mods-and-the-optional-api-key }
 
-Nexus Mods only answers these questions ("is there a newer file?") for people with an API key. So:
+Nexus Mods only answers these questions ("is there a newer file?") for people who are signed in or have an API
+key. Both are **optional**, and only used for Nexus update checks:
 
-- **Without a key** (the default), Nexus mods show *Needs a Nexus API key (optional) to check*. Everything else
-  in DDMM works exactly the same.
-- **With your own key**, DDMM can check Nexus mods too.
+- **Neither** (the default): Nexus mods show *Optional: sign in or add a key to check*. Everything else in DDMM
+  works exactly the same.
+- **Sign in to Nexus Mods** (recommended), or **a personal API key** entered manually: DDMM can check Nexus mods
+  too. If you do both, the sign-in is used.
 
-**Adding it:** on Nexus Mods, open your account's **API Keys** page (Settings → **Get a key** opens it) and
-copy the **Personal API Key** at the bottom. Enter it in **Settings → Mod updates → Nexus Mods API key
-(optional)** and click **Save & verify**. DDMM checks it with Nexus before saving and shows the account it
-belongs to.
+Both live in **Settings → Mod updates → Nexus Mods (optional)**.
 
-**Removing it:** click **Remove key** in the same place. You can also revoke the key on that Nexus page at any
-time; DDMM will then say Nexus didn't accept it.
+### Signing in { #signing-in-to-nexus-mods }
 
-What the key is, and isn't, used for:
+Click **Sign in to Nexus Mods**. DDMM opens Nexus Mods in your usual browser, where you log in (if you aren't
+already) and approve DDMM. The browser then shows *You can close this tab and return to DDMM*, and Settings shows
+*Signed in to Nexus Mods as &lt;your account&gt;*.
+
+- You log in **on the Nexus Mods website**, never in DDMM: DDMM never sees your password. What DDMM receives is
+  a sign-in token that Nexus issues for DDMM, which only allows the kind of read-only requests update checks
+  make.
+- DDMM waits up to 5 minutes for you to approve, and **Cancel** stops waiting. While it waits, DDMM listens on
+  `127.0.0.1` port `28647` on your own computer (never reachable from the network) for your browser to hand the
+  sign-in back; it stops listening right after. If another program is already using that port, DDMM says so;
+  close that program and try again.
+- The sign-in renews itself in the background of a check you start, shortly before it would expire.
+- **Sign out** removes the sign-in from this computer (always) and asks Nexus to revoke it. You can also
+  revoke DDMM's access on the Nexus Mods website at any time (your account's authorized applications); the next
+  Nexus check then signs DDMM out and tells you so.
+
+If the button is greyed out with *Coming soon*, this version of DDMM can't sign in to Nexus Mods yet. The API key
+below works in every version.
+
+### Using a personal API key instead { #using-a-personal-api-key }
+
+Under **Or enter a personal API key manually**: on Nexus Mods, open your account's **API Keys** page (**Get a
+key** opens it) and copy the **Personal API Key** at the bottom. Paste it and click **Save & verify**. DDMM checks
+it with Nexus before saving and shows the account it belongs to. **Remove key** deletes it; you can also revoke the
+key on that Nexus page at any time, and DDMM will then say Nexus didn't accept it.
+
+### What DDMM does, and doesn't do, with them { #nexus-privacy }
 
 - **Only update checks, and only when you click.** Nexus is contacted only for things you start: **Check for
-  Updates** and **Save & verify**. The automatic checks never use your key.
-- **As few requests as possible**, the same way Mod Organizer 2 does it:
+  Updates**, **Sign in to Nexus Mods**, **Sign out**, and **Save & verify**. The automatic checks never use your
+  sign-in or key.
+- **As few requests as possible:**
     - a mod checked in the last 5 minutes isn't checked again. If that's all of them, DDMM says *All your Nexus
       mods were checked recently. Update checks are limited to save your Nexus API requests.*;
     - a mod never checked, or not checked for a month, gets its own request for its file list;
@@ -125,10 +151,15 @@ What the key is, and isn't, used for:
 - **Never for downloading.** Downloading through the API is a Nexus Premium feature, and DDMM doesn't use it,
   for anyone. Nexus updates always go through your browser, where you click Nexus's own download button.
 - **Stored in your system's keychain** (Windows Credential Manager, macOS Keychain, or the Secret Service on
-  Linux, such as GNOME Keyring or KWallet). On a Linux desktop with no keychain running, it's stored instead as
-  a file only your user can read (`nexus-api-key` in DDMM's data folder), and Settings says so.
-- **Never** written to `settings.json`, never logged, only ever sent to `https://api.nexusmods.com`, and never
-  passed to the browser extension.
+  Linux, such as GNOME Keyring or KWallet). On a Linux desktop with no keychain running, they're stored instead as
+  files only your user can read (`nexus-oauth-tokens` for the sign-in, `nexus-api-key` for the key, in DDMM's
+  data folder), and Settings says so.
+- **Never** written to `settings.json`, never logged, never shown in DDMM's window, never passed to the browser
+  extension, and only ever sent to Nexus Mods over HTTPS: the sign-in to `https://users.nexusmods.com` (to sign
+  in, renew, sign out, and read your account name) and `https://api.nexusmods.com` (update checks); the key only
+  to `https://api.nexusmods.com`.
+- **What Nexus sees:** the requests come from your computer, identified as *Democracy Defender Mod Manager* and
+  its version, as Nexus asks of every application. DDMM keeps only your account name (to show it in Settings).
 
 ## How DDMM knows a mod's installed version
 

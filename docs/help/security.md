@@ -4,23 +4,31 @@ title: Security
 
 # Security
 
-## No logins, and one optional key
+## No logins, and one optional Nexus Mods credential
 
 DDMM never asks for, stores, or transmits a username or password for any mod site. Sites that require being
 logged in to download hand the actual download off to your own browser, where your own session (and your own
 login) does the work — see [Mod sites](../using/mod-sites.md). Update checks read public page/API information.
 
-The single exception is optional: you can add your own **personal Nexus Mods API key** so DDMM can check Nexus
-mods for updates. It is never required, and:
+The single exception is optional: so DDMM can check Nexus mods for updates, you can **sign in to Nexus Mods**
+(you log in and approve DDMM on the Nexus Mods website; DDMM gets a sign-in token, never your password) or add
+your own **personal Nexus Mods API key**. Neither is ever required, and:
 
-- it's stored in your OS keychain (Windows Credential Manager, macOS Keychain, Linux Secret Service), or, on a
-  Linux desktop without one, in an owner-only (`0600`) file in DDMM's data folder, and Settings tells you which;
-- it's never written to `settings.json` and never logged (errors that could contain it are scrubbed first);
-- it's only ever sent to `https://api.nexusmods.com` (redirects are not followed, so it can't be forwarded
-  elsewhere), and never crosses the browser bridge;
-- it's never used to download anything. Nexus updates always go through your browser.
-- it's only used when you start something yourself (Check for Updates, Save & verify), never by the automatic
-  update checks.
+- the sign-in uses OAuth 2.0 with PKCE: DDMM opens your browser, and Nexus hands the approval back to a listener
+  on `127.0.0.1:28647` that only this computer can reach, that checks the reply belongs to this sign-in attempt,
+  and that closes right after (or after 5 minutes);
+- both are stored in your OS keychain (Windows Credential Manager, macOS Keychain, Linux Secret Service), or, on
+  a Linux desktop without one, in owner-only (`0600`) files in DDMM's data folder, and Settings tells you which;
+- they're never written to `settings.json`, never logged, and never shown in DDMM's window (errors that could
+  contain them are scrubbed first);
+- they're only ever sent to Nexus Mods over HTTPS (the sign-in to `https://users.nexusmods.com` and
+  `https://api.nexusmods.com`, the key to `https://api.nexusmods.com`; redirects are not followed, so they can't
+  be forwarded elsewhere), and never cross the browser bridge;
+- they're never used to download anything. Nexus updates always go through your browser.
+- they're only used when you start something yourself (Check for Updates, Sign in, Sign out, Save & verify),
+  never by the automatic update checks;
+- **Sign out** deletes the sign-in from this computer and asks Nexus to revoke it; if Nexus stops accepting it
+  (for example, you revoked DDMM on the Nexus website), DDMM deletes it and tells you.
 
 See [Updating mods](../using/updating-mods.md#nexus-mods-and-the-optional-api-key).
 
