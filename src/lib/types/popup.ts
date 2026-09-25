@@ -9,11 +9,15 @@ import ModConfigPopupComponent from "$lib/components/popups/ModConfigPopup.svelt
 import HandoffPopupComponent from "$lib/components/popups/HandoffPopup.svelte";
 import BridgeConsentPopupComponent from "$lib/components/popups/BridgeConsentPopup.svelte";
 import AutoImportPopupComponent from "$lib/components/popups/AutoImportPopup.svelte";
+import UpdatesPopupComponent from "$lib/components/popups/UpdatesPopup.svelte";
+import UpdateFilePickPopupComponent from "$lib/components/popups/UpdateFilePickPopup.svelte";
+import UpdateDownloadPopupComponent from "$lib/components/popups/UpdateDownloadPopup.svelte";
+import BrowserUpdatePopupComponent from "$lib/components/popups/BrowserUpdatePopup.svelte";
 import type { ModAddResult } from "./results";
 import type { Config } from "$lib/models/profile";
 import type { Mod } from "$lib/models/mod";
 import type { UUID } from "./uuid";
-import type { BridgeConsentDecision } from "$lib/utils/commands";
+import type { BridgeConsentDecision, UpdateCheckReport, UpdateFile, UpdateStatusEntry } from "$lib/utils/commands";
 
 export abstract class Popup<T = void> {
     abstract component: Component<any, any, any>;
@@ -154,6 +158,83 @@ export class AutoImportPopup extends Popup<AutoImportDecision> {
     component = AutoImportPopupComponent;
 
     constructor(public readonly file: string) {
+        super();
+    }
+}
+export type UpdatesPopupAction =
+    | { kind: "update"; entry: UpdateStatusEntry }
+    | { kind: "updateAll" }
+    | { kind: "skip"; entry: UpdateStatusEntry }
+    | { kind: "unskip"; entry: UpdateStatusEntry }
+    | { kind: "nexusSettings" }
+    | null;
+
+/**
+ * The results of a "Check for Updates" click: every checked mod/source with
+ * its state, per-mod Update / Skip this version, "Update all", and a link to
+ * the optional Nexus API key setting when Nexus mods need one.
+ */
+export class UpdatesPopup extends Popup<UpdatesPopupAction> {
+    component = UpdatesPopupComponent;
+
+    constructor(
+        public readonly report: UpdateCheckReport,
+        public readonly modNames: Map<UUID, string>
+    ) {
+        super();
+    }
+}
+
+/** Several files could be the update (multi-file mods): ask which one. */
+export class UpdateFilePickPopup extends Popup<UpdateFile | null> {
+    component = UpdateFilePickPopupComponent;
+
+    constructor(
+        public readonly modName: string,
+        public readonly entry: UpdateStatusEntry
+    ) {
+        super();
+    }
+}
+
+export type UpdateDownloadResult =
+    | { ok: true; mod: Mod; warning?: string }
+    | { ok: false; message: string };
+
+/** Downloads and installs a one-click (direct) update, with progress. */
+export class UpdateDownloadPopup extends Popup<UpdateDownloadResult> {
+    component = UpdateDownloadPopupComponent;
+    /** Set once the download has been started, so re-mounting the popup
+     * (another popup shown on top, then closed) never starts it twice. */
+    started = false;
+
+    constructor(
+        public readonly modName: string,
+        public readonly entry: UpdateStatusEntry,
+        public readonly file: UpdateFile,
+        public readonly position?: { index: number; total: number }
+    ) {
+        super();
+    }
+}
+
+export type BrowserUpdateDecision = "Done" | "Handoff" | "Skip" | "Stop";
+
+/**
+ * An update that needs the browser (login-gated site such as AyakaMods or
+ * Nexus Mods). With the extension connected, DDMM opens the mod page and
+ * the extension's "Update with DDMM" button finishes it; otherwise (or on
+ * request) it falls back to the Downloads-folder handoff.
+ */
+export class BrowserUpdatePopup extends Popup<BrowserUpdateDecision> {
+    component = BrowserUpdatePopupComponent;
+
+    constructor(
+        public readonly modName: string,
+        public readonly entry: UpdateStatusEntry,
+        public readonly extensionActive: boolean,
+        public readonly position?: { index: number; total: number }
+    ) {
         super();
     }
 }

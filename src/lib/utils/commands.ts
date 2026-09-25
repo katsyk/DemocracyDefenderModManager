@@ -117,24 +117,99 @@ export async function installHandoffFile(file: string, pageUrl: string, existing
     return toInstalledMod(mod);
 }
 
-export type UpdateStateKind = "UpToDate" | "UpdateAvailable" | "Unknown" | "Unsupported" | "Error";
+export type UpdateStateKind =
+    | "UpToDate" | "UpdateAvailable" | "Skipped" | "Unknown" | "NeedsApiKey" | "Unsupported" | "Error";
 export type UpdateState = { Kind: UpdateStateKind, message?: string };
+export type UpdateMethod = "Direct" | "Browser";
+
+/** A file a one-click update can download directly (GitHub release asset,
+ * GameBanana/ModWorkshop file). */
+export type UpdateFile = {
+    Id: string,
+    Name: string,
+    Label?: string,
+    Size?: number,
+    UploadedAt?: number,
+    Url: string
+};
 
 export type UpdateStatusEntry = {
     Guid: UUID,
     Provider: string,
     DisplayName: string,
+    SourceId?: string,
     InstalledVersion?: string,
     LatestVersion?: string,
+    LatestFileName?: string,
     Status: UpdateState,
-    PageUrl?: string
+    PageUrl?: string,
+    Method?: UpdateMethod,
+    Files?: UpdateFile[],
+    PreselectedFile?: string
 };
 
-/** Only ever call this in direct response to the user clicking "Check for
- * updates" -- never on a timer, never at startup. */
-export async function checkUpdates(): Promise<UpdateStatusEntry[]> {
+export type CheckTrigger = "Manual" | "Startup" | "Scheduled";
+
+export type UpdateCheckReport = {
+    Trigger: CheckTrigger,
+    CheckedAt: number,
+    Results: UpdateStatusEntry[],
+    NexusRateLimit?: { HourlyRemaining?: number, DailyRemaining?: number }
+};
+
+/** Runs an update check now. Called when the user clicks "Check for
+ * Updates"; automatic checks (opt-in, off by default) run on the Rust side
+ * and arrive as the `updates://checked` event. */
+export async function checkUpdates(): Promise<UpdateCheckReport> {
     log.debug("Invoking `check_updates`.");
-    return await invoke<UpdateStatusEntry[]>("check_updates");
+    return await invoke<UpdateCheckReport>("check_updates");
+}
+
+/** The latest check's results from this session, if any. */
+export async function getLastUpdateReport(): Promise<UpdateCheckReport | null> {
+    return await invoke<UpdateCheckReport | null>("get_last_update_report");
+}
+
+/** "Skip this version" (a version) or stop skipping (null). */
+export async function skipUpdateVersion(guid: UUID, provider: string, version: string | null): Promise<void> {
+    log.debug("Invoking `skip_update_version`.");
+    await invoke<void>("skip_update_version", { guid, provider, version });
+}
+
+/** One-click in-place update from a public direct download. Progress comes
+ * through the `updates://progress` event. */
+export async function updateModDirect(guid: UUID, provider: string, file: UpdateFile, version: string | null): Promise<InstalledMod> {
+    log.debug("Invoking `update_mod_direct`.");
+    const mod = await invoke<RawInstalledMod>("update_mod_direct", { guid, provider, file, version });
+    return toInstalledMod(mod);
+}
+
+/** Whether the browser extension has talked to DDMM recently. */
+export async function browserExtensionActive(): Promise<boolean> {
+    return await invoke<boolean>("browser_extension_active");
+}
+
+export type NexusKeyStatus = {
+    Present: boolean,
+    Storage?: "Keychain" | "File",
+    Username?: string,
+    IsPremium?: boolean
+};
+
+export async function getNexusKeyStatus(): Promise<NexusKeyStatus> {
+    return await invoke<NexusKeyStatus>("get_nexus_key_status");
+}
+
+/** Validates the key with Nexus Mods and, if accepted, stores it in the OS
+ * keychain. The key is never logged or kept in settings. */
+export async function setNexusApiKey(key: string): Promise<NexusKeyStatus> {
+    log.debug("Invoking `set_nexus_api_key`.");
+    return await invoke<NexusKeyStatus>("set_nexus_api_key", { key });
+}
+
+export async function removeNexusApiKey(): Promise<NexusKeyStatus> {
+    log.debug("Invoking `remove_nexus_api_key`.");
+    return await invoke<NexusKeyStatus>("remove_nexus_api_key");
 }
 
 export async function loadProfiles(): Promise<ProfilesConfig> {
