@@ -83,8 +83,11 @@ Where DDMM keeps your mods, settings, profiles and logs depends on how you're ru
   itself, not the temporary location it's mounted at while running.
 
 You can always check which one is active, and where, without guessing: open **Settings** and look at
-**Data Folder** — it's read-only, and has an **Open Folder** button. The choice (and why) is also written to the
+**Data Folder**, which has an **Open Folder** button. The choice (and why) is also written to the
 [log file](../help/logs.md) every time DDMM starts.
+
+Either way, you can move the data to any other folder or drive with **Change...** next to **Data Folder**. DDMM
+remembers that choice and uses it from then on; see [Data folder](../using/data-folder.md).
 
 Moving to portable mode later: create an empty `portable.txt` next to the executable (or copy the one from a
 portable download) and restart DDMM — it'll start using that folder from then on. Note this does *not* move your

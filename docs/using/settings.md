@@ -5,8 +5,8 @@ title: Settings reference
 # Settings reference
 
 The Settings page has three actual settings, stored in `settings.json` in DDMM's
-[data folder](../getting-started/download.md#data-location), plus a read-only line showing where that data
-folder is.
+[data folder](../getting-started/download.md#data-location), plus a line showing where that data folder is, with
+buttons to open it or [move it](data-folder.md).
 
 ## Game Path
 
@@ -120,12 +120,17 @@ need to touch it.
 
 ## Data Folder
 
-Read-only — shows the folder DDMM is currently keeping `mods/`, `settings.json`, `profiles.json` and its logs in.
-Which folder that actually is depends on how you installed DDMM; see
-[Data location](../getting-started/download.md#data-location) for the full rules.
+Shows the folder DDMM is currently keeping `mods/`, `settings.json`, `profiles.json` and its logs in. Which folder
+that is by default depends on how you installed DDMM; see
+[Data location](../getting-started/download.md#data-location). The field itself isn't editable: use **Change...**
+to move it. See [Data folder](data-folder.md) for everything about moving it.
 
 - **Label:** Data Folder
 - **Open Folder button:** opens that folder in your system's file manager
+- **Change... button:** pick another folder; DDMM checks it, shows the size to move and the free space there, then
+  moves your data and restarts. If the folder already holds DDMM data, it offers to use that data instead.
+- **Reset to Default button** (only when you chose a folder): moves the data back to the default location the
+  same way.
 
 ## Where settings live
 

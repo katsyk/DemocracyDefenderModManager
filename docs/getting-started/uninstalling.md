@@ -35,5 +35,13 @@ DDMM doesn't run an installer in this case, so there's nothing to "uninstall" be
 2. Close DDMM and delete the folder you put it in — the executable, `portable.txt`, `mods/`, `settings.json`,
    `profiles.json`, and `logs/` all live there, so deleting the folder removes everything DDMM created.
 
+## If you moved the data folder
+
+If you picked your own data folder with **Change...** in Settings (see [Data folder](../using/data-folder.md)),
+your mods and settings are in *that* folder instead: delete it too if you want them gone. **Settings → Data
+Folder** shows where it is. The small `ddmm-data-location.json` file that remembers the choice is next to the
+executable (portable) or in `%APPDATA%\io.github.katsyk.ddmm` / `~/.config/io.github.katsyk.ddmm` (installed);
+delete it as well for a completely clean removal.
+
 In every case, your Helldivers 2 installation itself is never touched beyond the `data` folder changes
 Deploy/Purge make.

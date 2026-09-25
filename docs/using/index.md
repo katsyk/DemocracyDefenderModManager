@@ -11,4 +11,5 @@ title: Using DDMM
 - [Mod options & variants](options-variants.md) — mods that offer a choice at deploy time
 - [Deploy & purge](deploy-purge.md) — what actually happens to your game files
 - [Updating mods](updating-mods.md) — update checks (on request, or opt-in automatic), one-click and bulk updates
+- [Data folder](data-folder.md) — where your mods and settings live, and moving them to another folder or drive
 - [Settings reference](settings.md) — every setting, explained
