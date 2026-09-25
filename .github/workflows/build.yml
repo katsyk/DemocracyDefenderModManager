@@ -15,6 +15,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      checks: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,6 +54,15 @@ jobs:
       - name: Rust tests
         working-directory: src-tauri
         run: cargo test
+
+      # Cargo.lock is a single, platform-independent resolution, so auditing
+      # it once (not once per matrix OS) is enough.
+      - name: Cargo audit
+        if: matrix.os == 'ubuntu-latest'
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: src-tauri
 
       - name: i18n check
         run: pnpm run scan:i18n

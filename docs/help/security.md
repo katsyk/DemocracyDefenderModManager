@@ -26,6 +26,12 @@ Every archive (`.zip`, `.7z`, `.rar`) is checked before any of its contents are 
 
 If any check fails, the whole archive is rejected and nothing from it is kept.
 
+DDMM's `.7z` library dependency (`sevenz-rust2`) had its own path-traversal issue, tracked as
+[CVE-2026-61725 / GHSA-qh76-45cr-8xrc](https://github.com/advisories/GHSA-qh76-45cr-8xrc); the dependency has been
+upgraded to a version with the fix. It's worth noting DDMM's own entry-path checks above already caught and
+rejected this exact kind of malicious `.7z` archive before the fix landed — this upgrade removes a second point
+of exposure, it wasn't the only thing standing in the way.
+
 ## Downloads are `https://` only, size-capped, and content-checked
 
 [Add URL](../using/adding-mods.md#add-url) only accepts `https://` links — plain `http://` and any other scheme
