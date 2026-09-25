@@ -351,7 +351,7 @@ fn successful_move_copies_everything_rewrites_paths_and_cleans_up() {
         assert!(!data.join(name).exists(), "{name} should be gone from the old folder");
     }
     assert!(data.join("ddmm.exe").exists(), "non-DDMM files stay");
-    assert!(data.join("bridge.json").exists(), "the running app removes its own bridge.json");
+    assert!(!data.join("bridge.json").exists(), "the old bridge.json goes too; the restarted app writes a new one");
 }
 
 #[test]
@@ -359,7 +359,6 @@ fn old_custom_folder_is_removed_when_empty_but_the_default_never_is() {
     let root = tempfile::tempdir().unwrap();
     let custom = root.path().join("custom");
     make_data(&custom);
-    std::fs::remove_file(custom.join("bridge.json")).unwrap();
     let default_path = root.path().join("default");
     std::fs::create_dir(&default_path).unwrap();
     let dest = root.path().join("dest");

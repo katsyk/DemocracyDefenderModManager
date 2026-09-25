@@ -42,9 +42,10 @@ pub const MOVED_ITEMS: &[&str] = &[
 ];
 
 /// DDMM's own items that are recreated as needed (download staging, the
-/// Windows native messaging manifests, which are rewritten at every start):
-/// never copied, but removed from the old folder after a move.
-pub const REGENERATED_ITEMS: &[&str] = &[".downloads", "native-messaging"];
+/// Windows native messaging manifests, which are rewritten at every start,
+/// and `bridge.json`, which the restarted app writes again in the new
+/// folder): never copied, but removed from the old folder after a move.
+pub const REGENERATED_ITEMS: &[&str] = &[".downloads", "native-messaging", "bridge.json"];
 
 /// Items that may already exist in the default folder when moving back
 /// there ("Reset to default") without making it an existing DDMM data
