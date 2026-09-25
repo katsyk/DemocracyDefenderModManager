@@ -119,11 +119,39 @@ pub async fn run_registration(state: &AppState) -> Vec<BrowserIntegrationStatus>
 }
 
 /// Remove every native messaging manifest DDMM registered (Settings'
-/// "Remove" button / portable & Linux uninstall path -- NSIS handles
+/// "Remove all" button / portable & Linux uninstall path -- NSIS handles
 /// Windows registry cleanup itself on uninstall).
 #[tauri::command]
 pub async fn remove_browser_integration(state: State<'_, AppState>) -> TAResult<()> {
     native_messaging::remove_all(&state.base_path).await;
+    Ok(())
+}
+
+/// Re-register (or first-time register) just one browser -- Settings'
+/// per-browser "Repair" button.
+#[tauri::command]
+pub async fn repair_browser_integration_one(
+    state: State<'_, AppState>,
+    browser_id: String,
+) -> TAResult<Option<BrowserIntegrationStatus>> {
+    let exe = crate::bridge::exe_path();
+    let Some(outcome) = native_messaging::register_one_by_id(&browser_id, &exe, &state.base_path).await else {
+        return Ok(None);
+    };
+    let target = native_messaging::BROWSERS.iter().find(|b| b.id == outcome.browser_id);
+    Ok(Some(BrowserIntegrationStatus {
+        browser_id: outcome.browser_id,
+        display_name: target.map(|t| t.display_name).unwrap_or("unknown"),
+        registered: outcome.registered,
+        detail: outcome.detail,
+    }))
+}
+
+/// Remove just one browser's manifest -- Settings' per-browser "Remove"
+/// button.
+#[tauri::command]
+pub async fn remove_browser_integration_one(state: State<'_, AppState>, browser_id: String) -> TAResult<()> {
+    native_messaging::remove_one(&browser_id, &state.base_path).await;
     Ok(())
 }
 

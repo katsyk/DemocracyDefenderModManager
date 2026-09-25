@@ -7,10 +7,12 @@ import ErrorPopupComponent from "$lib/components/popups/ErrorPopup.svelte";
 import AddResultPopupComponent from "$lib/components/popups/AddResultPopup.svelte";
 import ModConfigPopupComponent from "$lib/components/popups/ModConfigPopup.svelte";
 import HandoffPopupComponent from "$lib/components/popups/HandoffPopup.svelte";
+import BridgeConsentPopupComponent from "$lib/components/popups/BridgeConsentPopup.svelte";
 import type { ModAddResult } from "./results";
 import type { Config } from "$lib/models/profile";
 import type { Mod } from "$lib/models/mod";
 import type { UUID } from "./uuid";
+import type { BridgeConsentDecision } from "$lib/utils/commands";
 
 export abstract class Popup<T = void> {
     abstract component: Component<any, any, any>;
@@ -121,6 +123,19 @@ export class HandoffPopup extends Popup<HandoffResult> {
         public readonly downloadsPath: string,
         public readonly existingGuid?: UUID
     ) {
+        super();
+    }
+}
+
+/**
+ * "Allow the DDMM browser extension to install mods from **site**?" -- the
+ * per-site consent prompt the bridge asks the first time a site tries to
+ * install through the extension. See `docs/development/bridge-protocol.md`.
+ */
+export class BridgeConsentPopup extends Popup<BridgeConsentDecision> {
+    component = BridgeConsentPopupComponent;
+
+    constructor(public readonly site: string) {
         super();
     }
 }

@@ -236,6 +236,8 @@ pub fn run() {
             commands::bridge::revoke_bridge_site,
             commands::bridge::repair_browser_integration,
             commands::bridge::remove_browser_integration,
+            commands::bridge::repair_browser_integration_one,
+            commands::bridge::remove_browser_integration_one,
             commands::bridge::focus_main_window,
             commands::bridge::is_game_running,
         ])

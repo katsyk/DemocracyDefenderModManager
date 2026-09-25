@@ -156,6 +156,22 @@ pub async fn register_all(exe_path: &Path, base_path: &Path) -> Vec<Registration
     results
 }
 
+/// Register just one browser by id (Settings' per-browser "Repair"
+/// button). `None` if `browser_id` isn't one of [`BROWSERS`].
+pub async fn register_one_by_id(browser_id: &str, exe_path: &Path, base_path: &Path) -> Option<RegistrationOutcome> {
+    let target = BROWSERS.iter().find(|b| b.id == browser_id)?;
+    Some(register_one(target, exe_path, base_path).await)
+}
+
+/// Remove just one browser's manifest by id (Settings' per-browser
+/// "Remove" button). A no-op (not an error) if `browser_id` is unknown.
+pub async fn remove_one(browser_id: &str, base_path: &Path) {
+    let Some(target) = BROWSERS.iter().find(|b| b.id == browser_id) else {
+        return;
+    };
+    remove_one_target(target, base_path).await;
+}
+
 #[allow(unused_variables)]
 async fn register_one(target: &BrowserTarget, exe_path: &Path, base_path: &Path) -> RegistrationOutcome {
     #[cfg(target_os = "linux")]
@@ -257,29 +273,33 @@ fn windows_register_key(hive_subkey: &str, manifest_path: &Path) -> std::io::Res
 /// that's never been registered is simply skipped). Windows registry keys
 /// are left for the NSIS uninstaller, which removes them directly; this
 /// path is for the in-app "Remove" button and portable/Linux cleanup.
-#[allow(unused_variables)]
 pub async fn remove_all(base_path: &Path) {
     for target in BROWSERS {
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(home) = dirs::home_dir() {
-                if let Some(path) = linux_manifest_path(&home, target) {
-                    let _ = tokio::fs::remove_file(&path).await;
-                }
+        remove_one_target(target, base_path).await;
+    }
+}
+
+#[allow(unused_variables)]
+async fn remove_one_target(target: &BrowserTarget, base_path: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(home) = dirs::home_dir() {
+            if let Some(path) = linux_manifest_path(&home, target) {
+                let _ = tokio::fs::remove_file(&path).await;
             }
         }
-        #[cfg(target_os = "windows")]
-        {
-            let path = windows_manifest_path(base_path, target);
-            let _ = tokio::fs::remove_file(&path).await;
-            if let Some(hive) = target.registry_hive {
-                windows_remove_key(hive);
-            }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let path = windows_manifest_path(base_path, target);
+        let _ = tokio::fs::remove_file(&path).await;
+        if let Some(hive) = target.registry_hive {
+            windows_remove_key(hive);
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        {
-            let _ = (target, base_path);
-        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (target, base_path);
     }
 }
 

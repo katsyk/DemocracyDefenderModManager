@@ -4,6 +4,7 @@
     import Sidebar from "$lib/components/Sidebar.svelte";
     import Statusbar from "$lib/components/Statusbar.svelte";
     import Popup from "$lib/components/Popup.svelte";
+    import Toast from "$lib/components/Toast.svelte";
     import { onMount } from "svelte";
     import { initLocalization } from "$lib/state/localization.svelte";
     import { checkSettings } from "$lib/utils/commands";
@@ -28,6 +29,7 @@
             <slot />
         </main>
         <Popup />
+        <Toast />
     </div>
     <Statusbar />
 </div>

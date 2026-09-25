@@ -1,23 +1,39 @@
 <script lang="ts">
     import * as fs from "@tauri-apps/plugin-fs";
     import { open } from "@tauri-apps/plugin-dialog";
-    import { openPath } from "@tauri-apps/plugin-opener";
+    import { openPath, openUrl } from "@tauri-apps/plugin-opener";
     import { beforeNavigate, onNavigate } from "$app/navigation";
     import { toSkipEntry, type SkipEntry } from "$lib/models/settings";
+    import type { AfterBrowserInstall } from "$lib/models/settings";
     import { useLocalization } from "$lib/state/localization.svelte";
-    import { loadSettings, saveSettings, detectGamePath, getDataDir } from "$lib/utils/commands";
-    import { Dash, Plus, ThreeDots, Search, Folder2Open } from "svelte-bootstrap-icons";
+    import {
+        loadSettings, saveSettings, detectGamePath, getDataDir,
+        getBridgeAllowedSites, revokeBridgeSite, repairBrowserIntegration, removeBrowserIntegration,
+        repairBrowserIntegrationOne, removeBrowserIntegrationOne,
+        type BrowserIntegrationStatus
+    } from "$lib/utils/commands";
+    import { Dash, Plus, ThreeDots, Search, Folder2Open, ArrowRepeat, BoxArrowUpRight } from "svelte-bootstrap-icons";
     import { usePopup } from "$lib/state/popup.svelte";
     import { InputPopup, NotificationPopup } from "$lib/types/popup";
     import { path } from "@tauri-apps/api";
+    import Select from "$lib/components/Select.svelte";
+    import ToggleSwitch from "$lib/components/ToggleSwitch.svelte";
 
     const { t } = useLocalization();
     const { show: showPopup } = usePopup();
+
+    const ONE_CLICK_INSTALL_DOCS_URL = "https://github.com/katsyk/DemocracyDefenderModManager/blob/main/docs/using/one-click-install.md";
+    const AFTER_BROWSER_INSTALL_OPTIONS: AfterBrowserInstall[] = ["library", "profile", "deploy"];
 
     let gamePath = $state<string>("");
     let downloadsPath = $state<string>("");
     let skipList = $state<SkipEntry[]>([]);
     let selectedSkipIndex = $state<number>(-1);
+    let afterBrowserInstallIndex = $state<number>(2);
+    let bridgeAllowedSites = $state<string[]>([]);
+    let autoImportEnabled = $state<boolean>(false);
+    let browserIntegration = $state<BrowserIntegrationStatus[]>([]);
+    let browserIntegrationBusy = $state<boolean>(false);
     let gamePathErrors = $state<string[]>([]);
     let dataDir = $state<string>("");
     let initPromise = $state<Promise<void>>(init());
@@ -79,7 +95,10 @@
             Version: "V1",
             GamePath: gamePath,
             SkipList: skipList,
-            DownloadsPath: downloadsPath
+            DownloadsPath: downloadsPath,
+            AfterBrowserInstall: AFTER_BROWSER_INSTALL_OPTIONS[afterBrowserInstallIndex] ?? "deploy",
+            BridgeAllowedSites: bridgeAllowedSites,
+            AutoImportEnabled: autoImportEnabled
         });
     })
 
@@ -90,9 +109,83 @@
                 gamePath = settings.GamePath;
                 skipList = settings.SkipList;
                 downloadsPath = settings.DownloadsPath;
+                afterBrowserInstallIndex = Math.max(0, AFTER_BROWSER_INSTALL_OPTIONS.indexOf(settings.AfterBrowserInstall));
+                bridgeAllowedSites = settings.BridgeAllowedSites;
+                autoImportEnabled = settings.AutoImportEnabled;
                 break;
         }
         dataDir = resolvedDataDir;
+
+        // Also registers (idempotently) as a side effect -- see
+        // repairBrowserIntegration's doc comment on the Rust side. Never
+        // fatal to the rest of Settings loading if it fails.
+        try {
+            browserIntegrationBusy = true;
+            browserIntegration = await repairBrowserIntegration();
+        } catch {
+            // Leave browserIntegration empty; the section just shows
+            // nothing rather than blocking Settings from loading.
+        } finally {
+            browserIntegrationBusy = false;
+        }
+    }
+
+    async function onRevokeSite(site: string) {
+        await revokeBridgeSite(site);
+        bridgeAllowedSites = bridgeAllowedSites.filter(s => s !== site);
+    }
+
+    function replaceBrowserStatus(status: BrowserIntegrationStatus) {
+        const i = browserIntegration.findIndex(b => b.browserId === status.browserId);
+        if (i !== -1) browserIntegration[i] = status;
+    }
+
+    async function onRepairBrowser(browserId: string) {
+        browserIntegrationBusy = true;
+        try {
+            const status = await repairBrowserIntegrationOne(browserId);
+            if (status) replaceBrowserStatus(status);
+        } finally {
+            browserIntegrationBusy = false;
+        }
+    }
+
+    async function onRemoveBrowser(browserId: string) {
+        browserIntegrationBusy = true;
+        try {
+            await removeBrowserIntegrationOne(browserId);
+            const current = browserIntegration.find(b => b.browserId === browserId);
+            if (current) {
+                replaceBrowserStatus({ ...current, registered: false, detail: t("pages.settings.browser_integration.removed_detail") });
+            }
+        } finally {
+            browserIntegrationBusy = false;
+        }
+    }
+
+    async function onRepairAllBrowsers() {
+        browserIntegrationBusy = true;
+        try {
+            browserIntegration = await repairBrowserIntegration();
+        } finally {
+            browserIntegrationBusy = false;
+        }
+    }
+
+    async function onRemoveAllBrowsers() {
+        browserIntegrationBusy = true;
+        try {
+            await removeBrowserIntegration();
+            browserIntegration = browserIntegration.map(b => (
+                { ...b, registered: false, detail: t("pages.settings.browser_integration.removed_detail") }
+            ));
+        } finally {
+            browserIntegrationBusy = false;
+        }
+    }
+
+    async function onGetExtension() {
+        await openUrl(ONE_CLICK_INSTALL_DOCS_URL);
     }
 
     async function onBrowse() {
@@ -270,6 +363,97 @@
                         onclick={onRemoveSkipEntry}
                     >
                         <Dash class="m-auto block" />
+                    </button>
+                </div>
+            </div>
+            <div class="flex flex-col gap-1">
+                <h2 class="text-zinc-300 text-xl">{t("pages.settings.browser_install.title")}</h2>
+                <p class="text-zinc-400 text-sm">{t("pages.settings.browser_install.description")}</p>
+                <div class="flex flex-row gap-2 items-center">
+                    <span class="text-zinc-300 text-sm">{t("pages.settings.browser_install.after_install.label")}</span>
+                    <Select
+                        bind:selectedIndex={afterBrowserInstallIndex}
+                        items={AFTER_BROWSER_INSTALL_OPTIONS}
+                        class="w-40"
+                    >
+                        {#snippet renderItem(option)}
+                            {#if option === "library"}
+                                {t("pages.settings.browser_install.after_install.options.library")}
+                            {:else if option === "profile"}
+                                {t("pages.settings.browser_install.after_install.options.profile")}
+                            {:else}
+                                {t("pages.settings.browser_install.after_install.options.deploy")}
+                            {/if}
+                        {/snippet}
+                    </Select>
+                </div>
+                <div class="flex flex-row gap-2 items-center">
+                    <ToggleSwitch bind:checked={autoImportEnabled} />
+                    <span class="text-zinc-300 text-sm">{t("pages.settings.browser_install.auto_import.label")}</span>
+                </div>
+                <p class="text-zinc-500 text-xs max-w-lg">{t("pages.settings.browser_install.auto_import.description")}</p>
+                <h3 class="text-zinc-300 text-base mt-1">{t("pages.settings.browser_install.allowed_sites.title")}</h3>
+                {#if bridgeAllowedSites.length === 0}
+                    <p class="text-zinc-500 text-sm">{t("pages.settings.browser_install.allowed_sites.empty")}</p>
+                {:else}
+                    <ul class="w-80 border-2 border-zinc-500 max-h-40 overflow-y-scroll">
+                        {#each bridgeAllowedSites as site (site)}
+                            <li class="flex flex-row items-center justify-between px-1 py-0.5 text-zinc-300 text-sm">
+                                <span class="truncate">{site}</span>
+                                <button
+                                    class="hd2mm-button shrink-0"
+                                    title={t("pages.settings.browser_install.allowed_sites.revoke_button.tip")}
+                                    onclick={() => onRevokeSite(site)}
+                                >
+                                    <Dash class="m-auto block" />
+                                </button>
+                            </li>
+                        {/each}
+                    </ul>
+                {/if}
+            </div>
+            <div class="flex flex-col gap-1">
+                <h2 class="text-zinc-300 text-xl">{t("pages.settings.browser_integration.title")}</h2>
+                <p class="text-zinc-400 text-sm">{t("pages.settings.browser_integration.description")}</p>
+                <button class="hd2mm-button self-start flex flex-row gap-1 items-center" onclick={onGetExtension}>
+                    <BoxArrowUpRight />
+                    {t("pages.settings.browser_integration.get_extension_button.text")}
+                </button>
+                <ul class="w-96 border-2 border-zinc-500 max-h-56 overflow-y-scroll">
+                    {#each browserIntegration as browser (browser.browserId)}
+                        <li class="flex flex-row items-center gap-2 px-1 py-0.5 text-sm">
+                            <span
+                                class="w-2.5 h-2.5 rounded-full shrink-0"
+                                class:bg-green-500={browser.registered}
+                                class:bg-zinc-600={!browser.registered}
+                                title={browser.detail}
+                            ></span>
+                            <span class="flex-1 text-zinc-300 truncate" title={browser.detail}>{browser.displayName}</span>
+                            <button
+                                class="hd2mm-button"
+                                disabled={browserIntegrationBusy}
+                                title={t("pages.settings.browser_integration.repair_button.tip")}
+                                onclick={() => onRepairBrowser(browser.browserId)}
+                            >
+                                <ArrowRepeat class="m-auto block" />
+                            </button>
+                            <button
+                                class="hd2mm-button"
+                                disabled={browserIntegrationBusy || !browser.registered}
+                                title={t("pages.settings.browser_integration.remove_button.tip")}
+                                onclick={() => onRemoveBrowser(browser.browserId)}
+                            >
+                                <Dash class="m-auto block" />
+                            </button>
+                        </li>
+                    {/each}
+                </ul>
+                <div class="flex flex-row gap-1 justify-end">
+                    <button class="hd2mm-button" disabled={browserIntegrationBusy} onclick={onRepairAllBrowsers}>
+                        {t("pages.settings.browser_integration.repair_all_button.text")}
+                    </button>
+                    <button class="hd2mm-button" disabled={browserIntegrationBusy} onclick={onRemoveAllBrowsers}>
+                        {t("pages.settings.browser_integration.remove_all_button.text")}
                     </button>
                 </div>
             </div>

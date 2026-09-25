@@ -36,6 +36,10 @@
                     "offer_handoff": {
                         "title": "Open in Browser Instead?",
                         "question": "That link didn't serve a downloadable archive directly. Open it on {site} in your browser and let DDMM install it automatically once it downloads?"
+                    },
+                    "deep_link_install": {
+                        "title": "Install This Mod?",
+                        "question": "A link wants to install a mod from {site}. Install?"
                     }
                 },
                 "input": {
@@ -245,6 +249,49 @@
             "skip_list": {
                 "title": "Skip List"
             },
+            "browser_install": {
+                "title": "Browser Installs",
+                "description": "Controls what happens after you click Install with DDMM on a mod site, once you've set up the browser extension.",
+                "after_install": {
+                    "label": "After a browser install:",
+                    "options": {
+                        "library": "Add to library only",
+                        "profile": "Add to active profile",
+                        "deploy": "Add to active profile and deploy"
+                    }
+                },
+                "auto_import": {
+                    "label": "Auto-import from Downloads",
+                    "description": "Watch your Downloads folder while DDMM is running and offer to install any new Helldivers 2 mod archive it sees, even without the browser extension. Never installs without you clicking Install first."
+                },
+                "allowed_sites": {
+                    "title": "Sites Allowed to Install Through the Extension",
+                    "empty": "No sites yet -- you'll be asked the first time one tries to install a mod.",
+                    "revoke_button": {
+                        "tip": "Revoke -- this site will ask again next time."
+                    }
+                }
+            },
+            "browser_integration": {
+                "title": "Browser Integration",
+                "description": "DDMM registers itself with your browsers so the extension can hand off downloads to it. This happens automatically on launch; use Repair if a browser stops recognizing DDMM (for example after moving the app).",
+                "get_extension_button": {
+                    "text": "Get the Browser Extension"
+                },
+                "repair_button": {
+                    "tip": "Repair -- re-register DDMM with this browser."
+                },
+                "remove_button": {
+                    "tip": "Remove -- unregister DDMM from this browser."
+                },
+                "repair_all_button": {
+                    "text": "Repair All"
+                },
+                "remove_all_button": {
+                    "text": "Remove All"
+                },
+                "removed_detail": "Not registered."
+            },
             "validation_error": {
                 "game_path": {
                     "empty": "Game path can not be empty!",
@@ -319,6 +366,29 @@
             "choose_file_button": {
                 "text": "I already downloaded it -- choose file"
             }
+        },
+        "bridge_consent": {
+            "title": "Allow Browser Install?",
+            "question": "Allow the DDMM browser extension to install mods from {site}?",
+            "always_allow_button": {
+                "text": "Always Allow"
+            },
+            "just_once_button": {
+                "text": "Just This Once"
+            },
+            "deny_button": {
+                "text": "Deny"
+            }
+        }
+    },
+    "toast": {
+        "bridge_install": {
+            "added_to_library": "{name} installed from your browser.",
+            "added_to_profile": "{name} installed and added to {profile}.",
+            "deployed": "{name} installed and deployed.",
+            "installed_with_issue": "{name} installed, but {message}",
+            "profile_save_failed": "couldn't save profiles.json",
+            "game_running": "Helldivers 2 is currently running; deploy manually once you've closed it."
         }
     }
 }
