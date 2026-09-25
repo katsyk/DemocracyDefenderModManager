@@ -87,6 +87,7 @@ nav:
       - using/index.md
       - Adding mods: using/adding-mods.md
       - Mod sites: using/mod-sites.md
+      - One-click install: using/one-click-install.md
       - Profiles: using/profiles.md
       - Mod options & variants: using/options-variants.md
       - Deploy & purge: using/deploy-purge.md
@@ -97,6 +98,7 @@ nav:
       - Packaging your mod: authors/packaging.md
       - Manifest reference: authors/manifest.md
       - The Sources field: authors/sources.md
+      - Install button for your mod page: authors/install-button.md
   - Help:
       - help/index.md
       - FAQ: help/faq.md

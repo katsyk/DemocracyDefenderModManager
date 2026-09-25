@@ -34,8 +34,10 @@ use crate::{
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const STABLE_POLLS_REQUIRED: u32 = 2;
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const IGNORED_SUFFIXES: [&str; 5] = [".crdownload", ".part", ".tmp", ".download", ".partial"];
-const ARCHIVE_SUFFIXES: [&str; 3] = [".zip", ".7z", ".rar"];
+/// Reused by `auto_import`, which watches the same folder for the same
+/// reason (a still-downloading file shouldn't be treated as a candidate).
+pub(crate) const IGNORED_SUFFIXES: [&str; 5] = [".crdownload", ".part", ".tmp", ".download", ".partial"];
+pub(crate) const ARCHIVE_SUFFIXES: [&str; 3] = [".zip", ".7z", ".rar"];
 
 /// The single `handoff` event the frontend listens for; `status` picks
 /// which of the optional fields are meaningful.

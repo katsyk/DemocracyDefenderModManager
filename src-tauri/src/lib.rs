@@ -6,17 +6,25 @@ pub mod sources;
 pub mod download;
 pub mod data_dir;
 pub mod steam;
+pub mod bridge;
+pub mod deep_link;
+pub mod auto_import;
 
 use std::{
     path::PathBuf,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize},
+        Arc,
+    },
 };
 
 use log::LevelFilter;
+use tauri::Manager;
+use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_log::{Target, TargetKind};
 use tokio::sync::Mutex;
 
-use crate::models::Mod;
+use crate::{bridge::BridgePending, models::Mod};
 
 pub struct AppState {
     base_path: PathBuf,
@@ -24,6 +32,14 @@ pub struct AppState {
     /// Cancellation flag for the single in-flight browser handoff, if any.
     /// `commands::handoff` is the only thing that touches this.
     handoff_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    /// Consent/install-completion round trips the bridge server is
+    /// waiting on the frontend to resolve. `bridge::server` only.
+    bridge_pending: Mutex<BridgePending>,
+    /// How many bridge installs are currently queued (including the one
+    /// running); see `bridge::protocol::MAX_QUEUE_DEPTH`.
+    bridge_queue_depth: AtomicUsize,
+    /// Serializes actual bridge installs to one at a time.
+    bridge_install_lock: Mutex<()>,
 }
 
 impl AppState {
@@ -32,12 +48,50 @@ impl AppState {
             base_path,
             mods: Mutex::default(),
             handoff_cancel: Mutex::default(),
+            bridge_pending: Mutex::default(),
+            bridge_queue_depth: AtomicUsize::new(0),
+            bridge_install_lock: Mutex::new(()),
         }
     }
 }
 
+/// Compute the base data directory the same way the desktop app does,
+/// without touching Tauri at all -- used both by `run()` before the
+/// builder is constructed and by host mode, which never constructs one.
+fn resolve_base_path() -> PathBuf {
+    let exe_dir = data_dir::resolve_exe_dir();
+    let app_data_dir = data_dir::platform_app_data_dir().unwrap_or_else(|e| {
+        eprintln!("warning: {e}; falling back to the executable directory for app data");
+        exe_dir.clone()
+    });
+    data_dir::decide_base_dir(&exe_dir, &app_data_dir).path
+}
+
+/// Run as the browser's native-messaging host: relay only, no window, no
+/// Tauri runtime at all. Must be checked before anything Tauri-related is
+/// touched, since a host-mode invocation has no display to attach to.
+fn run_host_mode(origin: bridge::host::HostOrigin) {
+    let base_path = resolve_base_path();
+    let _ = std::fs::create_dir_all(&base_path);
+
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("failed to start host-mode runtime: {e}");
+            return;
+        }
+    };
+    runtime.block_on(bridge::host::run(origin, base_path));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(origin) = bridge::host::detect_host_mode(&args) {
+        run_host_mode(origin);
+        return;
+    }
+
     let exe_dir = data_dir::resolve_exe_dir();
     let app_data_dir = data_dir::platform_app_data_dir().unwrap_or_else(|e| {
         eprintln!("warning: {e}; falling back to the executable directory for app data");
@@ -67,6 +121,15 @@ pub fn run() {
     );
 
     tauri::Builder::default()
+        // Must be registered first (see the plugin's own docs): it needs
+        // to intercept a second launch -- including one carrying a
+        // `ddmm://` deep link on Windows/Linux, where the OS starts a new
+        // process rather than emitting an event -- before anything else
+        // runs.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            bridge::server::focus_main_window(app);
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -88,8 +151,62 @@ pub fn run() {
                 ])
                 .build()
         )
-        .setup(move |_app| {
+        .setup(move |app| {
             log::info!("{}", startup_message);
+
+            // NSIS/deb register the `ddmm://` scheme at install time (from
+            // tauri.conf.json); a portable Windows exe or an AppImage has
+            // no installer to do that, so register it ourselves every
+            // launch too -- cheap and idempotent either way.
+            let needs_runtime_scheme_registration = match decision.kind {
+                data_dir::BaseDirKind::Portable => cfg!(windows),
+                data_dir::BaseDirKind::AppData => false,
+            } || std::env::var_os("APPIMAGE").is_some();
+            if needs_runtime_scheme_registration {
+                if let Err(e) = app.deep_link().register_all() {
+                    log::warn!("Failed to register the ddmm:// scheme: {e}");
+                }
+            }
+
+            // On Windows/Linux (unlike macOS/iOS) the deep-link plugin
+            // doesn't scan argv on its own; a cold start via a `ddmm://`
+            // link needs this explicit check. A second-instance launch is
+            // instead caught by tauri-plugin-single-instance (registered
+            // above, with its `deep-link` feature forwarding it into this
+            // same `on_open_url`/`get_current` machinery).
+            app.deep_link().handle_cli_arguments(std::env::args());
+            if let Ok(Some(urls)) = app.deep_link().get_current() {
+                deep_link::handle(app.handle(), urls);
+            }
+
+            let handle = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                deep_link::handle(&handle, event.urls());
+            });
+
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = bridge::server::start(handle.clone()).await {
+                    log::error!("Failed to start the browser bridge: {e}");
+                }
+
+                let exe = bridge::exe_path();
+                let base_path = handle.state::<AppState>().base_path.clone();
+                for outcome in bridge::native_messaging::register_all(&exe, &base_path).await {
+                    if outcome.registered {
+                        log::debug!("Native messaging registered for {}: {}", outcome.browser_id, outcome.detail);
+                    } else {
+                        log::warn!(
+                            "Native messaging registration skipped for {}: {}",
+                            outcome.browser_id,
+                            outcome.detail
+                        );
+                    }
+                }
+            });
+
+            auto_import::spawn(app.handle().clone());
+
             Ok(())
         })
         .manage(AppState::new(base_path))
@@ -115,8 +232,23 @@ pub fn run() {
             commands::settings::detect_game_path,
             commands::settings::auto_detect_and_save_game_path,
             commands::purge,
-            commands::deploy
+            commands::deploy,
+            commands::bridge::resolve_bridge_consent,
+            commands::bridge::resolve_bridge_install_completion,
+            commands::bridge::get_bridge_allowed_sites,
+            commands::bridge::revoke_bridge_site,
+            commands::bridge::repair_browser_integration,
+            commands::bridge::remove_browser_integration,
+            commands::bridge::repair_browser_integration_one,
+            commands::bridge::remove_browser_integration_one,
+            commands::bridge::focus_main_window,
+            commands::bridge::is_game_running,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                tauri::async_runtime::block_on(bridge::server::shutdown(app_handle));
+            }
+        });
 }

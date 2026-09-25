@@ -177,3 +177,92 @@ export async function purge(): Promise<void> {
     log.debug("Invoking `purge`.");
     await invoke<void>("purge");
 }
+
+// --- Browser bridge (one-click install) ---------------------------------
+
+export type BridgeConsentDecision = "AlwaysAllow" | "JustOnce" | "Deny";
+
+/** Answers a pending `bridge://consent-request` -- see BridgeConsentPopup. */
+export async function resolveBridgeConsent(requestId: string, decision: BridgeConsentDecision): Promise<void> {
+    log.debug("Invoking `resolve_bridge_consent`.");
+    await invoke<void>("resolve_bridge_consent", { requestId, decision });
+}
+
+export type BridgeSoftError = { code: "GAME_NOT_FOUND" | "DEPLOY_FAILED", message: string };
+
+/** Answers a pending `bridge://mod-installed` -- reports what the frontend
+ * actually did (or couldn't do) for the mod's `afterInstall` step. */
+export async function resolveBridgeInstallCompletion(
+    requestId: string,
+    addedToProfile: string | undefined,
+    deployed: boolean,
+    warnings: string[],
+    softError?: BridgeSoftError,
+): Promise<void> {
+    log.debug("Invoking `resolve_bridge_install_completion`.");
+    await invoke<void>("resolve_bridge_install_completion", {
+        requestId,
+        addedToProfile: addedToProfile ?? null,
+        deployed,
+        warnings,
+        softErrorCode: softError?.code ?? null,
+        softErrorMessage: softError?.message ?? null,
+    });
+}
+
+/** Registrable domains ("Always allow") the user has approved for
+ * browser-triggered installs -- revocable in Settings. */
+export async function getBridgeAllowedSites(): Promise<string[]> {
+    log.debug("Invoking `get_bridge_allowed_sites`.");
+    return await invoke<string[]>("get_bridge_allowed_sites");
+}
+
+export async function revokeBridgeSite(site: string): Promise<void> {
+    log.debug("Invoking `revoke_bridge_site`.");
+    await invoke<void>("revoke_bridge_site", { site });
+}
+
+export type BrowserIntegrationStatus = {
+    browserId: string,
+    displayName: string,
+    registered: boolean,
+    detail: string,
+};
+
+type RawBrowserIntegrationStatus = { browser_id: string, display_name: string, registered: boolean, detail: string };
+
+function toBrowserIntegrationStatus(raw: RawBrowserIntegrationStatus): BrowserIntegrationStatus {
+    return { browserId: raw.browser_id, displayName: raw.display_name, registered: raw.registered, detail: raw.detail };
+}
+
+/** Re-registers (idempotent) every browser's native-messaging manifest and
+ * reports per-browser status. Used both at startup and as Settings'
+ * "Repair all" button. */
+export async function repairBrowserIntegration(): Promise<BrowserIntegrationStatus[]> {
+    log.debug("Invoking `repair_browser_integration`.");
+    const raw = await invoke<RawBrowserIntegrationStatus[]>("repair_browser_integration");
+    return raw.map(toBrowserIntegrationStatus);
+}
+
+export async function removeBrowserIntegration(): Promise<void> {
+    log.debug("Invoking `remove_browser_integration`.");
+    await invoke<void>("remove_browser_integration");
+}
+
+export async function repairBrowserIntegrationOne(browserId: string): Promise<BrowserIntegrationStatus | null> {
+    log.debug("Invoking `repair_browser_integration_one`.");
+    const raw = await invoke<RawBrowserIntegrationStatus | null>("repair_browser_integration_one", { browserId });
+    return raw ? toBrowserIntegrationStatus(raw) : null;
+}
+
+export async function removeBrowserIntegrationOne(browserId: string): Promise<void> {
+    log.debug("Invoking `remove_browser_integration_one`.");
+    await invoke<void>("remove_browser_integration_one", { browserId });
+}
+
+/** Cheap check for whether Helldivers 2 is currently running -- used to
+ * skip deploying a browser-installed mod into a running game. */
+export async function isGameRunning(): Promise<boolean> {
+    log.debug("Invoking `is_game_running`.");
+    return await invoke<boolean>("is_game_running");
+}

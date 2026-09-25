@@ -31,6 +31,9 @@ pub async fn do_load_settings(base_path: &Path) -> anyhow::Result<Settings> {
             game_path: PathBuf::new(),
             skip_list: vec![],
             downloads_path: default_downloads_path(),
+            after_browser_install: "deploy".to_string(),
+            bridge_allowed_sites: vec![],
+            auto_import_enabled: false,
         }
     };
 

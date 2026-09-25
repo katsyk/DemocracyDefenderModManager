@@ -11,6 +11,7 @@ pub mod profiles;
 pub mod settings;
 pub mod handoff;
 pub mod updates;
+pub mod bridge;
 
 static INDEX_REGEX: OnceLock<Regex> = OnceLock::new();
 
