@@ -19,6 +19,21 @@ Click **Add Folder** (tip: "Add a mod from a plain folder.") to pick a folder th
 unpacked — no archive step needed. You can pick multiple folders at once. DDMM copies the folder's contents
 (symlinks are not followed) into its own managed `mods/` directory; your original folder is left untouched.
 
+Pick **one mod's folder** at a time (or several single-mod folders at once), not a folder that holds your whole
+collection. DDMM never copies a folder into itself, so it checks the folder you pick against its own `mods/`
+folder (after following shortcuts/symlinks, `..`, and on Windows and macOS ignoring upper/lower case):
+
+- **DDMM's own `mods/` folder, or a folder that contains it** (for example DDMM's data folder in a portable
+  install): refused with an explanation, and nothing is copied. Mods in `mods/` that have a `manifest.json` are
+  already in your list.
+- **A mod folder sitting directly in `mods/`** that isn't in your list yet (it has no `manifest.json`, for
+  example because you unpacked it there yourself): it's added **where it is**. Nothing is copied or moved; DDMM
+  just writes a `manifest.json` into it.
+- **A folder deeper inside one of your mods** (such as a mod's `Options/Red` folder): refused. Pick the mod's own
+  folder instead.
+
+If a copy fails partway (a file can't be read, the disk is full), DDMM removes the half-copied folder again.
+
 ## Add URL
 
 Click **Add URL** (tip: "Add a mod from a direct download link.") and paste a mod page or download link — its

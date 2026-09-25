@@ -53,6 +53,43 @@ delete its folder.
 - Check the [log file](logs.md) — a failed add shows a popup with the specific error, and the same detail is in
   the log.
 
+## My mods folder filled the disk with nested copies of itself
+
+Versions up to and including 2.0.0-rc.6 had a bug: using **Add Folder** (or dragging a folder in) on DDMM's own
+`mods/` folder, or on a folder that contains it, made DDMM copy that folder into itself. The copy kept reading
+what it had just written, so it nested a full copy of every mod inside the previous copy, over and over, until the
+path got too long or the disk filled up. A 1 GB mod folder can end up taking hundreds of GB. This is most likely
+when DDMM runs [portable](../getting-started/download.md#data-location) next to an existing `mods/` folder and you
+point **Add Folder** at that folder. Newer versions refuse to do this (see
+[Add Folder](../using/adding-mods.md#add-folder)).
+
+The duplicates all live under **one** extra folder, directly inside `mods/`, that is named after the folder you
+picked:
+
+- You picked `mods/` itself: the extra folder is `mods/mods/`, and inside it is `mods/mods/mods/`, and so on. Each
+  level holds another copy of all your mods.
+- You picked a folder that contains `mods/`, say `MyMods/`: the extra folder is `mods/MyMods/`, and the nesting
+  goes `mods/MyMods/mods/MyMods/...`.
+
+Your real mods are the other folders directly inside `mods/`. They were only ever read, never changed. To clean
+up:
+
+1. Close DDMM and update it to a version with the fix.
+2. Find the data folder: **Open Folder** next to **Data Folder** in Settings, then go into `mods/`.
+3. Look inside the extra folder (`mods/mods/` or `mods/<name you picked>/`) and check that it only holds copies of
+   mods you still have directly in `mods/`. If you really had a mod of your own named `mods`, only its own files
+   at the top of that folder are real. The copies start one level down.
+4. Delete that one extra folder. Don't delete anything else. It can be too deep for File Explorer ("path too
+   long"), and too big for the Recycle Bin, so use a terminal:
+    - **Windows** (Command Prompt, not PowerShell). The `\\?\` prefix lets it remove very long paths:
+      `rmdir /s /q "\\?\C:\full\path\to\mods\mods"`. If that still fails, mirror an empty folder over it first,
+      then remove both: `mkdir "%TEMP%\empty"`, then
+      `robocopy "%TEMP%\empty" "C:\full\path\to\mods\mods" /MIR`, then
+      `rmdir /s /q "\\?\C:\full\path\to\mods\mods"` and `rmdir "%TEMP%\empty"`.
+    - **Linux:** `rm -rf -- "/full/path/to/mods/mods"`.
+5. Start DDMM. Mods directly in `mods/` that have a `manifest.json` show up as before. For any that don't, use
+   **Add Folder** on that mod's own folder: DDMM adds it where it is, without copying it.
+
 ## Deploy or Purge fails immediately
 
 Both refuse to run against an invalid [Game Path](../using/settings.md#game-path) — double-check Settings first.
