@@ -58,7 +58,7 @@ async fn add_files_from_dir(dir: &Path, groups: &mut HashMap<String, Vec<PatchFi
         .collect();
 
     for name in names {
-        let indices: HashSet<u32> = entries
+        let mut indices: Vec<u32> = entries
             .iter()
             .filter_map(|p| {
                 let fname = p.file_name()?.to_str()?;
@@ -68,7 +68,13 @@ async fn add_files_from_dir(dir: &Path, groups: &mut HashMap<String, Vec<PatchFi
                 let caps = index_regex.captures(fname)?;
                 caps[1].parse().ok()
             })
+            .collect::<HashSet<u32>>()
+            .into_iter()
             .collect();
+        // A mod's own patch files keep their relative order: its patch_0
+        // is deployed before (below) its patch_1. A HashSet alone would
+        // shuffle them.
+        indices.sort_unstable();
 
         for index in indices {
             let patch = entries.iter().find(|p| {
@@ -299,6 +305,11 @@ pub async fn deploy(state: State<'_, AppState>, configs: Vec<Config>) -> TAResul
         }
     }
     
+    // Load order: `configs` is the profile's mod list, top to bottom, and
+    // each group's triplets were collected in that order. The first gets
+    // `<name>.patch_0` (after an optional skip-list offset), the next
+    // `.patch_1`, and so on. Helldivers 2 applies higher patch numbers over
+    // lower ones, so the mod LOWEST in the list wins a conflict.
     log::info!("Copying files...");
     for (name, triplets) in &groups {
         let offset = if settings.has_skip_entry(name) { 1 } else { 0 };
@@ -533,5 +544,54 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(groups.is_empty());
+    }
+
+    fn legacy_mod(guid: &str, dir: &std::path::Path) -> (Mod, Config) {
+        let guid = Uuid::parse_str(guid).unwrap();
+        let r#mod = Mod {
+            manifest: Manifest::Legacy(legacy::Manifest {
+                guid,
+                name: guid.to_string(),
+                description: String::new(),
+                icon_path: None,
+                options: None,
+            }),
+            directory: dir.to_path_buf(),
+            sources: Vec::new(),
+        };
+        (r#mod, Config::Legacy { guid, enabled: true, selected: 0 })
+    }
+
+    /// The deploy index of a file is its position in its group, so this pins
+    /// down the load order: list order top to bottom, and a mod's own
+    /// patch files in ascending order.
+    #[tokio::test]
+    async fn load_order_follows_list_order_then_each_mods_own_patch_order() {
+        let top = tempfile::tempdir().unwrap();
+        let bottom = tempfile::tempdir().unwrap();
+        for i in [3, 0, 2, 1] {
+            write_patch_file(top.path(), i).await;
+        }
+        write_patch_file(bottom.path(), 0).await;
+        let (top_mod, top_cfg) = legacy_mod("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", top.path());
+        let (bottom_mod, bottom_cfg) = legacy_mod("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", bottom.path());
+
+        let mods = vec![bottom_mod, top_mod];
+        // The profile list order, top first (not the installed-mods order).
+        let configs = vec![top_cfg, bottom_cfg];
+        let mut groups = HashMap::new();
+        for (r#mod, config) in pair_mods_with_configs(&mods, &configs) {
+            collect_files_for_mod(r#mod, config, &mut groups).await.unwrap();
+        }
+
+        let order: Vec<PathBuf> = groups["0123456789abcdef"]
+            .iter()
+            .map(|t| t.patch.clone().unwrap())
+            .collect();
+        let expected: Vec<PathBuf> = (0..4)
+            .map(|i| top.path().join(patch_file_name(i)))
+            .chain(std::iter::once(bottom.path().join(patch_file_name(0))))
+            .collect();
+        assert_eq!(order, expected, "bottom mod must get the highest patch index");
     }
 }

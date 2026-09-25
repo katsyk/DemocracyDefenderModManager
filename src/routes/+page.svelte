@@ -1,6 +1,6 @@
 <script lang="ts">
     import { SvelteMap } from "svelte/reactivity";
-    import { Plus, Dash, Backspace, ArrowBarRight, ArrowBarLeft, Arrow90degLeft, ArrowReturnLeft, PencilSquare, Download, ThreeDotsVertical, CaretUpFill, CaretDownFill, Trash3, ArrowBarUp, ArrowBarDown, CaretUp, CaretDown, Eraser, FolderPlus, Link45deg, BoxArrowUpRight, ArrowRepeat, CloudArrowDownFill } from "svelte-bootstrap-icons";
+    import { Plus, Dash, Backspace, ArrowBarRight, ArrowBarLeft, Arrow90degLeft, ArrowReturnLeft, PencilSquare, Download, ThreeDotsVertical, CaretUpFill, CaretDownFill, Trash3, ArrowBarUp, ArrowBarDown, CaretUp, CaretDown, Eraser, FolderPlus, Link45deg, BoxArrowUpRight, ArrowRepeat, CloudArrowDownFill, GripVertical, InfoCircle } from "svelte-bootstrap-icons";
     import { getCurrentWindow } from "@tauri-apps/api/window";
     import { getCurrentWebview } from "@tauri-apps/api/webview";
     import { listen } from "@tauri-apps/api/event";
@@ -1113,6 +1113,18 @@
                         <span class="text-zinc-500 text-sm max-w-100">{t("pages.mods.empty_state.works_with")}</span>
                     </div>
                 {/if}
+                {#if profileEntries.length > 0}
+                    <div class="flex flex-row items-center gap-1 px-1 pb-1 text-xs text-zinc-400" data-testid="load-order-hint">
+                        <InfoCircle class="shrink-0" width="12" height="12" />
+                        <span>{t("pages.mods.load_order.hint")}</span>
+                    </div>
+                {/if}
+                {#if profileEntries.length > 1}
+                    <div class="flex flex-row items-center gap-1 px-1 pb-1 text-xs text-zinc-500">
+                        <CaretUpFill class="shrink-0" width="10" height="10" />
+                        <span>{t("pages.mods.load_order.lowest")}</span>
+                    </div>
+                {/if}
                 <SortableList.Root
                     ondragend={onDragEnd}
                     isLocked={!allowReorder}
@@ -1125,6 +1137,13 @@
                             index={i}
                         >
                             <div class="p-2 text-zinc-300 bg-zinc-800 rounded flex flex-row gap-1 items-center">
+                                <span
+                                    class="shrink-0 text-zinc-500 {allowReorder ? 'cursor-grab' : 'opacity-40'}"
+                                    title={t("pages.mods.load_order.drag_handle")}
+                                    aria-label={t("pages.mods.load_order.drag_handle")}
+                                >
+                                    <GripVertical width="16" height="16" />
+                                </span>
                                 <img
                                     class="w-14 h-14 object-contain"
                                     src={iconPath ?? FALLBACK_MOD_IMAGE}
@@ -1222,6 +1241,12 @@
                         </SortableList.Item>
                     {/each}
                 </SortableList.Root>
+                {#if profileEntries.length > 1}
+                    <div class="flex flex-row items-center gap-1 px-1 pt-1 text-xs text-yellow-300/80">
+                        <CaretDownFill class="shrink-0" width="10" height="10" />
+                        <span>{t("pages.mods.load_order.highest")}</span>
+                    </div>
+                {/if}
             </div>
             <!-- Library -->
             <div

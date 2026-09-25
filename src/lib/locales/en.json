@@ -203,6 +203,12 @@
             "empty_state": {
                 "title": "No mods yet",
                 "works_with": "Works with AyakaMods, Nexus Mods, ModWorkshop, GameBanana, GitHub and more."
+            },
+            "load_order": {
+                "hint": "Load order: when two mods change the same game file, the one lower in the list wins.",
+                "lowest": "Lowest priority (loaded first)",
+                "highest": "Highest priority (wins conflicts)",
+                "drag_handle": "Drag to change load order. Mods lower in the list override mods above them."
             }
         },
         "settings": {
