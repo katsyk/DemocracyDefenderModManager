@@ -1,0 +1,103 @@
+name: CI
+
+# Runs on every pull request and every push to main. The job names below
+# ("test (ubuntu-latest)", "test (windows-latest)", "docs") are required
+# status checks in the `main` branch ruleset -- rename them only together
+# with the ruleset.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LINUX_DEPS: libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt update
+          sudo apt install -y ${{ env.LINUX_DEPS }}
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Default `cargo test` skips the #[ignore]d live-network tests.
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test --locked
+
+      # Cargo.lock is platform-independent, so one audit is enough. Uses a
+      # prebuilt cargo-audit so it needs no token (works for fork PRs too).
+      - name: Install cargo-audit
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Cargo audit
+        if: runner.os == 'Linux'
+        working-directory: src-tauri
+        run: cargo audit
+
+      - name: i18n check
+        run: pnpm run scan:i18n
+
+      - name: Frontend build
+        run: pnpm run build
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: docs/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r docs/requirements.txt
+
+      - name: Build (strict)
+        run: mkdocs build --strict
