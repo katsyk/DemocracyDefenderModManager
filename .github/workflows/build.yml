@@ -131,7 +131,7 @@ jobs:
           Compress-Archive -Path portable/* -DestinationPath "DDMM-$version-windows-x64-portable.zip"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-build
           path: |
@@ -214,7 +214,7 @@ jobs:
           tar -C tarball -czf "DDMM-${{ steps.version.outputs.version }}-linux-x64.tar.gz" .
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-build
           path: |
@@ -254,7 +254,7 @@ jobs:
         run: pnpm build
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: extension-build
           path: extension/dist/ddmm-extension-*.zip
