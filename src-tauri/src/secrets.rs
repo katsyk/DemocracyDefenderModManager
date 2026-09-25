@@ -229,6 +229,22 @@ mod tests {
         assert_eq!(out.matches("[redacted]").count(), 2);
     }
 
+    /// Round trip through the real OS keychain. `#[ignore]`d: it needs a
+    /// keychain and writes to it. On Linux, run it in a throwaway session so
+    /// it never touches your real keyring:
+    /// `dbus-run-session -- sh -c 'echo -n x | gnome-keyring-daemon --unlock --components=secrets >/dev/null; cargo test -- --ignored os_keychain'`
+    #[tokio::test]
+    #[ignore]
+    async fn os_keychain_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = NexusApiKey::parse("KeychainTestKey789").unwrap();
+        assert_eq!(store(dir.path(), &key).await.unwrap(), KeyStorage::Keychain);
+        assert!(!fallback_path(dir.path()).exists(), "keychain storage must not also write the file");
+        assert_eq!(load(dir.path()).await, Some((key, KeyStorage::Keychain)));
+        remove(dir.path()).await;
+        assert_eq!(load(dir.path()).await, None);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn fallback_file_is_owner_only_and_round_trips() {
