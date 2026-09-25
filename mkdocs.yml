@@ -11,6 +11,8 @@ copyright: >
 
 theme:
   name: material
+  logo: assets/images/ddmm-icon.svg
+  favicon: assets/images/ddmm-icon-64.png
   palette:
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
