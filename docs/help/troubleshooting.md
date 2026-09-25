@@ -76,6 +76,14 @@ exists — fix it in Settings, then retry.
 Only one [browser handoff](../using/mod-sites.md#how-the-browser-handoff-works) can run at a time. Cancel or wait
 for the current one (Waiting/Installing popup) to finish before starting another.
 
+## Closing DDMM says "Saving profiles..." but the window never closes
+
+Fixed in rc.4 — a missing window permission meant the app could save your profiles and then silently fail to
+actually close itself afterward, leaving the window stuck open with no visible error. If you're still on rc.3 or
+earlier, update DDMM. On a version with the fix, closing that still doesn't finish within a few seconds instead
+shows a "Couldn't save profiles" or "Deploy in progress" prompt asking whether to close anyway — check the
+[log file](logs.md) for the underlying error if that keeps happening.
+
 ## Still stuck?
 
 See [Reporting bugs](bugs.md).

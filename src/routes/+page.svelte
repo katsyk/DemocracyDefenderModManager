@@ -10,7 +10,7 @@
     import { useLocalization } from "$lib/state/localization.svelte";
     import { Mod } from "$lib/models/mod";
     import type {Config, Profile, ProfilesConfig} from "$lib/models/profile";
-    import { addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles, loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath, type UpdateStatusEntry } from "$lib/utils/commands";
+    import { addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles, loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath, forceExit, type UpdateStatusEntry } from "$lib/utils/commands";
     import type { UUID } from "$lib/types/uuid";
     import { usePopup } from "$lib/state/popup.svelte";
     import {
@@ -32,6 +32,11 @@
 
     const { t } = useLocalization();
     const { show: showPopup } = usePopup();
+    const appWindow = getCurrentWindow();
+
+    /** How long to wait for the on-close profile save before giving up and
+     * asking the user whether to close anyway. */
+    const CLOSE_SAVE_TIMEOUT_MS = 5000;
 
     let mods = $state<Mod[]>([]);
     let profiles = $state<Profile[]>([]);
@@ -45,6 +50,19 @@
     let initPromise = $state<Promise<void>>();
     let downloadsPath = $state<string>("");
     let updateStatuses = $state<UpdateStatusEntry[]>([]);
+    /** True once `init()` has actually loaded profiles from disk into
+     * `profiles`. Closing before this is true must not try to save --
+     * there's nothing loaded yet to save, and `currentProfile` is
+     * undefined, which would make `doSaveProfiles` fail every time. */
+    let profilesLoaded = $state<boolean>(false);
+    /** True while a deploy is in flight. Closing mid-deploy can leave the
+     * game's data directory half-written, so the close handler asks for
+     * confirmation instead of either hanging or silently interrupting it. */
+    let deploying = $state<boolean>(false);
+    /** Guards against re-entrant close requests (e.g. the window manager's
+     * close and a stray second click both firing before the first request
+     * has been resolved). */
+    let closeRequestInFlight = false;
 
     let currentProfile = $derived<Profile | undefined>(profiles[activeProfile]);
     let profileMods = $derived<Mod[]>(profileConfigs.map(config => mods.find(m => m.guid === config.Guid)).filter((m): m is Mod => m !== undefined));
@@ -90,8 +108,23 @@
     onMount(() => {
         initPromise = init();
 
-        const unlisten = getCurrentWindow().onCloseRequested(async (_) => {
-            await doSaveProfiles();
+        const unlisten = appWindow.onCloseRequested(async (event) => {
+            // We take full control of closing here rather than letting the
+            // `@tauri-apps/api` wrapper call `destroy()` on our behalf
+            // afterwards: that call isn't guarded, and if it ever fails
+            // (wrong permission, IPC hiccup, ...) the rejection goes
+            // nowhere and the window is simply stuck open with no way out
+            // for the user. `closeWindow()` below does the same thing but
+            // with a fallback.
+            event.preventDefault();
+
+            if (closeRequestInFlight) return;
+            closeRequestInFlight = true;
+            try {
+                await handleCloseRequest();
+            } finally {
+                closeRequestInFlight = false;
+            }
         });
 
         const unlistenDragDrop = getCurrentWebview().onDragDropEvent(async (e) => {
@@ -117,7 +150,10 @@
     });
 
     onNavigate(async () => {
-        await doSaveProfiles();
+        if (!profilesLoaded) return;
+
+        const result = await doSaveProfiles();
+        if (!result.ok) log.warn(`Failed to save profiles on navigation: ${result.error}`);
     });
 
     async function init() {
@@ -160,6 +196,7 @@
         mods = loadedMods;
         profiles = loadedConfig.Profiles;
         activeProfile = loadedConfig.Active;
+        profilesLoaded = true;
 
         const settings = await loadSettings();
         if (settings.Version === "V1") downloadsPath = settings.DownloadsPath;
@@ -447,19 +484,98 @@
         }
     }
 
-    async function doSaveProfiles(): Promise<boolean> {
+    type SaveResult = { ok: true } | { ok: false; error: string };
+
+    function errorMessage(ex: unknown): string {
+        if (ex instanceof Error) return ex.message;
+        if (typeof ex === "string") return ex;
+        return "Unknown error!";
+    }
+
+    async function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: string): Promise<T> {
+        let timer: ReturnType<typeof setTimeout>;
+        const timeout = new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(timeoutMessage)), ms);
+        });
+
+        try {
+            return await Promise.race([promise, timeout]);
+        } finally {
+            clearTimeout(timer!);
+        }
+    }
+
+    async function doSaveProfiles(): Promise<SaveResult> {
         const wait = new WaitPopup(t("pages.mods.popup.wait.saving.message"));
         showPopup(wait);
 
         try {
             applyCurrentConfigChanges()
             await saveProfiles({ Profiles: profiles, Active: activeProfile });
-            return true;
-        } catch {
-            return false;
+            return { ok: true };
+        } catch (ex: unknown) {
+            return { ok: false, error: errorMessage(ex) };
         } finally {
             wait.close();
         }
+    }
+
+    /** Same as `doSaveProfiles`, but gives up (rather than hanging
+     * indefinitely) after `CLOSE_SAVE_TIMEOUT_MS`. Used only on the close
+     * path, where we must always eventually decide whether to close. */
+    async function saveProfilesBeforeClose(): Promise<SaveResult> {
+        try {
+            return await withTimeout(
+                doSaveProfiles(),
+                CLOSE_SAVE_TIMEOUT_MS,
+                t("pages.mods.popup.confirm.close_save_failed.timeout_error"),
+            );
+        } catch (ex: unknown) {
+            return { ok: false, error: errorMessage(ex) };
+        }
+    }
+
+    /** Actually closes the window. Tries the normal `destroy()` IPC call
+     * first; if that throws for any reason, falls back to a Rust command
+     * that exits the process directly, so a broken `destroy()` call can
+     * never strand the user with an unclosable window again. */
+    async function closeWindow() {
+        try {
+            await appWindow.destroy();
+        } catch (ex: unknown) {
+            log.error(`Window destroy() failed, falling back to force_exit: ${errorMessage(ex)}`);
+            try {
+                await forceExit();
+            } catch (ex2: unknown) {
+                log.error(`force_exit fallback also failed: ${errorMessage(ex2)}`);
+            }
+        }
+    }
+
+    async function handleCloseRequest() {
+        if (deploying) {
+            const confirmed = await showPopup(new ConfirmPopup(
+                t("pages.mods.popup.confirm.close_deploying.title"),
+                t("pages.mods.popup.confirm.close_deploying.question"),
+            ));
+            if (!confirmed) return;
+        }
+
+        // Nothing was ever loaded (init() hasn't finished, or errored out
+        // before loading profiles) -- there's nothing to save, and trying
+        // to would just fail on the undefined `currentProfile`.
+        if (profilesLoaded) {
+            const result = await saveProfilesBeforeClose();
+            if (!result.ok) {
+                const confirmed = await showPopup(new ConfirmPopup(
+                    t("pages.mods.popup.confirm.close_save_failed.title"),
+                    t("pages.mods.popup.confirm.close_save_failed.question", { error: result.error }),
+                ));
+                if (!confirmed) return;
+            }
+        }
+
+        await closeWindow();
     }
 
     async function onAddProfile() {
@@ -704,21 +820,15 @@
 
         const wait = new WaitPopup(t("pages.mods.popup.wait.deploy.message"));
         showPopup(wait);
+        deploying = true;
 
         try {
             await deploy(currentProfile.Configs);
             showPopup(new NotificationPopup("info", t("pages.mods.popup.notification.deploy_success.message")));
         } catch(ex: unknown) {
-            let message: string;
-            if (ex instanceof Error) {
-                message = ex.message;
-            } else if (typeof ex === "string") {
-                message = ex;
-            } else {
-                message = "Unknown error!";
-            }
-            showPopup(new ErrorPopup(t("pages.mods.popup.error.deploy.message"), message));
+            showPopup(new ErrorPopup(t("pages.mods.popup.error.deploy.message"), errorMessage(ex)));
         } finally {
+            deploying = false;
             wait.close();
         }
     }

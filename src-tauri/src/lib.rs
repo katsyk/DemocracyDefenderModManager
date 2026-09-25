@@ -115,7 +115,8 @@ pub fn run() {
             commands::settings::detect_game_path,
             commands::settings::auto_detect_and_save_game_path,
             commands::purge,
-            commands::deploy
+            commands::deploy,
+            commands::force_exit
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

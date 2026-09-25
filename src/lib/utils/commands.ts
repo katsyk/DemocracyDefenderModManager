@@ -177,3 +177,11 @@ export async function purge(): Promise<void> {
     log.debug("Invoking `purge`.");
     await invoke<void>("purge");
 }
+
+/** Last-resort way to close the app: tells the Rust side to exit the
+ * process directly, bypassing the window's own `destroy` IPC call. Only
+ * used as a fallback if that call fails. */
+export async function forceExit(): Promise<void> {
+    log.debug("Invoking `force_exit`.");
+    await invoke<void>("force_exit");
+}
