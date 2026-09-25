@@ -330,15 +330,50 @@ pub struct MoveProgress {
     pub total_files: u64,
 }
 
+/// Copies one file: `(from, to, progress)`, see [`MoveOps::copy_file`].
+pub type CopyFileFn<'a> = dyn Fn(&Path, &Path, &mut dyn FnMut(u64)) -> io::Result<u64> + 'a;
+
 /// The file operations [`execute`] uses, injectable so tests can make any
 /// step fail.
 pub struct MoveOps<'a> {
-    pub copy_file: &'a dyn Fn(&Path, &Path) -> io::Result<u64>,
+    /// Copy one file, calling the callback with the bytes copied so far
+    /// (a single mod file can be several GB); returns the bytes copied.
+    pub copy_file: &'a CopyFileFn<'a>,
     pub rename: &'a dyn Fn(&Path, &Path) -> io::Result<()>,
 }
 
-fn real_copy(from: &Path, to: &Path) -> io::Result<u64> {
-    std::fs::copy(from, to)
+/// Copy in 4 MB chunks with progress, keeping the source's permissions
+/// (the optional Nexus key/sign-in files are owner-only, and are created
+/// that way rather than chmod-ed afterwards), and flush the copy to disk
+/// before it can be switched to.
+fn real_copy(from: &Path, to: &Path, progress: &mut dyn FnMut(u64)) -> io::Result<u64> {
+    use std::io::{Read, Write};
+    let mut src = std::fs::File::open(from)?;
+    let perms = src.metadata()?.permissions();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(perms.mode() & 0o7777);
+    }
+    let mut dst = options.open(to)?;
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = src.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        dst.write_all(&buf[..n])?;
+        total += n as u64;
+        progress(total);
+    }
+    dst.sync_all()?;
+    drop(dst);
+    #[cfg(not(unix))]
+    std::fs::set_permissions(to, perms)?;
+    Ok(total)
 }
 
 fn real_rename(from: &Path, to: &Path) -> io::Result<()> {
@@ -452,10 +487,14 @@ fn copy_entries(
             std::fs::create_dir_all(&to).with_context(|| format!("couldn't create {}", to.display()))?;
             continue;
         }
-        let bytes = (ops.copy_file)(&from, &to)
-            .with_context(|| format!("couldn't copy {} to {}", from.display(), to.display()))?;
+        let before = p.done_bytes;
+        let bytes = (ops.copy_file)(&from, &to, &mut |n| {
+            p.done_bytes = before + n.min(entry.size);
+            progress(&p);
+        })
+        .with_context(|| format!("couldn't copy {} to {}", from.display(), to.display()))?;
         copied.insert(entry.rel.clone(), bytes);
-        p.done_bytes += entry.size;
+        p.done_bytes = before + entry.size;
         p.done_files += 1;
         progress(&p);
     }
@@ -539,7 +578,7 @@ fn copy_tree_plain(from: &Path, to: &Path, ops: &MoveOps) -> anyhow::Result<()> 
             copy_tree_plain(&child.path(), &to.join(child.file_name()), ops)?;
         }
     } else {
-        let bytes = (ops.copy_file)(from, to).with_context(|| format!("couldn't copy {}", from.display()))?;
+        let bytes = (ops.copy_file)(from, to, &mut |_| {}).with_context(|| format!("couldn't copy {}", from.display()))?;
         if bytes != meta.len() {
             bail!("{} wasn't copied completely", from.display());
         }

@@ -415,7 +415,7 @@ fn failure_mid_copy_leaves_old_data_and_no_partial_destination() {
     let p = plan(&input(&data, &dest, &root.path().join("default")), &no_free_space_info).unwrap();
 
     let calls = AtomicUsize::new(0);
-    let failing_copy = |a: &Path, b: &Path| {
+    let failing_copy = |a: &Path, b: &Path, _: &mut dyn FnMut(u64)| {
         if calls.fetch_add(1, Ordering::SeqCst) == 3 {
             Err(io::Error::other("disk yanked"))
         } else {
@@ -461,7 +461,7 @@ fn failure_while_putting_items_in_place_or_committing_rolls_back() {
             std::fs::rename(a, b)
         }
     };
-    let ops = MoveOps { copy_file: &|a, b| std::fs::copy(a, b), rename: &failing_rename };
+    let ops = MoveOps { copy_file: &|a, b, _| std::fs::copy(a, b), rename: &failing_rename };
     assert!(execute(&p, &ops, &mut no_commit, &mut |_| {}).is_err());
     assert_failed_cleanly(&data, &before, &p.target, false);
     assert_eq!(std::fs::read(dest.join("unrelated.txt")).unwrap(), b"keep me");
@@ -484,7 +484,7 @@ fn a_file_changing_during_the_copy_fails_verification() {
     std::fs::create_dir(&dest).unwrap();
     let p = plan(&input(&data, &dest, &root.path().join("default")), &no_free_space_info).unwrap();
     // Simulates a file growing between the scan and the copy.
-    let growing_copy = |a: &Path, b: &Path| {
+    let growing_copy = |a: &Path, b: &Path, _: &mut dyn FnMut(u64)| {
         if a.ends_with("profiles.json") {
             std::fs::write(b, format!("{PROFILES} "))?;
             Ok(PROFILES.len() as u64 + 1)
@@ -506,7 +506,7 @@ fn cross_device_rename_falls_back_to_copy() {
     let dest = root.path().join("dest");
     std::fs::create_dir(&dest).unwrap();
     let p = plan(&input(&data, &dest, &root.path().join("default")), &no_free_space_info).unwrap();
-    let ops = MoveOps { copy_file: &|a, b| std::fs::copy(a, b), rename: &|_, _| Err(exdev()) };
+    let ops = MoveOps { copy_file: &|a, b, _| std::fs::copy(a, b), rename: &|_, _| Err(exdev()) };
     execute(&p, &ops, &mut no_commit, &mut |_| {}).unwrap();
     assert_eq!(
         std::fs::read(dest.join("mods/ModA/Options/Red/0123456789abcdef.patch_0")).unwrap(),
@@ -577,6 +577,44 @@ fn moved_items_match_the_names_the_rest_of_ddmm_uses() {
     assert!(MOVED_ITEMS.contains(&crate::secrets::API_KEY_SLOT.file_name));
     assert!(MOVED_ITEMS.contains(&crate::secrets::OAUTH_SLOT.file_name));
     assert!(REGENERATED_ITEMS.contains(&crate::download::STAGING_DIRECTORY));
+}
+
+#[test]
+fn progress_moves_within_a_big_file_and_permissions_are_kept() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    make_data(&data);
+    // One file bigger than a copy chunk.
+    std::fs::write(data.join("mods/ModA/big.patch_0"), vec![1u8; 9 * 1024 * 1024]).unwrap();
+    std::fs::write(data.join("nexus-api-key"), b"secret").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(data.join("nexus-api-key"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let dest = root.path().join("dest");
+    std::fs::create_dir(&dest).unwrap();
+    let p = plan(&input(&data, &dest, &root.path().join("default")), &no_free_space_info).unwrap();
+
+    let mut seen = Vec::new();
+    execute(&p, &REAL_OPS, &mut no_commit, &mut |pr: &MoveProgress| {
+        if pr.phase == "copying" {
+            seen.push((pr.done_bytes, pr.done_files));
+        }
+    })
+    .unwrap();
+    // Some update happened in the middle of a file (bytes grew while the
+    // file count didn't).
+    assert!(seen.windows(2).any(|w| w[1].0 > w[0].0 && w[1].1 == w[0].1), "{seen:?}");
+    assert!(seen.windows(2).all(|w| w[1].0 >= w[0].0), "progress never goes backwards");
+    assert_eq!(seen.last().unwrap().0, p.total_bytes);
+    assert_eq!(std::fs::read(dest.join("nexus-api-key")).unwrap(), b"secret");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dest.join("nexus-api-key")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
 }
 
 #[test]
