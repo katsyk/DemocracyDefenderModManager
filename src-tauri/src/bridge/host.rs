@@ -9,9 +9,13 @@ use std::{
     time::Duration,
 };
 
+use futures::FutureExt;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    net::TcpStream,
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpStream,
+    },
 };
 
 use super::{
@@ -91,28 +95,44 @@ async fn try_connect(base_path: &Path) -> Option<TcpStream> {
     }
 }
 
-/// Reach the running app, starting it (detached, no window is opened by
-/// *this* process either way -- the launched instance runs normally) and
-/// polling for up to `poll_timeout` if it isn't already up.
-async fn ensure_app_running_and_connect(base_path: &Path, poll_timeout: Duration) -> Option<TcpStream> {
-    if let Some(stream) = try_connect(base_path).await {
-        return Some(stream);
-    }
+/// Don't launch DDMM again within this long of the last launch: a slow
+/// start (it can take longer than the poll timeout on a busy machine) must
+/// not turn every retry into yet another launch.
+const RELAUNCH_COOLDOWN: Duration = Duration::from_secs(60);
 
-    let exe = super::exe_path();
-    if let Err(e) = spawn_detached(&exe) {
-        log::error!("Failed to launch DDMM ({exe:?}): {e}");
-        return None;
-    }
+#[derive(Default)]
+struct Launcher {
+    last_launch: Option<tokio::time::Instant>,
+}
 
-    let deadline = tokio::time::Instant::now() + poll_timeout;
-    while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(400)).await;
+impl Launcher {
+    /// Reach the running app, starting it (detached, no window is opened by
+    /// *this* process either way -- the launched instance runs normally) and
+    /// polling for up to `poll_timeout` if it isn't already up.
+    async fn ensure_app_running_and_connect(&mut self, base_path: &Path, poll_timeout: Duration) -> Option<TcpStream> {
         if let Some(stream) = try_connect(base_path).await {
             return Some(stream);
         }
+
+        let recently_launched = self.last_launch.is_some_and(|t| t.elapsed() < RELAUNCH_COOLDOWN);
+        if !recently_launched {
+            let exe = super::exe_path();
+            if let Err(e) = spawn_detached(&exe) {
+                log::error!("Failed to launch DDMM ({exe:?}): {e}");
+                return None;
+            }
+            self.last_launch = Some(tokio::time::Instant::now());
+        }
+
+        let deadline = tokio::time::Instant::now() + poll_timeout;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            if let Some(stream) = try_connect(base_path).await {
+                return Some(stream);
+            }
+        }
+        None
     }
-    None
 }
 
 enum Frame {
@@ -175,36 +195,43 @@ pub fn poll_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(20))
 }
 
-/// Run the host-mode relay to completion (until stdin closes or the
-/// connection to the app is lost). Never opens a window, never touches
-/// Tauri.
+type AppConnection = (BufReader<OwnedReadHalf>, OwnedWriteHalf);
+
+fn split_connection(stream: TcpStream) -> AppConnection {
+    let (read, write) = stream.into_split();
+    (BufReader::new(read), write)
+}
+
+/// Whether the app side of `conn` is still open, checked without blocking
+/// or consuming anything: the app never sends unsolicited data, so a
+/// readable socket between requests can only mean EOF (DDMM exited) or an
+/// error. `fill_buf` is cancel-safe, so dropping it while pending is fine.
+fn connection_alive(conn: &mut AppConnection) -> bool {
+    match conn.0.fill_buf().now_or_never() {
+        None => true,
+        Some(Ok(buf)) => !buf.is_empty(),
+        Some(Err(_)) => false,
+    }
+}
+
+/// Run the host-mode relay to completion (until stdin closes). Never opens
+/// a window, never touches Tauri.
+///
+/// The browser keeps this process (and its port) alive for as long as the
+/// extension holds the connection, which can far outlive one DDMM session.
+/// So losing the app is not fatal here: the next request reconnects --
+/// starting DDMM again if it isn't running, exactly as on first contact --
+/// instead of failing with `APP_NOT_RUNNING` because the user closed DDMM
+/// at some point since the browser first launched the host.
 pub async fn run(origin: HostOrigin, base_path: PathBuf) {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
 
-    let Some(app_stream) = ensure_app_running_and_connect(&base_path, poll_timeout()).await else {
-        // Degraded mode: every request gets APP_NOT_RUNNING, forever, until
-        // the browser closes the pipe.
-        loop {
-            match read_frame(&mut stdin, MAX_MESSAGE_BYTES).await {
-                Ok(Frame::Eof) | Err(_) => break,
-                Ok(Frame::TooLarge) => {
-                    let reply = ErrorReply::new("", ErrorCode::BadRequest, "message too large").to_line();
-                    let _ = write_frame(&mut stdout, reply.as_bytes()).await;
-                }
-                Ok(Frame::Data(data)) => {
-                    let id = extract_id(&data);
-                    let reply =
-                        ErrorReply::new(id, ErrorCode::AppNotRunning, "Host couldn't start or reach DDMM").to_line();
-                    let _ = write_frame(&mut stdout, reply.as_bytes()).await;
-                }
-            }
-        }
-        return;
-    };
-
-    let (app_read, mut app_write) = app_stream.into_split();
-    let mut app_reader = BufReader::new(app_read);
+    let mut launcher = Launcher::default();
+    let mut conn = launcher
+        .ensure_app_running_and_connect(&base_path, poll_timeout())
+        .await
+        .map(split_connection);
 
     loop {
         let data = match read_frame(&mut stdin, MAX_MESSAGE_BYTES).await {
@@ -236,10 +263,26 @@ pub async fn run(origin: HostOrigin, base_path: PathBuf) {
         };
         line.push('\n');
 
+        // Only (re)connect *before* sending: a request is never resent
+        // after the app may already have received it.
+        if !conn.as_mut().is_some_and(connection_alive) {
+            conn = launcher
+                .ensure_app_running_and_connect(&base_path, poll_timeout())
+                .await
+                .map(split_connection);
+        }
+        let Some((app_reader, app_write)) = conn.as_mut() else {
+            let reply =
+                ErrorReply::new(extract_id(&data), ErrorCode::AppNotRunning, "Host couldn't start or reach DDMM").to_line();
+            let _ = write_frame(&mut stdout, reply.as_bytes()).await;
+            continue;
+        };
+
         if app_write.write_all(line.as_bytes()).await.is_err() {
             let reply = ErrorReply::new(extract_id(&data), ErrorCode::AppNotRunning, "lost connection to DDMM").to_line();
             let _ = write_frame(&mut stdout, reply.as_bytes()).await;
-            break;
+            conn = None;
+            continue;
         }
 
         let mut reply_line = String::new();
@@ -247,7 +290,7 @@ pub async fn run(origin: HostOrigin, base_path: PathBuf) {
             Ok(0) | Err(_) => {
                 let reply = ErrorReply::new(extract_id(&data), ErrorCode::AppNotRunning, "lost connection to DDMM").to_line();
                 let _ = write_frame(&mut stdout, reply.as_bytes()).await;
-                break;
+                conn = None;
             }
             Ok(_) => {
                 let _ = write_frame(&mut stdout, reply_line.trim().as_bytes()).await;

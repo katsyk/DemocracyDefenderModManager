@@ -245,6 +245,75 @@ fn app_not_running_replies_with_error_after_the_configured_timeout() {
     let _ = child.wait_timeout_or_kill();
 }
 
+/// A fake "app" that completes the handshake, answers exactly one request
+/// (echoing its id with `served_by`), then closes the connection -- i.e.
+/// DDMM exiting while the browser keeps the host alive.
+fn spawn_one_shot_app_server(token: &str, served_by: &'static str) -> (u16, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token = token.to_string();
+    let handle = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let handshake: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(handshake["hello"], token);
+        stream.write_all(b"{\"ok\":true}\n").unwrap();
+
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let req: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let reply = serde_json::json!({ "id": req["id"], "ok": true, "type": "status", "servedBy": served_by });
+        stream.write_all(format!("{reply}\n").as_bytes()).unwrap();
+        // Dropping `stream` (and the listener) here closes everything.
+    });
+    (port, handle)
+}
+
+#[test]
+#[cfg(unix)]
+fn reconnects_after_the_app_restarts_instead_of_failing() {
+    let (dir, exe) = portable_copy_of_binary();
+    let dummy = dummy_launch_target(dir.path());
+
+    let (port1, first) = spawn_one_shot_app_server("token-one", "first");
+    write_bridge_json(dir.path(), port1, "token-one");
+
+    let mut child = spawn_host(
+        &exe,
+        &[
+            ("APPIMAGE", dummy.to_str().unwrap()),
+            ("DDMM_BRIDGE_POLL_TIMEOUT_MS", "3000"),
+        ],
+    );
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    write_frame(&mut stdin, br#"{"id":"1","type":"status"}"#);
+    let reply = read_frame_json(&mut stdout);
+    assert_eq!(reply["id"], "1");
+    assert_eq!(reply["servedBy"], "first");
+    first.join().unwrap();
+
+    // "DDMM" exited and a new instance came up with a new port and token.
+    let (port2, second) = spawn_one_shot_app_server("token-two", "second");
+    write_bridge_json(dir.path(), port2, "token-two");
+    std::thread::sleep(Duration::from_millis(200));
+
+    write_frame(&mut stdin, br#"{"id":"2","type":"status"}"#);
+    let reply = read_frame_json(&mut stdout);
+    assert_eq!(reply["id"], "2");
+    assert_eq!(reply["ok"], true, "expected a reconnect, got {reply}");
+    assert_eq!(reply["servedBy"], "second");
+    second.join().unwrap();
+
+    drop(stdin);
+    let _ = child.wait_timeout_or_kill();
+}
+
 /// Small helper so the tests above don't hang forever if something went
 /// wrong: give the child a moment to exit on its own (stdin closed), then
 /// kill it.

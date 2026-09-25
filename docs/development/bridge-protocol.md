@@ -73,6 +73,11 @@ If `bridge.json` is missing, stale (connection refused), or its `pid` is gone, t
 detached process, so the GUI appears) and polls for a fresh `bridge.json` for up to 20 s before replying with the
 error `APP_NOT_RUNNING`.
 
+The browser can keep one host process alive for much longer than one DDMM session. The host therefore checks the
+connection before relaying each request and, if DDMM has exited since, reconnects the same way (reading a fresh
+`bridge.json`, starting DDMM if needed). It never resends a request the app may already have received; a connection
+lost mid-request gets `APP_NOT_RUNNING` for that request only.
+
 ## Messages
 
 Every request has a string `id` chosen by the extension. Every reply echoes the `id`. Unknown `type` → error
