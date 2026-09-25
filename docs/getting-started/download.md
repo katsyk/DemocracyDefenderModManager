@@ -32,7 +32,20 @@ All releases are published on the
 
 === "Linux"
 
-    Three options:
+    Four options, all for 64-bit x86. **[Installing on Linux](linux.md) has the full per-distro guide**, with the
+    exact commands, dependencies, and fixes for a blank window or AppImage/FUSE errors.
+
+    - **.rpm** (`DDMM-<version>-linux-x86_64.rpm`): for Fedora, Nobara and openSUSE.
+
+      ```sh
+      sudo dnf install ./DDMM-*-linux-x86_64.rpm
+      ```
+
+    - **.deb** (`DDMM-<version>-linux-amd64.deb`): for Debian, Ubuntu, Mint and other `apt`-based distributions.
+
+      ```sh
+      sudo apt install ./DDMM-*-linux-amd64.deb
+      ```
 
     - **AppImage** (`DDMM-<version>-linux-x86_64.AppImage`): works on most distributions without installing
       anything. Make it executable and run it:
@@ -42,18 +55,13 @@ All releases are published on the
       ./DDMM-*-linux-x86_64.AppImage
       ```
 
-    - **.deb** (`DDMM-<version>-linux-amd64.deb`): for Debian/Ubuntu-based distributions.
+    - **tar.gz** (`DDMM-<version>-linux-x64.tar.gz`): just the `ddmm` binary plus a quick-start text file, for
+      Arch/CachyOS or anyone who wants the plain binary. It needs your distribution's WebKitGTK 4.1 package
+      (Arch: `webkit2gtk-4.1`, Fedora: `webkit2gtk4.1`, Debian/Ubuntu: `libwebkit2gtk-4.1-0`, openSUSE:
+      `libwebkit2gtk-4_1-0`).
 
-      ```sh
-      sudo apt install ./DDMM-*-linux-amd64.deb
-      ```
-
-    - **tar.gz** (`DDMM-<version>-linux-x64.tar.gz`): just the `ddmm` binary plus a quick-start text file. Extract
-      it, make the binary executable, and run it.
-
-    DDMM is a [Tauri](https://tauri.app/) application and needs WebKitGTK at runtime. If it fails to launch,
-    install your distribution's WebKitGTK package (Debian/Ubuntu: `libwebkit2gtk-4.1-0`) — see
-    [Troubleshooting](../help/troubleshooting.md).
+    The `.rpm` and `.deb` pull in their dependencies automatically. If DDMM doesn't start, run it from a terminal
+    to see why; see [Installing on Linux](linux.md#seeing-errors-run-it-from-a-terminal).
 
 Check `SHA256SUMS.txt` on the release page if you want to verify your download.
 
@@ -61,7 +69,7 @@ Check `SHA256SUMS.txt` on the release page if you want to verify your download.
 
 Where DDMM keeps your mods, settings, profiles and logs depends on how you're running it:
 
-- **Installed** (the Windows installer, the `.deb`, or an AppImage run from a location that isn't writable) —
+- **Installed** (the Windows installer, the `.rpm`/`.deb`, or an AppImage run from a location that isn't writable) —
   DDMM uses your OS's normal per-user application data directory: `%APPDATA%\io.github.katsyk.ddmm` on Windows,
   `~/.local/share/io.github.katsyk.ddmm` on Linux.
 - **Portable** — DDMM keeps everything in the same folder as its own executable instead. This is used

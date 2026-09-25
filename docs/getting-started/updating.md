@@ -28,6 +28,15 @@ Updating DDMM doesn't touch your mods, settings, or profiles — those live in y
 
     Your data (in `~/.local/share/io.github.katsyk.ddmm`) is untouched.
 
+=== "Linux .rpm"
+
+    ```sh
+    sudo dnf install ./DDMM-<version>-linux-x86_64.rpm
+    ```
+
+    (openSUSE: `sudo zypper install --allow-unsigned-rpm ./DDMM-<version>-linux-x86_64.rpm`.) Your data (in
+    `~/.local/share/io.github.katsyk.ddmm`) is untouched.
+
 === "Linux AppImage / tar.gz"
 
     Download the new file and replace the old one. If you're running it portably (a `portable.txt` sits next to
