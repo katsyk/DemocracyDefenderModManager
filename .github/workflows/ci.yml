@@ -101,3 +101,42 @@ jobs:
 
       - name: Build (strict)
         run: mkdocs build --strict
+
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      # extension/ is a standalone package (its own lockfile), not a member
+      # of the root pnpm workspace -- see extension/README.md for why -- so
+      # every pnpm command here runs from inside it.
+      - name: Install extension dependencies
+        working-directory: extension
+        run: pnpm install --frozen-lockfile
+
+      - name: Extension unit tests
+        working-directory: extension
+        run: pnpm test
+
+      - name: Extension build
+        working-directory: extension
+        run: pnpm build
+
+      # No DDMM_MANIFEST_KEY(_FILE) secret is available in CI, so this
+      # builds without the pinned Chrome extension id -- see
+      # extension/scripts/build.mjs. That's expected and fine here; it only
+      # matters for a real release build.
+      - name: Extension lint (web-ext)
+        working-directory: extension
+        run: pnpm lint

@@ -198,8 +198,48 @@ jobs:
             DDMM-*-linux-x64.tar.gz
           if-no-files-found: error
 
+  build-extension:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      # extension/ is a standalone package (its own lockfile) -- see
+      # extension/README.md -- so this installs and builds from inside it.
+      - name: Install extension dependencies
+        working-directory: extension
+        run: pnpm install --frozen-lockfile
+
+      - name: Build extension
+        working-directory: extension
+        # DDMM_MANIFEST_KEY (base64 DER public key) is an optional repo
+        # secret. If it's not set, the Chrome zip still builds fine, just
+        # without the pinned inomhciahaeeefhgdkiaabdponcfdane extension id
+        # -- see extension/scripts/build.mjs.
+        env:
+          DDMM_MANIFEST_KEY: ${{ secrets.DDMM_MANIFEST_KEY }}
+        run: pnpm build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-build
+          path: extension/dist/ddmm-extension-*.zip
+          if-no-files-found: error
+
   release:
-    needs: [build-windows, build-linux]
+    needs: [build-windows, build-linux, build-extension]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
