@@ -373,7 +373,7 @@
                     "remove_button": {
                         "text": "Remove key"
                     },
-                    "privacy": "Nexus is only contacted when you click something (Check for Updates, Update all, or Save & verify), never by automatic checks. The key is only sent to api.nexusmods.com over HTTPS, and isn't written to settings.json or logs."
+                    "privacy": "Nexus is only contacted when you click Check for Updates or Save & verify, never by automatic checks. The key is only sent to api.nexusmods.com over HTTPS, and isn't written to settings.json or logs."
                 }
             }
         }
