@@ -484,8 +484,8 @@ fn generate_local_manifest(name: String) -> anyhow::Result<Manifest> {
 }
 
 async fn resolve_manifest(mut archive: Archive, name: String, manifest_file: PathBuf) -> TAResult<(Archive, Manifest)> {
-    if archive.has_path(MANIFEST_FILE)? {
-        let manifest_data = archive.read_path(MANIFEST_FILE)?;
+    if let Some(entry) = archive.find_root_file_ci(MANIFEST_FILE)? {
+        let manifest_data = archive.read_path(&entry)?;
         let manifest = serde_json::from_slice(&manifest_data).into_ta_result()?;
         Ok((archive, manifest))
     } else {
@@ -505,8 +505,8 @@ async fn resolve_manifest(mut archive: Archive, name: String, manifest_file: Pat
 /// local one and write it straight into the (already-created) destination
 /// mod directory.
 async fn resolve_manifest_for_dir(source_dir: &Path, name: String, manifest_file: PathBuf) -> TAResult<Manifest> {
-    let source_manifest = source_dir.join(MANIFEST_FILE);
-    if tokio::fs::try_exists(&source_manifest).await.into_ta_result()? {
+    let source_manifest = find_manifest_file(source_dir).await;
+    if let Some(source_manifest) = source_manifest {
         let manifest_data = tokio::fs::read(&source_manifest).await.into_ta_result()?;
         let manifest: Manifest = serde_json::from_slice(&manifest_data).into_ta_result()?;
         Ok(manifest)
@@ -523,7 +523,43 @@ async fn resolve_manifest_for_dir(source_dir: &Path, name: String, manifest_file
 }
 
 async fn extract_archive(mut archive: Archive, mod_dir: PathBuf) -> TAResult<()> {
-    tokio::task::spawn_blocking(move || archive.extract_to(mod_dir).into_ta_result()).await.into_ta_result()?
+    let dir = mod_dir.clone();
+    tokio::task::spawn_blocking(move || archive.extract_to(dir).into_ta_result()).await.into_ta_result()??;
+    normalize_manifest_file_name(&mod_dir).await.into_ta_result()
+}
+
+/// `dir`'s manifest file: `manifest.json`, or failing that a case variant
+/// such as `Manifest.json` (fine on Windows, invisible to an exact lookup
+/// on Linux's case-sensitive filesystems).
+async fn find_manifest_file(dir: &Path) -> Option<PathBuf> {
+    let exact = dir.join(MANIFEST_FILE);
+    if exact.is_file() {
+        return Some(exact);
+    }
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_name().to_string_lossy().eq_ignore_ascii_case(MANIFEST_FILE)
+            && entry.file_type().await.map(|t| t.is_file()).unwrap_or(false)
+        {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+/// After extracting/copying a mod, rename a `Manifest.json`-style case
+/// variant to exactly `manifest.json`, which is what loading the library
+/// looks for -- otherwise, on Linux, the mod would disappear on restart.
+async fn normalize_manifest_file_name(mod_dir: &Path) -> anyhow::Result<()> {
+    let exact = mod_dir.join(MANIFEST_FILE);
+    if exact.is_file() {
+        return Ok(());
+    }
+    if let Some(variant) = find_manifest_file(mod_dir).await {
+        log::info!("Renaming {:?} to {:?}", variant, exact);
+        crate::fs_util::move_path(&variant, &exact).await?;
+    }
+    Ok(())
 }
 
 /// Install a mod from a plain, already-unpacked folder: `folder` becomes the
@@ -589,6 +625,7 @@ async fn install_from_folder_inner(
     copy_dir_recursive(folder, mod_dir, &[sources::ORIGIN_SIDECAR_FILE])
         .await
         .into_ta_result()?;
+    normalize_manifest_file_name(mod_dir).await.into_ta_result()?;
 
     log::debug!("Detecting patch file layout...");
     let warning = apply_patch_layout(mod_dir, &mut r#mod.manifest).await.into_ta_result()?;
@@ -646,6 +683,9 @@ pub async fn add_paths(state: State<'_, AppState>, paths: Vec<PathBuf>) -> TARes
             }
         };
 
+        if let Err(e) = &result {
+            log::error!("Adding {:?} failed: {}", path, e);
+        }
         results.push(result.map(|(r#mod, warning)| InstalledMod { r#mod, warning }));
     }
 
@@ -659,9 +699,10 @@ pub async fn add_paths(state: State<'_, AppState>, paths: Vec<PathBuf>) -> TARes
 /// ever touching the author's own `manifest.json`.
 #[tauri::command]
 pub async fn add_mod_from_url(state: State<'_, AppState>, url: String) -> TAResult<InstalledMod> {
-    log::info!("Downloading mod from {}...", url);
+    log::info!("Downloading mod from {}...", download::redact_url(&url));
 
-    let downloaded = download::download_archive(&url).await.into_ta_result()?;
+    let staging_root = state.base_path.join(download::STAGING_DIRECTORY);
+    let downloaded = download::download_archive(&url, &staging_root).await.into_ta_result()?;
 
     let install_result = {
         let mut mods = state.mods.lock().await;
@@ -786,14 +827,14 @@ pub(crate) async fn install_update_from_archive(
         .join(MODS_DIRECTORY)
         .join(format!(".update-backup-{}", Uuid::new_v4()));
 
-    if let Err(e) = tokio::fs::rename(&old_dir, &backup_dir).await {
+    if let Err(e) = crate::fs_util::move_path(&old_dir, &backup_dir).await {
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
         return Err(e).into_ta_result();
     }
 
-    if let Err(e) = tokio::fs::rename(&staging_dir, &old_dir).await {
+    if let Err(e) = crate::fs_util::move_path(&staging_dir, &old_dir).await {
         // Roll back: put the old content back where it was.
-        let _ = tokio::fs::rename(&backup_dir, &old_dir).await;
+        let _ = crate::fs_util::move_path(&backup_dir, &old_dir).await;
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
         return Err(e).into_ta_result();
     }
