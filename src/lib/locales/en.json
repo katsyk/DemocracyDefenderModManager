@@ -356,7 +356,7 @@
                 "nexus": {
                     "title": "Nexus Mods (optional)",
                     "description": "Optional. Only used to check your Nexus Mods mods for updates. Sign in, or enter a personal API key, or do neither: everything else in DDMM works the same.",
-                    "where_to_get": "Enter it manually: on Nexus Mods, open your account's API Keys page (Get a key), copy the Personal API Key at the bottom, and paste it here. DDMM checks it with Nexus before saving. Remove it here any time.",
+                    "where_to_get": "On Nexus Mods, open your account's API Keys page (Get a key), copy the Personal API Key at the bottom, and paste it here. DDMM checks it with Nexus before saving. Remove it here any time.",
                     "placeholder": "Paste your personal Nexus Mods API key",
                     "save_button": {
                         "text": "Save & verify"
@@ -514,7 +514,7 @@
             "unskip_button": {
                 "text": "Stop skipping"
             },
-            "needs_key_hint": "Nexus Mods only answers update checks for people with an API key. Adding one in Settings is optional and only used for Nexus update checks.",
+            "needs_key_hint": "Nexus Mods only answers update checks for people who are signed in or have an API key. Signing in or adding a key in Settings is optional and only used for Nexus update checks.",
             "update_all_button": {
                 "text": "Update all ({count})"
             },
