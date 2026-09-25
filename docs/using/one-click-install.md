@@ -45,8 +45,12 @@ installation needs the AMO-signed version, which is coming soon.
 - **The button.** On a mod page, look for the **Install with DDMM** button (near the site's own
   download button where possible; otherwise a small yellow-and-black button in the bottom corner of
   the page). Click it and DDMM installs the mod. If the site needs you to click its own download
-  control first (a login-gated file, or Nexus's "Slow download"), the button tells you to -- DDMM
-  picks up the download automatically once it finishes.
+  control (a login-gated file, or Nexus's download buttons), the button changes straight away to
+  **Click Download on this page...** -- start the download and DDMM picks it up once it finishes.
+  It doesn't matter how the download is started or whether it opens in another tab: the next mod
+  file that site downloads within 10 minutes is the one installed. If the file already finished
+  downloading just before you clicked the button, DDMM picks that one up too, as long as the
+  download itself shows it's this page's mod.
 - **Right-click any download link**, on any site, and choose **Install with DDMM** to send that
   file straight to DDMM.
 - **Auto-capture.** Open the extension popup and turn on auto-capture for a site to have every
@@ -58,6 +62,7 @@ installation needs the AMO-signed version, which is coming soon.
 | Label | Meaning |
 | --- | --- |
 | Install with DDMM | Not installed yet -- click to install. With the hint "DDMM will start", DDMM is closed: clicking starts it and installs in one go |
+| Click Download on this page... | Waiting for the site's download -- start it on the page. Clicking again restarts the 10-minute wait |
 | Starting DDMM... | DDMM is starting up for the install you clicked |
 | Installing... | Working on it |
 | Installed (check mark) | Already installed -- click to reinstall |

@@ -284,11 +284,10 @@
       }
       if (!state.clickable) return;
 
-      state.startInstalling();
-      render();
-
       const directUrl = adapter.findDirectDownloadUrl ? adapter.findDirectDownloadUrl(document) : null;
       if (directUrl) {
+        state.startInstalling();
+        render();
         await send({
           type: 'ddmm:installDirect',
           url: directUrl,
@@ -300,13 +299,49 @@
         return;
       }
 
-      await send({ type: 'ddmm:armCapture', site: adapter.name, pageUrl: location.href, pageVersion });
-      widget.setHint('Click Download on this page. DDMM will take it from there.');
+      // No direct link: arm capture. The label changes right away -- the
+      // user can start the download at once, and however it's started
+      // (the site's own button or any tool of theirs), the next archive
+      // from this site is the one installed.
+      state.waitForDownload();
+      render();
+      clearTimeout(armExpiryTimer);
+      armExpiryTimer = setTimeout(releaseArm, DDMM_NS.capture.DEFAULT_ARM_WINDOW_MS);
+      const reply = await send({ type: 'ddmm:armCapture', site: adapter.name, pageUrl: location.href, pageVersion });
+      if (reply && reply.claimed && state.state === 'waiting') {
+        // The file had already finished downloading; it's installing now.
+        state.startInstalling();
+        render();
+      }
     });
+
+    /** @type {ReturnType<typeof setTimeout>|undefined} */
+    let armExpiryTimer;
+
+    /**
+     * The armed install never happened; release the button and re-check.
+     * Also driven from here (not only by the background's
+     * `ddmm:captureExpired`), because a restarted service worker has lost
+     * its timers.
+     */
+    function releaseArm() {
+      clearTimeout(armExpiryTimer);
+      if (state.state !== 'waiting') return;
+      state.reset();
+      render();
+      refresh();
+    }
 
     DDMM_NS.browserApi.runtime.onMessage.addListener((message) => {
       if (!message) return;
-      if (message.type === 'ddmm:installResult') {
+      if (message.type === 'ddmm:captureStarted' && message.site === adapter.name) {
+        clearTimeout(armExpiryTimer);
+        if (state.state === 'waiting') {
+          state.startInstalling();
+          render();
+        }
+      } else if (message.type === 'ddmm:installResult') {
+        clearTimeout(armExpiryTimer);
         if (message.reply && message.reply.ok) {
           state.setInstalled();
         } else {
@@ -315,10 +350,7 @@
         }
         render();
       } else if (message.type === 'ddmm:captureExpired' && message.site === adapter.name) {
-        // The armed install never happened; release the button and re-check.
-        state.reset();
-        render();
-        refresh();
+        releaseArm();
       }
     });
 

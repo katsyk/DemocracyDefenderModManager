@@ -17,6 +17,11 @@
  * DOM access, `findDirectDownloadUrl` would still deliberately return
  * `null` here -- the only difference real DOM access would make is a nicer
  * inline button placement instead of the floating corner button.
+ *
+ * Nothing here watches Nexus's download page or its countdown either: the
+ * button arms capture the moment it's clicked, and the background installs
+ * the next Nexus archive the browser downloads (see lib/capture.js),
+ * however the user starts that download.
  */
 /* global DDMM */
 (function initNexusMods() {
