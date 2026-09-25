@@ -56,11 +56,12 @@ Update checks never run unless you ask: click **Check for Updates** on the Mods 
 here. See [Updating mods](updating-mods.md).
 
 - **Check for mod updates when DDMM starts** — off by default. When on, DDMM checks shortly after it starts and
-  shows a notice plus the update badges if something can be updated. It never downloads or installs by itself.
+  shows a notice plus the update badges if something can be updated. It never downloads or installs by itself,
+  and it skips Nexus Mods mods (Nexus is only checked when you click **Check for Updates**).
 - **then every N hours while DDMM is open** — off by default, and only available with the option above. Accepts
   1 to 168 hours.
-- **Nexus Mods API key (optional)** — only used to check Nexus Mods mods for updates; never required. Paste your
-  personal key (Nexus Mods account → API Keys → Personal API Key; **Get a key** opens that page) and click
+- **Nexus Mods API key (optional)** — optional, and only used for Nexus update checks. Enter your
+  personal key manually (Nexus Mods account → API Keys → Personal API Key; **Get a key** opens that page) and click
   **Save & verify**: DDMM checks it with Nexus and shows the account name. It's stored in your system keychain
   (or, on Linux without one, an owner-only file in the data folder, which Settings points out), never in
   `settings.json`. **Remove key** deletes it. See

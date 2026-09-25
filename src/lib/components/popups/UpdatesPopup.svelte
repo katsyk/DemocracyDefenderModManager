@@ -8,7 +8,7 @@
 
     let { popup }: { popup: UpdatesPopup } = $props();
 
-    const ORDER: UpdateStateKind[] = ["UpdateAvailable", "NeedsApiKey", "Error", "Unknown", "Skipped", "UpToDate", "Unsupported"];
+    const ORDER: UpdateStateKind[] = ["UpdateAvailable", "NeedsApiKey", "NeedsManualCheck", "Error", "Unknown", "Skipped", "UpToDate", "Unsupported"];
 
     let entries = $derived(
         [...popup.report.Results].sort((a, b) => ORDER.indexOf(a.Status.Kind) - ORDER.indexOf(b.Status.Kind))
@@ -70,6 +70,8 @@
                         </button>
                     {:else if entry.Status.Kind === "NeedsApiKey"}
                         <span class="text-zinc-400 text-xs shrink-0 max-w-56 text-right">{t("popup.updates.state.needs_api_key")}</span>
+                    {:else if entry.Status.Kind === "NeedsManualCheck"}
+                        <span class="text-zinc-400 text-xs shrink-0 max-w-56 text-right">{t("popup.updates.state.needs_manual_check")}</span>
                     {:else if entry.Status.Kind === "Error"}
                         <span class="text-red-400 text-xs shrink-0 max-w-64 text-right truncate" title={entry.Status.message}>
                             {t("popup.updates.state.error", { message: entry.Status.message ?? "" })}
@@ -85,6 +87,9 @@
     {/if}
     {#if needsKey}
         <p class="text-xs text-zinc-400 max-w-lg">{t("popup.updates.needs_key_hint")}</p>
+    {/if}
+    {#if popup.report.NexusCheckedRecently}
+        <p class="text-xs text-zinc-400 max-w-lg">{t("popup.updates.nexus_checked_recently")}</p>
     {/if}
     <div class="flex flex-row gap-2 justify-between">
         <div class="flex flex-row gap-2">

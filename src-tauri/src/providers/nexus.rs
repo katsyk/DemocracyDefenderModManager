@@ -15,10 +15,16 @@
 //!   through the user's browser, where they click Nexus's own download
 //!   button themselves (DDMM never automates "Slow download").
 //!
-//! Request budget per check: one `mods/updated.json` call (only when a
-//! previous check's results are cached), then one `files.json` call per
-//! installed Nexus mod that the updated list says changed, or that has no
-//! fresh cached result. Everything else is served from `update-cache.json`.
+//! Request budget per check follows Mod Organizer 2's `checkAllForUpdate`
+//! (see [`plan`]): mods checked in the last 5 minutes are skipped; mods
+//! never checked (or not within a month) get one `files.json` request
+//! each; the rest share one `updated.json?period=1d|1w|1m` request (the
+//! smallest window covering the oldest check), and only the mods it lists
+//! as changed get a `files.json` request. Last-check times and results
+//! live in `update-cache.json` in the data folder.
+//!
+//! Only user-initiated checks call the API at all (Nexus's API Acceptable
+//! Use Policy); the opt-in automatic checks skip Nexus mods.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -116,28 +122,6 @@ pub struct UpdatedEntry {
     pub latest_mod_activity: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Period {
-    Week,
-    Month,
-}
-
-impl Period {
-    pub fn as_param(self) -> &'static str {
-        match self {
-            Period::Week => "1w",
-            Period::Month => "1m",
-        }
-    }
-
-    pub fn seconds(self) -> i64 {
-        match self {
-            Period::Week => 7 * 86_400,
-            Period::Month => 28 * 86_400, // conservative: shortest month
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ModFiles {
     #[serde(default)]
@@ -212,8 +196,9 @@ impl NexusClient {
         Self::build(key, API_BASE, true)
     }
 
+    /// Test-only: point at a local mock (plain http allowed).
     #[cfg(test)]
-    fn with_base(key: NexusApiKey, base: &str) -> anyhow::Result<Self> {
+    pub(crate) fn with_base(key: NexusApiKey, base: &str) -> anyhow::Result<Self> {
         Self::build(key, base, false)
     }
 
@@ -487,42 +472,99 @@ pub async fn save_cache(base_path: &Path, cache: &Cache) {
     }
 }
 
-/// Which "updated mods" window (if any) to ask Nexus for, given how old the
-/// cached results for the installed mods are. `None` when nothing usable
-/// is cached -- then every mod needs a files call anyway, and the updated
-/// list would be a wasted request.
-pub fn choose_period(cached_ages: &[i64]) -> Option<Period> {
-    let oldest = cached_ages.iter().copied().max()?;
-    if oldest <= Period::Week.seconds() - 3600 {
-        Some(Period::Week)
-    } else {
-        Some(Period::Month)
+/// A mod checked less than this long ago isn't checked again (like Mod
+/// Organizer 2's 5-minute limit), so repeated clicks don't spend requests.
+pub const RECHECK_AFTER_SECS: i64 = 5 * 60;
+/// Mods not checked within this long (or never) get their own files
+/// request: the "updated mods" list only covers the last month. 28 days
+/// rather than 30 so the `1m` window always covers the gap.
+pub const PER_MOD_AFTER_SECS: i64 = 28 * 86_400;
+/// Slack when comparing a mod's last check with Nexus's
+/// `latest_file_update` (clock differences, as in MO2).
+pub const UPDATED_SLACK_SECS: i64 = 3600;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Period {
+    Day,
+    Week,
+    Month,
+}
+
+impl Period {
+    pub fn as_param(self) -> &'static str {
+        match self {
+            Period::Day => "1d",
+            Period::Week => "1w",
+            Period::Month => "1m",
+        }
     }
 }
 
-/// Whether a cached decision can be reused: it's for the same installed
-/// file, it's inside the updated-list window, and the list doesn't show a
-/// file change for this mod since it was made.
-pub fn can_reuse(
-    cached: &CachedDecision,
-    installed_key: &str,
-    mod_id: u64,
-    updated: &[UpdatedEntry],
-    period: Period,
-    now: i64,
-) -> bool {
-    if cached.installed_key != installed_key {
-        return false;
+/// One installed Nexus mod as the planner sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanInput {
+    pub mod_id: u64,
+    /// When DDMM last checked this mod *for the file that's installed now*
+    /// (`None`: never, or a different file was installed since).
+    pub last_checked: Option<i64>,
+}
+
+/// What a check will ask Nexus, following Mod Organizer 2's
+/// `checkAllForUpdate`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    /// Checked within [`RECHECK_AFTER_SECS`]: reuse the cached result, no
+    /// request.
+    pub recent: Vec<u64>,
+    /// Never checked, or not within [`PER_MOD_AFTER_SECS`]: one
+    /// `files.json` request each.
+    pub per_mod: Vec<u64>,
+    /// Everything else: covered by one `updated.json?period=` request with
+    /// the smallest window reaching back to the oldest of their checks; only
+    /// the mods it lists as changed since their check get a files request.
+    pub via_updated: Vec<u64>,
+    pub period: Option<Period>,
+}
+
+impl Plan {
+    /// Every mod was checked moments ago: nothing to ask Nexus.
+    pub fn all_recent(&self) -> bool {
+        self.per_mod.is_empty() && self.via_updated.is_empty()
     }
-    // Small slack for clock differences between this PC and Nexus.
-    let slack = 300;
-    if cached.checked_at < now - period.seconds() + slack {
-        return false;
+}
+
+pub fn plan(mods: &[PlanInput], now: i64) -> Plan {
+    let mut out = Plan { recent: vec![], per_mod: vec![], via_updated: vec![], period: None };
+    let mut earliest: Option<i64> = None;
+    for m in mods {
+        match m.last_checked {
+            Some(t) if now - t < RECHECK_AFTER_SECS => out.recent.push(m.mod_id),
+            Some(t) if now - t < PER_MOD_AFTER_SECS => {
+                out.via_updated.push(m.mod_id);
+                earliest = Some(earliest.map_or(t, |e: i64| e.min(t)));
+            }
+            _ => out.per_mod.push(m.mod_id),
+        }
     }
-    match updated.iter().find(|u| u.mod_id == mod_id) {
-        Some(u) => u.latest_file_update < cached.checked_at - slack,
-        None => true,
-    }
+    out.period = earliest.map(|t| {
+        let age = now - t;
+        if age < 86_400 - UPDATED_SLACK_SECS {
+            Period::Day
+        } else if age < 7 * 86_400 - UPDATED_SLACK_SECS {
+            Period::Week
+        } else {
+            Period::Month
+        }
+    });
+    out
+}
+
+/// Whether the "updated mods" list says `mod_id` got a new file since it
+/// was last checked (only those get a files request).
+pub fn changed_since(updated: &[UpdatedEntry], mod_id: u64, last_checked: i64) -> bool {
+    updated
+        .iter()
+        .any(|u| u.mod_id == mod_id && u.latest_file_update > last_checked - UPDATED_SLACK_SECS)
 }
 
 #[cfg(test)]
@@ -637,33 +679,66 @@ mod tests {
         assert!(!RateLimit::default().is_low());
     }
 
+    const NOW: i64 = 2_000_000_000;
+    const H: i64 = 3600;
+    const D: i64 = 86_400;
+
+    fn input(mod_id: u64, age: Option<i64>) -> PlanInput {
+        PlanInput { mod_id, last_checked: age.map(|a| NOW - a) }
+    }
+
     #[test]
-    fn period_choice_and_cache_reuse() {
-        assert_eq!(choose_period(&[]), None);
-        assert_eq!(choose_period(&[3600, 86_400]), Some(Period::Week));
-        assert_eq!(choose_period(&[20 * 86_400]), Some(Period::Month));
+    fn plan_uses_the_smallest_window_covering_the_oldest_check() {
+        let p = plan(&[input(1, Some(2 * H)), input(2, Some(10 * H))], NOW);
+        assert_eq!(p.period, Some(Period::Day));
+        assert_eq!(p.via_updated, vec![1, 2]);
+        assert!(p.per_mod.is_empty() && p.recent.is_empty());
 
-        let now = 2_000_000_000;
-        let cached = CachedDecision {
-            checked_at: now - 86_400,
-            installed_key: "k".into(),
-            decision: Decision {
-                state: DecisionState::UpToDate,
-                installed_version: None,
-                latest_version: None,
-                latest_file_name: None,
-            },
-        };
-        let quiet: Vec<UpdatedEntry> = vec![];
-        let changed = vec![UpdatedEntry { mod_id: 7, latest_file_update: now - 60, latest_mod_activity: now - 60 }];
-        let old_change = vec![UpdatedEntry { mod_id: 7, latest_file_update: now - 3 * 86_400, latest_mod_activity: 0 }];
+        let p = plan(&[input(1, Some(2 * H)), input(2, Some(3 * D))], NOW);
+        assert_eq!(p.period, Some(Period::Week));
 
-        assert!(can_reuse(&cached, "k", 7, &quiet, Period::Week, now));
-        assert!(!can_reuse(&cached, "k", 7, &changed, Period::Week, now), "a newer file means re-check");
-        assert!(can_reuse(&cached, "k", 7, &old_change, Period::Week, now), "a change before our check is already reflected");
-        assert!(!can_reuse(&cached, "other", 7, &quiet, Period::Week, now), "different installed file");
-        let stale = CachedDecision { checked_at: now - 10 * 86_400, ..cached.clone() };
-        assert!(!can_reuse(&stale, "k", 7, &quiet, Period::Week, now), "outside the window");
+        let p = plan(&[input(1, Some(2 * H)), input(2, Some(10 * D))], NOW);
+        assert_eq!(p.period, Some(Period::Month));
+
+        // Right at a boundary, step up (the window must reach past the check).
+        assert_eq!(plan(&[input(1, Some(D - 30 * 60))], NOW).period, Some(Period::Week));
+        assert_eq!(plan(&[input(1, Some(7 * D - 30 * 60))], NOW).period, Some(Period::Month));
+    }
+
+    #[test]
+    fn plan_checks_old_and_never_checked_mods_individually() {
+        let p = plan(&[input(1, None), input(2, Some(40 * D)), input(3, Some(2 * D))], NOW);
+        assert_eq!(p.per_mod, vec![1, 2]);
+        assert_eq!(p.via_updated, vec![3]);
+        assert_eq!(p.period, Some(Period::Week));
+
+        // Only old/never-checked mods: no updated list at all.
+        let p = plan(&[input(1, None), input(2, Some(29 * D))], NOW);
+        assert_eq!(p.per_mod, vec![1, 2]);
+        assert_eq!(p.period, None);
+    }
+
+    #[test]
+    fn plan_skips_mods_checked_moments_ago() {
+        let p = plan(&[input(1, Some(60)), input(2, Some(4 * 60))], NOW);
+        assert_eq!(p.recent, vec![1, 2]);
+        assert!(p.all_recent());
+        assert_eq!(p.period, None);
+
+        let p = plan(&[input(1, Some(60)), input(2, Some(6 * 60))], NOW);
+        assert_eq!(p.recent, vec![1]);
+        assert_eq!(p.via_updated, vec![2]);
+        assert!(!p.all_recent());
+    }
+
+    #[test]
+    fn only_mods_the_updated_list_shows_as_changed_need_files() {
+        let list: Vec<UpdatedEntry> = serde_json::from_str(UPDATED).unwrap();
+        // Fixture: 1234 got a file at 1718200500, 88 at 1718150000.
+        assert!(changed_since(&list, 1234, 1718100000), "new file after our check");
+        assert!(!changed_since(&list, 1234, 1718300000), "our check is newer than its last file");
+        assert!(changed_since(&list, 1234, 1718200500 + 1800), "within the 1 h slack");
+        assert!(!changed_since(&list, 5678, 0), "not in the list at all");
     }
 
     /// Minimal one-shot HTTP server: answers every request with `body` and
@@ -703,6 +778,15 @@ mod tests {
         let request = server.await.unwrap().join("\n").to_ascii_lowercase();
         assert!(request.starts_with("get /v1/users/validate.json "), "{request}");
         assert!(request.contains("apikey: headertestkey"));
+        // Nothing blank, nothing borrowed from another application: our own
+        // name, the real app version, and our own User-Agent.
+        assert!(!APP_NAME.trim().is_empty() && !env!("CARGO_PKG_VERSION").trim().is_empty());
+        assert!(request.contains("user-agent: democracydefendermodmanager/"));
+        for line in request.lines() {
+            if let Some((name, value)) = line.split_once(':') {
+                assert!(!value.trim().is_empty(), "blank header {name}");
+            }
+        }
         assert!(request.contains("application-name: democracy defender mod manager"));
         assert!(request.contains(&format!("application-version: {}", env!("CARGO_PKG_VERSION"))));
     }

@@ -94,6 +94,11 @@ pub enum UpdateState {
     Unknown,
     /// A Nexus Mods source, and no (optional) Nexus API key is set.
     NeedsApiKey,
+    /// A Nexus Mods source during an automatic check. Nexus's API
+    /// Acceptable Use Policy only allows using a user's key for actions the
+    /// user started, so automatic checks never call the Nexus API; the user
+    /// checks Nexus mods by clicking "Check for Updates".
+    NeedsManualCheck,
     /// Kept for compatibility; no longer produced.
     Unsupported,
     Error { message: String },
@@ -114,6 +119,19 @@ pub enum CheckTrigger {
     Scheduled,
 }
 
+impl CheckTrigger {
+    /// Whether the user started this check themselves. Only such checks
+    /// may use their Nexus API key (Nexus API Acceptable Use Policy).
+    pub fn is_user_initiated(self) -> bool {
+        matches!(self, CheckTrigger::Manual)
+    }
+}
+
+/// Makes the Nexus API client for a check. Production always uses
+/// [`NexusClient::new`] (fixed `https://api.nexusmods.com` base); tests
+/// substitute a local mock to count requests.
+type NexusClientFactory = dyn Fn(secrets::NexusApiKey) -> anyhow::Result<NexusClient> + Send + Sync;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct UpdateCheckReport {
@@ -123,6 +141,10 @@ pub struct UpdateCheckReport {
     pub results: Vec<UpdateStatusEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nexus_rate_limit: Option<nexus::RateLimit>,
+    /// All Nexus mods had been checked moments ago, so Nexus wasn't asked
+    /// again (to save the user's API requests); results are the last ones.
+    #[serde(default)]
+    pub nexus_checked_recently: bool,
 }
 
 impl UpdateCheckReport {
@@ -383,89 +405,142 @@ fn nexus_entry(t: &Target, d: &nexus::Decision) -> UpdateStatusEntry {
     e
 }
 
-/// Check every installed Nexus mod with as few API calls as possible (see
-/// `providers::nexus` for the budget). Returns entries in `targets` order.
-async fn check_nexus(
-    base_path: &Path,
-    targets: &[&Target],
-) -> (Vec<UpdateStatusEntry>, Option<nexus::RateLimit>) {
+/// The Nexus part of a user-initiated check.
+struct NexusOutcome {
+    entries: Vec<UpdateStatusEntry>,
+    rate: Option<nexus::RateLimit>,
+    /// Every Nexus mod had been checked moments ago, so nothing was asked.
+    all_recent: bool,
+}
+
+/// Check every installed Nexus mod the way Mod Organizer 2 does, to spend
+/// as few of the user's API requests as possible (see [`nexus::plan`]):
+/// mods checked in the last few minutes are skipped; mods never checked, or
+/// not within a month, get one `files.json` request each; the rest are
+/// covered by a single `updated.json?period=1d|1w|1m` request, and only the
+/// mods it lists as changed since their last check get a `files.json`
+/// request. Returns entries in `targets` order.
+async fn check_nexus(base_path: &Path, targets: &[&Target], make_client: &NexusClientFactory) -> NexusOutcome {
     let Some((key, _)) = secrets::load(base_path).await else {
-        return (targets.iter().map(|t| entry(t, UpdateState::NeedsApiKey, None)).collect(), None);
+        return NexusOutcome {
+            entries: targets.iter().map(|t| entry(t, UpdateState::NeedsApiKey, None)).collect(),
+            rate: None,
+            all_recent: false,
+        };
     };
-    let mut client = match NexusClient::new(key) {
+    let mut client = match make_client(key) {
         Ok(c) => c,
-        Err(e) => return (targets.iter().map(|t| error_entry(t, &e)).collect(), None),
+        Err(e) => {
+            return NexusOutcome { entries: targets.iter().map(|t| error_entry(t, &e)).collect(), rate: None, all_recent: false }
+        }
     };
 
     let now = now_unix();
     let mut cache = nexus::load_cache(base_path).await;
     let mut pacer = Pacer::default();
 
-    // Ask for the "recently updated" list only when there are cached
-    // results it could let us reuse.
-    let cached_ages: Vec<i64> = targets
+    // What we know about each target: its id, installed file, and when that
+    // file was last checked (a cache entry for a different installed file
+    // doesn't count).
+    let info: Vec<Option<(u64, nexus::Installed, String, Option<i64>)>> = targets
         .iter()
-        .filter_map(|t| {
-            let c = cache.nexus.get(&t.id)?;
-            (c.installed_key == nexus_installed(t).cache_key()).then_some(now - c.checked_at)
+        .map(|t| {
+            let mod_id = t.id.parse::<u64>().ok()?;
+            let installed = nexus_installed(t);
+            let key = installed.cache_key();
+            let last = cache.nexus.get(&t.id).filter(|c| c.installed_key == key).map(|c| c.checked_at);
+            Some((mod_id, installed, key, last))
         })
         .collect();
-    let updated = match nexus::choose_period(&cached_ages) {
-        Some(period) => {
-            pacer.wait(nexus::API_HOST, nexus::REQUEST_GAP).await;
-            match client.updated(period).await {
-                Ok(list) => Some((period, list)),
-                Err(NexusError::InvalidKey) => {
-                    return (
-                        targets.iter().map(|t| error_entry(t, NexusError::InvalidKey)).collect(),
-                        Some(client.rate),
-                    )
-                }
-                Err(e) => {
-                    log::warn!("Nexus updated-mods list unavailable ({e}); checking each mod directly");
-                    None
+
+    let inputs: Vec<nexus::PlanInput> = info
+        .iter()
+        .flatten()
+        .map(|(mod_id, _, _, last)| nexus::PlanInput { mod_id: *mod_id, last_checked: *last })
+        .collect();
+    let plan = nexus::plan(&inputs, now);
+    let mut need_files: std::collections::HashSet<u64> = plan.per_mod.iter().copied().collect();
+    let mut list_error: Option<String> = None;
+
+    if let Some(period) = plan.period {
+        pacer.wait(nexus::API_HOST, nexus::REQUEST_GAP).await;
+        match client.updated(period).await {
+            Ok(list) => {
+                for (mod_id, _, key, last) in info.iter().flatten() {
+                    if !plan.via_updated.contains(mod_id) {
+                        continue;
+                    }
+                    let last = last.unwrap_or(0);
+                    if nexus::changed_since(&list, *mod_id, last) {
+                        need_files.insert(*mod_id);
+                    } else if let Some(c) = cache.nexus.get_mut(&mod_id.to_string()) {
+                        // Nothing new since the last check: that result
+                        // still holds, as of now.
+                        if &c.installed_key == key {
+                            c.checked_at = now;
+                        }
+                    }
                 }
             }
+            Err(e @ NexusError::InvalidKey) => {
+                return NexusOutcome {
+                    entries: targets.iter().map(|t| error_entry(t, &e)).collect(),
+                    rate: Some(client.rate),
+                    all_recent: false,
+                }
+            }
+            Err(e) => {
+                log::warn!("Nexus updated-mods list unavailable: {e}");
+                list_error = Some(e.to_string());
+            }
         }
-        None => None,
-    };
+    }
 
     let mut results = Vec::with_capacity(targets.len());
+    let mut fetched: std::collections::HashMap<u64, Result<nexus::ModFiles, NexusError>> = Default::default();
     let mut stop: Option<NexusError> = None;
     let mut calls = 0usize;
-    for t in targets {
-        let installed = nexus_installed(t);
-        let key = installed.cache_key();
-        let Ok(mod_id) = t.id.parse::<u64>() else {
+    for (t, i) in targets.iter().zip(&info) {
+        let Some((mod_id, installed, key, _)) = i else {
             results.push(entry(t, UpdateState::Unknown, None));
             continue;
         };
 
-        if let (Some(cached), Some((period, list))) = (cache.nexus.get(&t.id), &updated) {
-            if nexus::can_reuse(cached, &key, mod_id, list, *period, now) {
-                results.push(nexus_entry(t, &cached.decision));
-                continue;
+        if !need_files.contains(mod_id) {
+            if plan.via_updated.contains(mod_id) {
+                if let Some(message) = &list_error {
+                    results.push(error_entry(t, message));
+                    continue;
+                }
             }
+            match cache.nexus.get(&t.id).filter(|c| &c.installed_key == key) {
+                Some(cached) => results.push(nexus_entry(t, &cached.decision)),
+                None => results.push(entry(t, UpdateState::Unknown, None)),
+            }
+            continue;
         }
+
         if let Some(e) = &stop {
             results.push(error_entry(t, e));
             continue;
         }
-
-        pacer.wait(nexus::API_HOST, nexus::REQUEST_GAP).await;
-        calls += 1;
-        match client.files(mod_id).await {
+        if !fetched.contains_key(mod_id) {
+            pacer.wait(nexus::API_HOST, nexus::REQUEST_GAP).await;
+            calls += 1;
+            fetched.insert(*mod_id, client.files(*mod_id).await);
+        }
+        match &fetched[mod_id] {
             Ok(files) => {
-                let decision = nexus::decide(&installed, &files);
+                let decision = nexus::decide(installed, files);
                 cache.nexus.insert(
                     t.id.clone(),
-                    nexus::CachedDecision { checked_at: now, installed_key: key, decision: decision.clone() },
+                    nexus::CachedDecision { checked_at: now, installed_key: key.clone(), decision: decision.clone() },
                 );
                 results.push(nexus_entry(t, &decision));
             }
             Err(e @ (NexusError::InvalidKey | NexusError::RateLimited)) => {
-                results.push(error_entry(t, &e));
-                stop = Some(e);
+                results.push(error_entry(t, e));
+                stop = Some(e.clone());
             }
             Err(e) => results.push(error_entry(t, e)),
         }
@@ -473,18 +548,29 @@ async fn check_nexus(
 
     nexus::save_cache(base_path, &cache).await;
     log::info!(
-        "Nexus update check: {} mod(s), {} files request(s), updated-list {}; quota left: hourly {:?}, daily {:?}",
+        "Nexus update check: {} mod(s): {} checked recently (skipped), {} individually, {} via updated list ({}); {} files request(s); quota left: hourly {:?}, daily {:?}",
         targets.len(),
+        plan.recent.len(),
+        plan.per_mod.len(),
+        plan.via_updated.len(),
+        plan.period.map(|p| p.as_param()).unwrap_or("not needed"),
         calls,
-        if updated.is_some() { "used" } else { "not needed" },
         client.rate.hourly_remaining,
         client.rate.daily_remaining
     );
-    (results, Some(client.rate))
+    NexusOutcome { entries: results, rate: Some(client.rate), all_recent: plan.all_recent() && !inputs.is_empty() }
 }
 
 /// Run one full check. Serialized: a second request waits for the first.
 pub async fn run_check(state: &AppState, trigger: CheckTrigger) -> anyhow::Result<UpdateCheckReport> {
+    run_check_with(state, trigger, &NexusClient::new).await
+}
+
+async fn run_check_with(
+    state: &AppState,
+    trigger: CheckTrigger,
+    make_nexus_client: &NexusClientFactory,
+) -> anyhow::Result<UpdateCheckReport> {
     let _guard = state.update_check_lock.lock().await;
     log::info!("Checking for mod updates ({trigger:?})...");
 
@@ -507,13 +593,35 @@ pub async fn run_check(state: &AppState, trigger: CheckTrigger) -> anyhow::Resul
 
     let nexus_targets: Vec<(usize, &Target)> = targets.iter().enumerate().filter(|(_, t)| t.provider == "nexus").collect();
     let mut nexus_rate = None;
-    if !nexus_targets.is_empty() {
+    let mut nexus_all_recent = false;
+    if !nexus_targets.is_empty() && trigger.is_user_initiated() {
         let refs: Vec<&Target> = nexus_targets.iter().map(|(_, t)| *t).collect();
-        let (entries, rate) = check_nexus(&state.base_path, &refs).await;
-        nexus_rate = rate;
-        for ((i, _), e) in nexus_targets.iter().zip(entries) {
+        let outcome = check_nexus(&state.base_path, &refs, make_nexus_client).await;
+        nexus_rate = outcome.rate;
+        nexus_all_recent = outcome.all_recent;
+        for ((i, _), e) in nexus_targets.iter().zip(outcome.entries) {
             by_index[*i] = Some(e);
         }
+    } else if !nexus_targets.is_empty() {
+        // Automatic check: no Nexus API calls at all (the user didn't start
+        // it). Keep what a check the user ran earlier this session found;
+        // otherwise say how to check. Reading whether a key exists is local.
+        let has_key = secrets::load(&state.base_path).await.is_some();
+        let previous = state.last_update_report.lock().await.clone();
+        for (i, t) in &nexus_targets {
+            let carried = previous.as_ref().and_then(|r| {
+                r.results
+                    .iter()
+                    .find(|e| e.guid == t.guid && e.provider == "nexus" && e.status != UpdateState::NeedsManualCheck)
+                    .cloned()
+            });
+            by_index[*i] = Some(match carried {
+                Some(e) if has_key => e,
+                _ if has_key => entry(t, UpdateState::NeedsManualCheck, None),
+                _ => entry(t, UpdateState::NeedsApiKey, None),
+            });
+        }
+        log::info!("Automatic check: skipped {} Nexus mod(s) (Nexus is only checked when you click Check for Updates).", nexus_targets.len());
     }
 
     let mut results = Vec::with_capacity(targets.len());
@@ -536,7 +644,13 @@ pub async fn run_check(state: &AppState, trigger: CheckTrigger) -> anyhow::Resul
         results.push(e);
     }
 
-    let report = UpdateCheckReport { trigger, checked_at: now_unix(), results, nexus_rate_limit: nexus_rate };
+    let report = UpdateCheckReport {
+        trigger,
+        checked_at: now_unix(),
+        results,
+        nexus_rate_limit: nexus_rate,
+        nexus_checked_recently: nexus_all_recent,
+    };
     log::info!(
         "Update check done: {} source(s) checked, {} mod(s) with updates.",
         report.results.len(),
@@ -967,9 +1081,9 @@ mod tests {
         // No fallback file in this data dir. (On a dev machine with a real
         // keychain entry this would find it -- so only assert when none.)
         if secrets::load(dir.path()).await.is_none() {
-            let (entries, rate) = check_nexus(dir.path(), &[&t]).await;
-            assert_eq!(entries[0].status, UpdateState::NeedsApiKey);
-            assert!(rate.is_none());
+            let outcome = check_nexus(dir.path(), &[&t], &NexusClient::new).await;
+            assert_eq!(outcome.entries[0].status, UpdateState::NeedsApiKey);
+            assert!(outcome.rate.is_none());
         }
     }
 
@@ -984,6 +1098,182 @@ mod tests {
         let (s, files) = enrich_install_source(&source, Some(Path::new("/dl/Other-99-2-0-1718100000.zip"))).await;
         assert_eq!(s.version, None);
         assert!(files.is_empty());
+    }
+
+    /// A mock Nexus API recording every request path. `updated.json`
+    /// answers with `updated_body`; any `files.json` with the recorded
+    /// files fixture.
+    async fn mock_nexus(updated_body: String) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            let files = include_str!("../../tests/fixtures/updates/nexus_files.json");
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                let body = if path.contains("/updated.json") { updated_body.clone() } else { files.to_string() };
+                log.lock().unwrap().push(path);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nx-rl-hourly-remaining: 499\r\nx-rl-daily-remaining: 19999\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}/v1/"), seen)
+    }
+
+    async fn add_nexus_mod(base: &Path, mod_id: &str) -> Uuid {
+        let mod_dir = base.join("mods").join(format!("nexus-{mod_id}"));
+        tokio::fs::create_dir_all(&mod_dir).await.unwrap();
+        let guid = Uuid::new_v4();
+        tokio::fs::write(
+            mod_dir.join("manifest.json"),
+            format!(r#"{{"Guid":"{guid}","Name":"Nexus {mod_id}","Description":"","IconPath":null,"Options":null}}"#),
+        )
+        .await
+        .unwrap();
+        sources::write_origin_sidecar_with_files(
+            &mod_dir,
+            vec![Source { provider: "nexus".into(), id: Some(mod_id.into()), url: None, version: Some("1.0".into()) }],
+            vec![InstalledFile { provider: "nexus".into(), uploaded_at: Some(1718000000), ..Default::default() }],
+        )
+        .await
+        .unwrap();
+        guid
+    }
+
+    /// Pretend every Nexus mod in `state` was last checked `age` seconds
+    /// ago (as a real earlier check would have recorded).
+    async fn backdate_nexus_checks(state: &AppState, age: i64) {
+        let mut cache = nexus::load_cache(&state.base_path).await;
+        for c in cache.nexus.values_mut() {
+            c.checked_at = now_unix() - age;
+        }
+        nexus::save_cache(&state.base_path, &cache).await;
+    }
+
+    fn files_requests(seen: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+        seen.lock().unwrap().iter().filter(|p| p.ends_with("/files.json")).cloned().collect()
+    }
+
+    /// Set up a data dir with one installed Nexus mod and a stored key.
+    async fn nexus_only_state() -> (tempfile::TempDir, AppState, Uuid) {
+        let dir = tempfile::tempdir().unwrap();
+        let mod_dir = dir.path().join("mods").join("nexus-mod");
+        tokio::fs::create_dir_all(&mod_dir).await.unwrap();
+        let guid = Uuid::new_v4();
+        tokio::fs::write(
+            mod_dir.join("manifest.json"),
+            format!(r#"{{"Guid":"{guid}","Name":"Better Stims","Description":"","IconPath":null,"Options":null}}"#),
+        )
+        .await
+        .unwrap();
+        sources::write_origin_sidecar_with_files(
+            &mod_dir,
+            vec![Source { provider: "nexus".into(), id: Some("1234".into()), url: None, version: Some("1.0".into()) }],
+            vec![InstalledFile { provider: "nexus".into(), uploaded_at: Some(1718000000), ..Default::default() }],
+        )
+        .await
+        .unwrap();
+        // The fallback file is read before the OS keychain, so this key is
+        // the one used whatever the machine's keychain holds.
+        tokio::fs::write(dir.path().join(secrets::FALLBACK_FILE_NAME), "TestKeyForAupCheck").await.unwrap();
+        let state = AppState::new(dir.path().to_path_buf());
+        (dir, state, guid)
+    }
+
+    #[tokio::test]
+    async fn automatic_checks_make_zero_nexus_api_requests() {
+        let (base, seen) = mock_nexus("[]".into()).await;
+        let count = || seen.lock().unwrap().len();
+        let factory = move |key| NexusClient::with_base(key, &base);
+
+        let (_dir, state, guid) = nexus_only_state().await;
+        for trigger in [CheckTrigger::Startup, CheckTrigger::Scheduled] {
+            let report = run_check_with(&state, trigger, &factory).await.unwrap();
+            let nexus = report.results.iter().find(|e| e.guid == guid).unwrap();
+            assert_eq!(nexus.status, UpdateState::NeedsManualCheck, "{trigger:?}");
+        }
+        assert_eq!(count(), 0, "an automatic check must never call the Nexus API");
+
+        // Control: the same setup with a user-initiated check does call it,
+        // so the zero above isn't just a broken mock.
+        let report = run_check_with(&state, CheckTrigger::Manual, &factory).await.unwrap();
+        assert!(count() >= 1);
+        let nexus = report.results.iter().find(|e| e.guid == guid).unwrap();
+        assert_eq!(nexus.status, UpdateState::UpdateAvailable);
+        assert_eq!(nexus.latest_version.as_deref(), Some("1.2"));
+
+        // A later automatic check keeps that result without calling Nexus.
+        let before = count();
+        let report = run_check_with(&state, CheckTrigger::Scheduled, &factory).await.unwrap();
+        assert_eq!(count(), before);
+        let nexus = report.results.iter().find(|e| e.guid == guid).unwrap();
+        assert_eq!(nexus.status, UpdateState::UpdateAvailable);
+    }
+
+    #[tokio::test]
+    async fn nexus_check_follows_the_plan_end_to_end() {
+        let (_dir, state, guid_a) = nexus_only_state().await; // mod 1234
+        let guid_b = add_nexus_mod(&state.base_path, "5678").await;
+        // Recorded "updated mods" fixture, with 1234's newest file moved to
+        // an hour ago; 5678 isn't in the list.
+        let mut list: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../tests/fixtures/updates/nexus_updated_1w.json")).unwrap();
+        list[0]["latest_file_update"] = serde_json::json!(now_unix() - 3600);
+        let (base, seen) = mock_nexus(serde_json::to_string(&list).unwrap()).await;
+        let factory = move |key| NexusClient::with_base(key, &base);
+
+        // 1. Never checked: one files request per mod, no updated list.
+        let report = run_check_with(&state, CheckTrigger::Manual, &factory).await.unwrap();
+        assert_eq!(files_requests(&seen).len(), 2);
+        assert!(!seen.lock().unwrap().iter().any(|p| p.contains("updated.json")));
+        assert!(!report.nexus_checked_recently);
+
+        // 2. Checked a minute ago: nothing asked, friendly note.
+        seen.lock().unwrap().clear();
+        let report = run_check_with(&state, CheckTrigger::Manual, &factory).await.unwrap();
+        assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock().unwrap());
+        assert!(report.nexus_checked_recently);
+        assert!(report.results.iter().any(|e| e.guid == guid_a && e.status == UpdateState::UpdateAvailable));
+
+        // 3. Checked 3 days ago: one 1w list; only the listed, changed mod
+        //    (1234) gets a files request.
+        backdate_nexus_checks(&state, 3 * 86_400).await;
+        seen.lock().unwrap().clear();
+        let report = run_check_with(&state, CheckTrigger::Manual, &factory).await.unwrap();
+        let paths = seen.lock().unwrap().clone();
+        assert_eq!(paths.iter().filter(|p| p.contains("updated.json?period=1w")).count(), 1, "{paths:?}");
+        assert_eq!(files_requests(&seen), vec!["/v1/games/helldivers2/mods/1234/files.json".to_string()]);
+        assert!(!report.nexus_checked_recently);
+        // 5678's earlier result still stands (and now counts as checked).
+        assert!(report.results.iter().any(|e| e.guid == guid_b && e.status == UpdateState::UpdateAvailable));
+
+        // 4. Checked 10 hours ago: the 1d window.
+        backdate_nexus_checks(&state, 10 * 3600).await;
+        seen.lock().unwrap().clear();
+        run_check_with(&state, CheckTrigger::Manual, &factory).await.unwrap();
+        assert!(seen.lock().unwrap().iter().any(|p| p.contains("updated.json?period=1d")));
+
+        // 5. Checked 10 days ago: the 1m window.
+        backdate_nexus_checks(&state, 10 * 86_400).await;
+        seen.lock().unwrap().clear();
+        run_check_with(&state, CheckTrigger::Manual, &factory).await.unwrap();
+        assert!(seen.lock().unwrap().iter().any(|p| p.contains("updated.json?period=1m")));
+    }
+
+    #[test]
+    fn only_manual_checks_are_user_initiated() {
+        assert!(CheckTrigger::Manual.is_user_initiated());
+        assert!(!CheckTrigger::Startup.is_user_initiated());
+        assert!(!CheckTrigger::Scheduled.is_user_initiated());
     }
 
     #[test]
@@ -1008,6 +1298,7 @@ mod tests {
             checked_at: 0,
             results: vec![mk(UpdateState::UpdateAvailable), mk(UpdateState::UpdateAvailable), mk(UpdateState::Skipped)],
             nexus_rate_limit: None,
+            nexus_checked_recently: false,
         };
         assert_eq!(report.available_count(), 1);
     }

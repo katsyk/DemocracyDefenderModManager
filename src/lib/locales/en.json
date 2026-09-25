@@ -347,7 +347,7 @@
                 "description": "Update checks never run unless you ask: click Check for Updates on the Mods page, or turn on automatic checks here.",
                 "auto_check": {
                     "label": "Check for mod updates when DDMM starts",
-                    "description": "Off by default. Checks only contact the sites your mods came from, and never download or install anything by themselves."
+                    "description": "Off by default. Checks only contact the sites your mods came from, and never download or install anything by themselves. Nexus Mods mods are only checked when you click Check for Updates."
                 },
                 "interval": {
                     "label_before": "then every",
@@ -355,8 +355,8 @@
                 },
                 "nexus": {
                     "title": "Nexus Mods API key (optional)",
-                    "description": "Only used to check Nexus Mods mods for updates. It's never required: without it, everything else works and Nexus mods just aren't checked. DDMM never downloads from Nexus with it; updates still go through your browser.",
-                    "where_to_get": "Get yours on Nexus Mods: your account → API Keys → the Personal API Key at the bottom (Request/Copy). Paste it here; DDMM checks it with Nexus before saving. Remove it here any time (you can also revoke it on that Nexus page).",
+                    "description": "Optional. Only used to check your Nexus Mods mods for updates.",
+                    "where_to_get": "Enter it manually: on Nexus Mods, open your account's API Keys page (Get a key), copy the Personal API Key at the bottom, and paste it here. DDMM checks it with Nexus before saving. Remove it here any time.",
                     "placeholder": "Paste your personal Nexus Mods API key",
                     "save_button": {
                         "text": "Save & verify"
@@ -373,7 +373,7 @@
                     "remove_button": {
                         "text": "Remove key"
                     },
-                    "privacy": "The key is only ever sent to api.nexusmods.com over HTTPS. It isn't written to settings.json or logs, and never goes to the browser extension."
+                    "privacy": "Nexus is only contacted when you click something (Check for Updates, Update all, or Save & verify), never by automatic checks. The key is only sent to api.nexusmods.com over HTTPS, and isn't written to settings.json or logs."
                 }
             }
         }
@@ -478,7 +478,8 @@
                 "error": "Couldn't check: {message}",
                 "unknown": "Unknown",
                 "unknown_tip": "DDMM doesn't know which version is installed (or the site didn't say), so it won't guess.",
-                "up_to_date": "Up to date"
+                "up_to_date": "Up to date",
+                "needs_manual_check": "Click Check for Updates to check Nexus mods"
             },
             "update_button": {
                 "text": "Update"
@@ -490,7 +491,7 @@
             "unskip_button": {
                 "text": "Stop skipping"
             },
-            "needs_key_hint": "Nexus Mods only answers update checks for people with an API key. Adding your own personal key in Settings is optional and only used for these checks.",
+            "needs_key_hint": "Nexus Mods only answers update checks for people with an API key. Adding one in Settings is optional and only used for Nexus update checks.",
             "update_all_button": {
                 "text": "Update all ({count})"
             },
@@ -499,7 +500,8 @@
             },
             "close_button": {
                 "text": "Close"
-            }
+            },
+            "nexus_checked_recently": "All your Nexus mods were checked recently. Update checks are limited to save your Nexus API requests."
         },
         "update_file_pick": {
             "title": "Which file?",

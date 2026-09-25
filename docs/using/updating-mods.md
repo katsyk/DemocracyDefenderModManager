@@ -18,6 +18,10 @@ DDMM can tell you when a mod you installed has a newer version on the site it ca
   **Check for mod updates when DDMM starts**, and optionally **then every N hours while DDMM is open** (1–168
   hours; also off by default). An automatic check only shows a small notice and the update badges; it never
   downloads or installs anything by itself.
+- **Automatic checks skip Nexus Mods.** Nexus only allows your API key to be used for things you start yourself,
+  so Nexus mods are checked only when you click **Check for Updates**. After an automatic check they show
+  *Click Check for Updates to check Nexus mods* (or the result of the last check you ran this session). Every
+  other site is still checked automatically.
 
 A mod with an update gets a cloud badge and an **Update** button in your profile list, the Library's update button
 becomes clickable, and **Update all (N)** appears next to Check for Updates.
@@ -30,7 +34,7 @@ becomes clickable, and **Update all (N)** appears next to Check for Updates.
 | GameBanana | The mod's public API entry (version and files, no key) | **One click**: DDMM downloads the new file itself |
 | ModWorkshop | The mod's public API entry (version and files, no key) | **One click**: DDMM downloads the new file itself (a mod whose download is an external link goes through the browser) |
 | AyakaMods | The version published on the mod page | **In your browser** (downloads need your login) |
-| Nexus Mods | The Nexus Mods API, **only if you add your own optional API key** | **In your browser**, always |
+| Nexus Mods | The Nexus Mods API, **only if you add your own optional API key**, and only when you click Check for Updates | **In your browser**, always |
 | Anything else | Not checked | — |
 
 A mod can have more than one source (for example, declared by its author and recorded by DDMM); each is checked.
@@ -98,7 +102,7 @@ Nexus Mods only answers these questions ("is there a newer file?") for people wi
 - **With your own key**, DDMM can check Nexus mods too.
 
 **Adding it:** on Nexus Mods, open your account's **API Keys** page (Settings → **Get a key** opens it) and
-copy the **Personal API Key** at the bottom. Paste it into **Settings → Mod updates → Nexus Mods API key
+copy the **Personal API Key** at the bottom. Enter it in **Settings → Mod updates → Nexus Mods API key
 (optional)** and click **Save & verify**. DDMM checks it with Nexus before saving and shows the account it
 belongs to.
 
@@ -107,10 +111,17 @@ time; DDMM will then say Nexus didn't accept it.
 
 What the key is, and isn't, used for:
 
-- **Only update checks.** DDMM asks Nexus which files a mod has, and which mods changed recently, so it asks
-  about as little as possible: one "recently updated mods" request, then one request per installed Nexus mod
-  that changed (or wasn't checked recently). It reads Nexus's rate-limit headers and stops early rather than use
-  up your allowance.
+- **Only update checks, and only when you click.** Nexus is contacted only for things you start: **Check for
+  Updates** and **Save & verify**. The automatic checks never use your key.
+- **As few requests as possible**, the same way Mod Organizer 2 does it:
+    - a mod checked in the last 5 minutes isn't checked again. If that's all of them, DDMM says *All your Nexus
+      mods were checked recently. Update checks are limited to save your Nexus API requests.*;
+    - a mod never checked, or not checked for a month, gets its own request for its file list;
+    - every other mod is covered by one "recently updated mods" request, for the last day, week or month
+      (the shortest period that reaches back to the oldest check). Only the mods that list shows as changed
+      get a file-list request.
+
+  DDMM reads Nexus's rate-limit headers and stops early rather than use up your allowance.
 - **Never for downloading.** Downloading through the API is a Nexus Premium feature, and DDMM doesn't use it,
   for anyone. Nexus updates always go through your browser, where you click Nexus's own download button.
 - **Stored in your system's keychain** (Windows Credential Manager, macOS Keychain, or the Secret Service on
@@ -149,7 +160,8 @@ the site publishes. That makes update checks work even for people who didn't ins
 
 ## Privacy
 
-- Nothing is checked unless you ask (the button, or the automatic checks you turned on).
+- Nothing is checked unless you ask (the button, or the automatic checks you turned on). Nexus Mods is only
+  contacted when you click.
 - Checks only contact the sites your mods came from, with the mod's id on that site. No list of your mods is
   sent anywhere else, and there's no DDMM server involved.
 - The only credential DDMM can hold is the optional Nexus API key described above.

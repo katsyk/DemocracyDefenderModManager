@@ -17,7 +17,7 @@ DDMM's first-class citizen. [Say hi to AyakaMods](https://ayakamods.com/games/he
 *Every Helldiver takes an oath. This one's ours.*
 
 - **Every mod is welcome.** DDMM will never block, blacklist, or rank mods or mod sites.
-- **No account, anywhere.** No mod site's login is ever asked for. (A Nexus Mods API key for Nexus update checks is strictly optional.)
+- **No account, anywhere.** No mod site's login or credentials are ever asked for.
 - **Your files, your choice.** Your mods live in a folder you control.
 - **Open source, forever.** Apache-2.0, today and always.
 - **Updates on your terms.** Update checks never run unless you ask: click **Check for Updates**, or turn on automatic checks in Settings.

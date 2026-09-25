@@ -1,4 +1,7 @@
-//! Settings' optional "Nexus Mods API key" field. The key is only used for
+//! Settings' optional "Nexus Mods API key" field (entered manually, from
+//! the user's Nexus account API Keys page).
+//!
+//! The key is only used for
 //! update checks; see `crate::secrets` for how it's stored and
 //! `crate::providers::nexus` for how it's used. It never reaches the
 //! frontend again once saved (only the account name and where it's stored
@@ -52,30 +55,35 @@ pub async fn set_nexus_api_key(state: State<'_, AppState>, key: String) -> TARes
         Err(reason) => return anyhow::anyhow!("That doesn't look like a Nexus Mods API key: {reason}.").into_ta_result(),
     };
 
+    validate_and_store(&state, key).await.into_ta_result()
+}
+
+/// Check `key` with Nexus (`/v1/users/validate.json`, a user-initiated
+/// action) and, only if Nexus accepts it, store it and remember the
+/// account name. Errors never contain the key.
+pub async fn validate_and_store(state: &AppState, key: NexusApiKey) -> anyhow::Result<NexusKeyStatus> {
     log::info!("Validating a Nexus Mods API key with api.nexusmods.com...");
-    let mut client = NexusClient::new(key.clone()).into_ta_result()?;
+    let mut client = NexusClient::new(key.clone())?;
     let user = match client.validate().await {
         Ok(user) => user,
         Err(NexusError::InvalidKey) => {
             log::warn!("Nexus Mods rejected the API key.");
-            return anyhow::anyhow!("Nexus Mods didn't accept that key. Copy it again from your Nexus Mods account (API Keys), then paste it here.")
-                .into_ta_result();
+            anyhow::bail!("Nexus Mods didn't accept that key. Copy it again from your Nexus Mods account (API Keys), then paste it here.");
         }
         Err(e) => {
             let message = secrets::redact(&e.to_string(), &key);
             log::warn!("Couldn't validate the Nexus Mods API key: {message}");
-            return anyhow::anyhow!("Couldn't check the key with Nexus Mods: {message}").into_ta_result();
+            anyhow::bail!("Couldn't check the key with Nexus Mods: {message}");
         }
     };
 
     let storage = secrets::store(&state.base_path, &key)
         .await
-        .map_err(|e| anyhow::anyhow!(secrets::redact(&e.to_string(), &key)))
-        .into_ta_result()?;
+        .map_err(|e| anyhow::anyhow!(secrets::redact(&e.to_string(), &key)))?;
 
-    let mut settings = do_load_settings(&state.base_path).await.into_ta_result()?;
+    let mut settings = do_load_settings(&state.base_path).await?;
     settings.set_nexus_username(Some(user.name.clone()));
-    write_settings(&state.base_path, &settings).await.into_ta_result()?;
+    write_settings(&state.base_path, &settings).await?;
 
     // Cached Nexus decisions belong to whatever key/account made them;
     // start fresh.

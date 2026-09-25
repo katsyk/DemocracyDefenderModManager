@@ -118,7 +118,7 @@ export async function installHandoffFile(file: string, pageUrl: string, existing
 }
 
 export type UpdateStateKind =
-    | "UpToDate" | "UpdateAvailable" | "Skipped" | "Unknown" | "NeedsApiKey" | "Unsupported" | "Error";
+    | "UpToDate" | "UpdateAvailable" | "Skipped" | "Unknown" | "NeedsApiKey" | "NeedsManualCheck" | "Unsupported" | "Error";
 export type UpdateState = { Kind: UpdateStateKind, message?: string };
 export type UpdateMethod = "Direct" | "Browser";
 
@@ -154,7 +154,9 @@ export type UpdateCheckReport = {
     Trigger: CheckTrigger,
     CheckedAt: number,
     Results: UpdateStatusEntry[],
-    NexusRateLimit?: { HourlyRemaining?: number, DailyRemaining?: number }
+    NexusRateLimit?: { HourlyRemaining?: number, DailyRemaining?: number },
+    /** Every Nexus mod was checked moments ago, so Nexus wasn't asked again. */
+    NexusCheckedRecently?: boolean
 };
 
 /** Runs an update check now. Called when the user clicks "Check for

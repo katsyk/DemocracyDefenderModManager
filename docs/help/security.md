@@ -19,6 +19,8 @@ mods for updates. It is never required, and:
 - it's only ever sent to `https://api.nexusmods.com` (redirects are not followed, so it can't be forwarded
   elsewhere), and never crosses the browser bridge;
 - it's never used to download anything. Nexus updates always go through your browser.
+- it's only used when you start something yourself (Check for Updates, Save & verify), never by the automatic
+  update checks.
 
 See [Updating mods](../using/updating-mods.md#nexus-mods-and-the-optional-api-key).
 
@@ -99,7 +101,9 @@ the browser extension downloads using your own logged-in session, the same as th
 ## Update checks are opt-in and size-capped
 
 Update checks never run unless you ask: when you click [Check for Updates](../using/updating-mods.md), or, if you
-turned it on in Settings (off by default), when DDMM starts and optionally every N hours while it's open. Each
+turned it on in Settings (off by default), when DDMM starts and optionally every N hours while it's open. The
+automatic checks never contact Nexus Mods: your optional Nexus API key is only used for things you start
+yourself (Check for Updates, Save & verify), as Nexus's API policy requires. Each
 request (an AyakaMods mod page, or the GitHub, GameBanana, ModWorkshop or Nexus Mods APIs) is `https://` only,
 times out, is spaced out per site, and is capped at 5 MB, the same belt-and-braces size-limit approach used for
 archive downloads.
