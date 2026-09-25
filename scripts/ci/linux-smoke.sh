@@ -86,8 +86,8 @@ test_tools() {
 # keep these two lists in sync.
 runtime_deps() {
     case $family in
-        fedora) echo webkit2gtk4.1 gtk3 ;;
-        arch)   echo webkit2gtk-4.1 gtk3 ;;
+        fedora) echo webkit2gtk4.1 ;;
+        arch)   echo webkit2gtk-4.1 ;;
         debian) echo libwebkit2gtk-4.1-0 ;;
         suse)   echo libwebkit2gtk-4_1-0 ;;
     esac
