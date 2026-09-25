@@ -6,11 +6,12 @@
 <script lang="ts">
     import { useToast } from "$lib/state/toast.svelte";
 
-    const { toasts, dismiss } = useToast();
+    const toastState = useToast();
+    const dismiss = toastState.dismiss;
 </script>
 
 <div class="absolute bottom-2 right-2 z-50 flex flex-col-reverse gap-1 items-end pointer-events-none">
-    {#each toasts as toast (toast.id)}
+    {#each toastState.toasts as toast (toast.id)}
         <button
             class="pointer-events-auto max-w-80 p-2 border-2 text-sm text-start shadow-xl/30"
             class:bg-blue-950={toast.kind === "info"}

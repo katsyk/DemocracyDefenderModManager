@@ -14,7 +14,12 @@ let nextId = 0;
 const DEFAULT_DURATION_MS = 6000;
 
 function dismiss(id: number) {
-    toasts = toasts.filter((t) => t.id !== id);
+    // Mutate in place rather than reassigning: consumers hold on to this
+    // exact array (Toast.svelte reads it once via useToast()), so a new
+    // array would leave them rendering a stale list -- the first toast
+    // never went away and every later one was never shown.
+    const i = toasts.findIndex((t) => t.id === id);
+    if (i !== -1) toasts.splice(i, 1);
 }
 
 function show(kind: ToastKind, message: string, durationMs: number = DEFAULT_DURATION_MS): number {
