@@ -162,25 +162,56 @@ fn take_number(it: &mut std::iter::Peekable<std::str::Chars>) -> u64 {
     n
 }
 
+/// How many folders deep [`copy_dir_recursive`] will go before giving up.
+/// Real mods are a handful of levels deep; this is only a backstop so a
+/// runaway copy can never fill a disk.
+pub const MAX_COPY_DEPTH: usize = 64;
+
 /// Recursively copy the contents of `src` into `dst`, creating directories
-/// as needed. Symlinks are never followed (skipped outright); entries whose
-/// file name matches one of `skip_names` are skipped at every depth.
+/// as needed. Symlinks (and Windows junctions) are never followed (skipped
+/// outright); entries whose file name matches one of `skip_names` are
+/// skipped at every depth.
+///
+/// Refuses up front when `src` and `dst` are the same folder or one is
+/// inside the other ([`crate::fs_util::ensure_no_overlap`]): copying a
+/// folder into its own subtree re-reads what it just wrote and nests
+/// copies of itself inside itself until the path gets too long or the disk
+/// is full. As further backstops, each folder's listing is taken before
+/// anything is written into its copy, the destination folder itself is
+/// never descended into, and nothing deeper than [`MAX_COPY_DEPTH`] is
+/// copied.
+///
+/// On failure, whatever was already copied is left in `dst`; every caller
+/// removes `dst` again (it's always a folder the caller just created).
 pub async fn copy_dir_recursive(src: &Path, dst: &Path, skip_names: &[&str]) -> anyhow::Result<()> {
-    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+    crate::fs_util::ensure_no_overlap(src, dst)?;
 
-    while let Some((from, to)) = stack.pop() {
-        tokio::fs::create_dir_all(&to).await?;
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf(), 0usize)];
 
+    while let Some((from, to, depth)) = stack.pop() {
+        if depth > MAX_COPY_DEPTH {
+            anyhow::bail!(
+                "{:?} has folders nested more than {} levels deep; refusing to copy it",
+                src,
+                MAX_COPY_DEPTH
+            );
+        }
+
+        // Snapshot the listing before creating anything under `to`.
+        let mut listing = Vec::new();
         let mut entries = tokio::fs::read_dir(&from).await?;
         while let Some(entry) = entries.next_entry().await? {
-            let file_type = entry.file_type().await?;
+            listing.push((entry.path(), entry.file_name(), entry.file_type().await?));
+        }
 
+        tokio::fs::create_dir_all(&to).await?;
+
+        for (from_path, name, file_type) in listing {
             // Never follow symlinks.
             if file_type.is_symlink() {
                 continue;
             }
 
-            let name = entry.file_name();
             if skip_names
                 .iter()
                 .any(|skip| name.to_str() == Some(*skip))
@@ -188,11 +219,14 @@ pub async fn copy_dir_recursive(src: &Path, dst: &Path, skip_names: &[&str]) -> 
                 continue;
             }
 
-            let from_path = entry.path();
             let to_path = to.join(&name);
 
             if file_type.is_dir() {
-                stack.push((from_path, to_path));
+                if same_file::is_same_file(&from_path, dst).unwrap_or(false) {
+                    log::warn!("Not copying {:?}: it is the copy's own destination", from_path);
+                    continue;
+                }
+                stack.push((from_path, to_path, depth + 1));
             } else if file_type.is_file() {
                 tokio::fs::copy(&from_path, &to_path).await?;
             }
@@ -399,6 +433,137 @@ mod tests {
 
             assert!(!dst.path().join("link.txt").exists());
         }
+    }
+
+    /// (files, total bytes) under `dir`, not following symlinks.
+    fn tree_size(dir: &Path) -> (usize, u64) {
+        let mut out = (0, 0);
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let ft = entry.file_type().unwrap();
+            if ft.is_dir() {
+                let (n, b) = tree_size(&entry.path());
+                out = (out.0 + n, out.1 + b);
+            } else if ft.is_file() {
+                out = (out.0 + 1, out.1 + entry.metadata().unwrap().len());
+            }
+        }
+        out
+    }
+
+    /// A folder with two mods in it, like a user's existing mod folder.
+    fn mod_collection(root: &Path) {
+        for name in ["ModA", "ModB"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(root.join(name).join(patch_file_name(0)), vec![7u8; 1000]).unwrap();
+        }
+    }
+
+    /// The bug report: copying a folder into a folder inside itself used to
+    /// re-read the growing copy and nest `mods/mods/mods/...` (each level
+    /// holding another full copy) until the path got too long -- 810 levels
+    /// deep on Linux for a 2 KB folder.
+    #[tokio::test]
+    async fn copy_dir_recursive_refuses_destination_inside_source() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("mods");
+        mod_collection(&src);
+        let before = tree_size(&src);
+
+        let err = copy_dir_recursive(&src, &src.join("mods"), &[]).await.unwrap_err();
+
+        assert!(format!("{err:#}").contains("into itself"), "{err:#}");
+        assert!(!src.join("mods").exists(), "nothing may be created");
+        assert_eq!(tree_size(&src), before);
+    }
+
+    #[tokio::test]
+    async fn copy_dir_recursive_refuses_source_inside_destination() {
+        let root = tempfile::tempdir().unwrap();
+        mod_collection(root.path());
+        let before = tree_size(root.path());
+
+        assert!(copy_dir_recursive(&root.path().join("ModA"), root.path(), &[]).await.is_err());
+        assert_eq!(tree_size(root.path()), before);
+    }
+
+    #[tokio::test]
+    async fn copy_dir_recursive_refuses_copying_onto_itself() {
+        let root = tempfile::tempdir().unwrap();
+        mod_collection(root.path());
+        let before = tree_size(root.path());
+
+        assert!(copy_dir_recursive(root.path(), root.path(), &[]).await.is_err());
+        // Copying a file onto itself would truncate it; nothing changed.
+        assert_eq!(tree_size(root.path()), before);
+    }
+
+    #[tokio::test]
+    async fn copy_dir_recursive_refuses_overlap_spelled_with_dotdot() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("mods");
+        mod_collection(&src);
+        let dst = src.join("ModA").join("..").join("copy");
+
+        assert!(copy_dir_recursive(&src, &dst, &[]).await.is_err());
+        assert!(!src.join("copy").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copy_dir_recursive_refuses_overlap_through_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("mods");
+        mod_collection(&src);
+        let link = root.path().join("link-to-mods");
+        std::os::unix::fs::symlink(&src, &link).unwrap();
+
+        assert!(copy_dir_recursive(&src, &link.join("copy"), &[]).await.is_err());
+        assert!(copy_dir_recursive(&link, &src.join("copy"), &[]).await.is_err());
+        assert!(!src.join("copy").exists());
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn copy_dir_recursive_refuses_overlap_spelled_in_other_case() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("mods");
+        mod_collection(&src);
+
+        assert!(copy_dir_recursive(&src, &root.path().join("MODS").join("copy"), &[]).await.is_err());
+        assert!(!src.join("copy").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copy_dir_recursive_does_not_follow_a_symlink_loop() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        mod_collection(src.path());
+        std::os::unix::fs::symlink(src.path(), src.path().join("ModA").join("loop")).unwrap();
+
+        copy_dir_recursive(src.path(), &dst.path().join("copy"), &[]).await.unwrap();
+
+        assert_eq!(tree_size(&dst.path().join("copy")), tree_size(src.path()));
+        assert!(!dst.path().join("copy/ModA/loop").exists());
+    }
+
+    #[tokio::test]
+    async fn copy_dir_recursive_stops_at_the_depth_cap() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let mut deep = src.path().to_path_buf();
+        for _ in 0..=MAX_COPY_DEPTH {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let err = copy_dir_recursive(src.path(), &dst.path().join("copy"), &[]).await.unwrap_err();
+        assert!(format!("{err:#}").contains("levels deep"), "{err:#}");
+
+        // One level shallower is fine.
+        std::fs::remove_dir(&deep).unwrap();
+        copy_dir_recursive(src.path(), &dst.path().join("copy2"), &[]).await.unwrap();
     }
 
     fn patch_file_name(index: u32) -> String {

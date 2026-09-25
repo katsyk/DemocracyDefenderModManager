@@ -48,6 +48,9 @@ keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync
 # `nexus_oauth.rs`.
 sha2 = "0.10"
 base64 = "0.22"
+# File identity (dev+inode / volume+file index) for "is this folder the
+# same as, inside, or containing that one" checks. See `fs_util::path_overlap`.
+same-file = "1.0"
 
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"

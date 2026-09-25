@@ -35,6 +35,10 @@ surfaces as an error at the moment you actually start a handoff ("the downloads 
 exist -- check it in Settings"). Only the browser handoff uses this setting; every other install method (Add,
 Add Folder, Add URL for a direct link) is unaffected by it.
 
+It can't be DDMM's own `mods/` folder or a folder inside it (saving Settings says so, and neither the handoff nor
+auto-import will watch such a folder). A downloads folder that *contains* DDMM's data folder, such as a portable
+DDMM kept in Downloads, is fine: only files directly in the downloads folder are ever looked at.
+
 ## Skip List
 
 A list of 16-character lowercase hex patch-name prefixes (for example `0cf14e223de06a26`) that already occupy

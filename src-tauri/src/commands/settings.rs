@@ -82,6 +82,49 @@ pub async fn do_check_settings(base_path: &Path) -> anyhow::Result<bool> {
     }
 }
 
+/// DDMM's mod storage folder (`<data>/mods`).
+fn mods_storage(base_path: &Path) -> PathBuf {
+    base_path.join(crate::commands::mods::MODS_DIRECTORY)
+}
+
+/// The downloads folder may contain DDMM's data folder (a portable copy
+/// kept in Downloads is normal: only files directly in the downloads folder
+/// are ever looked at), but must not be the mod storage folder or anything
+/// inside it -- downloads would then land among, or inside, installed mods.
+pub fn check_downloads_path(base_path: &Path, downloads: &Path) -> anyhow::Result<()> {
+    use crate::fs_util::{path_overlap, PathOverlap};
+    if downloads.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let storage = mods_storage(base_path);
+    match path_overlap(downloads, &storage)? {
+        Some(PathOverlap::Same) | Some(PathOverlap::FirstInsideSecond) => anyhow::bail!(
+            "The downloads folder ({}) is DDMM's own mod storage or a folder inside it ({}). \
+             Pick the folder your browser saves downloads to instead.",
+            downloads.display(),
+            storage.display()
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// The game's `data` folder (where deploy writes, and purge deletes, patch
+/// files) must not be DDMM's mod storage or inside it: purging would delete
+/// installed mods' own files.
+pub fn check_game_data_dir(base_path: &Path, game_data_dir: &Path) -> anyhow::Result<()> {
+    use crate::fs_util::{path_overlap, PathOverlap};
+    let storage = mods_storage(base_path);
+    match path_overlap(game_data_dir, &storage)? {
+        Some(PathOverlap::Same) | Some(PathOverlap::FirstInsideSecond) => anyhow::bail!(
+            "The game folder's data folder ({}) is inside DDMM's own mod storage ({}). \
+             Set the game path to your real Helldivers 2 install in Settings.",
+            game_data_dir.display(),
+            storage.display()
+        ),
+        _ => Ok(()),
+    }
+}
+
 #[tauri::command]
 pub async fn load_settings(state: State<'_, AppState>) -> TAResult<Settings> {
     do_load_settings(&state.base_path).await.into_ta_result()
@@ -107,6 +150,11 @@ pub async fn save_settings(state: State<'_, AppState>, settings: Settings) -> TA
             log::info!("Normalizing game path {:?} to {:?}", settings.game_path(), root);
             settings.set_game_path(root);
         }
+    }
+
+    check_downloads_path(&state.base_path, settings.downloads_path()).into_ta_result()?;
+    if !settings.game_path().as_os_str().is_empty() {
+        check_game_data_dir(&state.base_path, &settings.game_path().join("data")).into_ta_result()?;
     }
 
     let data = serde_json::to_vec_pretty(&settings).into_ta_result()?;
@@ -173,4 +221,37 @@ pub async fn auto_detect_and_save_game_path(state: State<'_, AppState>) -> TARes
     tokio::fs::write(state.base_path.join(SETTINGS_FILE), data).await.into_ta_result()?;
 
     Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downloads_folder_may_contain_the_data_folder_but_not_be_inside_the_mod_storage() {
+        let downloads = tempfile::tempdir().unwrap();
+        // A portable DDMM kept in Downloads: fine.
+        let base = downloads.path().join("DDMM");
+        std::fs::create_dir_all(base.join("mods").join("ModA")).unwrap();
+        check_downloads_path(&base, downloads.path()).unwrap();
+        check_downloads_path(&base, &base).unwrap();
+        check_downloads_path(&base, Path::new("")).unwrap();
+
+        assert!(check_downloads_path(&base, &base.join("mods")).is_err());
+        assert!(check_downloads_path(&base, &base.join("mods").join("ModA")).is_err());
+        assert!(check_downloads_path(&base, &base.join("mods").join("ModA").join("..")).is_err());
+    }
+
+    #[test]
+    fn game_data_folder_must_not_be_inside_the_mod_storage() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base.path().join("mods")).unwrap();
+        let game = tempfile::tempdir().unwrap();
+        check_game_data_dir(base.path(), &game.path().join("data")).unwrap();
+        // A portable DDMM inside the game's data folder is harmless.
+        check_game_data_dir(base.path(), base.path()).unwrap();
+
+        assert!(check_game_data_dir(base.path(), &base.path().join("mods")).is_err());
+        assert!(check_game_data_dir(base.path(), &base.path().join("mods").join("x").join("data")).is_err());
+    }
 }
