@@ -1,0 +1,10 @@
+// Exported by hand -- please don't judge
+{
+    "Version": 1, /* v1 format */
+    "Guid": "5b1c7a3e-6f0b-4b43-9a55-0d7f1c2e8a11",
+    "Name": "Fixture Mod", // display name
+    "Description": "See https://example.com/mod // not a comment",
+    "Options": [
+        { "Name": "Red", "Description": "", "Include": ["Red",], },
+    ],
+}

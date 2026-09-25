@@ -1,5 +1,4 @@
 <script lang="ts">
-    import * as fs from "@tauri-apps/plugin-fs";
     import { open } from "@tauri-apps/plugin-dialog";
     import { openPath, openUrl } from "@tauri-apps/plugin-opener";
     import { beforeNavigate, onNavigate } from "$app/navigation";
@@ -7,7 +6,7 @@
     import type { AfterBrowserInstall } from "$lib/models/settings";
     import { useLocalization } from "$lib/state/localization.svelte";
     import {
-        loadSettings, saveSettings, detectGamePath, getDataDir,
+        loadSettings, saveSettings, detectGamePath, getDataDir, validateGamePath,
         getBridgeAllowedSites, revokeBridgeSite, repairBrowserIntegration, removeBrowserIntegration,
         repairBrowserIntegrationOne, removeBrowserIntegrationOne,
         type BrowserIntegrationStatus
@@ -15,7 +14,6 @@
     import { Dash, Plus, ThreeDots, Search, Folder2Open, ArrowRepeat, BoxArrowUpRight } from "svelte-bootstrap-icons";
     import { usePopup } from "$lib/state/popup.svelte";
     import { InputPopup, NotificationPopup } from "$lib/types/popup";
-    import { path } from "@tauri-apps/api";
     import Select from "$lib/components/Select.svelte";
     import ToggleSwitch from "$lib/components/ToggleSwitch.svelte";
 
@@ -35,6 +33,25 @@
     let browserIntegration = $state<BrowserIntegrationStatus[]>([]);
     let browserIntegrationBusy = $state<boolean>(false);
     let gamePathErrors = $state<string[]>([]);
+    /** The folder that will actually be used, when it differs from what
+     * was typed (e.g. the user picked `Helldivers 2/data`). */
+    let resolvedGamePath = $state<string | null>(null);
+
+    /** Translated message for a backend `GamePathReport.code`. */
+    function gamePathErrorText(code: string | null, detail: string | null): string {
+        switch (code) {
+            case "empty": return t("pages.settings.validation_error.game_path.empty");
+            case "not_found": return t("pages.settings.validation_error.game_path.exists");
+            case "not_a_directory": return t("pages.settings.validation_error.game_path.not_a_directory");
+            case "portal_path": return t("pages.settings.validation_error.game_path.portal_path");
+            case "unreadable": return t("pages.settings.validation_error.game_path.unreadable", { detail: detail ?? "" });
+            case "missing_tools": return t("pages.settings.validation_error.game_path.tools_exists");
+            case "missing_data": return t("pages.settings.validation_error.game_path.data_exists");
+            case "missing_bin": return t("pages.settings.validation_error.game_path.bin_exists");
+            case "missing_exe": return t("pages.settings.validation_error.game_path.exe_exists");
+            default: return t("pages.settings.validation_error.game_path.invalid");
+        }
+    }
     let dataDir = $state<string>("");
     let initPromise = $state<Promise<void>>(init());
 
@@ -47,34 +64,26 @@
 
         const validationPromise = async () => {
             const errors = [];
-            
-            if (!current.gamePath || current.gamePath.length === 0) {
-                errors.push(t("pages.settings.validation_error.game_path.empty"));
-            } else {
-                try {
-                    if (!await fs.exists(current.gamePath)) {
-                        errors.push(t("pages.settings.validation_error.game_path.exists"));
-                    } else {
-                        if (!await fs.exists(await path.join(current.gamePath, "tools"))) {
-                            errors.push(t("pages.settings.validation_error.game_path.tools_exists"));
-                        }
-                        
-                        if (!await fs.exists(await path.join(current.gamePath, "data"))) {
-                            errors.push(t("pages.settings.validation_error.game_path.data_exists"));
-                        }
-                        
-                        if (!await fs.exists(await path.join(current.gamePath, "bin"))) {
-                            errors.push(t("pages.settings.validation_error.game_path.bin_exists"));
-                        } else if (!await fs.exists(await path.join(current.gamePath, "bin", "helldivers2.exe"))) {
-                            errors.push(t("pages.settings.validation_error.game_path.exe_exists"));
-                        }
-                    }
-                } catch {
-                    errors.push(t("pages.settings.validation_error.game_path.invalid"));
+            let resolved: string | null = null;
+
+            // Checked on the backend: the fs plugin's scope can't see paths
+            // under dot-directories on Linux (~/.local/share/Steam), which
+            // made every default Linux install look invalid.
+            try {
+                const report = await validateGamePath(current.gamePath ?? "");
+                if (report.valid) {
+                    resolved = report.resolvedPath;
+                } else {
+                    errors.push(gamePathErrorText(report.code, report.detail));
                 }
+            } catch (ex: unknown) {
+                errors.push(t("pages.settings.validation_error.game_path.check_failed", { detail: String(ex) }));
             }
 
-            if (!cancelled) gamePathErrors = errors;
+            if (!cancelled) {
+                gamePathErrors = errors;
+                resolvedGamePath = resolved;
+            }
         };
 
         validationPromise();
@@ -93,7 +102,7 @@
     onNavigate(async () => {
         await saveSettings({
             Version: "V1",
-            GamePath: gamePath,
+            GamePath: resolvedGamePath ?? gamePath,
             SkipList: skipList,
             DownloadsPath: downloadsPath,
             AfterBrowserInstall: AFTER_BROWSER_INSTALL_OPTIONS[afterBrowserInstallIndex] ?? "deploy",
@@ -290,6 +299,11 @@
                         <li>{error}</li>
                     {/each}
                 </ul>
+                {#if gamePathErrors.length === 0 && resolvedGamePath && resolvedGamePath !== gamePath}
+                    <p class="text-zinc-400 text-sm">
+                        {t("pages.settings.game_path.resolved_hint", { path: resolvedGamePath })}
+                    </p>
+                {/if}
             </div>
             <div class="flex flex-col gap-1">
                 <h2 class="text-zinc-300 text-xl">{t("pages.settings.data_dir.title")}</h2>

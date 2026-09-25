@@ -237,7 +237,8 @@
                 "detect_button": {
                     "text": "Auto-detect",
                     "tip": "Look for a Helldivers 2 install via Steam."
-                }
+                },
+                "resolved_hint": "Using the game folder: {path}"
             },
             "downloads_path": {
                 "title": "Downloads Folder",
@@ -304,12 +305,16 @@
             "validation_error": {
                 "game_path": {
                     "empty": "Game path can not be empty!",
-                    "exists": "Game path does not exist!",
+                    "exists": "Game path does not exist! Check for typos, or use Auto-detect.",
                     "invalid": "Game path is invalid!",
                     "tools_exists": "Game path does not contain a directory named \"tools\"!",
                     "data_exists": "Game path does not contain a directory named \"data\"!",
                     "bin_exists": "Game path does not contain a directory named \"bin\"!",
-                    "exe_exists": "Game path's \"bin\" directory does not contain the \"helldivers2.exe\"!"
+                    "exe_exists": "Game path's \"bin\" directory does not contain the \"helldivers2.exe\"!",
+                    "not_a_directory": "Game path is a file, not a folder! Pick the \"Helldivers 2\" folder.",
+                    "portal_path": "This is a temporary desktop-portal path (/run/user/.../doc/...), not the real game folder. Type or paste the real path instead, e.g. ~/.local/share/Steam/steamapps/common/Helldivers 2.",
+                    "unreadable": "DDMM isn't allowed to read this folder: {detail}",
+                    "check_failed": "Couldn't check the game path: {detail}"
                 }
             }
         }

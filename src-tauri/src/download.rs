@@ -10,12 +10,31 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::Context;
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 
 /// Hard cap on how much a single download is allowed to be, enforced both
 /// from `Content-Length` (when present) and by counting streamed bytes.
 pub const MAX_DOWNLOAD_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// Directory (under DDMM's data dir) that URL downloads are staged in; see
+/// [`download_archive`].
+pub const STAGING_DIRECTORY: &str = ".downloads";
+
+/// `url` with its query string and fragment removed, for logging: direct
+/// CDN links carry short-lived access tokens there, and users attach their
+/// logs to bug reports.
+pub fn redact_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut u) => {
+            u.set_query(None);
+            u.set_fragment(None);
+            u.to_string()
+        }
+        Err(_) => "<unparseable URL>".to_string(),
+    }
+}
 
 /// A successfully downloaded and identified archive, staged under its own
 /// throwaway directory. Callers are responsible for removing `temp_dir` once
@@ -25,20 +44,26 @@ pub struct DownloadedArchive {
     pub temp_dir: PathBuf,
 }
 
-/// Download `url` to a fresh temp directory, sniff/confirm it is a
-/// zip/7z/rar archive, and return its staged path.
+/// Download `url` to a fresh directory under `staging_root`, sniff/confirm
+/// it is a zip/7z/rar archive, and return its staged path.
 ///
-/// On any error the temp directory is cleaned up before returning.
-pub async fn download_archive(url: &str) -> anyhow::Result<DownloadedArchive> {
+/// `staging_root` is normally a directory inside DDMM's own data dir rather
+/// than `std::env::temp_dir()`: on Arch/CachyOS (and most systemd distros)
+/// `/tmp` is a RAM-backed tmpfs that is often much smaller than the disk,
+/// so a large mod could fail there with "No space left on device", and it
+/// keeps the staged archive on the same filesystem as `mods/`.
+///
+/// On any error the staging directory is cleaned up before returning.
+pub async fn download_archive(url: &str, staging_root: &Path) -> anyhow::Result<DownloadedArchive> {
     let parsed = reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL: {}", e))?;
     if parsed.scheme() != "https" {
         anyhow::bail!("only https:// URLs are supported");
     }
 
-    let temp_dir = std::env::temp_dir()
-        .join("ddmm-downloads")
-        .join(uuid::Uuid::new_v4().to_string());
-    tokio::fs::create_dir_all(&temp_dir).await?;
+    let temp_dir = staging_root.join(uuid::Uuid::new_v4().to_string());
+    tokio::fs::create_dir_all(&temp_dir)
+        .await
+        .with_context(|| format!("failed to create download staging directory {:?}", temp_dir))?;
 
     match download_archive_into(&parsed, &temp_dir).await {
         Ok(path) => Ok(DownloadedArchive { path, temp_dir }),
@@ -57,8 +82,19 @@ async fn download_archive_into(url: &reqwest::Url, temp_dir: &Path) -> anyhow::R
         .connect_timeout(Duration::from_secs(20))
         .build()?;
 
-    let response = client.get(url.clone()).send().await?;
-    let response = response.error_for_status()?;
+    // `without_url()`: reqwest errors embed the full URL, and direct CDN
+    // links (e.g. Nexus) carry short-lived access tokens in the query
+    // string. Errors are now shown to the user and written to the log, so
+    // name the host instead.
+    let host = url.host_str().unwrap_or("the server").to_string();
+    let response = client
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("couldn't reach {}: {}", host, e.without_url()))?;
+    let response = response
+        .error_for_status()
+        .map_err(|e| anyhow::anyhow!("{} refused the download: {}", host, e.without_url()))?;
 
     if let Some(len) = response.content_length() {
         if len > MAX_DOWNLOAD_SIZE {
@@ -78,11 +114,13 @@ async fn download_archive_into(url: &reqwest::Url, temp_dir: &Path) -> anyhow::R
         .and_then(parse_content_disposition_filename);
 
     let staging_path = temp_dir.join("download.part");
-    let mut file = tokio::fs::File::create(&staging_path).await?;
+    let mut file = tokio::fs::File::create(&staging_path)
+        .await
+        .with_context(|| format!("failed to create {:?}", staging_path))?;
     let mut stream = response.bytes_stream();
     let mut total: u64 = 0;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| anyhow::anyhow!("download failed: {}", e))?;
+        let chunk = chunk.map_err(|e| anyhow::anyhow!("download from {} failed: {}", host, e.without_url()))?;
         total += chunk.len() as u64;
         if total > MAX_DOWNLOAD_SIZE {
             anyhow::bail!(
@@ -90,7 +128,9 @@ async fn download_archive_into(url: &reqwest::Url, temp_dir: &Path) -> anyhow::R
                 MAX_DOWNLOAD_SIZE
             );
         }
-        file.write_all(&chunk).await?;
+        file.write_all(&chunk)
+            .await
+            .with_context(|| format!("failed to write the download to {:?}", staging_path))?;
     }
     file.flush().await?;
     drop(file);
@@ -116,7 +156,7 @@ async fn download_archive_into(url: &reqwest::Url, temp_dir: &Path) -> anyhow::R
     }
 
     let final_path = temp_dir.join(&filename);
-    tokio::fs::rename(&staging_path, &final_path).await?;
+    crate::fs_util::move_path(&staging_path, &final_path).await?;
 
     Ok(final_path)
 }
@@ -282,6 +322,15 @@ mod tests {
     }
 
     #[test]
+    fn redact_url_strips_query_and_fragment() {
+        assert_eq!(
+            redact_url("https://cdn.example.com/files/mod.zip?md5=abc&expires=123#frag"),
+            "https://cdn.example.com/files/mod.zip"
+        );
+        assert_eq!(redact_url("not a url"), "<unparseable URL>");
+    }
+
+    #[test]
     fn last_path_segment_decodes_percent_encoding() {
         let url = reqwest::Url::parse("https://example.com/files/cool%20mod.zip").unwrap();
         assert_eq!(last_path_segment(&url), Some("cool mod.zip".to_string()));
@@ -294,8 +343,10 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn downloads_a_real_small_zip() {
+        let staging = tempfile::tempdir().unwrap();
         let result = download_archive(
             "https://github.com/octocat/Hello-World/archive/refs/heads/master.zip",
+            staging.path(),
         )
         .await
         .expect("download should succeed");
