@@ -1,0 +1,23 @@
+{
+  "name": "ddmm-extension",
+  "version": "1.0.0",
+  "description": "Browser extension half of one-click Helldivers 2 mod installs for DDMM.",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "node scripts/build.mjs --test && node test/e2e/smoke.mjs",
+    "build": "node scripts/build.mjs",
+    "build:test": "node scripts/build.mjs --test",
+    "lint": "node scripts/lint.mjs"
+  },
+  "devDependencies": {
+    "archiver": "^7.0.1",
+    "jsdom": "^25.0.1",
+    "playwright": "^1.48.0",
+    "vitest": "^3.0.5",
+    "web-ext": "^8.3.0"
+  }
+}
