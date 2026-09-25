@@ -10,7 +10,7 @@
     import { useLocalization } from "$lib/state/localization.svelte";
     import { Mod } from "$lib/models/mod";
     import type {Config, Profile, ProfilesConfig} from "$lib/models/profile";
-    import { addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles, loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath, forceExit, type UpdateStatusEntry } from "$lib/utils/commands";
+    import { addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles, loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath, forceExit, ackCloseRequested, type UpdateStatusEntry } from "$lib/utils/commands";
     import type { UUID } from "$lib/types/uuid";
     import { usePopup } from "$lib/state/popup.svelte";
     import {
@@ -117,8 +117,20 @@
             // for the user. `closeWindow()` below does the same thing but
             // with a fallback.
             event.preventDefault();
+            log.info("Close requested.");
+            try {
+                // Tell the Rust-side watchdog we're alive and on it, so it
+                // doesn't force-exit out from under a legitimate save or
+                // confirmation popup. See `ackCloseRequested`'s doc comment.
+                await ackCloseRequested();
+            } catch (ex: unknown) {
+                log.error(`Failed to acknowledge close request: ${errorMessage(ex)}`);
+            }
 
-            if (closeRequestInFlight) return;
+            if (closeRequestInFlight) {
+                log.info("Close already in progress; ignoring re-entrant request.");
+                return;
+            }
             closeRequestInFlight = true;
             try {
                 await handleCloseRequest();
@@ -540,8 +552,10 @@
      * that exits the process directly, so a broken `destroy()` call can
      * never strand the user with an unclosable window again. */
     async function closeWindow() {
+        log.info("Destroying window.");
         try {
             await appWindow.destroy();
+            log.info("Window destroy() resolved.");
         } catch (ex: unknown) {
             log.error(`Window destroy() failed, falling back to force_exit: ${errorMessage(ex)}`);
             try {
@@ -553,12 +567,16 @@
     }
 
     async function handleCloseRequest() {
+        log.info(`Handling close request (deploying=${deploying}, profilesLoaded=${profilesLoaded}).`);
         if (deploying) {
             const confirmed = await showPopup(new ConfirmPopup(
                 t("pages.mods.popup.confirm.close_deploying.title"),
                 t("pages.mods.popup.confirm.close_deploying.question"),
             ));
-            if (!confirmed) return;
+            if (!confirmed) {
+                log.info("Close cancelled: deploy in progress.");
+                return;
+            }
         }
 
         // Nothing was ever loaded (init() hasn't finished, or errored out
@@ -566,12 +584,16 @@
         // to would just fail on the undefined `currentProfile`.
         if (profilesLoaded) {
             const result = await saveProfilesBeforeClose();
+            log.info(`Save before close: ${result.ok ? "ok" : `failed (${result.error})`}.`);
             if (!result.ok) {
                 const confirmed = await showPopup(new ConfirmPopup(
                     t("pages.mods.popup.confirm.close_save_failed.title"),
                     t("pages.mods.popup.confirm.close_save_failed.question", { error: result.error }),
                 ));
-                if (!confirmed) return;
+                if (!confirmed) {
+                    log.info("Close cancelled: user chose not to close after a failed save.");
+                    return;
+                }
             }
         }
 

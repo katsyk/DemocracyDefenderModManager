@@ -185,3 +185,10 @@ export async function forceExit(): Promise<void> {
     log.debug("Invoking `force_exit`.");
     await invoke<void>("force_exit");
 }
+
+/** Tells the Rust-side close watchdog (see `lib.rs`) that the frontend is
+ * alive and handling a close request, so it won't force-exit from under
+ * us. Call this as the very first thing the close handler does. */
+export async function ackCloseRequested(): Promise<void> {
+    await invoke<void>("ack_close_requested");
+}

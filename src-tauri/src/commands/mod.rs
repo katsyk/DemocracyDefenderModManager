@@ -360,6 +360,14 @@ pub fn force_exit(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+/// Called by the frontend's close handler as the very first thing it does,
+/// proving to the Rust-side close watchdog (see `lib.rs`) that the
+/// frontend is alive and actually handling the close request.
+#[tauri::command]
+pub fn ack_close_requested(state: State<'_, AppState>) {
+    state.close_ack.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
