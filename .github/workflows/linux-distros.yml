@@ -147,6 +147,7 @@ jobs:
           - { name: ubuntu-22.04, image: 'ubuntu:22.04', family: debian, package: true }
           - { name: debian-12, image: 'debian:12', family: debian, package: true }
     continue-on-error: ${{ matrix.informational == true }}
+    timeout-minutes: 45
     name: smoke (${{ matrix.name }})
     steps:
       - name: Checkout
@@ -167,7 +168,7 @@ jobs:
         id: portable
         continue-on-error: true
         run: |
-          docker run --rm --privileged -v "$PWD:/w" -w /w "${{ matrix.image }}" \
+          timeout 1200 docker run --rm --privileged -v "$PWD:/w" -w /w "${{ matrix.image }}" \
             bash scripts/ci/linux-smoke.sh "${{ matrix.family }}" portable /w/dist /w/out/portable
 
       - name: Native package (fresh container)
@@ -175,7 +176,7 @@ jobs:
         if: matrix.package
         continue-on-error: true
         run: |
-          docker run --rm --privileged -v "$PWD:/w" -w /w "${{ matrix.image }}" \
+          timeout 900 docker run --rm --privileged -v "$PWD:/w" -w /w "${{ matrix.image }}" \
             bash scripts/ci/linux-smoke.sh "${{ matrix.family }}" package /w/dist /w/out/package
 
       - name: Summary

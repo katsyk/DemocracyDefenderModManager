@@ -78,7 +78,7 @@ test_tools() {
         fedora) echo xorg-x11-server-Xvfb dbus-daemon dbus-tools procps-ng util-linux findutils grep file mesa-dri-drivers dejavu-sans-fonts ;;
         arch)   echo xorg-server-xvfb dbus procps-ng util-linux findutils grep file mesa ttf-dejavu ;;
         debian) echo xvfb dbus procps util-linux findutils grep file libgl1-mesa-dri fonts-dejavu-core ;;
-        suse)   echo xorg-x11-server-Xvfb dbus-1 /usr/bin/dbus-run-session procps util-linux findutils grep file Mesa-dri dejavu-fonts gzip tar ;;
+        suse)   echo xorg-x11-server-Xvfb dbus-1 procps util-linux findutils grep file Mesa-dri dejavu-fonts gzip tar ;;
     esac
 }
 
@@ -99,14 +99,19 @@ fuse_deps() {
     echo fuse3
 }
 
-# GTK 3 alone, i.e. what practically any desktop install already has, but
-# without WebKitGTK -- the AppImage bundles WebKitGTK but not all of GTK.
-gtk_baseline() {
+# What practically any desktop install already has, but without WebKitGTK.
+# The AppImage bundles WebKitGTK and most of GTK, but (per the AppImage
+# excludelist) expects the host to provide libEGL, libgbm, fontconfig,
+# harfbuzz, fribidi, libgpg-error and libcom_err -- see the
+# appimage-host-libs-bare row.
+desktop_baseline() {
     case $family in
-        fedora|arch) echo gtk3 ;;
+        fedora) echo gtk3 mesa-libEGL mesa-libgbm libgpg-error libcom_err ;;
+        arch)   echo gtk3 mesa libglvnd libgpg-error e2fsprogs ;;
         debian)
-            if apt-cache show libgtk-3-0t64 >/dev/null 2>&1; then echo libgtk-3-0t64; else echo libgtk-3-0; fi ;;
-        suse) echo libgtk-3-0 ;;
+            if apt-cache show libgtk-3-0t64 >/dev/null 2>&1; then echo -n 'libgtk-3-0t64 '; else echo -n 'libgtk-3-0 '; fi
+            echo libegl1 libgbm1 libgpg-error0 libcom-err2 ;;
+        suse) echo libgtk-3-0 libEGL1 libgbm1 libgpg-error0 libcom_err2 ;;
     esac
 }
 
@@ -226,6 +231,15 @@ log "install test harness"
 # shellcheck disable=SC2046
 pm_install $(test_tools) >"$out/install-test-tools.txt" 2>&1 \
     || { tail -n 30 "$out/install-test-tools.txt"; echo "harness install failed"; exit 2; }
+if ! command -v dbus-run-session >/dev/null && [ "$family" = suse ]; then
+    # Tumbleweed moved dbus-run-session out of dbus-1 at some point.
+    for p in dbus-1-daemon dbus-1-tools dbus-1-x11; do
+        pm_install "$p" >>"$out/install-test-tools.txt" 2>&1
+        command -v dbus-run-session >/dev/null && break
+    done
+    command -v dbus-run-session >/dev/null \
+        || { zypper -n se dbus >"$out/zypper-se-dbus.txt" 2>&1; cat "$out/zypper-se-dbus.txt"; echo "no dbus-run-session"; exit 2; }
+fi
 start_xvfb
 
 appimage=$(find "$dist" -name 'DDMM-*-linux-x86_64.AppImage' | head -n1)
@@ -242,13 +256,14 @@ portable)
     launch appimage-no-fuse info -- /tmp/ddmm.AppImage || true
 
     # Which libraries the AppImage expects the host to provide.
-    (cd /tmp && /tmp/ddmm.AppImage --appimage-extract >/dev/null 2>&1)
+    log "extract AppImage"
+    (cd /tmp && timeout 180 /tmp/ddmm.AppImage --appimage-extract >/dev/null 2>&1)
     if [ -x /tmp/squashfs-root/usr/bin/ddmm ]; then
         libpath=$(find /tmp/squashfs-root -name '*.so*' -printf '%h\n' | sort -u | tr '\n' ':')
         {
             find /tmp/squashfs-root/usr/bin/ddmm /tmp/squashfs-root -name '*.so*' -type f
             echo /tmp/squashfs-root/usr/bin/ddmm
-        } | sort -u | while read -r f; do LD_LIBRARY_PATH="$libpath" ldd "$f" 2>/dev/null; done \
+        } | sort -u | while read -r f; do LD_LIBRARY_PATH="$libpath" timeout 10 ldd "$f" </dev/null 2>/dev/null; done \
             | grep 'not found' | awk '{print $1}' | sort -u >"$out/appimage-host-libs-bare.txt"
         record appimage-host-libs-bare INFO "not bundled and missing on a bare system: $(tr '\n' ' ' <"$out/appimage-host-libs-bare.txt")"
         find /tmp/squashfs-root -name '*.so*' -type f -printf '%P\n' | sort >"$out/appimage-bundled-libs.txt"
@@ -263,13 +278,13 @@ portable)
         || record install-fuse FAIL "$(tail -n 3 "$out/install-fuse.txt")"
     launch appimage-fuse-bare info -- /tmp/ddmm.AppImage || true
 
-    log "install GTK 3 baseline: $(gtk_baseline)"
+    log "install desktop baseline: $(desktop_baseline)"
     # shellcheck disable=SC2046
-    if pm_install $(gtk_baseline) >"$out/install-gtk.txt" 2>&1; then
+    if pm_install $(desktop_baseline) >"$out/install-desktop.txt" 2>&1; then
         launch_with_fallback appimage-fuse required /tmp/ddmm.AppImage
         launch_with_fallback appimage-extract-and-run required /tmp/ddmm.AppImage --appimage-extract-and-run
     else
-        record appimage-fuse FAIL "installing $(gtk_baseline) failed: $(tail -n 3 "$out/install-gtk.txt")"
+        record appimage-fuse FAIL "installing $(desktop_baseline) failed: $(tail -n 3 "$out/install-desktop.txt")"
     fi
 
     # --- tar.gz binary --------------------------------------------------------
