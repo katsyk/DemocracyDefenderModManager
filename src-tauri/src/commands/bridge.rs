@@ -4,7 +4,7 @@
 //! integration (native messaging) status/repair/remove for Settings.
 
 use anyhow_tauri::{IntoTAResult, TAResult};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, State};
 
 use crate::{
     bridge::{native_messaging, protocol::ErrorCode, ConsentDecision, InstallCompletion},
@@ -127,14 +127,19 @@ pub async fn remove_browser_integration(state: State<'_, AppState>) -> TAResult<
     Ok(())
 }
 
-/// Bring the main window to front on demand -- used after a `ddmm://open`
-/// deep link and reused here so Settings' "Get the extension" flow can
-/// also request focus without duplicating the logic.
+/// Cheap check for whether Helldivers 2 is currently running, so the
+/// frontend can refuse `afterInstall: deploy` for a browser install rather
+/// than overwrite a running game's data files. See `steam::is_game_running`.
+#[tauri::command]
+pub fn is_game_running() -> bool {
+    crate::steam::is_game_running()
+}
+
+/// Bring the main window to front on demand -- `deep_link` and
+/// `bridge::server` use the same underlying helper for the same reason
+/// (a `ddmm://open` link, or a browser install prompt); this command lets
+/// Settings' "Get the extension" flow request it too.
 #[tauri::command]
 pub fn focus_main_window(app: AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-    }
+    crate::bridge::server::focus_main_window(&app);
 }

@@ -445,7 +445,9 @@ async fn request_install_completion(
     }
 }
 
-fn focus_main_window(app: &AppHandle) {
+/// Bring the main window to front -- reused by `deep_link` and by the
+/// frontend-facing `commands::bridge::focus_main_window` command.
+pub fn focus_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();

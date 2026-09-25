@@ -7,6 +7,7 @@ pub mod download;
 pub mod data_dir;
 pub mod steam;
 pub mod bridge;
+pub mod deep_link;
 
 use std::{
     path::PathBuf,
@@ -18,6 +19,7 @@ use std::{
 
 use log::LevelFilter;
 use tauri::Manager;
+use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_log::{Target, TargetKind};
 use tokio::sync::Mutex;
 
@@ -118,6 +120,15 @@ pub fn run() {
     );
 
     tauri::Builder::default()
+        // Must be registered first (see the plugin's own docs): it needs
+        // to intercept a second launch -- including one carrying a
+        // `ddmm://` deep link on Windows/Linux, where the OS starts a new
+        // process rather than emitting an event -- before anything else
+        // runs.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            bridge::server::focus_main_window(app);
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -141,6 +152,36 @@ pub fn run() {
         )
         .setup(move |app| {
             log::info!("{}", startup_message);
+
+            // NSIS/deb register the `ddmm://` scheme at install time (from
+            // tauri.conf.json); a portable Windows exe or an AppImage has
+            // no installer to do that, so register it ourselves every
+            // launch too -- cheap and idempotent either way.
+            let needs_runtime_scheme_registration = match decision.kind {
+                data_dir::BaseDirKind::Portable => cfg!(windows),
+                data_dir::BaseDirKind::AppData => false,
+            } || std::env::var_os("APPIMAGE").is_some();
+            if needs_runtime_scheme_registration {
+                if let Err(e) = app.deep_link().register_all() {
+                    log::warn!("Failed to register the ddmm:// scheme: {e}");
+                }
+            }
+
+            // On Windows/Linux (unlike macOS/iOS) the deep-link plugin
+            // doesn't scan argv on its own; a cold start via a `ddmm://`
+            // link needs this explicit check. A second-instance launch is
+            // instead caught by tauri-plugin-single-instance (registered
+            // above, with its `deep-link` feature forwarding it into this
+            // same `on_open_url`/`get_current` machinery).
+            app.deep_link().handle_cli_arguments(std::env::args());
+            if let Ok(Some(urls)) = app.deep_link().get_current() {
+                deep_link::handle(app.handle(), urls);
+            }
+
+            let handle = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                deep_link::handle(&handle, event.urls());
+            });
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -196,6 +237,7 @@ pub fn run() {
             commands::bridge::repair_browser_integration,
             commands::bridge::remove_browser_integration,
             commands::bridge::focus_main_window,
+            commands::bridge::is_game_running,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

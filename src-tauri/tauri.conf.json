@@ -9,6 +9,13 @@
     "beforeBuildCommand": "pnpm build:checked",
     "frontendDist": "../build"
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["ddmm"]
+      }
+    }
+  },
   "app": {
     "windows": [
       {

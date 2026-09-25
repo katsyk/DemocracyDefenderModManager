@@ -372,16 +372,25 @@ mod tests {
         assert_eq!(extract_id(br#"{"type":"hello"}"#), "");
     }
 
+    /// `poll_timeout` reads a process-global env var; cargo runs tests in
+    /// parallel threads of the same process, so the two tests below must
+    /// never interleave their set/remove with each other (or they'll
+    /// observe each other's value and flake).
+    static POLL_TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn poll_timeout_defaults_to_20s_without_env_var() {
-        // SAFETY: test-only; no other test reads/writes this var
-        // concurrently within this assertion window.
+        let _guard = POLL_TIMEOUT_ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized against the other env-mutating test above by
+        // POLL_TIMEOUT_ENV_LOCK; no other test in this crate touches this
+        // var.
         unsafe { std::env::remove_var("DDMM_BRIDGE_POLL_TIMEOUT_MS") };
         assert_eq!(poll_timeout(), Duration::from_secs(20));
     }
 
     #[test]
     fn poll_timeout_honors_env_override() {
+        let _guard = POLL_TIMEOUT_ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("DDMM_BRIDGE_POLL_TIMEOUT_MS", "250") };
         assert_eq!(poll_timeout(), Duration::from_millis(250));
         unsafe { std::env::remove_var("DDMM_BRIDGE_POLL_TIMEOUT_MS") };

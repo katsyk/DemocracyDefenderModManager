@@ -175,9 +175,61 @@ pub async fn detect_game_path() -> Option<PathBuf> {
     None
 }
 
+/// Case-insensitive substring every known Helldivers 2 process name
+/// contains: the native Windows exe, and the same exe's name as reported
+/// under Linux/Proton (where `sysinfo` truncates process names to 15
+/// characters -- this needle is only 11, so it always survives that).
+const GAME_PROCESS_NAME_NEEDLE: &str = "helldivers2";
+
+/// Pure decision logic over already-collected process names, so this is
+/// testable without actually spawning a process or touching `sysinfo`.
+fn process_names_indicate_game_running<'a>(names: impl Iterator<Item = &'a str>) -> bool {
+    names
+        .map(|n| n.to_ascii_lowercase())
+        .any(|n| n.contains(GAME_PROCESS_NAME_NEEDLE))
+}
+
+/// Cheap, best-effort check for whether Helldivers 2 is currently running --
+/// used to refuse a browser-triggered `afterInstall: deploy` while it is
+/// (overwriting a running game's data files is unsafe). Best-effort: a
+/// false negative just means a deploy is attempted anyway (and can still
+/// fail safely on its own); this never blocks the game from launching or
+/// anything other than that one bridge step.
+pub fn is_game_running() -> bool {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    process_names_indicate_game_running(system.processes().values().filter_map(|p| p.name().to_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn game_process_detected_by_windows_style_name() {
+        assert!(process_names_indicate_game_running(["explorer.exe", "HellDivers2.exe"].into_iter()));
+    }
+
+    #[test]
+    fn game_process_detected_case_insensitively() {
+        assert!(process_names_indicate_game_running(["helldivers2.exe"].into_iter()));
+    }
+
+    #[test]
+    fn game_process_detected_when_truncated_to_15_chars_like_linux() {
+        // "HellDivers2.exe" truncated to sysinfo's 15-char Linux limit.
+        assert!(process_names_indicate_game_running(["HellDivers2.ex"].into_iter()));
+    }
+
+    #[test]
+    fn unrelated_processes_do_not_match() {
+        assert!(!process_names_indicate_game_running(["steam.exe", "explorer.exe", "bash"].into_iter()));
+    }
+
+    #[test]
+    fn empty_process_list_does_not_match() {
+        assert!(!process_names_indicate_game_running(std::iter::empty()));
+    }
 
     #[test]
     fn parses_multiple_library_paths() {
