@@ -8,12 +8,20 @@ released, so this file never gets published itself.
 Democracy Defender Mod Manager (DDMM), release candidate <N>: *your mods, your democracy, defended.* It's still an
 early build, but it's meant to be usable by anyone, not just developers.
 
+**The DDMM Promise, in brief:** every mod is welcome (DDMM never blocks, blacklists or ranks mods or mod sites),
+no account is ever needed on any site, your files stay in a folder you control, it's Apache-2.0 open source
+forever, and update checks never run unless you ask.
+
 ## Quick start
 
 1. **Download** the right file for you (see the table below).
 2. **Run it.** DDMM looks for your Helldivers 2 install automatically. If Steam is in its usual place, there's
    nothing to set up.
 3. **Add mods and click Deploy.** Drag in an archive or folder, or click "Add URL" and paste a link.
+
+**Works with AyakaMods, Nexus Mods, ModWorkshop, GameBanana, GitHub, any direct link, or files already on your
+disk.** Special love to the AyakaMods community ❤️, one of the best homes for Helldivers 2 modding. Go say hi:
+<https://ayakamods.com/games/helldivers-2.119/>.
 
 ## Which file do I download?
 

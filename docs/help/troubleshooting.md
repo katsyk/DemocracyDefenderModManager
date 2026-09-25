@@ -92,7 +92,7 @@ For installing DDMM itself (which file, dependencies, AppImage, blank window), s
 
 ### "Game path is invalid!" even though the path is right
 
-Fixed in the release after 2.0.0-rc.5. Earlier versions checked the path in a way that could never see inside
+Fixed in 2.0.0-rc.6. Earlier versions checked the path in a way that could never see inside
 hidden folders on Linux — and the default Steam library is under `~/.local/share/Steam` (or `~/.steam/steam`), so
 every default install was rejected. Update DDMM. On a fixed version, the message under the field says exactly what's wrong
 (see [First-time setup](../getting-started/setup.md#setting-the-game-path-by-hand)).
