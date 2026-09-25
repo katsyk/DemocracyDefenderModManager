@@ -853,6 +853,15 @@ pub(crate) async fn install_update_from_archive(
     let final_guid = if is_local_generated(&manifest) {
         if let Manifest::Legacy(legacy) = &mut manifest {
             legacy.guid = existing_guid;
+            // The generated manifest is named after the update's archive
+            // file ("CoolMod-1.4.zip" -> "CoolMod-1"); it's the same mod, so
+            // keep the name and description the user already knows it by.
+            legacy.name = old_mod.name().to_string();
+            legacy.description = match &old_mod.manifest {
+                Manifest::Legacy(m) => m.description.clone(),
+                Manifest::V1(m) => m.description.clone(),
+                Manifest::V2(m) => m.description.clone(),
+            };
         }
         existing_guid
     } else {
@@ -1042,6 +1051,7 @@ mod tests {
 
         assert!(warning.is_none());
         assert_eq!(updated.guid(), old_guid);
+        assert_eq!(updated.name(), "CoolMod", "an update keeps the mod's name, not the archive's");
         assert_eq!(mods.len(), 1);
         assert_eq!(mods[0].guid(), old_guid);
 

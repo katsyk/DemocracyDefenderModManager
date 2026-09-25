@@ -1617,11 +1617,14 @@
                 onclick={onCheckUpdates}
             >
                 <ArrowRepeat />
-                {t("pages.mods.check_updates_button.text")}
+                <!-- Icon-only while "Update all" is shown, so the row fits at the default window size. -->
+                {#if updatesAvailableCount === 0}
+                    {t("pages.mods.check_updates_button.text")}
+                {/if}
             </button>
             {#if updatesAvailableCount > 0}
                 <button
-                    class="hd2mm-success-button flex flex-row gap-1 items-center"
+                    class="hd2mm-success-button flex flex-row gap-1 items-center whitespace-nowrap"
                     title={t("pages.mods.update_all_button.tip")}
                     onclick={onUpdateAll}
                 >

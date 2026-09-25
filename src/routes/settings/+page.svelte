@@ -2,6 +2,7 @@
     import { open } from "@tauri-apps/plugin-dialog";
     import { openPath, openUrl } from "@tauri-apps/plugin-opener";
     import { beforeNavigate, onNavigate } from "$app/navigation";
+    import { tick } from "svelte";
     import { toSkipEntry, type SkipEntry } from "$lib/models/settings";
     import type { AfterBrowserInstall } from "$lib/models/settings";
     import { useLocalization } from "$lib/state/localization.svelte";
@@ -65,6 +66,13 @@
     }
     let dataDir = $state<string>("");
     let initPromise = $state<Promise<void>>(init());
+    // Linked from the Mods page ("add a Nexus API key"): scroll there once
+    // the page has actually rendered (it only renders after init).
+    initPromise.then(async () => {
+        if (location.hash !== "#nexus-api-key") return;
+        await tick();
+        document.getElementById("nexus-api-key")?.scrollIntoView({ block: "start" });
+    }).catch(() => {});
 
     $effect(() => {
         const current = {
@@ -149,10 +157,6 @@
             // Show as "no key"; never blocks Settings.
         }
 
-        // Linked from the Mods page ("add a Nexus API key").
-        if (location.hash === "#nexus-api-key") {
-            setTimeout(() => document.getElementById("nexus-api-key")?.scrollIntoView({ block: "start" }), 0);
-        }
 
         // Also registers (idempotently) as a side effect -- see
         // repairBrowserIntegration's doc comment on the Rust side. Never
