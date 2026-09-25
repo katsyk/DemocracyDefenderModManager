@@ -227,7 +227,7 @@
             }
         }
 
-        const [loadedMods, loadedConfig]: [Mod[], ProfilesConfig] = await Promise.all<Promise<Mod[]> | Promise<ProfilesConfig>>([
+        const [loadedMods, loadedConfig]: [Mod[], ProfilesConfig] = await Promise.all([
             getMods(),
             loadProfiles()
         ]);
