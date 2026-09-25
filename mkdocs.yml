@@ -81,6 +81,7 @@ nav:
   - Getting Started:
       - getting-started/index.md
       - Download & install: getting-started/download.md
+      - Installing on Linux: getting-started/linux.md
       - First-time setup: getting-started/setup.md
       - Your first mod: getting-started/first-mod.md
       - Updating DDMM: getting-started/updating.md

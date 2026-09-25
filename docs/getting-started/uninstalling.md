@@ -18,10 +18,12 @@ you're not sure which of these applies to you.
    hand afterward if you want your mods, settings and logs gone too. **Open Folder** next to **Data Folder** in
    Settings will take you straight there before you uninstall, if you want to check what's in it first.
 
-## Installed with the .deb (Linux)
+## Installed with the .deb or .rpm (Linux)
 
 1. **Purge** first, as above.
-2. `sudo apt remove ddmm`
+2. Remove the package. It's called `democracy-defender-mod-manager`, not `ddmm`:
+    - .deb: `sudo apt remove democracy-defender-mod-manager`
+    - .rpm: `sudo dnf remove democracy-defender-mod-manager` (openSUSE: `sudo zypper remove democracy-defender-mod-manager`)
 3. As with the Windows installer, this doesn't delete `~/.local/share/io.github.katsyk.ddmm`. Remove it by hand
    if you want a completely clean removal.
 

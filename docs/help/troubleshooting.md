@@ -6,12 +6,11 @@ title: Troubleshooting
 
 ## DDMM won't start (Linux)
 
-DDMM is a [Tauri](https://tauri.app/) app and needs WebKitGTK installed to run. If nothing happens when you run
-`./ddmm`, or it exits immediately, install your distribution's WebKitGTK runtime package. On Debian/Ubuntu-based
-systems that's `libwebkit2gtk-4.1-0` (the project's own CI installs `libwebkit2gtk-4.1-dev` plus
-`build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev` to *build* DDMM
-on Ubuntu — see [Building from source](../development/building.md) — but just running a pre-built binary only
-needs the WebKitGTK runtime library itself).
+Run DDMM from a terminal to see why. Most often a library is missing, for example
+`error while loading shared libraries: libwebkit2gtk-4.1.so.0` from the `.tar.gz` when WebKitGTK 4.1 isn't
+installed. An AppImage window can also stay blank with an `EGL_BAD_PARAMETER` error. [Installing on
+Linux](../getting-started/linux.md) covers which download to use for your distribution, the exact package to
+install for each one, AppImage/FUSE errors, and the blank-window workaround.
 
 ## Windows SmartScreen warns about an unknown publisher
 
@@ -87,6 +86,9 @@ shows a "Couldn't save profiles" or "Deploy in progress" prompt asking whether t
 [log file](logs.md) for the underlying error if that keeps happening.
 
 ## Linux (CachyOS, Arch, Steam Deck, and others)
+
+For installing DDMM itself (which file, dependencies, AppImage, blank window), see
+[Installing on Linux](../getting-started/linux.md). This section covers problems once DDMM is running.
 
 ### "Game path is invalid!" even though the path is right
 

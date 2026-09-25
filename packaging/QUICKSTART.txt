@@ -11,5 +11,9 @@ Democracy Defender Mod Manager (DDMM) -- Quick Start
 Works with AyakaMods, Nexus Mods, ModWorkshop, GameBanana, GitHub, any direct
 download link, or files already on your disk.
 
+Linux: DDMM needs WebKitGTK 4.1 (e.g. `sudo pacman -S webkit2gtk-4.1`). If it
+doesn't start, run ./ddmm from a terminal to see why, and see:
+                https://katsyk.github.io/DemocracyDefenderModManager/getting-started/linux/
+
 Full docs:      https://katsyk.github.io/DemocracyDefenderModManager/
 Report a bug:   https://github.com/katsyk/DemocracyDefenderModManager/issues

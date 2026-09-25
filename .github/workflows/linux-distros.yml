@@ -1,0 +1,214 @@
+name: Linux distros
+
+# Builds the Linux release artifacts exactly like build.yml's build-linux job
+# (AppImage, .deb, .rpm, tar.gz), then smoke-tests each of them inside real
+# distro containers: install only the documented runtime deps, check every
+# shared library resolves, and launch the app under Xvfb until the frontend
+# logs "Initialization complete." against a fake Steam/Helldivers 2 install.
+# See scripts/ci/linux-smoke.sh for the per-distro steps, and
+# docs/getting-started/linux.md for the install instructions it verifies.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/linux-distros.yml'
+      - '.github/workflows/build.yml'
+      - 'scripts/ci/**'
+      - 'packaging/**'
+      - 'src-tauri/tauri.conf.json'
+      - 'src-tauri/Cargo.toml'
+      - 'src-tauri/Cargo.lock'
+  workflow_call:
+    inputs:
+      artifact:
+        description: >-
+          Name of an already-uploaded artifact (from the calling run) holding
+          the renamed DDMM-*-linux-* files. Empty = build them here.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  # github.workflow is the caller's name under workflow_call, so a release
+  # run of build.yml never cancels (or is cancelled by) a PR run.
+  group: linux-distros-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LINUX_DEPS: libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+jobs:
+  build:
+    if: ${{ !inputs.artifact }}
+    # Oldest supported Ubuntu LTS, like build.yml's build-linux: the binary
+    # needs the build host's glibc or newer (24.04's 2.39 locked out
+    # Ubuntu 22.04 / Debian 12 / Mint 21).
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          # Separate from the ubuntu-latest caches: restoring a 24.04
+          # target/ dir on 22.04 breaks the build ("can't find crate").
+          key: ubuntu-22.04
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y ${{ env.LINUX_DEPS }} rpm
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      - name: Build
+        run: pnpm tauri build
+
+      - name: Determine version
+        id: version
+        run: echo "version=$(jq -r .version src-tauri/tauri.conf.json)" >> "$GITHUB_OUTPUT"
+
+      # Same names as build.yml's release assets.
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          v="${{ steps.version.outputs.version }}"
+          mkdir -p dist tarball
+          cp "$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' | head -n1)" "dist/DDMM-$v-linux-x86_64.AppImage"
+          bash scripts/ci/fix-appimage.sh "dist/DDMM-$v-linux-x86_64.AppImage"
+          cp "$(find src-tauri/target/release/bundle/deb -name '*.deb' | head -n1)" "dist/DDMM-$v-linux-amd64.deb"
+          cp "$(find src-tauri/target/release/bundle/rpm -name '*.rpm' | head -n1)" "dist/DDMM-$v-linux-x86_64.rpm"
+          cp src-tauri/target/release/ddmm tarball/
+          cp packaging/QUICKSTART.txt tarball/
+          tar -C tarball -czf "dist/DDMM-$v-linux-x64.tar.gz" .
+          ls -la dist
+
+      - name: Inspect packages
+        run: |
+          set -uo pipefail
+          {
+            echo "## Build host"; grep PRETTY_NAME /etc/os-release; ldd --version | head -n1
+            echo; echo "## rpm -qpi"; rpm -qpi dist/*.rpm
+            echo; echo "## rpm -qpR (Requires)"; rpm -qpR dist/*.rpm
+            echo; echo "## rpm -qpl"; rpm -qpl dist/*.rpm
+            echo; echo "## dpkg-deb -I"; dpkg-deb -I dist/*.deb
+            echo; echo "## dpkg-deb -c"; dpkg-deb -c dist/*.deb
+            echo; echo "## ddmm NEEDED"; objdump -p src-tauri/target/release/ddmm | grep NEEDED
+            echo; echo "## highest GLIBC symbol version"
+            objdump -T src-tauri/target/release/ddmm | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n1
+            echo; echo "## AppImage runtime"; file dist/*.AppImage
+          } | tee dist-inspect.txt
+          { echo '```'; cat dist-inspect.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-distros-build
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Upload package inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-distros-inspect
+          path: dist-inspect.txt
+
+  smoke:
+    needs: build
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: fedora-44, image: 'fedora:44', family: fedora, package: true }
+          - { name: archlinux, image: 'archlinux:latest', family: arch, package: false }
+          - { name: ubuntu-24.04, image: 'ubuntu:24.04', family: debian, package: true }
+          - { name: debian-13, image: 'debian:13', family: debian, package: true }
+          - { name: opensuse-tumbleweed, image: 'opensuse/tumbleweed:latest', family: suse, package: true }
+          # Oldest glibc we aim to support (2.35 / 2.36): catches a build
+          # host that's too new.
+          - { name: ubuntu-22.04, image: 'ubuntu:22.04', family: debian, package: true }
+          - { name: debian-12, image: 'debian:12', family: debian, package: true }
+    timeout-minutes: 45
+    name: smoke (${{ matrix.name }})
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.artifact || 'linux-distros-build' }}
+          path: dist
+
+      - name: Pull image
+        run: docker pull "${{ matrix.image }}"
+
+      # --privileged so /dev/fuse and user namespaces (WebKitGTK's bubblewrap
+      # sandbox) behave like on a desktop instead of like a locked container.
+      - name: AppImage + tar.gz (fresh container)
+        id: portable
+        continue-on-error: true
+        run: |
+          timeout 1200 docker run --rm --privileged -v "$PWD:/w" -w /w "${{ matrix.image }}" \
+            bash scripts/ci/linux-smoke.sh "${{ matrix.family }}" portable /w/dist /w/out/portable
+
+      - name: Native package (fresh container)
+        id: package
+        if: matrix.package
+        continue-on-error: true
+        run: |
+          timeout 900 docker run --rm --privileged -v "$PWD:/w" -w /w "${{ matrix.image }}" \
+            bash scripts/ci/linux-smoke.sh "${{ matrix.family }}" package /w/dist /w/out/package
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.name }} (\`${{ matrix.image }}\`)"
+            cat out/*/os-release.txt 2>/dev/null | sort -u | sed 's/^/    /'
+            echo
+            echo "| check | result | detail |"
+            echo "| --- | --- | --- |"
+            for f in out/portable/results.tsv out/package/results.tsv; do
+              [ -f "$f" ] || continue
+              while IFS=$'\t' read -r check status detail; do
+                echo "| $check | $status | ${detail//|/\\|} |"
+              done < "$f"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          sudo chown -R "$(id -u)" out || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.name }}
+          path: out/
+          if-no-files-found: warn
+
+      - name: Fail on failed checks
+        if: steps.portable.outcome == 'failure' || steps.package.outcome == 'failure'
+        run: |
+          echo "::error::one or more required checks failed on ${{ matrix.name }}; see the summary and the smoke-${{ matrix.name }} artifact"
+          exit 1
