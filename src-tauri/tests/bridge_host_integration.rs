@@ -245,6 +245,57 @@ fn app_not_running_replies_with_error_after_the_configured_timeout() {
     let _ = child.wait_timeout_or_kill();
 }
 
+/// Children of `pid` that have exited but were never waited for.
+#[cfg(target_os = "linux")]
+fn zombie_children_of(pid: u32) -> Vec<u32> {
+    let mut zombies = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Ok(child_pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else { continue };
+        // "<pid> (<comm>) <state> <ppid> ..." -- comm may contain spaces,
+        // so split after the last ')'.
+        let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else { continue };
+        let mut fields = rest.split_whitespace();
+        let state = fields.next();
+        let ppid = fields.next().and_then(|p| p.parse::<u32>().ok());
+        if ppid == Some(pid) && state == Some("Z") {
+            zombies.push(child_pid);
+        }
+    }
+    zombies
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn launched_app_is_reaped_when_it_exits() {
+    let (dir, exe) = portable_copy_of_binary();
+    // The dummy "DDMM" exits immediately, like a real one the user closed
+    // while the browser keeps the host running.
+    let dummy = dummy_launch_target(dir.path());
+
+    let mut child = spawn_host(
+        &exe,
+        &[
+            ("APPIMAGE", dummy.to_str().unwrap()),
+            ("DDMM_BRIDGE_POLL_TIMEOUT_MS", "300"),
+        ],
+    );
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    write_frame(&mut stdin, br#"{"id":"1","type":"hello"}"#);
+    let reply = read_frame_json(&mut stdout);
+    assert_eq!(reply["error"]["code"], "APP_NOT_RUNNING");
+
+    // The host is still alive (stdin open); its launched child must not be
+    // left as a zombie.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(zombie_children_of(child.id()), Vec::<u32>::new());
+
+    drop(stdin);
+    let _ = child.wait_timeout_or_kill();
+}
+
 /// A fake "app" that completes the handshake, answers exactly one request
 /// (echoing its id with `served_by`), then closes the connection -- i.e.
 /// DDMM exiting while the browser keeps the host alive.

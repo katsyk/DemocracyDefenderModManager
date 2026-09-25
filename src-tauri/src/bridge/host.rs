@@ -63,7 +63,13 @@ fn spawn_detached(exe: &Path) -> io::Result<()> {
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
 
-    cmd.spawn()?;
+    let mut child = cmd.spawn()?;
+    // Reap it once it exits. The browser can keep this host alive for a
+    // long time, and an un-waited child the user later closes would
+    // otherwise linger as a zombie until then.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 
