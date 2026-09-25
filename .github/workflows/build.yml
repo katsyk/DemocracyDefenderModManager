@@ -223,12 +223,8 @@ jobs:
 
       - name: Build extension
         working-directory: extension
-        # DDMM_MANIFEST_KEY (base64 DER public key) is an optional repo
-        # secret. If it's not set, the Chrome zip still builds fine, just
-        # without the pinned inomhciahaeeefhgdkiaabdponcfdane extension id
-        # -- see extension/scripts/build.mjs.
-        env:
-          DDMM_MANIFEST_KEY: ${{ secrets.DDMM_MANIFEST_KEY }}
+        # The pinned Chrome extension id comes from the committed PUBLIC key
+        # in extension/chrome-public-key.txt (see scripts/build.mjs).
         run: pnpm build
 
       - name: Upload artifacts

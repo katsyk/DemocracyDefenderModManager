@@ -133,10 +133,6 @@ jobs:
         working-directory: extension
         run: pnpm build
 
-      # No DDMM_MANIFEST_KEY(_FILE) secret is available in CI, so this
-      # builds without the pinned Chrome extension id -- see
-      # extension/scripts/build.mjs. That's expected and fine here; it only
-      # matters for a real release build.
       - name: Extension lint (web-ext)
         working-directory: extension
         run: pnpm lint

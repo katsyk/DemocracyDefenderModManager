@@ -11,8 +11,8 @@
  * inomhciahaeeefhgdkiaabdponcfdane) is a secret never committed to this
  * repo. The build looks for it, in order:
  *   1. `DDMM_MANIFEST_KEY` env var (the base64 DER public key itself).
- *   2. A file at `DDMM_MANIFEST_KEY_FILE` (default:
- *      /home/rabite/dev/ddmm-secrets/manifest-key.txt).
+ *   2. A file at `DDMM_MANIFEST_KEY_FILE` (default: extension/chrome-public-key.txt,
+ *      the committed PUBLIC key -- it is not a secret; the private key never enters the repo).
  * If neither is available (e.g. on CI, or a contributor's machine), the
  * build still succeeds -- it just omits `key`, so Chrome assigns a random
  * id for that unpacked build instead of the pinned one. This is what keeps
@@ -35,7 +35,7 @@ const SRC = path.join(ROOT, 'src');
 const ICONS = path.join(ROOT, 'icons');
 const DIST = path.join(ROOT, 'dist');
 
-const DEFAULT_KEY_FILE = '/home/rabite/dev/ddmm-secrets/manifest-key.txt';
+const DEFAULT_KEY_FILE = path.join(ROOT, 'chrome-public-key.txt');
 const GECKO_ID = 'ddmm@katsyk.github.io';
 const MIN_FIREFOX_VERSION = '109.0';
 
