@@ -162,6 +162,7 @@ pub struct QueryRequest {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct QueryModSummary {
     pub guid: String,
     pub name: String,
@@ -283,6 +284,25 @@ mod tests {
         };
         let value = serde_json::to_value(&reply).unwrap();
         assert!(value["updateAvailable"].is_null());
+    }
+
+    #[test]
+    fn query_reply_mod_uses_camel_case_installed_version() {
+        let reply = QueryReply {
+            id: "3".to_string(),
+            ok: true,
+            kind: "queryResult",
+            installed: true,
+            r#mod: Some(QueryModSummary {
+                guid: "g".to_string(),
+                name: "Cool Mod".to_string(),
+                installed_version: Some("1.0".to_string()),
+            }),
+            update_available: Some(true),
+        };
+        let value = serde_json::to_value(&reply).unwrap();
+        assert_eq!(value["mod"]["installedVersion"], "1.0");
+        assert!(value["mod"].get("installed_version").is_none());
     }
 
     #[test]
