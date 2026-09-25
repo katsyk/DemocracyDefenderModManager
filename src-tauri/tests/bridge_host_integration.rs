@@ -25,6 +25,10 @@ fn portable_copy_of_binary() -> (tempfile::TempDir, PathBuf) {
     let src = PathBuf::from(env!("CARGO_BIN_EXE_ddmm"));
     let dest = dir.path().join(src.file_name().unwrap());
     std::fs::copy(&src, &dest).unwrap();
+    // Belt and braces against the ETXTBSY flake `spawn_host` also retries
+    // around: make sure the copy is fully flushed to the filesystem (and
+    // the handle closed) before anything tries to exec it.
+    std::fs::File::open(&dest).unwrap().sync_all().unwrap();
 
     #[cfg(unix)]
     {
@@ -71,15 +75,33 @@ fn read_frame_json(stream: &mut impl Read) -> serde_json::Value {
 }
 
 fn spawn_host(exe: &Path, extra_env: &[(&str, &str)]) -> Child {
-    let mut cmd = Command::new(exe);
-    cmd.arg(CHROME_EXTENSION_ARG)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (k, v) in extra_env {
-        cmd.env(k, v);
+    // `fs::copy` (in `portable_copy_of_binary`) returns before the kernel
+    // has necessarily finished releasing the destination inode for exec on
+    // every filesystem, so an exec right after a fresh copy can transiently
+    // fail with ETXTBSY ("Text file busy") -- a handful of short retries
+    // clears it reliably without weakening what the test actually checks.
+    let mut last_err = None;
+    for attempt in 0..10 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let mut cmd = Command::new(exe);
+        cmd.arg(CHROME_EXTENSION_ARG)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+
+        match cmd.spawn() {
+            Ok(child) => return child,
+            Err(e) if e.raw_os_error() == Some(26) /* ETXTBSY */ => last_err = Some(e),
+            Err(e) => panic!("failed to spawn ddmm in host mode: {e}"),
+        }
     }
-    cmd.spawn().expect("failed to spawn ddmm in host mode")
+    panic!("failed to spawn ddmm in host mode after retries: {:?}", last_err.unwrap())
 }
 
 /// A minimal stand-in for `bridge::server`: accepts one connection,

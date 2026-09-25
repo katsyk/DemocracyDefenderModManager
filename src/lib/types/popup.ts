@@ -8,6 +8,7 @@ import AddResultPopupComponent from "$lib/components/popups/AddResultPopup.svelt
 import ModConfigPopupComponent from "$lib/components/popups/ModConfigPopup.svelte";
 import HandoffPopupComponent from "$lib/components/popups/HandoffPopup.svelte";
 import BridgeConsentPopupComponent from "$lib/components/popups/BridgeConsentPopup.svelte";
+import AutoImportPopupComponent from "$lib/components/popups/AutoImportPopup.svelte";
 import type { ModAddResult } from "./results";
 import type { Config } from "$lib/models/profile";
 import type { Mod } from "$lib/models/mod";
@@ -136,6 +137,23 @@ export class BridgeConsentPopup extends Popup<BridgeConsentDecision> {
     component = BridgeConsentPopupComponent;
 
     constructor(public readonly site: string) {
+        super();
+    }
+}
+
+export type AutoImportDecision = "Install" | "InstallAndDeploy" | "Ignore";
+
+/**
+ * A new archive appeared in the Downloads folder while
+ * [auto-import](../../../docs/using/one-click-install.md) was on and
+ * looked like a Helldivers 2 mod -- asks what to do with it. Never
+ * triggered without this confirmation, however it looks; "auto" only
+ * means "auto-detected", not "auto-installed".
+ */
+export class AutoImportPopup extends Popup<AutoImportDecision> {
+    component = AutoImportPopupComponent;
+
+    constructor(public readonly file: string) {
         super();
     }
 }

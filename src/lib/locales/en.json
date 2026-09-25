@@ -379,6 +379,19 @@
             "deny_button": {
                 "text": "Deny"
             }
+        },
+        "auto_import": {
+            "title": "Install This Mod?",
+            "question": "{file} looks like a Helldivers 2 mod. Install it?",
+            "install_and_deploy_button": {
+                "text": "Install & Deploy"
+            },
+            "install_button": {
+                "text": "Install"
+            },
+            "ignore_button": {
+                "text": "Ignore"
+            }
         }
     },
     "toast": {
@@ -389,6 +402,10 @@
             "installed_with_issue": "{name} installed, but {message}",
             "profile_save_failed": "couldn't save profiles.json",
             "game_running": "Helldivers 2 is currently running; deploy manually once you've closed it."
+        },
+        "auto_import": {
+            "deployed": "{name} installed and deployed.",
+            "deploy_failed": "Installed, but deploy failed: {message}"
         }
     }
 }

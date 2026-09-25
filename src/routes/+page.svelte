@@ -29,7 +29,8 @@
         AddResultPopup,
         ModConfigPopup,
         HandoffPopup,
-        BridgeConsentPopup
+        BridgeConsentPopup,
+        AutoImportPopup
     } from "$lib/types/popup";
     import ToggleSwitch from "$lib/components/ToggleSwitch.svelte";
     import PopupMenuButton from "$lib/components/PopupMenuButton.svelte";
@@ -135,6 +136,12 @@
             "deep-link://install-request",
             (e) => onDeepLinkInstallRequest(e.payload),
         );
+        // Auto-import from Downloads (see auto_import.rs on the Rust side;
+        // opt-in, off by default).
+        const unlistenAutoImport = listen<{ file: string }>(
+            "auto-import://candidate",
+            (e) => onAutoImportCandidate(e.payload),
+        );
 
         return () => {
             unlisten.then(f => f());
@@ -142,6 +149,7 @@
             unlistenBridgeConsent.then(f => f());
             unlistenBridgeInstalled.then(f => f());
             unlistenDeepLinkInstall.then(f => f());
+            unlistenAutoImport.then(f => f());
         };
     });
 
@@ -281,13 +289,14 @@
         }
     }
 
-    async function doAddMod(filename: string) {
+    async function doAddMod(filename: string): Promise<Mod | undefined> {
         const wait = new WaitPopup(t("pages.mods.popup.wait.add.message"));
         showPopup(wait);
         try {
             const { mod, warning } = await addMod(filename);
             mods.push(mod);
             if (warning) showPopup(new NotificationPopup("warning", warning));
+            return mod;
         } catch(ex: unknown) {
             let message: string;
             if (ex instanceof Error) {
@@ -298,6 +307,7 @@
                 message = "Unknown error!";
             }
             showPopup(new ErrorPopup(t("pages.mods.popup.error.add.message"), message));
+            return undefined;
         } finally {
             wait.close();
         }
@@ -578,6 +588,32 @@
         if (!confirmed) return;
 
         await installFromUrl(payload.url);
+    }
+
+    /** `auto-import://candidate` -- a new, finished archive appeared in
+     * Downloads and looked like a Helldivers 2 mod (opt-in, off by
+     * default; see auto_import.rs). Never installs without this click. */
+    async function onAutoImportCandidate(payload: { file: string }) {
+        const decision = await showPopup(new AutoImportPopup(payload.file));
+        if (decision === "Ignore") return;
+
+        const mod = await doAddMod(payload.file);
+        if (!mod) return;
+
+        if (decision === "InstallAndDeploy" && currentProfile) {
+            if (!profileConfigs.some(c => c.Guid === mod.guid)) {
+                profileConfigs.push(makeConfigForMod(mod));
+            }
+            await doSaveProfiles();
+
+            try {
+                await deploy(currentProfile.Configs);
+                showToast("info", t("toast.auto_import.deployed", { name: mod.name }));
+            } catch (ex: unknown) {
+                const message = ex instanceof Error ? ex.message : String(ex);
+                showToast("warning", t("toast.auto_import.deploy_failed", { message }));
+            }
+        }
     }
 
     async function doSaveProfiles(): Promise<boolean> {

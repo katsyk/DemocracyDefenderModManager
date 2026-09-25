@@ -8,6 +8,7 @@ pub mod data_dir;
 pub mod steam;
 pub mod bridge;
 pub mod deep_link;
+pub mod auto_import;
 
 use std::{
     path::PathBuf,
@@ -203,6 +204,8 @@ pub fn run() {
                     }
                 }
             });
+
+            auto_import::spawn(app.handle().clone());
 
             Ok(())
         })
