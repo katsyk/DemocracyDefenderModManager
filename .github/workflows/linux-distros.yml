@@ -32,7 +32,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: linux-distros-${{ github.ref }}
+  # github.workflow is the caller's name under workflow_call, so a release
+  # run of build.yml never cancels (or is cancelled by) a PR run.
+  group: linux-distros-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -147,7 +149,6 @@ jobs:
           # host that's too new.
           - { name: ubuntu-22.04, image: 'ubuntu:22.04', family: debian, package: true }
           - { name: debian-12, image: 'debian:12', family: debian, package: true }
-    continue-on-error: ${{ matrix.informational == true }}
     timeout-minutes: 45
     name: smoke (${{ matrix.name }})
     steps:
