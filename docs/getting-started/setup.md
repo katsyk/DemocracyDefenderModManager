@@ -36,19 +36,29 @@ the path:
 - exists,
 - contains a `tools` directory,
 - contains a `data` directory, and
-- contains a `bin` directory, which in turn contains `helldivers2.exe`.
+- contains a `bin` directory, which in turn contains `helldivers2.exe` (in any letter case).
 
-If any of those checks fail, DDMM tells you exactly which one, right under the field:
+Picked a folder one level off? That's fine: if you choose the game's own `data`, `bin` or `tools` folder (or
+`bin/helldivers2.exe` itself), or a folder *above* it — `steamapps/common`, `steamapps`, or the Steam library
+folder — DDMM finds the real `Helldivers 2` folder, shows "Using the game folder: ..." under the field, and saves
+that.
+
+If the checks fail, DDMM tells you exactly which one, right under the field:
 
 | Message | Meaning |
 | --- | --- |
 | Game path can not be empty! | Nothing entered yet |
-| Game path does not exist! | The folder itself wasn't found |
-| Game path is invalid! | The path couldn't be read at all |
+| Game path does not exist! ... | The folder itself wasn't found (check for typos) |
+| Game path is a file, not a folder! ... | You picked a file rather than the `Helldivers 2` folder |
+| DDMM isn't allowed to read this folder: ... | The OS refused access (permissions, or a drive that isn't mounted properly); the OS's own error follows |
+| This is a temporary desktop-portal path ... | The folder picker handed back a `/run/user/.../doc/...` path (Linux); type or paste the real path |
 | Game path does not contain a directory named "tools"! | Not a Helldivers 2 install folder |
 | Game path does not contain a directory named "data"! | Not a Helldivers 2 install folder |
 | Game path does not contain a directory named "bin"! | Not a Helldivers 2 install folder |
 | Game path's "bin" directory does not contain the "helldivers2.exe"! | `bin` exists, but the game executable doesn't |
+| Couldn't check the game path: ... | The check itself failed; the reason follows |
+
+On Linux, see also [Troubleshooting → Linux](../help/troubleshooting.md#linux-cachyos-arch-steam-deck-and-others).
 
 ## The rest of Settings
 

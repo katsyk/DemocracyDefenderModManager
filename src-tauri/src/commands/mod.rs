@@ -21,12 +21,26 @@ struct PatchFileTriplet {
     stream: Option<PathBuf>,
 }
 
+/// `relative` (from a mod's manifest) resolved under the mod directory
+/// `base`, tolerating Windows-style backslash separators and wrong casing --
+/// see [`crate::utils::fix_path_casing`].
+async fn resolve_mod_path(base: &Path, relative: &Path) -> PathBuf {
+    match crate::utils::fix_path_casing(base, relative).await {
+        Ok(fixed) => base.join(fixed),
+        Err(_) => base.join(relative),
+    }
+}
+
 async fn get_patch_files_from_dir(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    use anyhow::Context;
+
     log::info!("Collecting patch files of directory {:?}...", dir);
 
     let mut entries = Vec::new();
-    let mut dir_reader = tokio::fs::read_dir(dir).await?;
-    while let Some(entry) = dir_reader.next_entry().await? {
+    let mut dir_reader = tokio::fs::read_dir(dir)
+        .await
+        .with_context(|| format!("can't read folder {:?}", dir))?;
+    while let Some(entry) = dir_reader.next_entry().await.with_context(|| format!("can't read folder {:?}", dir))? {
         if !entry.file_type()
             .await
             .map(|t| t.is_file())
@@ -108,13 +122,35 @@ async fn add_files_from_dir(dir: &Path, groups: &mut HashMap<String, Vec<PatchFi
     Ok(())
 }
 
+async fn copy_patch_file(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    tokio::fs::copy(src, dest)
+        .await
+        .with_context(|| format!("failed to copy {:?} to {:?}", src, dest))?;
+    Ok(())
+}
+
+async fn create_empty_patch_file(dest: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    tokio::fs::File::create(dest)
+        .await
+        .with_context(|| format!("failed to create {:?}", dest))?;
+    Ok(())
+}
+
 async fn do_purge(data_dir: &Path) -> anyhow::Result<()> {
     log::info!("Purging...");
 
     let patch_files = get_patch_files_from_dir(data_dir).await?;
 
     log::info!("Deleting files...");
-    futures::future::try_join_all(patch_files.iter().map(|f| tokio::fs::remove_file(f))).await?;
+    futures::future::try_join_all(patch_files.iter().map(|f| async move {
+        use anyhow::Context;
+        tokio::fs::remove_file(f)
+            .await
+            .with_context(|| format!("failed to delete {:?}", f))
+    }))
+    .await?;
 
     log::info!("Purge complete.");
     Ok(())
@@ -164,7 +200,7 @@ async fn collect_files_for_mod(
 
             if let Some(options) = manifest.options.as_ref() {
                 if let Some(opt) = options.get(*selected) {
-                    let dir = base.join(opt);
+                    let dir = resolve_mod_path(base, Path::new(opt)).await;
                     add_files_from_dir(&dir, groups).await?;
                 } else {
                     log::warn!(
@@ -187,7 +223,7 @@ async fn collect_files_for_mod(
 
                     if let Some(includes) = opt.include.as_ref() {
                         for inc in includes {
-                            let dir = base.join(inc);
+                            let dir = resolve_mod_path(base, inc).await;
                             add_files_from_dir(&dir, groups).await?;
                         }
                     }
@@ -196,7 +232,7 @@ async fn collect_files_for_mod(
                         if let Some(idx) = selected.get(i).cloned() {
                             if let Some(sub) = sub_options.get(idx) {
                                 for inc in &sub.include {
-                                    let dir = base.join(inc);
+                                    let dir = resolve_mod_path(base, inc).await;
                                     add_files_from_dir(&dir, groups).await?;
                                 }
                             } else {
@@ -230,7 +266,7 @@ async fn collect_files_for_mod(
 
                     if let Some(includes) = opt.include.as_ref() {
                         for inc in includes {
-                            let dir = base.join(inc);
+                            let dir = resolve_mod_path(base, inc).await;
                             add_files_from_dir(&dir, groups).await?;
                         }
                     }
@@ -239,7 +275,7 @@ async fn collect_files_for_mod(
                         if let Some(idx) = selected.get(i).cloned() {
                             if let Some(sub) = sub_options.get(idx) {
                                 for inc in &sub.include {
-                                    let dir = base.join(inc);
+                                    let dir = resolve_mod_path(base, inc).await;
                                     add_files_from_dir(&dir, groups).await?;
                                 }
                             } else {
@@ -275,13 +311,14 @@ pub async fn deploy(state: State<'_, AppState>, configs: Vec<Config>) -> TAResul
     let mods = mods.as_ref().unwrap();
 
     let settings = do_load_settings(&state.base_path).await?;
-    if let Err(e) = settings.validate().await {
-        return anyhow::anyhow!("invalid settings: {}", e).into_ta_result();
-    }
+    let game_root = match settings.validate().await {
+        Ok(root) => root,
+        Err(e) => return anyhow::anyhow!("invalid settings: {}", e).into_ta_result(),
+    };
 
     let mods = pair_mods_with_configs(mods, &configs);
 
-    let data_dir = settings.game_path().join("data");
+    let data_dir = game_root.join("data");
 
     do_purge(&data_dir).await?;
 
@@ -319,20 +356,20 @@ pub async fn deploy(state: State<'_, AppState>, configs: Vec<Config>) -> TAResul
 
             let patch_dest = data_dir.join(format!("{}.patch_{}", name, index));
             match &triplet.patch {
-                Some(src) => { tokio::fs::copy(src, &patch_dest).await.into_ta_result()?; }
-                None => { tokio::fs::File::create(&patch_dest).await.into_ta_result()?; }
+                Some(src) => { copy_patch_file(src, &patch_dest).await.into_ta_result()?; }
+                None => { create_empty_patch_file(&patch_dest).await.into_ta_result()?; }
             }
             
             let gpu_dest = data_dir.join(format!("{}.patch_{}.gpu_resources", name, index));
             match &triplet.gpu_resources {
-                Some(src) => { tokio::fs::copy(src, &gpu_dest).await.into_ta_result()?; }
-                None => { tokio::fs::File::create(&gpu_dest).await.into_ta_result()?; }
+                Some(src) => { copy_patch_file(src, &gpu_dest).await.into_ta_result()?; }
+                None => { create_empty_patch_file(&gpu_dest).await.into_ta_result()?; }
             }
             
             let stream_dest = data_dir.join(format!("{}.patch_{}.stream", name, index));
             match &triplet.stream {
-                Some(src) => { tokio::fs::copy(src, &stream_dest).await.into_ta_result()?; }
-                None => { tokio::fs::File::create(&stream_dest).await.into_ta_result()?; }
+                Some(src) => { copy_patch_file(src, &stream_dest).await.into_ta_result()?; }
+                None => { create_empty_patch_file(&stream_dest).await.into_ta_result()?; }
             }
         }
     }
@@ -344,11 +381,12 @@ pub async fn deploy(state: State<'_, AppState>, configs: Vec<Config>) -> TAResul
 #[tauri::command]
 pub async fn purge(state: State<'_, AppState>) -> TAResult<()> {
     let settings = load_settings(state).await?;
-    if let Err(e) = settings.validate().await {
-        return anyhow::anyhow!("invalid settings: {}", e).into_ta_result();
-    }
+    let game_root = match settings.validate().await {
+        Ok(root) => root,
+        Err(e) => return anyhow::anyhow!("invalid settings: {}", e).into_ta_result(),
+    };
 
-    let data_dir = settings.game_path().join("data");
+    let data_dir = game_root.join("data");
     do_purge(&data_dir).await.into_ta_result()
 }
 
@@ -421,6 +459,50 @@ mod tests {
 
     fn v2_guid() -> Uuid {
         Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap()
+    }
+
+    #[tokio::test]
+    async fn windows_style_include_paths_resolve_on_case_sensitive_filesystems() {
+        // A Windows-authored manifest: backslash separators and casing
+        // that doesn't match the folders on disk.
+        let dir = tempfile::tempdir().unwrap();
+        write_patch_file(&dir.path().join("Variants/Red"), 0).await;
+        let r#mod = Mod {
+            manifest: Manifest::Legacy(legacy::Manifest {
+                guid: Uuid::nil(),
+                name: "win".into(),
+                description: String::new(),
+                icon_path: None,
+                options: Some(vec!["variants\\red".into()]),
+            }),
+            directory: dir.path().to_path_buf(),
+            sources: Vec::new(),
+        };
+        let config = Config::Legacy { guid: Uuid::nil(), enabled: true, selected: 0 };
+
+        let mut groups = HashMap::new();
+        collect_files_for_mod(&r#mod, &config, &mut groups).await.unwrap();
+        assert!(groups.contains_key("0123456789abcdef"));
+    }
+
+    #[tokio::test]
+    async fn missing_include_folder_error_names_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let r#mod = Mod {
+            manifest: Manifest::Legacy(legacy::Manifest {
+                guid: Uuid::nil(),
+                name: "m".into(),
+                description: String::new(),
+                icon_path: None,
+                options: Some(vec!["NotThere".into()]),
+            }),
+            directory: dir.path().to_path_buf(),
+            sources: Vec::new(),
+        };
+        let config = Config::Legacy { guid: Uuid::nil(), enabled: true, selected: 0 };
+
+        let err = collect_files_for_mod(&r#mod, &config, &mut HashMap::new()).await.unwrap_err();
+        assert!(format!("{:#}", err).contains("NotThere"), "{err:#}");
     }
 
     #[tokio::test]

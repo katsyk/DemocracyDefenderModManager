@@ -30,16 +30,31 @@ pub fn find_steam_roots() -> Vec<PathBuf> {
     #[cfg(target_os = "linux")]
     {
         if let Some(home) = dirs::home_dir() {
-            roots.push(home.join(".steam/steam"));
+            // Native package (Arch/CachyOS `steam`, Debian, ...). `~/.steam/steam`
+            // and `~/.steam/root` are usually symlinks to `~/.local/share/Steam`.
             roots.push(home.join(".local/share/Steam"));
+            roots.push(home.join(".steam/steam"));
+            roots.push(home.join(".steam/root"));
+            // Flatpak (`com.valvesoftware.Steam`).
             roots.push(home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"));
+            roots.push(home.join(".var/app/com.valvesoftware.Steam/data/Steam"));
+            // Snap.
+            roots.push(home.join("snap/steam/common/.local/share/Steam"));
         }
     }
 
+    dedupe_existing_dirs(roots)
+}
+
+/// Keep only existing directories, dropping any that are the same
+/// directory as an earlier one once symlinks are resolved (`~/.steam/steam`
+/// -> `~/.local/share/Steam`). The first spelling of each is kept.
+fn dedupe_existing_dirs(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut seen = std::collections::HashSet::new();
-    roots
+    paths
         .into_iter()
-        .filter(|p| p.is_dir() && seen.insert(p.clone()))
+        .filter(|p| p.is_dir())
+        .filter(|p| seen.insert(std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())))
         .collect()
 }
 
@@ -62,14 +77,12 @@ pub fn find_libraries(steam_root: &Path) -> Vec<PathBuf> {
 
     let vdf_path = steam_root.join("steamapps").join("libraryfolders.vdf");
     if let Ok(content) = std::fs::read_to_string(&vdf_path) {
-        for path in parse_library_paths(&content) {
-            if !libraries.contains(&path) {
-                libraries.push(path);
-            }
-        }
+        libraries.extend(parse_library_paths(&content));
     }
 
-    libraries
+    // Same library listed twice, or once via a symlink -- only search it
+    // once. Missing libraries (an unplugged drive) are simply skipped.
+    dedupe_existing_dirs(libraries)
 }
 
 /// Extract every `"path"` value from a `libraryfolders.vdf`'s contents.
@@ -132,26 +145,13 @@ pub fn find_installdir(library: &Path, app_id: &str) -> Option<String> {
     parse_installdir(&content)
 }
 
-/// The same validity checks `Settings::validate` applies to a configured
-/// game path (existence, `tools/`, `data/`, `bin/`, `bin/helldivers2.exe`)
-/// -- duplicated here (rather than shared) since `Settings::validate` also
-/// checks a non-empty path and produces user-facing error messages, which
-/// don't apply to a detection candidate.
+/// Whether `path` is itself a Helldivers 2 game root. Same check
+/// `Settings::validate` uses (see [`crate::game_path`]), but without the
+/// walk-up/walk-down normalisation -- a detection candidate is always the
+/// exact `steamapps/common/<installdir>` folder.
 async fn is_valid_game_path(path: &Path) -> bool {
-    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
-        return false;
-    }
-    if !tokio::fs::try_exists(path.join("tools")).await.unwrap_or(false) {
-        return false;
-    }
-    if !tokio::fs::try_exists(path.join("data")).await.unwrap_or(false) {
-        return false;
-    }
-    let bin = path.join("bin");
-    if !tokio::fs::try_exists(&bin).await.unwrap_or(false) {
-        return false;
-    }
-    tokio::fs::try_exists(bin.join("helldivers2.exe"))
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::game_path::check_root(&path).is_ok())
         .await
         .unwrap_or(false)
 }
@@ -359,6 +359,19 @@ mod tests {
         }
 
         assert_eq!(found, Some(game_dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_duplicate_roots_are_searched_once() {
+        let real = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("steam");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        let missing = links.path().join("not-there");
+
+        let roots = dedupe_existing_dirs(vec![real.path().to_path_buf(), link, missing]);
+        assert_eq!(roots, vec![real.path().to_path_buf()]);
     }
 
     #[tokio::test]

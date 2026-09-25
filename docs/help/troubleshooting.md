@@ -29,20 +29,22 @@ You only land on Settings when auto-detection also fails (Steam isn't installed,
 yourself, or click **Auto-detect** again after installing/moving the game — see
 [First-time setup](../getting-started/setup.md).
 
-## "Loading failed!" on the Mods page
+## A mod's manifest can't be read
 
-DDMM loads every mod's `manifest.json` when it starts. If exactly one of them is malformed (invalid JSON, or
-missing a required field), loading the whole list fails with this error and its underlying message.
+DDMM reads each mod's `manifest.json` when you add the mod and every time it starts. It accepts the usual
+hand-editing quirks — a UTF-8 byte-order mark, UTF-16 files, `//` comments, trailing commas, `GUID`/`iconPath`
+style key spellings, `"Version": "1"`, a missing `Description`, `Manifest.json` instead of `manifest.json`, and
+Windows `\` paths. When a manifest still can't be read, the error names the file (and the archive it came from)
+and, for a JSON syntax error, the line and column, e.g.
+`manifest.json in archive "Some Mod" is not valid JSON: expected ',' or '}' at line 4 column 5`.
 
-To fix it:
+If that happens while **adding** a mod, the mod isn't installed; the popup and the [log](logs.md) show the reason.
+Report it to the mod's author (and to us, see [Reporting bugs](bugs.md), if you think DDMM should accept it).
 
-1. Open the `mods/` folder — click **Open Folder** next to **Data Folder** in Settings to find it, then go into
-   `mods/` from there (see [Data location](../getting-started/download.md#data-location) if you're not sure
-   which folder that is).
-2. Move mod subfolders out one at a time (or check the error text — it often reports which file the failure came
-   from) until DDMM loads successfully again.
-3. Fix or re-download the offending mod, then move it back in — or leave it out and re-add it through DDMM
-   normally.
+If an already-installed mod's manifest becomes unreadable (e.g. you edited it by hand), DDMM skips just that mod
+when loading the list and logs `Skipping mod in "...": <reason>` — the rest of your mods still load. Fix or
+re-download that mod: click **Open Folder** next to **Data Folder** in Settings, go into `mods/`, and fix or
+delete its folder.
 
 ## A mod I added doesn't show up
 
@@ -83,6 +85,60 @@ actually close itself afterward, leaving the window stuck open with no visible e
 earlier, update DDMM. On a version with the fix, closing that still doesn't finish within a few seconds instead
 shows a "Couldn't save profiles" or "Deploy in progress" prompt asking whether to close anyway — check the
 [log file](logs.md) for the underlying error if that keeps happening.
+
+## Linux (CachyOS, Arch, Steam Deck, and others)
+
+### "Game path is invalid!" even though the path is right
+
+Fixed in the release after 2.0.0-rc.5. Earlier versions checked the path in a way that could never see inside
+hidden folders on Linux — and the default Steam library is under `~/.local/share/Steam` (or `~/.steam/steam`), so
+every default install was rejected. Update DDMM. On a fixed version, the message under the field says exactly what's wrong
+(see [First-time setup](../getting-started/setup.md#setting-the-game-path-by-hand)).
+
+Where the game usually is:
+
+| Steam install | Game Path |
+| --- | --- |
+| Native package (`steam` from pacman/CachyOS, Debian, ...) | `~/.local/share/Steam/steamapps/common/Helldivers 2` |
+| Flatpak (`com.valvesoftware.Steam`) | `~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/Helldivers 2` |
+| Snap | `~/snap/steam/common/.local/share/Steam/steamapps/common/Helldivers 2` |
+| Extra library on another drive | `<library>/steamapps/common/Helldivers 2` (see Steam → Settings → Storage) |
+
+**Auto-detect** checks all of the above plus every library listed in Steam's `libraryfolders.vdf`. Paths with
+spaces, non-English characters, and symlinked libraries all work. In the folder picker, press `Ctrl+H` to show
+hidden folders like `.local`, or just paste the path into the field (`~` isn't expanded — use the full
+`/home/<you>/...` form).
+
+DDMM only needs to read and write the game's `data/` folder; it doesn't care whether Steam is native or Flatpak,
+or which Proton version runs the game.
+
+### Game on an NTFS or exFAT drive (dual boot)
+
+- If the drive is mounted **read-only** — Linux does this to an NTFS volume Windows left "dirty" (Fast Startup or
+  hibernation) — deploying fails with `Read-only file system`. Disable Fast Startup in Windows, shut Windows down
+  fully, and remount.
+- The drive must be mounted with your user as owner (the default for drives mounted from your file manager). If
+  deploying fails with `Permission denied`, check the mount options (`uid=`/`gid=` for `ntfs3`/`exfat`).
+- Letter case: NTFS keeps the names Windows created (`data`, `bin`, `helldivers2.exe`), which is what DDMM expects.
+
+### Adding a mod fails
+
+Every failure now shows the real reason in the popup (older versions only said `errors disabled in production.`)
+and writes it to the log. Mods downloaded from a URL are staged in a `.downloads` folder inside the data folder
+(not `/tmp`, which is a small RAM disk on Arch/CachyOS), and DDMM copies instead of moving whenever a file has to
+cross from one drive to another.
+
+### Where the log is on Linux
+
+With the `.tar.gz`, `.deb`, `.rpm` or AppImage, the [data folder](../getting-started/download.md#data-location) is
+normally `~/.local/share/io.github.katsyk.ddmm/`, so the log is
+`~/.local/share/io.github.katsyk.ddmm/logs/Democracy Defender Mod Manager.log`. Exception: if you extracted the
+`.tar.gz` into a folder you can write to that already has DDMM data (`mods/`, `settings.json`) or a
+`portable.txt` next to the executable, DDMM runs portable and the log is in `logs/` next to the executable. The
+first lines of the log say which one it picked; **Open Folder** next to **Data Folder** in Settings always opens
+the right one.
+
+Running DDMM from a terminal (`./ddmm`) also prints the log live.
 
 ## Still stuck?
 

@@ -2,6 +2,8 @@ pub mod commands;
 pub mod models;
 pub mod archive;
 pub mod utils;
+pub mod fs_util;
+pub mod game_path;
 pub mod sources;
 pub mod download;
 pub mod data_dir;
@@ -290,6 +292,7 @@ pub fn run() {
             commands::settings::check_settings,
             commands::settings::get_data_dir,
             commands::settings::detect_game_path,
+            commands::settings::validate_game_path,
             commands::settings::auto_detect_and_save_game_path,
             commands::purge,
             commands::deploy,

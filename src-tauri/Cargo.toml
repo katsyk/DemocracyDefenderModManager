@@ -25,7 +25,9 @@ rand = "0.10"
 uuid = { version = "1.23", features = ["serde", "v4"] }
 tokio = { version = "1.52", features = ["fs", "net", "io-util", "io-std", "sync", "time", "process", "rt-multi-thread", "macros"] }
 anyhow = "1.0"
-anyhow-tauri = "1.0"
+# `show_errs_in_release`: without it every command error reaches the UI as
+# "errors disabled in production." in release builds, hiding the real cause.
+anyhow-tauri = { version = "1.0", features = ["show_errs_in_release"] }
 zip = "8.5"
 sevenz-rust2 = { version = "0.23", features = ["util"] }
 unrar = "0.5"

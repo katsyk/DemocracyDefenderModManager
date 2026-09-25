@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke as tauriInvoke, type InvokeArgs } from '@tauri-apps/api/core';
 import * as log from '@tauri-apps/plugin-log';
 import { Mod, type ResolvedSource } from '../models/mod';
 import type { Config, ProfilesConfig } from '$lib/models/profile';
@@ -6,6 +6,19 @@ import type { Manifest } from '$lib/models/manifest';
 import type { RustResult } from '$lib/types/results';
 import type { UUID } from '$lib/types/uuid';
 import type { Settings } from '$lib/models/settings';
+
+/** `invoke`, but every failure is also written to the log file with the
+ * command's name, so a user's log shows *why* something failed even if
+ * they only saw (or closed) the popup. */
+async function invoke<T>(cmd: string, args?: InvokeArgs): Promise<T> {
+    try {
+        return await tauriInvoke<T>(cmd, args);
+    } catch (ex: unknown) {
+        const message = typeof ex === "string" ? ex : ex instanceof Error ? ex.message : JSON.stringify(ex);
+        log.error(`\`${cmd}\` failed: ${message}`).catch(() => {});
+        throw ex;
+    }
+}
 
 type RawMod = { Manifest: Manifest, Directory: string, Sources?: ResolvedSource[] };
 type RawInstalledMod = RawMod & { Warning?: string };
@@ -153,6 +166,25 @@ export async function checkSettings(): Promise<boolean> {
 export async function getDataDir(): Promise<string> {
     log.debug("Invoking `get_data_dir`.");
     return await invoke<string>("get_data_dir");
+}
+
+/** Result of checking a game path on the backend (see `game_path.rs`). */
+export type GamePathReport = {
+    valid: boolean;
+    /** The real game root, when valid -- may differ from the input if a
+     * folder above/below it was picked. */
+    resolvedPath: string | null;
+    /** Why it's invalid: "empty" | "not_found" | "not_a_directory" |
+     * "portal_path" | "unreadable" | "missing_tools" | "missing_data" |
+     * "missing_bin" | "missing_exe". */
+    code: string | null;
+    detail: string | null;
+    message: string | null;
+};
+
+/** Check a game path and get the specific reason it's invalid, if it is. */
+export async function validateGamePath(path: string): Promise<GamePathReport> {
+    return await invoke<GamePathReport>("validate_game_path", { path });
 }
 
 /** Look for a Helldivers 2 install via Steam, without touching settings. */

@@ -54,12 +54,12 @@ pub async fn do_check_settings(base_path: &Path) -> anyhow::Result<bool> {
     match do_load_settings(base_path).await {
         Ok(settings) => {
             match settings.validate().await {
-                Ok(()) => {
-                    log::info!("Settings vaid.");
+                Ok(root) => {
+                    log::info!("Settings valid (game root {:?}).", root);
                     Ok(true)
                 }
                 Err(e) => {
-                    log::error!("Settings invalid: {}", e);       
+                    log::error!("Settings invalid: {:#}", e);
                     Ok(false)
                 }
             }
@@ -76,6 +76,16 @@ pub async fn load_settings(state: State<'_, AppState>) -> TAResult<Settings> {
 #[tauri::command]
 pub async fn save_settings(state: State<'_, AppState>, settings: Settings) -> TAResult<()> {
     log::info!("Saving settings...");
+
+    // Store the real game root if the user picked a folder above/below it
+    // (e.g. `.../Helldivers 2/data` or `.../steamapps/common`).
+    let mut settings = settings;
+    if let Ok(root) = crate::game_path::resolve(settings.game_path()).await {
+        if root != settings.game_path() {
+            log::info!("Normalizing game path {:?} to {:?}", settings.game_path(), root);
+            settings.set_game_path(root);
+        }
+    }
 
     let data = serde_json::to_vec_pretty(&settings).into_ta_result()?;
     tokio::fs::write(state.base_path.join(SETTINGS_FILE), data).await.into_ta_result()?;
@@ -95,6 +105,23 @@ pub  async fn check_settings(state: State<'_, AppState>) -> TAResult<bool> {
 #[tauri::command]
 pub fn get_data_dir(state: State<'_, AppState>) -> String {
     state.base_path.to_string_lossy().into_owned()
+}
+
+/// Check a game path the user is typing/picking in Settings and say
+/// exactly what's wrong with it (or which folder will actually be used).
+/// Done here rather than in the frontend so the result doesn't depend on
+/// Tauri's fs scope -- see `crate::game_path`.
+#[tauri::command]
+pub async fn validate_game_path(path: String) -> crate::game_path::GamePathReport {
+    let input = PathBuf::from(&path);
+    let result = crate::game_path::resolve(&input).await;
+    let report = crate::game_path::GamePathReport::from_result(&input, &result);
+    match &result {
+        Ok(root) if root != &input => log::info!("Game path {:?} resolves to {:?}", input, root),
+        Ok(_) => {}
+        Err(_) => log::warn!("Game path check: {}", report.message.as_deref().unwrap_or("invalid")),
+    }
+    report
 }
 
 /// Look for a Helldivers 2 install via Steam, without touching settings.
