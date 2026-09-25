@@ -1,6 +1,6 @@
 {
   "name": "ddmm",
-  "version": "2.0.0-rc.3",
+  "version": "2.0.0-rc.4",
   "description": "Democracy Defender Mod Manager — a source-neutral mod manager for Helldivers 2.",
   "type": "module",
   "scripts": {
@@ -28,13 +28,13 @@
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.6",
     "@sveltejs/kit": "^2.9.0",
-    "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "@sveltejs/vite-plugin-svelte": "^6.2.4",
     "@tailwindcss/vite": "^4.2.2",
     "@tauri-apps/cli": "^2",
     "svelte": "^5.0.0",
     "svelte-check": "^4.0.0",
     "tailwindcss": "^4.2.2",
-    "typescript": "~5.6.2",
+    "typescript": "~6.0.3",
     "vite": "^6.0.3"
   }
 }

@@ -266,3 +266,18 @@ export async function isGameRunning(): Promise<boolean> {
     log.debug("Invoking `is_game_running`.");
     return await invoke<boolean>("is_game_running");
 }
+
+/** Last-resort way to close the app: tells the Rust side to exit the
+ * process directly, bypassing the window's own `destroy` IPC call. Only
+ * used as a fallback if that call fails. */
+export async function forceExit(): Promise<void> {
+    log.debug("Invoking `force_exit`.");
+    await invoke<void>("force_exit");
+}
+
+/** Tells the Rust-side close watchdog (see `lib.rs`) that the frontend is
+ * alive and handling a close request, so it won't force-exit from under
+ * us. Call this as the very first thing the close handler does. */
+export async function ackCloseRequested(): Promise<void> {
+    await invoke<void>("ack_close_requested");
+}

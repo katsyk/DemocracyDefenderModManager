@@ -13,9 +13,10 @@ pub mod auto_import;
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicUsize},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use log::LevelFilter;
@@ -40,6 +41,13 @@ pub struct AppState {
     bridge_queue_depth: AtomicUsize,
     /// Serializes actual bridge installs to one at a time.
     bridge_install_lock: Mutex<()>,
+    /// Set by `commands::ack_close_requested` -- the frontend's close
+    /// handler calls it as the very first thing it does, so this being
+    /// `true` proves the frontend is alive and actually handling the close
+    /// (as opposed to never having loaded, having crashed, or the IPC
+    /// bridge itself being broken). Reset to `false` each time a new close
+    /// is requested; read by the close watchdog in `run()`.
+    close_ack: AtomicBool,
 }
 
 impl AppState {
@@ -51,6 +59,7 @@ impl AppState {
             bridge_pending: Mutex::default(),
             bridge_queue_depth: AtomicUsize::new(0),
             bridge_install_lock: Mutex::new(()),
+            close_ack: AtomicBool::new(false),
         }
     }
 }
@@ -209,6 +218,38 @@ pub fn run() {
 
             Ok(())
         })
+        // Last-resort safety net: guarantee the app can never be stranded
+        // open by a broken close handler, regardless of *why* it's broken
+        // (a future permission regression, the frontend crashing, the IPC
+        // bridge itself being wedged, ...). The frontend's close handler
+        // acks via `ack_close_requested` as the very first thing it does;
+        // if that ack never arrives within a few seconds of a close being
+        // requested, assume the frontend isn't going to handle this on its
+        // own and force the process to exit directly. This never fires
+        // during normal operation -- a real save, a confirmation popup
+        // waiting on the user, etc. all happen *after* the ack, so they're
+        // never affected by it.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                let app_handle = window.app_handle().clone();
+                let label = window.label().to_string();
+                app_handle.state::<AppState>().close_ack.store(false, Ordering::SeqCst);
+                tauri::async_runtime::spawn(async move {
+                    const ACK_TIMEOUT: Duration = Duration::from_secs(10);
+                    tokio::time::sleep(ACK_TIMEOUT).await;
+
+                    let acked = app_handle.state::<AppState>().close_ack.load(Ordering::SeqCst);
+                    let still_open = app_handle.get_webview_window(&label).is_some();
+                    if still_open && !acked {
+                        log::warn!(
+                            "Close watchdog: window '{label}' got no acknowledgement from the \
+                             frontend within {ACK_TIMEOUT:?} of a close request; forcing exit."
+                        );
+                        app_handle.exit(0);
+                    }
+                });
+            }
+        })
         .manage(AppState::new(base_path))
         .invoke_handler(tauri::generate_handler![
             commands::mods::get_mods,
@@ -243,6 +284,8 @@ pub fn run() {
             commands::bridge::remove_browser_integration_one,
             commands::bridge::focus_main_window,
             commands::bridge::is_game_running,
+            commands::force_exit,
+            commands::ack_close_requested,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

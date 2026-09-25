@@ -340,6 +340,35 @@ pub async fn purge(state: State<'_, AppState>) -> TAResult<()> {
     let data_dir = settings.game_path().join("data");
     do_purge(&data_dir).await.into_ta_result()
 }
+
+/// Last-resort way to close the app from the frontend.
+///
+/// Normally the window closes itself via the `window|destroy` IPC call
+/// that `@tauri-apps/api`'s `onCloseRequested` wrapper makes once our close
+/// handler resolves. This command exists for the case where that call
+/// fails for some other reason (the permission is granted as of this
+/// release, but a future regression there, a webview IPC hiccup, etc.
+/// shouldn't be able to strand a user with an unclosable window again) --
+/// the frontend falls back to this after logging the `destroy` error.
+///
+/// This intentionally does not go through `AppState` or try to save
+/// anything: by the time the frontend reaches for this fallback it has
+/// already given the user a chance to save/confirm, and the whole point is
+/// to guarantee the process actually exits.
+#[tauri::command]
+pub fn force_exit(app: tauri::AppHandle) {
+    log::warn!("force_exit invoked; exiting immediately.");
+    app.exit(0);
+}
+
+/// Called by the frontend's close handler as the very first thing it does,
+/// proving to the Rust-side close watchdog (see `lib.rs`) that the
+/// frontend is alive and actually handling the close request.
+#[tauri::command]
+pub fn ack_close_requested(state: State<'_, AppState>) {
+    state.close_ack.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
