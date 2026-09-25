@@ -10,7 +10,7 @@ All releases are published on the
 [GitHub Releases page](https://github.com/katsyk/DemocracyDefenderModManager/releases).
 
 !!! warning "Release candidate"
-    Releases are marked as pre-releases (`2.0.0-rc.3` and similar). Expect some rough edges, and back up any
+    Releases are marked as pre-releases (`2.0.0-rc.4` and similar). Expect some rough edges, and back up any
     manually edited mod files before updating.
 
 === "Windows"
