@@ -274,6 +274,7 @@ pub fn run() {
         .manage(AppState::new(base_path))
         .invoke_handler(tauri::generate_handler![
             commands::mods::get_mods,
+            commands::mods::resolve_mod_image,
             commands::mods::delete_mod,
             commands::mods::add_mod,
             commands::mods::add_mods,

@@ -16,7 +16,7 @@
     let initPromise = $state<Promise<void>>();
     let toggled = $state<boolean[]>([]);
     let selected = $state<number[]>([]);
-    let imagePaths = new SvelteMap<string, string>();
+    let imagePaths = new SvelteMap<string, string | null>();
 
     type AnyOption = v1.Option | v2.Option;
     type Entry = { option: AnyOption; index: number };
