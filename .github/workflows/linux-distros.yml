@@ -92,6 +92,7 @@ jobs:
           v="${{ steps.version.outputs.version }}"
           mkdir -p dist tarball
           cp "$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' | head -n1)" "dist/DDMM-$v-linux-x86_64.AppImage"
+          bash scripts/ci/fix-appimage.sh "dist/DDMM-$v-linux-x86_64.AppImage"
           cp "$(find src-tauri/target/release/bundle/deb -name '*.deb' | head -n1)" "dist/DDMM-$v-linux-amd64.deb"
           cp "$(find src-tauri/target/release/bundle/rpm -name '*.rpm' | head -n1)" "dist/DDMM-$v-linux-x86_64.rpm"
           cp src-tauri/target/release/ddmm tarball/

@@ -183,6 +183,9 @@ jobs:
           set -euo pipefail
           appimage=$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' | head -n1)
           cp "$appimage" "DDMM-${{ steps.version.outputs.version }}-linux-x86_64.AppImage"
+          # Drop the bundled libwayland/libxkbcommon/libxcb-* that break EGL on
+          # newer Mesa (Fedora 44); see the script and linux-distros.yml.
+          bash scripts/ci/fix-appimage.sh "DDMM-${{ steps.version.outputs.version }}-linux-x86_64.AppImage"
           deb=$(find src-tauri/target/release/bundle/deb -name '*.deb' | head -n1)
           cp "$deb" "DDMM-${{ steps.version.outputs.version }}-linux-amd64.deb"
           rpm=$(find src-tauri/target/release/bundle/rpm -name '*.rpm' | head -n1)

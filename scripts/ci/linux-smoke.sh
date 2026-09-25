@@ -99,19 +99,20 @@ fuse_deps() {
     echo fuse3
 }
 
-# What practically any desktop install already has, but without WebKitGTK.
-# The AppImage bundles WebKitGTK and most of GTK, but (per the AppImage
-# excludelist) expects the host to provide libEGL, libgbm, fontconfig,
-# harfbuzz, fribidi, libgpg-error and libcom_err -- see the
-# appimage-host-libs-bare row.
+# What practically any desktop install already has, but without WebKitGTK:
+# GTK 3 and the Mesa/libglvnd EGL + GLES + GBM libraries. The AppImage
+# bundles WebKitGTK and most of GTK, but by design (AppImage excludelist)
+# takes the graphics driver stack (libEGL, libGLESv2 -- dlopen()ed by
+# WebKit --, libgbm), fontconfig, harfbuzz and fribidi from the host, and
+# after scripts/ci/fix-appimage.sh also libwayland/libxkbcommon/libxcb-*.
+# See the appimage-host-libs-bare row for what a bare system lacks.
 desktop_baseline() {
     case $family in
-        fedora) echo gtk3 mesa-libEGL mesa-libgbm libgpg-error libcom_err ;;
+        fedora|suse) echo 'libgtk-3.so.0()(64bit)' 'libEGL.so.1()(64bit)' 'libGLESv2.so.2()(64bit)' 'libgbm.so.1()(64bit)' ;;
         arch)   echo gtk3 mesa libglvnd libgpg-error e2fsprogs ;;
         debian)
             if apt-cache show libgtk-3-0t64 >/dev/null 2>&1; then echo -n 'libgtk-3-0t64 '; else echo -n 'libgtk-3-0 '; fi
-            echo libegl1 libgbm1 libgpg-error0 libcom-err2 ;;
-        suse) echo libgtk-3-0 libEGL1 libgbm1 libgpg-error0 libcom_err2 ;;
+            echo libegl1 libgles2 libgbm1 libgpg-error0 libcom-err2 ;;
     esac
 }
 
@@ -267,6 +268,13 @@ portable)
             | grep 'not found' | awk '{print $1}' | sort -u >"$out/appimage-host-libs-bare.txt"
         record appimage-host-libs-bare INFO "not bundled and missing on a bare system: $(tr '\n' ' ' <"$out/appimage-host-libs-bare.txt")"
         find /tmp/squashfs-root -name '*.so*' -type f -printf '%P\n' | sort >"$out/appimage-bundled-libs.txt"
+        stale=$(grep -oE 'usr/lib/(libwayland-[a-z]+|libxkbcommon|libxcb-[a-z]+|libXau|libXdmcp)\.so[.0-9]*' \
+            "$out/appimage-bundled-libs.txt" | tr '\n' ' ')
+        if [ -n "$stale" ]; then
+            record appimage-no-bundled-display-libs FAIL "still bundled (EGL_BAD_PARAMETER on newer Mesa): $stale"
+        else
+            record appimage-no-bundled-display-libs PASS "no libwayland/libxkbcommon/libxcb-*/libXau/libXdmcp in usr/lib"
+        fi
         cp /tmp/squashfs-root/AppRun "$out/appimage-AppRun.txt" 2>/dev/null
         cp -r /tmp/squashfs-root/apprun-hooks "$out/appimage-apprun-hooks" 2>/dev/null
         rm -rf /tmp/squashfs-root
