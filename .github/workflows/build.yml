@@ -159,6 +159,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: './src-tauri -> target'
+          # Separate from the ubuntu-latest caches: restoring a 24.04
+          # target/ dir on 22.04 breaks the build ("can't find crate").
+          key: ubuntu-22.04
 
       - name: Install Linux dependencies
         run: |
