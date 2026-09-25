@@ -1,8 +1,7 @@
 <script lang="ts">
     import { onMount } from "svelte";
     import { SvelteMap } from "svelte/reactivity";
-    import { convertFileSrc } from "@tauri-apps/api/core";
-    import { join } from "@tauri-apps/api/path";
+    import { FALLBACK_MOD_IMAGE, modImageSrc, useFallbackImage } from "$lib/utils/modImages";
     import type { ModConfigPopup } from "$lib/types/popup";
     import type { v1, v2 } from "$lib/models/manifest";
     import { useLocalization } from "$lib/state/localization.svelte";
@@ -51,12 +50,12 @@
 
         for (const opt of manifest.Options) {
             if (opt.Image) {
-                imagePaths.set(opt.Image, convertFileSrc(await join(mod.Directory, opt.Image)));
+                imagePaths.set(opt.Image, await modImageSrc(mod.Directory, opt.Image));
             }
             if (opt.SubOptions) {
                 for (const sub of opt.SubOptions) {
                     if (sub.Image) {
-                        imagePaths.set(sub.Image, convertFileSrc(await join(mod.Directory, sub.Image)));
+                        imagePaths.set(sub.Image, await modImageSrc(mod.Directory, sub.Image));
                     }
                 }
             }
@@ -137,7 +136,8 @@
                         <div class="flex flex-row gap-1">
                             <img
                                 class="object-contain self-center shrink-0"
-                                src={image ?? "images/hd2_icon.png"}
+                                src={image ?? FALLBACK_MOD_IMAGE}
+                                onerror={useFallbackImage}
                                 alt="Option icon"
                                 width="64"
                                 height="64"
@@ -158,7 +158,8 @@
                                             >
                                                 <img
                                                     class="object-contain shrink-0"
-                                                    src={subImage ?? "images/hd2_icon.png"}
+                                                    src={subImage ?? FALLBACK_MOD_IMAGE}
+                                                    onerror={useFallbackImage}
                                                     alt="Sub-Option icon"
                                                     width="48"
                                                     height="48"

@@ -39,6 +39,7 @@
     import type { ModAddResult } from "$lib/types/results";
     import { onMount } from "svelte";
     import Select from "$lib/components/Select.svelte";
+    import { FALLBACK_MOD_IMAGE, useFallbackImage } from "$lib/utils/modImages";
 
     const { t } = useLocalization();
     const { show: showPopup } = usePopup();
@@ -1125,8 +1126,9 @@
                         >
                             <div class="p-2 text-zinc-300 bg-zinc-800 rounded flex flex-row gap-1 items-center">
                                 <img
-                                    class="w-14 h-14"
-                                    src={iconPath ?? "images/hd2_icon.png"}
+                                    class="w-14 h-14 object-contain"
+                                    src={iconPath ?? FALLBACK_MOD_IMAGE}
+                                    onerror={useFallbackImage}
                                     alt="Mod icon"
                                 />
                                 <div class="flex-1 flex flex-col gap-0.5 justify-between min-w-0">

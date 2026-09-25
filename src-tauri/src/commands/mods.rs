@@ -16,7 +16,7 @@ use std::{collections::HashSet, path::{Path, PathBuf}};
 use tauri::State;
 use uuid::Uuid;
 
-const MODS_DIRECTORY: &'static str = "mods/";
+pub(crate) const MODS_DIRECTORY: &'static str = "mods/";
 const MANIFEST_FILE: &'static str = "manifest.json";
 const NO_PATCH_FILES_WARNING: &str = "no Helldivers 2 patch files found in this archive";
 
