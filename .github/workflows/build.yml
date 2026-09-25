@@ -134,7 +134,10 @@ jobs:
 
   build-linux:
     needs: test
-    runs-on: ubuntu-latest
+    # Oldest supported Ubuntu LTS on purpose: the binary requires the build
+    # host's glibc or newer, and 24.04's (2.39) locked out Ubuntu 22.04,
+    # Debian 12 and Mint 21. Verified by linux-distros.yml.
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4

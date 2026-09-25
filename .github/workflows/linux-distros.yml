@@ -41,7 +41,10 @@ env:
 jobs:
   build:
     if: ${{ !inputs.artifact }}
-    runs-on: ubuntu-latest
+    # Oldest supported Ubuntu LTS, like build.yml's build-linux: the binary
+    # needs the build host's glibc or newer (24.04's 2.39 locked out
+    # Ubuntu 22.04 / Debian 12 / Mint 21).
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -136,10 +139,10 @@ jobs:
           - { name: ubuntu-24.04, image: 'ubuntu:24.04', family: debian, package: true }
           - { name: debian-13, image: 'debian:13', family: debian, package: true }
           - { name: opensuse-tumbleweed, image: 'opensuse/tumbleweed:latest', family: suse, package: true }
-          # Informational: the oldest Ubuntu LTS still in standard support.
-          # Artifacts are built on ubuntu-latest, so this shows whether the
-          # glibc floor locks it out.
-          - { name: ubuntu-22.04, image: 'ubuntu:22.04', family: debian, package: true, informational: true }
+          # Oldest glibc we aim to support (2.35 / 2.36): catches a build
+          # host that's too new.
+          - { name: ubuntu-22.04, image: 'ubuntu:22.04', family: debian, package: true }
+          - { name: debian-12, image: 'debian:12', family: debian, package: true }
     continue-on-error: ${{ matrix.informational == true }}
     name: smoke (${{ matrix.name }})
     steps:

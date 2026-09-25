@@ -75,10 +75,10 @@ pm_install_local() { # path to .rpm / .deb
 # WebKitGTK/GTK -- those are the documented runtime deps under test.
 test_tools() {
     case $family in
-        fedora) echo xorg-x11-server-Xvfb dbus-daemon dbus-tools procps-ng util-linux findutils file mesa-dri-drivers dejavu-sans-fonts fuse3 ;;
-        arch)   echo xorg-server-xvfb dbus procps-ng util-linux findutils file mesa ttf-dejavu fuse3 ;;
-        debian) echo xvfb dbus procps util-linux findutils file libgl1-mesa-dri fonts-dejavu-core fuse3 ;;
-        suse)   echo xorg-x11-server-Xvfb dbus-1 procps util-linux findutils file Mesa-dri dejavu-fonts fuse3 gzip tar ;;
+        fedora) echo xorg-x11-server-Xvfb dbus-daemon dbus-tools procps-ng util-linux findutils grep file mesa-dri-drivers dejavu-sans-fonts ;;
+        arch)   echo xorg-server-xvfb dbus procps-ng util-linux findutils grep file mesa ttf-dejavu ;;
+        debian) echo xvfb dbus procps util-linux findutils grep file libgl1-mesa-dri fonts-dejavu-core ;;
+        suse)   echo xorg-x11-server-Xvfb dbus-1 /usr/bin/dbus-run-session procps util-linux findutils grep file Mesa-dri dejavu-fonts gzip tar ;;
     esac
 }
 
@@ -93,14 +93,20 @@ runtime_deps() {
     esac
 }
 
-# The documented "make the AppImage mount" fix: FUSE 2.
-fuse2_deps() {
+# What the AppImage needs to mount itself. Tauri ships the static type2
+# runtime, which needs only the fusermount3 helper (no libfuse.so.2).
+fuse_deps() {
+    echo fuse3
+}
+
+# GTK 3 alone, i.e. what practically any desktop install already has, but
+# without WebKitGTK -- the AppImage bundles WebKitGTK but not all of GTK.
+gtk_baseline() {
     case $family in
-        fedora) echo fuse fuse-libs ;;
-        arch)   echo fuse2 ;;
+        fedora|arch) echo gtk3 ;;
         debian)
-            if apt-cache show libfuse2t64 >/dev/null 2>&1; then echo libfuse2t64; else echo libfuse2; fi ;;
-        suse)   echo fuse libfuse2 ;;
+            if apt-cache show libgtk-3-0t64 >/dev/null 2>&1; then echo libgtk-3-0t64; else echo libgtk-3-0; fi ;;
+        suse) echo libgtk-3-0 ;;
     esac
 }
 
@@ -201,7 +207,8 @@ ldd_check() {
     if command -v ldd >/dev/null; then ldd "$bin" >"$report" 2>&1
     else LD_TRACE_LOADED_OBJECTS=1 "$bin" >"$report" 2>&1; fi
     local missing
-    missing=$(grep 'not found' "$report" | awk '{print $1}' | tr '\n' ' ')
+    missing=$(grep 'not found' "$report" | sed -E 's/^[[:space:]]*([^ ]+) => not found/\1/; s/^[^:]+: [^:]+: //' \
+        | cut -c1-120 | tr '\n' ' ')
     if [ -z "$missing" ]; then
         record "$check" PASS "all $(grep -c '=>' "$report") shared libraries resolve"
     elif [ "$level" = required ]; then
@@ -228,17 +235,41 @@ rpm=$(find "$dist" -name 'DDMM-*-linux-x86_64.rpm' | head -n1)
 
 case $mode in
 portable)
-    # --- AppImage, before installing anything app-specific ------------------
+    # --- AppImage ---------------------------------------------------------------
     cp "$appimage" /tmp/ddmm.AppImage && chmod +x /tmp/ddmm.AppImage
-    launch_with_fallback appimage-fuse-no-fuse2 info /tmp/ddmm.AppImage
-    launch_with_fallback appimage-extract-and-run required /tmp/ddmm.AppImage --appimage-extract-and-run
 
-    log "install FUSE 2: $(fuse2_deps)"
+    # Bare system, no FUSE at all: shows the mount error a user would get.
+    launch appimage-no-fuse info -- /tmp/ddmm.AppImage || true
+
+    # Which libraries the AppImage expects the host to provide.
+    (cd /tmp && /tmp/ddmm.AppImage --appimage-extract >/dev/null 2>&1)
+    if [ -x /tmp/squashfs-root/usr/bin/ddmm ]; then
+        libpath=$(find /tmp/squashfs-root -name '*.so*' -printf '%h\n' | sort -u | tr '\n' ':')
+        {
+            find /tmp/squashfs-root/usr/bin/ddmm /tmp/squashfs-root -name '*.so*' -type f
+            echo /tmp/squashfs-root/usr/bin/ddmm
+        } | sort -u | while read -r f; do LD_LIBRARY_PATH="$libpath" ldd "$f" 2>/dev/null; done \
+            | grep 'not found' | awk '{print $1}' | sort -u >"$out/appimage-host-libs-bare.txt"
+        record appimage-host-libs-bare INFO "not bundled and missing on a bare system: $(tr '\n' ' ' <"$out/appimage-host-libs-bare.txt")"
+        find /tmp/squashfs-root -name '*.so*' -type f -printf '%P\n' | sort >"$out/appimage-bundled-libs.txt"
+        cp /tmp/squashfs-root/AppRun "$out/appimage-AppRun.txt" 2>/dev/null
+        cp -r /tmp/squashfs-root/apprun-hooks "$out/appimage-apprun-hooks" 2>/dev/null
+        rm -rf /tmp/squashfs-root
+    fi
+
+    log "install FUSE: $(fuse_deps)"
     # shellcheck disable=SC2046
-    if pm_install $(fuse2_deps) >"$out/install-fuse2.txt" 2>&1; then
-        launch_with_fallback appimage-fuse-with-fuse2 required /tmp/ddmm.AppImage
+    pm_install $(fuse_deps) >"$out/install-fuse.txt" 2>&1 \
+        || record install-fuse FAIL "$(tail -n 3 "$out/install-fuse.txt")"
+    launch appimage-fuse-bare info -- /tmp/ddmm.AppImage || true
+
+    log "install GTK 3 baseline: $(gtk_baseline)"
+    # shellcheck disable=SC2046
+    if pm_install $(gtk_baseline) >"$out/install-gtk.txt" 2>&1; then
+        launch_with_fallback appimage-fuse required /tmp/ddmm.AppImage
+        launch_with_fallback appimage-extract-and-run required /tmp/ddmm.AppImage --appimage-extract-and-run
     else
-        record appimage-fuse-with-fuse2 FAIL "installing $(fuse2_deps) failed: $(tail -n 3 "$out/install-fuse2.txt")"
+        record appimage-fuse FAIL "installing $(gtk_baseline) failed: $(tail -n 3 "$out/install-gtk.txt")"
     fi
 
     # --- tar.gz binary --------------------------------------------------------
