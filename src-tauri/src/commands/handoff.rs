@@ -306,58 +306,57 @@ async fn install_found_file(
     // Done before taking the mods lock so a slow/failed metadata fetch
     // never holds up anything else touching the mod list. Best-effort:
     // falls back to the plain source (no Version) on any failure.
-    let sidecar_source = enrich_source_with_version(source).await;
+    let (mut sidecar_source, installed_files) =
+        crate::commands::updates::enrich_install_source(source, Some(archive_path)).await;
+    // An update the last check found, arriving without a version of its
+    // own: record the version that check reported.
+    if sidecar_source.version.is_none() {
+        if let Some(guid) = existing_guid {
+            sidecar_source.version =
+                crate::commands::updates::known_latest_version(state, guid, &sidecar_source.provider).await;
+        }
+    }
 
-    let mut mods_guard = state.mods.lock().await;
-    let mods = mods_guard
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("mods not read"))?;
+    let (r#mod, warning) = {
+        let mut mods_guard = state.mods.lock().await;
+        let mods = mods_guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("mods not read"))?;
 
-    let (mut r#mod, warning) = match existing_guid {
-        Some(guid) => install_update_from_archive(state, mods, archive_path, guid)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?,
-        None => install_from_archive(state, mods, archive_path)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        let (mut r#mod, warning) = match existing_guid {
+            Some(guid) => install_update_from_archive(state, mods, archive_path, guid)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            None => install_from_archive(state, mods, archive_path)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        };
+
+        if let Err(e) =
+            sources::write_origin_sidecar_with_files(&r#mod.directory, vec![sidecar_source.clone()], installed_files).await
+        {
+            log::error!("Failed to write origin sidecar: {}", e);
+        }
+        r#mod.resolve_sources().await;
+
+        if let Some(existing) = mods.iter_mut().find(|m| m.guid() == r#mod.guid()) {
+            *existing = r#mod.clone();
+        }
+        (r#mod, warning)
     };
 
-    if let Err(e) = sources::write_origin_sidecar(&r#mod.directory, vec![sidecar_source]).await {
-        log::error!("Failed to write origin sidecar: {}", e);
-    }
-    r#mod.resolve_sources().await;
-
-    if let Some(existing) = mods.iter_mut().find(|m| m.guid() == r#mod.guid()) {
-        *existing = r#mod.clone();
+    if let Some(guid) = existing_guid {
+        crate::commands::updates::mark_mod_updated(
+            state,
+            guid,
+            r#mod.guid(),
+            Some(&sidecar_source.provider),
+            sidecar_source.version.as_deref(),
+        )
+        .await;
     }
 
     Ok((r#mod, warning))
-}
-
-/// For an AyakaMods source, fetch the mod page's JSON-LD metadata and stamp
-/// its `softwareVersion` onto the sidecar `Source` so update checks have an
-/// installed version to compare against. Best-effort: any failure (network,
-/// parsing, missing id) just falls back to the source as given, with no
-/// `Version` -- never fails the install over this.
-async fn enrich_source_with_version(source: &Source) -> Source {
-    if source.provider != "ayakamods" {
-        return source.clone();
-    }
-    let Some(id) = source.id.clone() else {
-        return source.clone();
-    };
-    let Ok(client) = crate::commands::updates::build_client() else {
-        return source.clone();
-    };
-
-    match crate::commands::updates::fetch_ayakamods_metadata(&client, &id).await {
-        Ok(Some(meta)) if meta.latest_version.is_some() => {
-            let mut enriched = source.clone();
-            enriched.version = meta.latest_version;
-            enriched
-        }
-        _ => source.clone(),
-    }
 }
 
 enum WaitOutcome {

@@ -1,0 +1,29 @@
+{
+    "_idRow": 660132,
+    "_bIsPrivate": false,
+    "_tsDateModified": 1773531618,
+    "_tsDateUpdated": 1773531618,
+    "_bIsWithheld": false,
+    "_sName": "MLP - Queen Chrysalis",
+    "_sVersion": "",
+    "_bIsTrashed": false,
+    "_bIsObsolete": false,
+    "_aFiles": [
+        {
+            "_idRow": 1647807,
+            "_sFile": "queenchrysalis.zip",
+            "_nFilesize": 16613,
+            "_tsDateAdded": 1773531588,
+            "_nDownloadCount": 9,
+            "_sDownloadUrl": "https://gamebanana.com/dl/1647807",
+            "_sMd5Checksum": "ff0d1bc431e7adadb76bb3476a3d6e05",
+            "_sAnalysisState": "done",
+            "_sAnalysisResult": "ok",
+            "_sAnalysisResultVerbose": "File passed preliminary analysis",
+            "_sAvState": "done",
+            "_sAvResult": "clean",
+            "_bIsArchived": false,
+            "_bHasContents": true
+        }
+    ]
+}

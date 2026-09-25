@@ -1,0 +1,142 @@
+{
+  "files": [
+    {
+      "id": [
+        10,
+        5000
+      ],
+      "uid": 21474836480010,
+      "file_id": 10,
+      "name": "Better Stims",
+      "version": "1.0",
+      "category_id": 4,
+      "category_name": "OLD_VERSION",
+      "is_primary": false,
+      "size": 1200,
+      "file_name": "Better Stims-1234-1-0-1718000000.zip",
+      "uploaded_timestamp": 1718000000,
+      "uploaded_time": "2024-06-10T06:13:20.000+00:00",
+      "mod_version": "1.0",
+      "external_virus_scan_url": null,
+      "description": "",
+      "size_kb": 1200,
+      "size_in_bytes": 1228800,
+      "changelog_html": null,
+      "content_preview_link": "https://file-metadata.nexusmods.com/file/nexus-files-s3-meta/5000/1234/10.zip.json"
+    },
+    {
+      "id": [
+        19,
+        5000
+      ],
+      "uid": 21474836480019,
+      "file_id": 19,
+      "name": "Better Stims - No Sounds",
+      "version": "1.0",
+      "category_id": 4,
+      "category_name": "OLD_VERSION",
+      "is_primary": false,
+      "size": 1200,
+      "file_name": "Better Stims - No Sounds-1234-1-0-1718000500.zip",
+      "uploaded_timestamp": 1718000500,
+      "uploaded_time": "2024-06-10T06:13:20.000+00:00",
+      "mod_version": "1.0",
+      "external_virus_scan_url": null,
+      "description": "",
+      "size_kb": 1200,
+      "size_in_bytes": 1228800,
+      "changelog_html": null,
+      "content_preview_link": "https://file-metadata.nexusmods.com/file/nexus-files-s3-meta/5000/1234/19.zip.json"
+    },
+    {
+      "id": [
+        11,
+        5000
+      ],
+      "uid": 21474836480011,
+      "file_id": 11,
+      "name": "Better Stims",
+      "version": "1.1",
+      "category_id": 4,
+      "category_name": "OLD_VERSION",
+      "is_primary": false,
+      "size": 1200,
+      "file_name": "Better Stims-1234-1-1-1718100000.zip",
+      "uploaded_timestamp": 1718100000,
+      "uploaded_time": "2024-06-10T06:13:20.000+00:00",
+      "mod_version": "1.1",
+      "external_virus_scan_url": null,
+      "description": "",
+      "size_kb": 1200,
+      "size_in_bytes": 1228800,
+      "changelog_html": null,
+      "content_preview_link": "https://file-metadata.nexusmods.com/file/nexus-files-s3-meta/5000/1234/11.zip.json"
+    },
+    {
+      "id": [
+        12,
+        5000
+      ],
+      "uid": 21474836480012,
+      "file_id": 12,
+      "name": "Better Stims",
+      "version": "1.2",
+      "category_id": 1,
+      "category_name": "MAIN",
+      "is_primary": true,
+      "size": 1200,
+      "file_name": "Better Stims-1234-1-2-1718200000.zip",
+      "uploaded_timestamp": 1718200000,
+      "uploaded_time": "2024-06-10T06:13:20.000+00:00",
+      "mod_version": "1.2",
+      "external_virus_scan_url": null,
+      "description": "",
+      "size_kb": 1200,
+      "size_in_bytes": 1228800,
+      "changelog_html": null,
+      "content_preview_link": "https://file-metadata.nexusmods.com/file/nexus-files-s3-meta/5000/1234/12.zip.json"
+    },
+    {
+      "id": [
+        20,
+        5000
+      ],
+      "uid": 21474836480020,
+      "file_id": 20,
+      "name": "Better Stims - No Sounds",
+      "version": "1.2",
+      "category_id": 3,
+      "category_name": "OPTIONAL",
+      "is_primary": false,
+      "size": 1200,
+      "file_name": "Better Stims - No Sounds-1234-1-2-1718200500.zip",
+      "uploaded_timestamp": 1718200500,
+      "uploaded_time": "2024-06-10T06:13:20.000+00:00",
+      "mod_version": "1.2",
+      "external_virus_scan_url": null,
+      "description": "",
+      "size_kb": 1200,
+      "size_in_bytes": 1228800,
+      "changelog_html": null,
+      "content_preview_link": "https://file-metadata.nexusmods.com/file/nexus-files-s3-meta/5000/1234/20.zip.json"
+    }
+  ],
+  "file_updates": [
+    {
+      "old_file_id": 10,
+      "new_file_id": 11,
+      "old_file_name": "Better Stims-1234-1-0-1718000000.zip",
+      "new_file_name": "Better Stims-1234-1-1-1718100000.zip",
+      "uploaded_timestamp": 1718100000,
+      "uploaded_time": "2024-06-11T10:00:00.000+00:00"
+    },
+    {
+      "old_file_id": 11,
+      "new_file_id": 12,
+      "old_file_name": "Better Stims-1234-1-1-1718100000.zip",
+      "new_file_name": "Better Stims-1234-1-2-1718200000.zip",
+      "uploaded_timestamp": 1718200000,
+      "uploaded_time": "2024-06-12T13:46:40.000+00:00"
+    }
+  ]
+}

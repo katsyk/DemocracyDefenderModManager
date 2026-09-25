@@ -55,6 +55,16 @@ pub struct DownloadedArchive {
 ///
 /// On any error the staging directory is cleaned up before returning.
 pub async fn download_archive(url: &str, staging_root: &Path) -> anyhow::Result<DownloadedArchive> {
+    download_archive_with_progress(url, staging_root, |_, _| {}).await
+}
+
+/// [`download_archive`], calling `progress(downloaded_bytes, total_bytes)`
+/// as the body streams in (`total` is `None` when the server didn't say).
+pub async fn download_archive_with_progress(
+    url: &str,
+    staging_root: &Path,
+    mut progress: impl FnMut(u64, Option<u64>) + Send,
+) -> anyhow::Result<DownloadedArchive> {
     let parsed = reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL: {}", e))?;
     if parsed.scheme() != "https" {
         anyhow::bail!("only https:// URLs are supported");
@@ -65,7 +75,7 @@ pub async fn download_archive(url: &str, staging_root: &Path) -> anyhow::Result<
         .await
         .with_context(|| format!("failed to create download staging directory {:?}", temp_dir))?;
 
-    match download_archive_into(&parsed, &temp_dir).await {
+    match download_archive_into(&parsed, &temp_dir, &mut progress).await {
         Ok(path) => Ok(DownloadedArchive { path, temp_dir }),
         Err(e) => {
             let _ = tokio::fs::remove_dir_all(&temp_dir).await;
@@ -74,9 +84,13 @@ pub async fn download_archive(url: &str, staging_root: &Path) -> anyhow::Result<
     }
 }
 
-async fn download_archive_into(url: &reqwest::Url, temp_dir: &Path) -> anyhow::Result<PathBuf> {
+async fn download_archive_into(
+    url: &reqwest::Url,
+    temp_dir: &Path,
+    progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+) -> anyhow::Result<PathBuf> {
     let client = reqwest::Client::builder()
-        .user_agent(format!("ddmm/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(crate::providers::user_agent())
         .redirect(reqwest::redirect::Policy::limited(10))
         .timeout(Duration::from_secs(10 * 60))
         .connect_timeout(Duration::from_secs(20))
@@ -117,8 +131,10 @@ async fn download_archive_into(url: &reqwest::Url, temp_dir: &Path) -> anyhow::R
     let mut file = tokio::fs::File::create(&staging_path)
         .await
         .with_context(|| format!("failed to create {:?}", staging_path))?;
+    let expected_len = response.content_length();
     let mut stream = response.bytes_stream();
     let mut total: u64 = 0;
+    progress(0, expected_len);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| anyhow::anyhow!("download from {} failed: {}", host, e.without_url()))?;
         total += chunk.len() as u64;
@@ -131,6 +147,7 @@ async fn download_archive_into(url: &reqwest::Url, temp_dir: &Path) -> anyhow::R
         file.write_all(&chunk)
             .await
             .with_context(|| format!("failed to write the download to {:?}", staging_path))?;
+        progress(total, expected_len);
     }
     file.flush().await?;
     drop(file);

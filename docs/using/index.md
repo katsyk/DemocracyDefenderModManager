@@ -10,5 +10,5 @@ title: Using DDMM
 - [Profiles](profiles.md) — separate, reorderable mod loadouts
 - [Mod options & variants](options-variants.md) — mods that offer a choice at deploy time
 - [Deploy & purge](deploy-purge.md) — what actually happens to your game files
-- [Checking for updates](updates.md) — on-demand update checks per mod
+- [Updating mods](updating-mods.md) — update checks (on request, or opt-in automatic), one-click and bulk updates
 - [Settings reference](settings.md) — every setting, explained

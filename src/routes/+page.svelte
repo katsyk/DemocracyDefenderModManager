@@ -1,6 +1,6 @@
 <script lang="ts">
     import { SvelteMap } from "svelte/reactivity";
-    import { Plus, Dash, Backspace, ArrowBarRight, ArrowBarLeft, Arrow90degLeft, ArrowReturnLeft, PencilSquare, Download, ThreeDotsVertical, CaretUpFill, CaretDownFill, Trash3, ArrowBarUp, ArrowBarDown, CaretUp, CaretDown, Eraser, FolderPlus, Link45deg, BoxArrowUpRight, ArrowRepeat, CloudArrowDownFill, GripVertical, InfoCircle } from "svelte-bootstrap-icons";
+    import { Plus, Dash, Backspace, ArrowBarRight, ArrowBarLeft, Arrow90degLeft, ArrowReturnLeft, PencilSquare, Download, ThreeDotsVertical, CaretUpFill, CaretDownFill, Trash3, ArrowBarUp, ArrowBarDown, CaretUp, CaretDown, Eraser, FolderPlus, Link45deg, BoxArrowUpRight, ArrowRepeat, CloudArrowDownFill, GripVertical, InfoCircle, SkipForward, ArrowCounterclockwise, Key } from "svelte-bootstrap-icons";
     import { getCurrentWindow } from "@tauri-apps/api/window";
     import { getCurrentWebview } from "@tauri-apps/api/webview";
     import { listen } from "@tauri-apps/api/event";
@@ -15,8 +15,8 @@
         addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles,
         loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath,
         resolveBridgeConsent, resolveBridgeInstallCompletion, isGameRunning, forceExit, ackCloseRequested,
-        setBridgeFrontendReady,
-        type UpdateStatusEntry, type BridgeConsentDecision, type BridgeSoftError
+        setBridgeFrontendReady, getLastUpdateReport, skipUpdateVersion, browserExtensionActive,
+        type UpdateStatusEntry, type UpdateCheckReport, type BridgeConsentDecision, type BridgeSoftError
     } from "$lib/utils/commands";
     import type { UUID } from "$lib/types/uuid";
     import { usePopup } from "$lib/state/popup.svelte";
@@ -31,8 +31,14 @@
         ModConfigPopup,
         HandoffPopup,
         BridgeConsentPopup,
-        AutoImportPopup
+        AutoImportPopup,
+        UpdatesPopup,
+        UpdateFilePickPopup,
+        UpdateDownloadPopup,
+        BrowserUpdatePopup
     } from "$lib/types/popup";
+    import type { HandoffResult } from "$lib/types/popup";
+    import type { AfterBrowserInstall } from "$lib/models/settings";
     import ToggleSwitch from "$lib/components/ToggleSwitch.svelte";
     import PopupMenuButton from "$lib/components/PopupMenuButton.svelte";
     import { goto, onNavigate } from "$app/navigation";
@@ -62,6 +68,13 @@
     let initPromise = $state<Promise<void>>();
     let downloadsPath = $state<string>("");
     let updateStatuses = $state<UpdateStatusEntry[]>([]);
+    /** What happens after a mod lands (Settings); also decides whether an
+     * update redeploys by itself or asks first. */
+    let afterBrowserInstall = $state<AfterBrowserInstall>("deploy");
+    /** Mods (not sources) with an update available and not skipped. */
+    let updatesAvailableCount = $derived(
+        new Set(updateStatuses.filter(u => u.Status.Kind === "UpdateAvailable").map(u => u.Guid)).size
+    );
     /** True once `init()` has actually loaded profiles from disk into
      * `profiles`. Closing before this is true must not try to save --
      * there's nothing loaded yet to save, and `currentProfile` is
@@ -189,6 +202,12 @@
             "auto-import://candidate",
             (e) => onAutoImportCandidate(e.payload),
         );
+        // Results of an automatic update check (opt-in in Settings, off by
+        // default) -- see commands::updates::spawn_auto_check.
+        const unlistenUpdatesChecked = listen<UpdateCheckReport>(
+            "updates://checked",
+            (e) => onUpdatesChecked(e.payload),
+        );
 
         // Only now can a browser install's consent prompt / afterInstall
         // step actually be handled; the backend holds them until then (on a
@@ -207,6 +226,7 @@
             unlistenBridgeInstalled.then(f => f());
             unlistenDeepLinkInstall.then(f => f());
             unlistenAutoImport.then(f => f());
+            unlistenUpdatesChecked.then(f => f());
         };
     });
 
@@ -260,7 +280,19 @@
         profilesLoaded = true;
 
         const settings = await loadSettings();
-        if (settings.Version === "V1") downloadsPath = settings.DownloadsPath;
+        if (settings.Version === "V1") {
+            downloadsPath = settings.DownloadsPath;
+            afterBrowserInstall = settings.AfterBrowserInstall;
+        }
+
+        // A check may already have run this session (at startup, if the user
+        // turned that on, or before navigating away and back).
+        try {
+            const last = await getLastUpdateReport();
+            if (last) updateStatuses = last.Results;
+        } catch (ex: unknown) {
+            log.warn(`Couldn't load the last update check: ${errorMessage(ex)}`);
+        }
 
         log.info("Initialization complete.");
     }
@@ -291,6 +323,16 @@
 
     function hasUpdateAvailable(guid: UUID): boolean {
         return updatesFor(guid).some(u => u.Status.Kind === "UpdateAvailable");
+    }
+
+    /** The update to use for a mod: prefer a one-click (direct) source. */
+    function bestUpdateFor(guid: UUID): UpdateStatusEntry | undefined {
+        const available = updatesFor(guid).filter(u => u.Status.Kind === "UpdateAvailable");
+        return available.find(u => u.Method === "Direct" && (u.Files?.length ?? 0) > 0) ?? available[0];
+    }
+
+    function needsNexusKey(guid: UUID): boolean {
+        return updatesFor(guid).some(u => u.Status.Kind === "NeedsApiKey");
     }
 
     function makeConfigForMod(mod: Mod): Config {
@@ -520,7 +562,7 @@
         wait.close();
     }
 
-    async function doStartHandoff(pageUrl: string, siteName: string, existingGuid?: UUID) {
+    async function doStartHandoff(pageUrl: string, siteName: string, existingGuid?: UUID): Promise<HandoffResult["status"]> {
         const result = await showPopup(new HandoffPopup(pageUrl, siteName, downloadsPath, existingGuid));
         switch (result.status) {
             case "Done":
@@ -545,6 +587,7 @@
             case "Cancelled":
                 break;
         }
+        return result.status;
     }
 
     /** Shared by the manual "Add URL" button and a `ddmm://install` deep
@@ -582,6 +625,7 @@
         // The bridge installed this behind the frontend's back; refresh
         // before touching it.
         mods = await getMods();
+        await refreshUpdateStatuses();
         const mod = mods.find(m => m.guid === payload.mod.guid);
 
         let addedToProfile: string | undefined;
@@ -898,42 +942,245 @@
         await doDeleteMod(mod.guid);
     }
 
-    async function onUpdateFrom(mod: Mod, entry: UpdateStatusEntry) {
-        if (!entry.PageUrl) return;
-        await doStartHandoff(entry.PageUrl, entry.DisplayName, mod.guid);
+    // --- Mod updates -------------------------------------------------------
+    // Checks only run when the user asks: "Check for Updates", or the
+    // opt-in automatic checks in Settings (off by default).
+
+    async function refreshUpdateStatuses() {
+        try {
+            const last = await getLastUpdateReport();
+            if (last) updateStatuses = last.Results;
+        } catch (ex: unknown) {
+            log.warn(`Couldn't refresh update statuses: ${errorMessage(ex)}`);
+        }
+    }
+
+    function onUpdatesChecked(report: UpdateCheckReport) {
+        updateStatuses = report.Results;
+        const count = new Set(report.Results.filter(u => u.Status.Kind === "UpdateAvailable").map(u => u.Guid)).size;
+        if (report.Trigger !== "Manual" && count > 0) {
+            showToast("info", t("toast.updates.available", { count }));
+        }
+    }
+
+    function replaceMod(oldGuid: UUID, updated: Mod) {
+        const i = mods.findIndex(m => m.guid === oldGuid || m.guid === updated.guid);
+        if (i === -1) mods.push(updated);
+        else mods[i] = updated;
+        iconPaths.delete(updated.guid);
+    }
+
+    /** "updated" -- DDMM installed it (needs the redeploy step);
+     * "updatedByExtension" -- the extension's install already ran the
+     * afterInstall step. */
+    type UpdateOutcome = "updated" | "updatedByExtension" | "skipped" | "stopped" | "failed";
+
+    async function runUpdate(
+        entry: UpdateStatusEntry,
+        position?: { index: number; total: number },
+        failures?: string[],
+    ): Promise<UpdateOutcome> {
+        const mod = mods.find(m => m.guid === entry.Guid);
+        if (!mod) return "failed";
+
+        const reportFailure = (message: string) => {
+            if (failures) failures.push(`${mod.name}: ${message}`);
+            else showPopup(new ErrorPopup(t("pages.mods.popup.error.update.message", { name: mod.name }), message));
+        };
+
+        if (entry.Method === "Direct" && (entry.Files?.length ?? 0) > 0) {
+            let file = entry.Files!.find(f => f.Id === entry.PreselectedFile);
+            if (!file) {
+                const picked = await showPopup(new UpdateFilePickPopup(mod.name, entry));
+                if (!picked) return "skipped";
+                file = picked;
+            }
+            const result = await showPopup(new UpdateDownloadPopup(mod.name, entry, file, position));
+            if (!result.ok) {
+                reportFailure(result.message);
+                return "failed";
+            }
+            replaceMod(entry.Guid, result.mod);
+            if (result.warning) {
+                if (failures) failures.push(`${mod.name}: ${result.warning}`);
+                else showToast("warning", result.warning);
+            }
+            return "updated";
+        }
+
+        if (!entry.PageUrl) {
+            reportFailure(t("pages.mods.popup.error.update.no_page"));
+            return "failed";
+        }
+
+        let extensionActive = false;
+        try {
+            extensionActive = await browserExtensionActive();
+        } catch {
+            // Treat as not connected: the Downloads-folder handoff still works.
+        }
+
+        if (extensionActive || position) {
+            const decision = await showPopup(new BrowserUpdatePopup(mod.name, entry, extensionActive, position));
+            switch (decision) {
+                case "Done":
+                    mods = await getMods();
+                    return "updatedByExtension";
+                case "Skip":
+                    return "skipped";
+                case "Stop":
+                    return "stopped";
+                case "Handoff":
+                    break;
+            }
+        }
+
+        const status = await doStartHandoff(entry.PageUrl, entry.DisplayName, mod.guid);
+        return status === "Done" ? "updated" : status === "Cancelled" ? "stopped" : "failed";
+    }
+
+    /** After DDMM itself updated mods in place: redeploy per the
+     * after-install setting ("deploy" redeploys automatically; otherwise
+     * ask), but only if an updated mod is enabled in the active profile. */
+    async function afterUpdates(updatedGuids: UUID[]) {
+        if (updatedGuids.length === 0 || !currentProfile) return;
+        const affectsProfile = updatedGuids.some(g => profileConfigs.some(c => c.Guid === g && c.Enabled));
+        if (!affectsProfile) return;
+
+        if (afterBrowserInstall !== "deploy") {
+            const confirmed = await showPopup(new ConfirmPopup(
+                t("pages.mods.popup.confirm.redeploy_after_update.title"),
+                t("pages.mods.popup.confirm.redeploy_after_update.question"),
+            ));
+            if (!confirmed) return;
+        } else if (await isGameRunning()) {
+            showToast("warning", t("toast.updates.game_running"));
+            return;
+        }
+
+        const saved = await doSaveProfiles();
+        if (!saved.ok) log.warn(`Failed to save profiles before redeploying: ${saved.error}`);
+
+        const wait = new WaitPopup(t("pages.mods.popup.wait.deploy.message"));
+        showPopup(wait);
+        deploying = true;
+        try {
+            await deploy(currentProfile.Configs);
+            showToast("info", t("toast.updates.redeployed"));
+        } catch (ex: unknown) {
+            showPopup(new ErrorPopup(t("pages.mods.popup.error.deploy.message"), errorMessage(ex)));
+        } finally {
+            deploying = false;
+            wait.close();
+        }
+    }
+
+    async function onUpdateEntry(entry: UpdateStatusEntry) {
+        const outcome = await runUpdate(entry);
+        await refreshUpdateStatuses();
+        if (outcome === "updated") {
+            const mod = mods.find(m => m.guid === entry.Guid);
+            showToast("info", t("toast.updates.updated", { name: mod?.name ?? "" }));
+            await afterUpdates([entry.Guid]);
+        }
+    }
+
+    async function onUpdateMod(mod: Mod) {
+        const entry = bestUpdateFor(mod.guid);
+        if (entry) await onUpdateEntry(entry);
+    }
+
+    async function onSkipVersion(entry: UpdateStatusEntry, skip: boolean) {
+        try {
+            await skipUpdateVersion(entry.Guid, entry.Provider, skip ? (entry.LatestVersion ?? null) : null);
+            await refreshUpdateStatuses();
+        } catch (ex: unknown) {
+            showPopup(new ErrorPopup(t("pages.mods.popup.error.skip_version.message"), errorMessage(ex)));
+        }
+    }
+
+    /** "Update all (N)": one-click (direct) updates run automatically
+     * first; updates that need the browser are then offered one page at a
+     * time. */
+    async function onUpdateAll() {
+        const seen = new Set<UUID>();
+        const entries: UpdateStatusEntry[] = [];
+        for (const u of updateStatuses) {
+            if (u.Status.Kind !== "UpdateAvailable" || seen.has(u.Guid)) continue;
+            const best = bestUpdateFor(u.Guid);
+            if (!best) continue;
+            seen.add(u.Guid);
+            entries.push(best);
+        }
+        const direct = entries.filter(e => e.Method === "Direct" && (e.Files?.length ?? 0) > 0);
+        const browser = entries.filter(e => !direct.includes(e));
+        const ordered = [...direct, ...browser];
+
+        const failures: string[] = [];
+        const redeploy: UUID[] = [];
+        let updated = 0;
+        for (let i = 0; i < ordered.length; i++) {
+            const outcome = await runUpdate(ordered[i], { index: i + 1, total: ordered.length }, failures);
+            if (outcome === "updated") redeploy.push(ordered[i].Guid);
+            if (outcome === "updated" || outcome === "updatedByExtension") updated++;
+            if (outcome === "stopped") break;
+        }
+
+        await refreshUpdateStatuses();
+        if (failures.length > 0) {
+            showPopup(new ErrorPopup(
+                t("pages.mods.popup.error.update_all.message", { updated, failed: failures.length }),
+                failures.join("\n"),
+            ));
+        } else if (updated > 0) {
+            showToast("info", t("toast.updates.bulk_done", { count: updated }));
+        }
+        await afterUpdates(redeploy);
+    }
+
+    async function showUpdatesPopup(report: UpdateCheckReport) {
+        for (;;) {
+            const names = new Map(mods.map(m => [m.guid, m.name] as [UUID, string]));
+            const action = await showPopup(new UpdatesPopup({ ...report, Results: updateStatuses }, names));
+            if (!action) return;
+            switch (action.kind) {
+                case "update":
+                    await onUpdateEntry(action.entry);
+                    break;
+                case "skip":
+                    await onSkipVersion(action.entry, true);
+                    break;
+                case "unskip":
+                    await onSkipVersion(action.entry, false);
+                    break;
+                case "updateAll":
+                    await onUpdateAll();
+                    return;
+                case "nexusSettings":
+                    goto("/settings#nexus-api-key");
+                    return;
+            }
+        }
     }
 
     function onUpdate(i: number) {
-        const mod = libraryMods[i];
-        const entry = updatesFor(mod.guid).find(u => u.Status.Kind === "UpdateAvailable");
-        if (entry) onUpdateFrom(mod, entry);
+        onUpdateMod(libraryMods[i]);
     }
 
     async function onCheckUpdates() {
         const wait = new WaitPopup(t("pages.mods.popup.wait.check_updates.message"));
         showPopup(wait);
+        let report: UpdateCheckReport;
         try {
-            updateStatuses = await checkUpdates();
-            const available = updateStatuses.filter(u => u.Status.Kind === "UpdateAvailable").length;
-            showPopup(new NotificationPopup(
-                "info",
-                available > 0
-                    ? t("pages.mods.popup.notification.updates_available.message", { count: available })
-                    : t("pages.mods.popup.notification.updates_none.message"),
-            ));
+            report = await checkUpdates();
+            updateStatuses = report.Results;
         } catch(ex: unknown) {
-            let message: string;
-            if (ex instanceof Error) {
-                message = ex.message;
-            } else if (typeof ex === "string") {
-                message = ex;
-            } else {
-                message = "Unknown error!";
-            }
-            showPopup(new ErrorPopup(t("pages.mods.popup.error.check_updates.message"), message));
-        } finally {
             wait.close();
+            showPopup(new ErrorPopup(t("pages.mods.popup.error.check_updates.message"), errorMessage(ex)));
+            return;
         }
+        wait.close();
+        await showUpdatesPopup(report);
     }
 
     async function onAddMod() {
@@ -1166,6 +1413,16 @@
                                     {/if}
                                     <span class="text-sm truncate">{mod.description}</span>
                                 </div>
+                                {#if hasUpdateAvailable(mod.guid)}
+                                    <button
+                                        class="hd2mm-success-button text-sm px-2 shrink-0 flex flex-row gap-1 items-center"
+                                        title={t("pages.mods.update_mod_button.tip", { version: bestUpdateFor(mod.guid)?.LatestVersion ?? "", site: bestUpdateFor(mod.guid)?.DisplayName ?? "" })}
+                                        onclick={() => onUpdateMod(mod)}
+                                    >
+                                        <CloudArrowDownFill />
+                                        {t("pages.mods.update_mod_button.text")}
+                                    </button>
+                                {/if}
                                 <ToggleSwitch bind:checked={config.Enabled} />
                                 {#if config.For === "Legacy"}
                                     {#if !("Version" in mod.Manifest) && mod.Manifest.Options}
@@ -1227,14 +1484,36 @@
                                             </button>
                                         {/each}
                                     {/if}
-                                    {#if updatesFor(mod.guid).some(u => u.Status.Kind === "UpdateAvailable")}
+                                    {#if updatesFor(mod.guid).some(u => u.Status.Kind === "UpdateAvailable" || u.Status.Kind === "Skipped" || u.Status.Kind === "NeedsApiKey" || u.Status.Kind === "NeedsManualCheck")}
                                         <hr>
-                                        {#each updatesFor(mod.guid).filter(u => u.Status.Kind === "UpdateAvailable" && u.PageUrl) as entry}
-                                            <button onclick={() => onUpdateFrom(mod, entry)}>
+                                        {#each updatesFor(mod.guid).filter(u => u.Status.Kind === "UpdateAvailable") as entry}
+                                            <button onclick={() => onUpdateEntry(entry)}>
                                                 <CloudArrowDownFill />
                                                 <span>{t("pages.mods.update_from_site", { name: entry.DisplayName })}</span>
                                             </button>
+                                            <button onclick={() => onSkipVersion(entry, true)}>
+                                                <SkipForward />
+                                                <span>{t("pages.mods.skip_version", { version: entry.LatestVersion ?? "" })}</span>
+                                            </button>
                                         {/each}
+                                        {#each updatesFor(mod.guid).filter(u => u.Status.Kind === "Skipped") as entry}
+                                            <button onclick={() => onSkipVersion(entry, false)}>
+                                                <ArrowCounterclockwise />
+                                                <span>{t("pages.mods.unskip_version", { version: entry.LatestVersion ?? "" })}</span>
+                                            </button>
+                                        {/each}
+                                        {#if updatesFor(mod.guid).some(u => u.Status.Kind === "NeedsManualCheck")}
+                                            <button onclick={onCheckUpdates}>
+                                                <ArrowRepeat />
+                                                <span>{t("popup.updates.state.needs_manual_check")}</span>
+                                            </button>
+                                        {/if}
+                                        {#if needsNexusKey(mod.guid)}
+                                            <button onclick={() => goto("/settings#nexus-api-key")}>
+                                                <Key />
+                                                <span>{t("pages.mods.needs_nexus_key")}</span>
+                                            </button>
+                                        {/if}
                                     {/if}
                                 </PopupMenuButton>
                             </div>
@@ -1344,8 +1623,21 @@
                 onclick={onCheckUpdates}
             >
                 <ArrowRepeat />
-                {t("pages.mods.check_updates_button.text")}
+                <!-- Icon-only while "Update all" is shown, so the row fits at the default window size. -->
+                {#if updatesAvailableCount === 0}
+                    {t("pages.mods.check_updates_button.text")}
+                {/if}
             </button>
+            {#if updatesAvailableCount > 0}
+                <button
+                    class="hd2mm-success-button flex flex-row gap-1 items-center whitespace-nowrap"
+                    title={t("pages.mods.update_all_button.tip")}
+                    onclick={onUpdateAll}
+                >
+                    <CloudArrowDownFill />
+                    {t("pages.mods.update_all_button.text", { count: updatesAvailableCount })}
+                </button>
+            {/if}
             <div class="flex-1"></div>
             <button
                 class="hd2mm-danger-button"

@@ -142,7 +142,7 @@ pub(crate) async fn ensure_mods_loaded<'a>(
     base_path: &Path,
 ) -> TAResult<&'a mut Vec<Mod>> {
     if state_mods.is_some() {
-        log::info!("Mods already loaded.");
+        log::debug!("Mods already loaded.");
         return Ok(state_mods.as_mut().unwrap());
     }
 
@@ -764,13 +764,30 @@ pub async fn add_mod_from_url(state: State<'_, AppState>, url: String) -> TAResu
     let (mut r#mod, warning) = install_result?;
 
     log::info!("Recording install origin...");
-    let origin_source = sources::source_from_page_url(&url).unwrap_or_else(|| Source {
+    let mut origin_source = sources::source_from_page_url(&url).unwrap_or_else(|| Source {
         provider: sources::provider_from_url(&url),
         id: None,
         url: Some(url.clone()),
         version: None,
     });
-    if let Err(e) = sources::write_origin_sidecar(&r#mod.directory, vec![origin_source]).await {
+    // A GitHub release-asset link names its release: record that as the
+    // installed version, so update checks work for this mod right away.
+    let mut installed_files = Vec::new();
+    if let Some(tag) = sources::github_tag_from_download_url(&url) {
+        origin_source.version = Some(tag);
+        installed_files.push(sources::InstalledFile {
+            provider: "github".to_string(),
+            file_name: url.rsplit('/').next().map(|n| {
+                percent_encoding::percent_decode_str(n.split(['?', '#']).next().unwrap_or(n))
+                    .decode_utf8_lossy()
+                    .into_owned()
+            }),
+            ..Default::default()
+        });
+    }
+    if let Err(e) =
+        sources::write_origin_sidecar_with_files(&r#mod.directory, vec![origin_source], installed_files).await
+    {
         log::error!("Failed to write origin sidecar: {}", e);
     }
 
@@ -836,6 +853,15 @@ pub(crate) async fn install_update_from_archive(
     let final_guid = if is_local_generated(&manifest) {
         if let Manifest::Legacy(legacy) = &mut manifest {
             legacy.guid = existing_guid;
+            // The generated manifest is named after the update's archive
+            // file ("CoolMod-1.4.zip" -> "CoolMod-1"); it's the same mod, so
+            // keep the name and description the user already knows it by.
+            legacy.name = old_mod.name().to_string();
+            legacy.description = match &old_mod.manifest {
+                Manifest::Legacy(m) => m.description.clone(),
+                Manifest::V1(m) => m.description.clone(),
+                Manifest::V2(m) => m.description.clone(),
+            };
         }
         existing_guid
     } else {
@@ -1025,6 +1051,7 @@ mod tests {
 
         assert!(warning.is_none());
         assert_eq!(updated.guid(), old_guid);
+        assert_eq!(updated.name(), "CoolMod", "an update keeps the mod's name, not the archive's");
         assert_eq!(mods.len(), 1);
         assert_eq!(mods[0].guid(), old_guid);
 

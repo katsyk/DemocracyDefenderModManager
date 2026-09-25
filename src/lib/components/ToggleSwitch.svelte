@@ -1,15 +1,18 @@
 <script lang="ts">
     let {
         checked = $bindable(false),
-        onchange
+        onchange,
+        disabled = false
     }: {
         checked: boolean;
         onchange?: () => void;
+        disabled?: boolean;
     } = $props();
 </script>
 
 <button
-    class="relative inline-flex items-center cursor-pointer"
+    class="relative inline-flex items-center cursor-pointer disabled:cursor-not-allowed"
+    {disabled}
     onpointerdown={(e) => e.stopPropagation()}
     onclick={() => {
         checked = !checked;

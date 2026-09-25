@@ -49,6 +49,10 @@
                     "deep_link_install": {
                         "title": "Install This Mod?",
                         "question": "A link wants to install a mod from {site}. Install?"
+                    },
+                    "redeploy_after_update": {
+                        "title": "Redeploy?",
+                        "question": "Updated mods are in your active profile. Deploy now so the game uses the new versions?"
                     }
                 },
                 "input": {
@@ -96,12 +100,6 @@
                     "deploy_success": {
                         "message": "Deployment successful."
                     },
-                    "updates_available": {
-                        "message": "{count} update(s) available."
-                    },
-                    "updates_none": {
-                        "message": "Everything is up to date."
-                    },
                     "game_path_detected": {
                         "message": "Found Helldivers 2 at {path}"
                     },
@@ -128,6 +126,16 @@
                     },
                     "check_updates": {
                         "message": "Checking for updates failed!"
+                    },
+                    "update": {
+                        "message": "Updating {name} failed!",
+                        "no_page": "This mod's site didn't give DDMM a page to update from."
+                    },
+                    "update_all": {
+                        "message": "Updated {updated} mod(s); {failed} problem(s):"
+                    },
+                    "skip_version": {
+                        "message": "Couldn't change the skipped version!"
                     }
                 }
             },
@@ -168,7 +176,7 @@
             "update_from_site": "Update from {name}",
             "check_updates_button": {
                 "text": "Check for Updates",
-                "tip": "Check installed mods against their source site for a newer version."
+                "tip": "Check installed mods against their source sites for a newer version. Checks only ever run when you ask."
             },
             "purge_button": {
                 "text": "Purge",
@@ -209,7 +217,18 @@
                 "lowest": "Lowest priority (loaded first)",
                 "highest": "Highest priority (wins conflicts)",
                 "drag_handle": "Drag to change load order. Mods lower in the list override mods above them."
-            }
+            },
+            "update_mod_button": {
+                "text": "Update",
+                "tip": "Update to {version} from {site}"
+            },
+            "update_all_button": {
+                "text": "Update all ({count})",
+                "tip": "Update every mod with an available update: one-click updates run by themselves, browser-only sites open one page at a time."
+            },
+            "skip_version": "Skip version {version}",
+            "unskip_version": "Stop skipping {version}",
+            "needs_nexus_key": "Add a Nexus API key (optional) to check for updates"
         },
         "settings": {
             "popup": {
@@ -322,6 +341,40 @@
                     "unreadable": "DDMM isn't allowed to read this folder: {detail}",
                     "check_failed": "Couldn't check the game path: {detail}"
                 }
+            },
+            "updates": {
+                "title": "Mod updates",
+                "description": "Update checks never run unless you ask: click Check for Updates on the Mods page, or turn on automatic checks here.",
+                "auto_check": {
+                    "label": "Check for mod updates when DDMM starts",
+                    "description": "Off by default. Checks only contact the sites your mods came from, and never download or install anything by themselves. Nexus Mods mods are only checked when you click Check for Updates."
+                },
+                "interval": {
+                    "label_before": "then every",
+                    "label_after": "hours while DDMM is open"
+                },
+                "nexus": {
+                    "title": "Nexus Mods API key (optional)",
+                    "description": "Optional. Only used to check your Nexus Mods mods for updates.",
+                    "where_to_get": "Enter it manually: on Nexus Mods, open your account's API Keys page (Get a key), copy the Personal API Key at the bottom, and paste it here. DDMM checks it with Nexus before saving. Remove it here any time.",
+                    "placeholder": "Paste your personal Nexus Mods API key",
+                    "save_button": {
+                        "text": "Save & verify"
+                    },
+                    "checking": "Checking...",
+                    "open_page_button": {
+                        "text": "Get a key",
+                        "tip": "Open the API Keys page of your Nexus Mods account in your browser"
+                    },
+                    "connected": "Connected as {name}.",
+                    "connected_unknown": "A Nexus Mods API key is saved.",
+                    "stored_keychain": "Stored in your system's keychain (credential store), not in DDMM's settings.",
+                    "stored_file": "No system keychain was available, so the key is stored as a file readable only by you (nexus-api-key in DDMM's data folder).",
+                    "remove_button": {
+                        "text": "Remove key"
+                    },
+                    "privacy": "Nexus is only contacted when you click Check for Updates or Save & verify, never by automatic checks. The key is only sent to api.nexusmods.com over HTTPS, and isn't written to settings.json or logs."
+                }
             }
         }
     },
@@ -412,6 +465,87 @@
             "ignore_button": {
                 "text": "Ignore"
             }
+        },
+        "updates": {
+            "title": "Mod updates",
+            "summary_available": "{count} mod(s) can be updated.",
+            "summary_none": "Everything that could be checked is up to date.",
+            "nothing_checkable": "None of your mods come from a site DDMM can check (AyakaMods, GitHub, GameBanana, ModWorkshop, or Nexus Mods).",
+            "state": {
+                "update_available": "Update available",
+                "skipped": "Skipping {version}",
+                "needs_api_key": "Needs a Nexus API key (optional) to check",
+                "error": "Couldn't check: {message}",
+                "unknown": "Unknown",
+                "unknown_tip": "DDMM doesn't know which version is installed (or the site didn't say), so it won't guess.",
+                "up_to_date": "Up to date",
+                "needs_manual_check": "Click Check for Updates to check Nexus mods"
+            },
+            "update_button": {
+                "text": "Update"
+            },
+            "skip_button": {
+                "text": "Skip",
+                "tip": "Skip version {version}: don't show this update again (a newer one will still show)."
+            },
+            "unskip_button": {
+                "text": "Stop skipping"
+            },
+            "needs_key_hint": "Nexus Mods only answers update checks for people with an API key. Adding one in Settings is optional and only used for Nexus update checks.",
+            "update_all_button": {
+                "text": "Update all ({count})"
+            },
+            "nexus_settings_button": {
+                "text": "Nexus API key settings"
+            },
+            "close_button": {
+                "text": "Close"
+            },
+            "nexus_checked_recently": "All your Nexus mods were checked recently. Update checks are limited to save your Nexus API requests."
+        },
+        "update_file_pick": {
+            "title": "Which file?",
+            "message": "{name} has several files on {site} (version {version}). Pick the one to install:",
+            "cancel_button": {
+                "text": "Cancel"
+            },
+            "confirm_button": {
+                "text": "Update with this file"
+            }
+        },
+        "update_download": {
+            "title": "Updating",
+            "title_bulk": "Updating {index} of {total}",
+            "message": "Downloading {name} {version} from {site}...",
+            "installing": "Installing...",
+            "progress": "{done} / {total} MB ({percent}%)",
+            "progress_unknown": "{done} MB"
+        },
+        "browser_update": {
+            "title": "Update in your browser",
+            "title_bulk": "Update {index} of {total}",
+            "message": "{name} {version} is on {site}, which needs your browser to download it.",
+            "extension_hint": "DDMM will open the mod page. Click \"Update with DDMM\" on it (for Nexus Mods, choose the file and click its own download button); this closes by itself when the update is installed.",
+            "waiting": "Waiting for the update from your browser...",
+            "handoff_hint": "DDMM will open the mod page and watch your Downloads folder. Download the new version there and DDMM installs it over the old one.",
+            "open_button": {
+                "text": "Open on {site}"
+            },
+            "open_and_watch_button": {
+                "text": "Open on {site} and watch Downloads"
+            },
+            "use_handoff_button": {
+                "text": "Use Downloads-folder watch instead"
+            },
+            "next_button": {
+                "text": "Skip to next"
+            },
+            "stop_button": {
+                "text": "Stop"
+            },
+            "close_button": {
+                "text": "Close"
+            }
         }
     },
     "toast": {
@@ -426,6 +560,13 @@
         "auto_import": {
             "deployed": "{name} installed and deployed.",
             "deploy_failed": "Installed, but deploy failed: {message}"
+        },
+        "updates": {
+            "available": "{count} mod update(s) available.",
+            "updated": "{name} updated.",
+            "bulk_done": "{count} mod(s) updated.",
+            "redeployed": "Redeployed with the updated mods.",
+            "game_running": "Mods updated, but Helldivers 2 is running: deploy after closing it to use the new versions."
         }
     }
 }

@@ -94,7 +94,7 @@ nav:
       - Profiles: using/profiles.md
       - Mod options & variants: using/options-variants.md
       - Deploy & purge: using/deploy-purge.md
-      - Checking for updates: using/updates.md
+      - Updating mods: using/updating-mods.md
       - Settings reference: using/settings.md
   - For Mod Authors:
       - authors/index.md

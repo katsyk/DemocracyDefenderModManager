@@ -26,8 +26,8 @@ What happens next depends on the link:
 
   Confirming starts the same browser handoff.
 
-DDMM never asks for, stores, or uses credentials for any mod site — every handoff downloads through your own,
-already-logged-in browser session.
+DDMM never asks for your login on any mod site — every handoff downloads through your own, already-logged-in
+browser session.
 
 ## How the browser handoff works
 
@@ -57,17 +57,19 @@ turf. Go say hi: [ayakamods.com/games/helldivers-2](https://ayakamods.com/games/
 
 [AyakaMods](https://ayakamods.com) is a first-class, built-in `Provider` in DDMM: its page-URL shape
 (`https://ayakamods.com/mods/<slug>.<id>/` or `https://ayakamods.com/mods/<id>/`) is recognized directly, mod
-pages always use the browser handoff above, and [Check for updates](updates.md) reads the same page's published
+pages always use the browser handoff above, and [update checks](updating-mods.md) read the same page's published
 version automatically. At install time, DDMM also fetches the mod page once to record its current version for
-future update checks — see [Checking for updates](updates.md#how-ddmm-knows-a-mods-installed-version).
+future update checks — see [Updating mods](updating-mods.md#how-ddmm-knows-a-mods-installed-version).
 
 ## Nexus Mods
 
 Nexus Mods gates its downloads behind a login too, so a Nexus Mods mod-page link always uses the browser handoff.
 A direct Nexus **file** link (not the mod page) can still install immediately, if you have one.
 
-Update checking against Nexus Mods is **not** supported — it would require a personal Nexus API key DDMM doesn't
-ask you to provide. See [Checking for updates](updates.md).
+Update checks for Nexus Mods need a Nexus API key. Adding your own personal key in Settings is **optional**;
+without one, Nexus mods show "Needs a Nexus API key (optional) to check" and everything else works the same.
+DDMM never downloads from Nexus through the API: updating a Nexus mod always goes through your browser. See
+[Updating mods](updating-mods.md#nexus-mods-and-the-optional-api-key).
 
 ## ModWorkshop, GameBanana
 
@@ -77,13 +79,14 @@ GameBanana" menu entry. Pasting a link from either isn't hardcoded to the browse
 Nexus Mods are: DDMM tries a direct download first, and only offers the browser handoff if that comes back as an
 HTML page rather than an archive.
 
-DDMM doesn't have an update-check integration for either site.
+[Update checks](updating-mods.md) use each site's public API (no key), and because both serve files publicly, an
+update can be installed with one click.
 
 ## GitHub
 
 GitHub is a supported `Provider` too, and its release-asset links are ordinarily plain `https://` links that don't
-require a login, so they install immediately through **Add URL**. [Check for updates](updates.md) also supports
-GitHub, reading a repository's latest release tag.
+require a login, so they install immediately through **Add URL**. [Update checks](updating-mods.md) read a
+repository's latest release, and updates install with one click from the release's archive asset.
 
 ## Other / unrecognized sites
 

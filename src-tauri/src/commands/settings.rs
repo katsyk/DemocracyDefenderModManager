@@ -13,19 +13,23 @@ pub fn default_downloads_path() -> PathBuf {
     dirs::download_dir().unwrap_or_default()
 }
 
+/// Read settings.json (or the defaults if there's none yet).
+///
+/// Called constantly (the auto-import watcher every 2 s, every browser
+/// extension request, the update-check scheduler), so it logs at debug
+/// level only -- at info it filled and rotated the log file within minutes,
+/// wiping the history users attach to bug reports. Failures are returned
+/// to the caller, which reports them.
 pub async fn do_load_settings(base_path: &Path) -> anyhow::Result<Settings> {
-    log::info!("Loading settings...");
     let settings_file = base_path.join(SETTINGS_FILE);
+    log::debug!("Loading settings from {:?}", &settings_file);
 
-    log::info!("Looking for {:?}", &settings_file);
     let mut settings = if tokio::fs::try_exists(&settings_file).await? {
-        log::info!("Opening...");
         let data = tokio::fs::read(&settings_file).await?;
-
-        log::info!("Deserializing...");
-        serde_json::from_slice(&data)?
+        serde_json::from_slice(&data)
+            .map_err(|e| anyhow::anyhow!("{:?} isn't valid settings JSON: {e}", settings_file))?
     } else {
-        log::info!("Not found. Using default.");
+        log::debug!("No settings file yet; using defaults.");
 
         Settings::V1 {
             game_path: PathBuf::new(),
@@ -34,6 +38,9 @@ pub async fn do_load_settings(base_path: &Path) -> anyhow::Result<Settings> {
             after_browser_install: "deploy".to_string(),
             bridge_allowed_sites: vec![],
             auto_import_enabled: false,
+            auto_check_updates: false,
+            auto_check_interval_hours: 0,
+            nexus_username: None,
         }
     };
 
@@ -44,8 +51,15 @@ pub async fn do_load_settings(base_path: &Path) -> anyhow::Result<Settings> {
         settings.set_downloads_path(default_downloads_path());
     }
 
-    log::info!("Settings loaded.");
     Ok(settings)
+}
+
+/// Write `settings` to settings.json (backend-side changes: the Nexus
+/// account name, "Always allow" sites, ...).
+pub async fn write_settings(base_path: &Path, settings: &Settings) -> anyhow::Result<()> {
+    let data = serde_json::to_vec_pretty(settings)?;
+    tokio::fs::write(base_path.join(SETTINGS_FILE), data).await?;
+    Ok(())
 }
 
 pub async fn do_check_settings(base_path: &Path) -> anyhow::Result<bool> {
@@ -77,9 +91,17 @@ pub async fn load_settings(state: State<'_, AppState>) -> TAResult<Settings> {
 pub async fn save_settings(state: State<'_, AppState>, settings: Settings) -> TAResult<()> {
     log::info!("Saving settings...");
 
+    let mut settings = settings;
+    // The Nexus account name is owned by the backend (set when a key is
+    // saved/removed); a page that loaded settings earlier mustn't clobber it.
+    let on_disk_username = do_load_settings(&state.base_path)
+        .await
+        .ok()
+        .and_then(|s| s.nexus_username().map(str::to_string));
+    settings.set_nexus_username(on_disk_username);
+
     // Store the real game root if the user picked a folder above/below it
     // (e.g. `.../Helldivers 2/data` or `.../steamapps/common`).
-    let mut settings = settings;
     if let Ok(root) = crate::game_path::resolve(settings.game_path()).await {
         if root != settings.game_path() {
             log::info!("Normalizing game path {:?} to {:?}", settings.game_path(), root);

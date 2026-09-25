@@ -2,6 +2,7 @@
     import { open } from "@tauri-apps/plugin-dialog";
     import { openPath, openUrl } from "@tauri-apps/plugin-opener";
     import { beforeNavigate, onNavigate } from "$app/navigation";
+    import { tick } from "svelte";
     import { toSkipEntry, type SkipEntry } from "$lib/models/settings";
     import type { AfterBrowserInstall } from "$lib/models/settings";
     import { useLocalization } from "$lib/state/localization.svelte";
@@ -9,7 +10,8 @@
         loadSettings, saveSettings, detectGamePath, getDataDir, validateGamePath,
         getBridgeAllowedSites, revokeBridgeSite, repairBrowserIntegration, removeBrowserIntegration,
         repairBrowserIntegrationOne, removeBrowserIntegrationOne,
-        type BrowserIntegrationStatus
+        getNexusKeyStatus, setNexusApiKey, removeNexusApiKey,
+        type BrowserIntegrationStatus, type NexusKeyStatus
     } from "$lib/utils/commands";
     import { Dash, Plus, ThreeDots, Search, Folder2Open, ArrowRepeat, BoxArrowUpRight } from "svelte-bootstrap-icons";
     import { usePopup } from "$lib/state/popup.svelte";
@@ -21,6 +23,8 @@
     const { show: showPopup } = usePopup();
 
     const ONE_CLICK_INSTALL_DOCS_URL = "https://github.com/katsyk/DemocracyDefenderModManager/blob/main/docs/using/one-click-install.md";
+    const NEXUS_API_KEYS_URL = "https://next.nexusmods.com/settings/api-keys";
+    const DEFAULT_AUTO_CHECK_INTERVAL_HOURS = 6;
     const AFTER_BROWSER_INSTALL_OPTIONS: AfterBrowserInstall[] = ["library", "profile", "deploy"];
 
     let gamePath = $state<string>("");
@@ -30,6 +34,14 @@
     let afterBrowserInstallIndex = $state<number>(2);
     let bridgeAllowedSites = $state<string[]>([]);
     let autoImportEnabled = $state<boolean>(false);
+    // Mod updates: both automatic options are opt-in (off by default).
+    let autoCheckUpdates = $state<boolean>(false);
+    let autoCheckIntervalEnabled = $state<boolean>(false);
+    let autoCheckIntervalHours = $state<number>(DEFAULT_AUTO_CHECK_INTERVAL_HOURS);
+    let nexusStatus = $state<NexusKeyStatus>({ Present: false });
+    let nexusKeyInput = $state<string>("");
+    let nexusBusy = $state<boolean>(false);
+    let nexusError = $state<string | undefined>();
     let browserIntegration = $state<BrowserIntegrationStatus[]>([]);
     let browserIntegrationBusy = $state<boolean>(false);
     let gamePathErrors = $state<string[]>([]);
@@ -54,6 +66,13 @@
     }
     let dataDir = $state<string>("");
     let initPromise = $state<Promise<void>>(init());
+    // Linked from the Mods page ("add a Nexus API key"): scroll there once
+    // the page has actually rendered (it only renders after init).
+    initPromise.then(async () => {
+        if (location.hash !== "#nexus-api-key") return;
+        await tick();
+        document.getElementById("nexus-api-key")?.scrollIntoView({ block: "start" });
+    }).catch(() => {});
 
     $effect(() => {
         const current = {
@@ -107,7 +126,9 @@
             DownloadsPath: downloadsPath,
             AfterBrowserInstall: AFTER_BROWSER_INSTALL_OPTIONS[afterBrowserInstallIndex] ?? "deploy",
             BridgeAllowedSites: bridgeAllowedSites,
-            AutoImportEnabled: autoImportEnabled
+            AutoImportEnabled: autoImportEnabled,
+            AutoCheckUpdates: autoCheckUpdates,
+            AutoCheckIntervalHours: autoCheckIntervalEnabled ? clampInterval(autoCheckIntervalHours) : 0
         });
     })
 
@@ -121,9 +142,21 @@
                 afterBrowserInstallIndex = Math.max(0, AFTER_BROWSER_INSTALL_OPTIONS.indexOf(settings.AfterBrowserInstall));
                 bridgeAllowedSites = settings.BridgeAllowedSites;
                 autoImportEnabled = settings.AutoImportEnabled;
+                autoCheckUpdates = settings.AutoCheckUpdates ?? false;
+                autoCheckIntervalEnabled = (settings.AutoCheckIntervalHours ?? 0) > 0;
+                autoCheckIntervalHours = autoCheckIntervalEnabled
+                    ? clampInterval(settings.AutoCheckIntervalHours)
+                    : DEFAULT_AUTO_CHECK_INTERVAL_HOURS;
                 break;
         }
         dataDir = resolvedDataDir;
+
+        try {
+            nexusStatus = await getNexusKeyStatus();
+        } catch {
+            // Show as "no key"; never blocks Settings.
+        }
+
 
         // Also registers (idempotently) as a side effect -- see
         // repairBrowserIntegration's doc comment on the Rust side. Never
@@ -136,6 +169,38 @@
             // nothing rather than blocking Settings from loading.
         } finally {
             browserIntegrationBusy = false;
+        }
+    }
+
+    function clampInterval(hours: number): number {
+        if (!Number.isFinite(hours)) return DEFAULT_AUTO_CHECK_INTERVAL_HOURS;
+        return Math.min(168, Math.max(1, Math.round(hours)));
+    }
+
+    async function onSaveNexusKey() {
+        const key = nexusKeyInput.trim();
+        if (!key) return;
+        nexusBusy = true;
+        nexusError = undefined;
+        try {
+            nexusStatus = await setNexusApiKey(key);
+            nexusKeyInput = "";
+        } catch (ex: unknown) {
+            nexusError = ex instanceof Error ? ex.message : String(ex);
+        } finally {
+            nexusBusy = false;
+        }
+    }
+
+    async function onRemoveNexusKey() {
+        nexusBusy = true;
+        nexusError = undefined;
+        try {
+            nexusStatus = await removeNexusApiKey();
+        } catch (ex: unknown) {
+            nexusError = ex instanceof Error ? ex.message : String(ex);
+        } finally {
+            nexusBusy = false;
         }
     }
 
@@ -379,6 +444,83 @@
                         <Dash class="m-auto block" />
                     </button>
                 </div>
+            </div>
+            <div class="flex flex-col gap-1">
+                <h2 class="text-zinc-300 text-xl">{t("pages.settings.updates.title")}</h2>
+                <p class="text-zinc-400 text-sm max-w-lg">{t("pages.settings.updates.description")}</p>
+                <div class="flex flex-row gap-2 items-center">
+                    <ToggleSwitch bind:checked={autoCheckUpdates} />
+                    <span class="text-zinc-300 text-sm">{t("pages.settings.updates.auto_check.label")}</span>
+                </div>
+                <div class="flex flex-row gap-2 items-center ml-6" class:opacity-50={!autoCheckUpdates}>
+                    <ToggleSwitch bind:checked={autoCheckIntervalEnabled} disabled={!autoCheckUpdates} />
+                    <span class="text-zinc-300 text-sm">{t("pages.settings.updates.interval.label_before")}</span>
+                    <input
+                        type="number"
+                        min="1"
+                        max="168"
+                        class="hd2mm-input w-16"
+                        bind:value={autoCheckIntervalHours}
+                        disabled={!autoCheckUpdates || !autoCheckIntervalEnabled}
+                        onchange={() => (autoCheckIntervalHours = clampInterval(autoCheckIntervalHours))}
+                    />
+                    <span class="text-zinc-300 text-sm">{t("pages.settings.updates.interval.label_after")}</span>
+                </div>
+                <p class="text-zinc-500 text-xs max-w-lg">{t("pages.settings.updates.auto_check.description")}</p>
+
+                <h3 id="nexus-api-key" class="text-zinc-300 text-base mt-2">{t("pages.settings.updates.nexus.title")}</h3>
+                <p class="text-zinc-400 text-sm max-w-lg">{t("pages.settings.updates.nexus.description")}</p>
+                <p class="text-zinc-500 text-xs max-w-lg">{t("pages.settings.updates.nexus.where_to_get")}</p>
+                {#if nexusStatus.Present}
+                    <p class="text-sm text-green-400">
+                        {nexusStatus.Username
+                            ? t("pages.settings.updates.nexus.connected", { name: nexusStatus.Username })
+                            : t("pages.settings.updates.nexus.connected_unknown")}
+                    </p>
+                    <p class="text-zinc-400 text-xs max-w-lg">
+                        {nexusStatus.Storage === "File"
+                            ? t("pages.settings.updates.nexus.stored_file")
+                            : t("pages.settings.updates.nexus.stored_keychain")}
+                    </p>
+                    <div class="flex flex-row gap-1">
+                        <button class="hd2mm-button" disabled={nexusBusy} onclick={onRemoveNexusKey}>
+                            {t("pages.settings.updates.nexus.remove_button.text")}
+                        </button>
+                    </div>
+                {:else}
+                    <div class="flex flex-row gap-1 max-w-lg">
+                        <input
+                            type="password"
+                            class="hd2mm-input flex-1"
+                            placeholder={t("pages.settings.updates.nexus.placeholder")}
+                            autocomplete="off"
+                            autocorrect="off"
+                            autocapitalize="off"
+                            spellcheck="false"
+                            bind:value={nexusKeyInput}
+                            onkeydown={(e) => { if (e.key === "Enter") onSaveNexusKey(); }}
+                        />
+                        <button
+                            class="hd2mm-button"
+                            disabled={nexusBusy || nexusKeyInput.trim().length === 0}
+                            onclick={onSaveNexusKey}
+                        >
+                            {nexusBusy ? t("pages.settings.updates.nexus.checking") : t("pages.settings.updates.nexus.save_button.text")}
+                        </button>
+                        <button
+                            class="hd2mm-button flex flex-row gap-1 items-center"
+                            title={t("pages.settings.updates.nexus.open_page_button.tip")}
+                            onclick={() => openUrl(NEXUS_API_KEYS_URL)}
+                        >
+                            <BoxArrowUpRight />
+                            {t("pages.settings.updates.nexus.open_page_button.text")}
+                        </button>
+                    </div>
+                {/if}
+                {#if nexusError}
+                    <p class="text-red-500 text-sm max-w-lg">{nexusError}</p>
+                {/if}
+                <p class="text-zinc-500 text-xs max-w-lg">{t("pages.settings.updates.nexus.privacy")}</p>
             </div>
             <div class="flex flex-col gap-1">
                 <h2 class="text-zinc-300 text-xl">{t("pages.settings.browser_install.title")}</h2>

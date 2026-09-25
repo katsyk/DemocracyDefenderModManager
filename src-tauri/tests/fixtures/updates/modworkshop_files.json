@@ -1,0 +1,26 @@
+{
+  "data": [
+    {
+      "id": 96181,
+      "mod_id": 51110,
+      "name": "Mr Pizza Portable Hellbomb",
+      "file": "51110_1076_BRAaLsnibIkO37I2oRLXUxqqQRC5gyEwK4ftaup9.zip",
+      "type": "zip",
+      "size": 6537282,
+      "label": "",
+      "version": "",
+      "version_type": "release",
+      "created_at": "2026-04-30T04:30:21.000000Z",
+      "updated_at": "2026-04-30T04:30:21.000000Z",
+      "download_url": "https://storage.modworkshop.net/mods/files/51110_1076_BRAaLsnibIkO37I2oRLXUxqqQRC5gyEwK4ftaup9.zip?filename=Mr%20Pizza%20Portable%20Hellbomb.zip"
+    }
+  ],
+  "meta": {
+    "current_page": 1,
+    "from": 1,
+    "last_page": 1,
+    "per_page": 20,
+    "to": 1,
+    "total": 1
+  }
+}

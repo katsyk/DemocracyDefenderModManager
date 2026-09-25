@@ -150,6 +150,11 @@ async fn dispatch(app: &AppHandle, line: &str) -> String {
         return ErrorReply::new(id, ErrorCode::ForbiddenOrigin, "caller is not an allowed extension").to_line();
     }
 
+    // Any authenticated request from the extension means it's installed and
+    // connected -- a browser-based mod update can then finish with its
+    // "Update with DDMM" button (see commands::updates).
+    *app.state::<AppState>().bridge_last_seen.lock().await = Some(tokio::time::Instant::now());
+
     match kind.as_str() {
         "hello" => handle_hello(app, id).await,
         "install" => handle_install_queued(app, raw, id).await,
@@ -263,7 +268,14 @@ async fn handle_query(app: &AppHandle, raw: serde_json::Value, id: String) -> St
                 .find(|s| s.provider.eq_ignore_ascii_case(&source.provider))
                 .and_then(|s| s.version.clone());
             let update_available = match (&installed_version, &req.page_version) {
-                (Some(installed), Some(latest)) if !latest.is_empty() => Some(installed != latest),
+                (Some(installed), Some(latest)) if !latest.is_empty() => Some(
+                    crate::providers::compare_versions(installed, latest) == crate::providers::VersionRelation::Update,
+                ),
+                // The page doesn't expose a version (e.g. Nexus), but DDMM's
+                // own update check found one for this mod: not a guess.
+                _ if crate::commands::updates::known_update_available(&state, m.guid(), &source.provider).await => {
+                    Some(true)
+                }
                 _ => None,
             };
             (
@@ -342,6 +354,21 @@ async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String) -> 
     let state = app.state::<AppState>();
     let file = std::path::PathBuf::from(&req.file);
 
+    // Record what's being installed (version, which file) so update checks
+    // work for it: from the page, or -- before taking the mods lock, since
+    // it may ask the site -- from the archive name / the site itself.
+    let mut page_version = req.page_version.clone();
+    let mut installed_files = Vec::new();
+    if let Some(source) = install::resolve_source(req.page_url.as_deref(), req.download_url.as_deref(), page_version.as_deref())
+        .filter(|s| s.id.is_some())
+    {
+        let (enriched, files) = crate::commands::updates::enrich_install_source(&source, Some(&file)).await;
+        if page_version.is_none() {
+            page_version = enriched.version;
+        }
+        installed_files = files;
+    }
+
     let outcome = {
         let mut mods_guard = state.mods.lock().await;
         let mods = match ensure_mods_loaded(&mut mods_guard, &state.base_path).await {
@@ -350,13 +377,14 @@ async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String) -> 
                 return ErrorReply::new(id, ErrorCode::Internal, format!("couldn't read installed mods: {e}")).to_line()
             }
         };
-        install::install_file(
+        install::install_file_with(
             &state,
             mods,
             &file,
             req.page_url.as_deref(),
             req.download_url.as_deref(),
-            req.page_version.as_deref(),
+            page_version.as_deref(),
+            installed_files,
         )
         .await
     };
@@ -488,6 +516,7 @@ async fn request_install_completion(
             "name": outcome.r#mod.name(),
         },
         "afterInstall": after_install,
+        "updated": outcome.updated,
     });
     let _ = app.emit("bridge://mod-installed", payload);
 

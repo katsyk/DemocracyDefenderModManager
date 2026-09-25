@@ -30,7 +30,15 @@ export type SettingsV1 = {
     DownloadsPath: string,
     AfterBrowserInstall: AfterBrowserInstall,
     BridgeAllowedSites: string[],
-    AutoImportEnabled: boolean
+    AutoImportEnabled: boolean,
+    /** Opt-in: check for mod updates when DDMM starts (off by default). */
+    AutoCheckUpdates: boolean,
+    /** With AutoCheckUpdates: re-check every this many hours while open;
+     * 0 = only at startup. */
+    AutoCheckIntervalHours: number,
+    /** Nexus account whose optional API key is stored (backend-owned; the
+     * key itself is never part of settings). */
+    NexusUsername?: string
 };
 
 export type Settings = SettingsV1 /* | SettingsV2 */;

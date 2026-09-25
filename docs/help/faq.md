@@ -6,8 +6,10 @@ title: FAQ
 
 ### Do I need an account on Nexus Mods, AyakaMods, or any other site?
 
-No. DDMM never asks for, stores, or uses credentials for any mod site. Sites that require being logged in to
-download hand the actual download off to your own browser session — see [Mod sites](../using/mod-sites.md).
+No. DDMM never asks for your login on any mod site. Sites that require being logged in to download hand the
+actual download off to your own browser session — see [Mod sites](../using/mod-sites.md). The one optional
+extra is a personal Nexus Mods API key, used only to check Nexus mods for updates; see
+[Updating mods](../using/updating-mods.md#nexus-mods-and-the-optional-api-key).
 
 ### Where does DDMM store my mods and settings?
 
@@ -52,11 +54,13 @@ before the handoff started), use **"I already downloaded it -- choose file"** in
 
 ### "Check for Updates" doesn't show a badge for a mod I know has a new version
 
-Update checks only cover mods with a recognized, [supported](../using/updates.md#which-sites-are-supported)
-source (AyakaMods or GitHub) *and* a recorded installed version to compare against — see
-[How DDMM knows a mod's installed version](../using/updates.md#how-ddmm-knows-a-mods-installed-version). A mod
-installed manually, with no `Sources` declared, or sourced only from Nexus Mods or an unsupported site, has
-nothing for DDMM to check.
+Update checks only cover mods with a recognized, [supported](../using/updating-mods.md#which-sites-are-supported)
+source (AyakaMods, GitHub, GameBanana, ModWorkshop, or Nexus Mods with your optional API key) *and* a recorded
+installed version to compare against — see
+[How DDMM knows a mod's installed version](../using/updating-mods.md#how-ddmm-knows-a-mods-installed-version).
+The results after **Check for Updates** show each mod's state, including "unknown" (no installed version on
+record) and "needs a Nexus API key". A mod installed manually with no `Sources` declared, or sourced only from an
+unsupported site, has nothing for DDMM to check.
 
 ### Where do I ask questions or get help that isn't a bug report?
 
