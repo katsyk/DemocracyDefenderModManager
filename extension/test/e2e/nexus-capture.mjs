@@ -146,6 +146,28 @@ async function waitFor(fn, what, timeoutMs = 20_000) {
   }
 }
 
+/**
+ * The emblem must contrast with the button behind it in every state (it
+ * used to be yellow on the yellow button). Its stroke follows the label
+ * color, so compare the computed stroke with the button's background.
+ * @param {import('playwright').Locator} button
+ * @param {string} state
+ */
+async function expectEmblemVisible(button, state) {
+  const colors = await button.evaluate((btn) => {
+    const shape = btn.querySelector('svg path');
+    return {
+      stroke: getComputedStyle(shape).stroke,
+      color: getComputedStyle(btn).color,
+      background: getComputedStyle(btn).backgroundColor,
+    };
+  });
+  if (colors.stroke !== colors.color || colors.stroke === colors.background) {
+    throw new Error(`emblem not visible in state "${state}": ${JSON.stringify(colors)}`);
+  }
+  console.log(`PASS: emblem visible in "${state}" (${colors.stroke} on ${colors.background}).`);
+}
+
 function freePort() {
   return new Promise((resolve) => {
     const s = net.createServer();
@@ -207,7 +229,9 @@ async function main() {
     await waitFor(async () => (await readdir(downloadDir)).some((f) => f.includes('Cool Mod A') && !f.endsWith('.crdownload')), 'download A on disk');
     const buttonA = pageA.locator('.ddmm-btn');
     await waitFor(async () => (await buttonA.getAttribute('data-state')) === 'install', 'button A ready');
+    await expectEmblemVisible(buttonA, 'install');
     if (shots) await pageA.screenshot({ path: path.join(shots, 'e2e-a1-before-click.png') });
+    if (shots) await buttonA.screenshot({ path: path.join(shots, 'e2e-button-install.png') });
     if ((await readInstalls(hostLog)).length !== 0) throw new Error('installed before the user clicked');
     await buttonA.click();
     const installsA = await waitFor(async () => {
@@ -217,7 +241,9 @@ async function main() {
     if (!installsA[0].file.includes('Cool Mod A')) throw new Error(`wrong file: ${installsA[0].file}`);
     if (installsA[0].pageUrl !== `https://www.nexusmods.com${FILE_PAGE_PATH}`) throw new Error(`wrong pageUrl: ${installsA[0].pageUrl}`);
     await waitFor(async () => (await buttonA.getAttribute('data-state')) === 'installed', 'button A installed');
+    await expectEmblemVisible(buttonA, 'installed');
     if (shots) await pageA.screenshot({ path: path.join(shots, 'e2e-a2-installed.png') });
+    if (shots) await buttonA.screenshot({ path: path.join(shots, 'e2e-button-installed.png') });
     console.log(`PASS A: a download that finished before the click was installed (${installsA[0].file}).`);
 
     // ---- Scenario B: armed first, then a no-referrer download in a new tab.
@@ -229,7 +255,9 @@ async function main() {
     await waitFor(async () => (await buttonB.getAttribute('data-state')) === 'waiting', 'button B "Click Download on this page…"', 3_000);
     const labelB = await buttonB.textContent();
     if (labelB !== 'Click Download on this page…') throw new Error(`unexpected label: ${labelB}`);
+    await expectEmblemVisible(buttonB, 'waiting');
     if (shots) await pageB.screenshot({ path: path.join(shots, 'e2e-b1-waiting.png') });
+    if (shots) await buttonB.screenshot({ path: path.join(shots, 'e2e-button-waiting.png') });
     await pageB.evaluate((url) => {
       const a = document.createElement('a');
       a.href = url;

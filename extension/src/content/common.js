@@ -18,8 +18,10 @@
   const SVG_NS = 'http://www.w3.org/2000/svg';
 
   /**
-   * Builds a small inline version of the shield-and-chevrons emblem, DDMM
-   * yellow on transparent, as real SVG DOM nodes (not `innerHTML`, so
+   * Builds a small inline version of the shield-and-chevrons emblem, drawn
+   * in `currentColor` so it always matches the button's label color (dark
+   * on the yellow/green/blue/red buttons, yellow on the dark "Get DDMM"
+   * one), as real SVG DOM nodes (not `innerHTML`, so
    * there's nothing here for a store reviewer -- or `web-ext lint` -- to
    * flag as an unsanitized dynamic-markup assignment, even though every
    * value involved is a static constant).
@@ -32,17 +34,18 @@
     svg.setAttribute('height', '14');
     svg.setAttribute('aria-hidden', 'true');
     svg.setAttribute('focusable', 'false');
+    svg.setAttribute('class', 'ddmm-emblem');
 
     const shield = document.createElementNS(SVG_NS, 'path');
     shield.setAttribute('d', 'M256 40 L440 100 V250 C440 362 358 436 256 478 C154 436 72 362 72 250 V100 Z');
     shield.setAttribute('fill', 'none');
-    shield.setAttribute('stroke', '#FFC61A');
+    shield.setAttribute('stroke', 'currentColor');
     shield.setAttribute('stroke-width', '28');
     svg.appendChild(shield);
 
     const chevrons = document.createElementNS(SVG_NS, 'g');
     chevrons.setAttribute('fill', 'none');
-    chevrons.setAttribute('stroke', '#FFC61A');
+    chevrons.setAttribute('stroke', 'currentColor');
     chevrons.setAttribute('stroke-width', '30');
     chevrons.setAttribute('stroke-linejoin', 'miter');
     chevrons.setAttribute('stroke-linecap', 'butt');
@@ -74,6 +77,7 @@
       user-select: none;
       box-shadow: 0 1px 0 rgba(0,0,0,0.4);
     }
+    .ddmm-emblem { flex: none; color: inherit; }
     .ddmm-btn:hover { background: #ffd24d; }
     .ddmm-btn:active { background: #e6b117; }
     .ddmm-btn[data-state="installing"],
