@@ -106,6 +106,32 @@ impl Archive {
         }
     }
 
+    /// The raw entry path of a file sitting at the archive root whose name
+    /// matches `name` ignoring ASCII case (`Manifest.json` for
+    /// `manifest.json`). An exact match wins over a case variant. Mods are
+    /// mostly packed on Windows, where the difference never matters.
+    pub fn find_root_file_ci(&mut self, name: &str) -> anyhow::Result<Option<PathBuf>> {
+        let mut variant = None;
+        for entry in self.iter()? {
+            let entry = entry?;
+            if entry.is_directory() {
+                continue;
+            }
+            let raw = entry.path().to_string_lossy().replace('\\', "/");
+            let raw = raw.strip_prefix("./").unwrap_or(&raw);
+            if raw.contains('/') {
+                continue;
+            }
+            if raw == name {
+                return Ok(Some(entry.path().to_path_buf()));
+            }
+            if variant.is_none() && raw.eq_ignore_ascii_case(name) {
+                variant = Some(entry.path().to_path_buf());
+            }
+        }
+        Ok(variant)
+    }
+
     pub fn read_path(&mut self, path: impl AsRef<Path>) -> anyhow::Result<Vec<u8>> {
         match &mut self.0 {
             ArchiveInner::Zip(archive) => {
@@ -581,6 +607,35 @@ mod tests {
             "world"
         );
         assert_eq!(std::fs::read_to_string(dest.join("root.txt")).unwrap(), "!");
+    }
+
+    #[test]
+    fn finds_root_manifest_case_insensitively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip = make_zip(tmp.path(), "m.zip", &[("Manifest.json", b"{}"), ("sub/manifest.json", b"{}")]);
+        let mut archive = Archive::open(&zip).unwrap();
+        assert_eq!(archive.find_root_file_ci("manifest.json").unwrap(), Some(PathBuf::from("Manifest.json")));
+        assert_eq!(archive.read_path("Manifest.json").unwrap(), b"{}");
+
+        let zip = make_zip(tmp.path(), "n.zip", &[("sub/manifest.json", b"{}")]);
+        let mut archive = Archive::open(&zip).unwrap();
+        assert_eq!(archive.find_root_file_ci("manifest.json").unwrap(), None);
+    }
+
+    #[test]
+    fn windows_backslash_entry_names_extract_as_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip = make_zip(
+            tmp.path(),
+            "win.zip",
+            &[("Options\\Red\\0123456789abcdef.patch_0", b"p")],
+        );
+        let dest = fresh_dest(tmp.path(), "out");
+        Archive::open(&zip).unwrap().extract_to(&dest).unwrap();
+        assert!(
+            dest.join("Options/Red/0123456789abcdef.patch_0").is_file(),
+            "backslash entry names should become real folders on every platform"
+        );
     }
 
     #[test]
