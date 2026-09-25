@@ -108,11 +108,12 @@ fuse_deps() {
 # See the appimage-host-libs-bare row for what a bare system lacks.
 desktop_baseline() {
     case $family in
-        fedora|suse) echo 'libgtk-3.so.0()(64bit)' 'libEGL.so.1()(64bit)' 'libGLESv2.so.2()(64bit)' 'libgbm.so.1()(64bit)' ;;
-        arch)   echo gtk3 mesa libglvnd libgpg-error e2fsprogs ;;
-        debian)
-            if apt-cache show libgtk-3-0t64 >/dev/null 2>&1; then echo -n 'libgtk-3-0t64 '; else echo -n 'libgtk-3-0 '; fi
-            echo libegl1 libgles2 libgbm1 libgpg-error0 libcom-err2 ;;
+        fedora) echo gtk3 mesa-libEGL libglvnd-gles mesa-libgbm libwayland-server ;;
+        suse)   echo libgtk-3-0 Mesa-libEGL1 Mesa-libGLESv2-2 libgbm1 libwayland-server0 ;;
+        arch)   echo gtk3 mesa libglvnd ;;
+        # libgtk-3-0 is virtual on 24.04+/13 (libgtk-3-0t64); apt picks the
+        # single provider, and this is the name the docs give.
+        debian) echo libgtk-3-0 libegl1 libgles2 libgbm1 libwayland-server0 ;;
     esac
 }
 

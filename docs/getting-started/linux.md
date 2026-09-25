@@ -16,8 +16,11 @@ Ubuntu, Debian and openSUSE systems (see [How this is tested](#how-this-is-teste
 | --- | --- | --- |
 | Fedora, Nobara, openSUSE | **`.rpm`** | Your package manager installs everything DDMM needs, and adds a menu entry. |
 | Ubuntu, Debian, Linux Mint, Pop!_OS, Zorin, elementary | **`.deb`** | Same, for `apt`-based systems. |
-| Arch, CachyOS, EndeavourOS, Manjaro | **`.tar.gz`** (plus one package) or the **AppImage** | There's no Arch package yet (an AUR package may come later). |
-| Anything else, or you don't want to install anything system-wide | **AppImage** | Carries most of its own libraries and runs from anywhere. |
+| Arch, CachyOS, EndeavourOS, Manjaro | **`.tar.gz`** (plus one package) | There's no Arch package yet (an AUR package may come later). |
+| Anything else, or you don't want to install anything system-wide | **AppImage** | Carries WebKitGTK inside it and runs from anywhere, but relies on your desktop's graphics and font libraries. |
+
+When in doubt, use the `.rpm`, `.deb` or `.tar.gz`. They use your distribution's own WebKitGTK, which is built for
+your graphics drivers. The AppImage is the fallback.
 
 The files on the [Releases page](https://github.com/katsyk/DemocracyDefenderModManager/releases) are named:
 
@@ -110,10 +113,43 @@ chmod +x DDMM-*-linux-x86_64.AppImage
 ./DDMM-*-linux-x86_64.AppImage
 ```
 
-The AppImage carries WebKitGTK and most of GTK inside it. It still uses a few libraries every desktop already has
-(graphics drivers/EGL, fontconfig, HarfBuzz, FriBidi). On a very minimal install (no desktop environment, only a
-window manager) you may see `error while loading shared libraries: libEGL.so.1` or `libfontconfig.so.1`. Installing
-GTK 3 and Mesa (`gtk3 mesa` on Arch, `gtk3 mesa-libEGL mesa-libgbm` on Fedora) fixes that.
+The AppImage carries WebKitGTK and most of GTK inside it. Like every AppImage, it deliberately does *not* carry
+your graphics driver libraries (EGL, OpenGL ES, GBM), and it uses your system's fontconfig, HarfBuzz, FriBidi,
+Wayland and X11 libraries. Bundled copies of those are exactly what breaks on newer systems. Any desktop with
+GTK 3 and Mesa already has all of them. On a very minimal install (only a window manager, no desktop
+environment), an error like `error while loading shared libraries: libfontconfig.so.1` (or
+`libwayland-server.so.0`), or `Couldn't open libGLESv2.so.2`, means one is missing. Install them with:
+
+=== "Arch / CachyOS"
+
+    ```sh
+    sudo pacman -S --needed gtk3 mesa libglvnd
+    ```
+
+=== "Fedora"
+
+    ```sh
+    sudo dnf install gtk3 mesa-libEGL libglvnd-gles mesa-libgbm libwayland-server
+    ```
+
+=== "Debian / Ubuntu"
+
+    ```sh
+    sudo apt install libgtk-3-0 libegl1 libgles2 libgbm1 libwayland-server0
+    ```
+
+=== "openSUSE"
+
+    ```sh
+    sudo zypper install libgtk-3-0 Mesa-libEGL1 Mesa-libGLESv2-2 libgbm1 libwayland-server0
+    ```
+
+Those are the packages the automated tests install before running the AppImage.
+
+Releases up to and including 2.0.0-rc.5 bundled old Wayland/X11 client libraries in the AppImage. On current
+Mesa (Fedora 44, Arch) that makes the window stay blank while the terminal shows
+`Could not create default EGL display: EGL_BAD_PARAMETER. Aborting...`. Later releases fix this. For rc.5 itself,
+use the `.tar.gz` instead (or the `.rpm` from a later release).
 
 ### FUSE
 
