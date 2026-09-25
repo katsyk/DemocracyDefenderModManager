@@ -23,7 +23,7 @@ early build, but it's meant to be usable by anyone, not just developers.
 | Windows without installing anything (unzip and run) | `DDMM-<version>-windows-x64-portable.zip` |
 | Linux: Fedora, Nobara, openSUSE (`dnf`/`zypper`) | `DDMM-<version>-linux-x86_64.rpm` |
 | Linux: Debian, Ubuntu, Mint (`apt`) | `DDMM-<version>-linux-amd64.deb` |
-| Linux: any distro, nothing to install | `DDMM-<version>-linux-x86_64.AppImage` |
+| Linux: other distros, no install (uses your desktop's graphics libraries) | `DDMM-<version>-linux-x86_64.AppImage` |
 | Linux: Arch/CachyOS, or just the binary (needs WebKitGTK 4.1) | `DDMM-<version>-linux-x64.tar.gz` |
 
 Linux install commands, the dependencies for each distro, and fixes for a blank window or AppImage/FUSE errors

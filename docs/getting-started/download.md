@@ -47,8 +47,8 @@ All releases are published on the
       sudo apt install ./DDMM-*-linux-amd64.deb
       ```
 
-    - **AppImage** (`DDMM-<version>-linux-x86_64.AppImage`): works on most distributions without installing
-      anything. Make it executable and run it:
+    - **AppImage** (`DDMM-<version>-linux-x86_64.AppImage`): the fallback for other distributions. It carries
+      WebKitGTK itself and uses your desktop's graphics and font libraries. Make it executable and run it:
 
       ```sh
       chmod +x DDMM-*-linux-x86_64.AppImage

@@ -154,7 +154,7 @@ use the `.tar.gz` instead (or the `.rpm` from a later release).
 ### FUSE
 
 An AppImage normally mounts itself with FUSE. DDMM's AppImage uses the current AppImage runtime, which only needs
-the `fusermount3` helper from the `fuse3` package (installed by default on Fedora, Ubuntu and most desktops).
+the `fusermount3` helper from the `fuse3` package, which most desktops already have.
 You do **not** need the old `fuse` / `fuse2` / `libfuse2` package that older guides mention.
 
 If FUSE isn't available at all, the AppImage prints `Error: No suitable fusermount binary found on the $PATH` and
@@ -169,6 +169,10 @@ To install FUSE anyway: `sudo dnf install fuse3` (Fedora), `sudo pacman -S fuse3
 `sudo apt install fuse3` (Debian/Ubuntu), `sudo zypper install fuse3` (openSUSE).
 
 ## Blank or white window
+
+If the terminal shows `Could not create default EGL display: EGL_BAD_PARAMETER. Aborting...` and you're using the
+rc.5 (or older) AppImage, that's the bundled-library bug described under [AppImage](#appimage). Use the `.tar.gz`
+or a newer release instead; the setting below won't fix it.
 
 If DDMM opens but the window stays white, grey or black, or the terminal shows `EGL` / `DMABUF` / `GBM` errors,
 that's a WebKitGTK graphics issue, most often with NVIDIA's driver or under Wayland. Start DDMM with the DMA-BUF
