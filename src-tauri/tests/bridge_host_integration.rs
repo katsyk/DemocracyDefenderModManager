@@ -27,8 +27,16 @@ fn portable_copy_of_binary() -> (tempfile::TempDir, PathBuf) {
     std::fs::copy(&src, &dest).unwrap();
     // Belt and braces against the ETXTBSY flake `spawn_host` also retries
     // around: make sure the copy is fully flushed to the filesystem (and
-    // the handle closed) before anything tries to exec it.
-    std::fs::File::open(&dest).unwrap().sync_all().unwrap();
+    // the handle closed) before anything tries to exec it. `sync_all`
+    // (FlushFileBuffers on Windows) requires a handle opened with write
+    // access, so a plain read-only `File::open` fails there with
+    // ERROR_ACCESS_DENIED.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&dest)
+        .unwrap()
+        .sync_all()
+        .unwrap();
 
     #[cfg(unix)]
     {
