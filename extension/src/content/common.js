@@ -300,7 +300,7 @@
         return;
       }
 
-      await send({ type: 'ddmm:armCapture', site: adapter.name, pageUrl: location.href });
+      await send({ type: 'ddmm:armCapture', site: adapter.name, pageUrl: location.href, pageVersion });
       widget.setHint('Click Download on this page. DDMM will take it from there.');
     });
 

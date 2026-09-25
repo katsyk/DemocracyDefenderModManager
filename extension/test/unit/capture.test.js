@@ -69,12 +69,12 @@ describe('CaptureRegistry', () => {
   it('matches an armed site within the time window', () => {
     let now = 1000;
     const reg = new CaptureRegistry({ now: () => now, windowMs: 10 * 60 * 1000 });
-    reg.arm('ayakamods', { tabId: 7, pageUrl: 'https://ayakamods.com/mods/foo.1/' });
+    reg.arm('ayakamods', { tabId: 7, pageUrl: 'https://ayakamods.com/mods/foo.1/', pageVersion: '2.0' });
     expect(reg.isArmed('ayakamods')).toBe(true);
 
     now += 60 * 1000; // 1 minute later, still within window
     const result = reg.match({ referrer: 'https://ayakamods.com/mods/foo.1/', filename: 'C:/dl/foo.zip' });
-    expect(result).toEqual({ site: 'ayakamods', pageUrl: 'https://ayakamods.com/mods/foo.1/', tabId: 7 });
+    expect(result).toEqual({ site: 'ayakamods', pageUrl: 'https://ayakamods.com/mods/foo.1/', pageVersion: '2.0', tabId: 7 });
   });
 
   it('is one-shot: a match disarms the site', () => {

@@ -141,5 +141,44 @@
     return 'url';
   }
 
-  DDMM.sources = { sourceFromPageUrl, providerFromUrl, extractHost, isNumeric };
+  /**
+   * @param {{provider: string, id: string}|null} a
+   * @param {{provider: string, id: string}|null} b
+   * @returns {boolean} Whether both name the same mod.
+   */
+  function isSameMod(a, b) {
+    return Boolean(a && b && a.provider === b.provider && a.id === b.id);
+  }
+
+  /**
+   * Decide which mod page a downloaded file belongs to, i.e. the `pageUrl`
+   * to send with an install, and whether it's the mod of the page the user
+   * was on (only then may that page's scraped version be sent).
+   *
+   * `pageUrl` becomes the app's source of truth, and a mod already
+   * installed from that (provider, id) gets *updated in place*. So a page
+   * URL must never be attached to a file that belongs to a different mod
+   * (e.g. a link to mod B right-clicked on mod A's page, which would
+   * overwrite A with B):
+   *   - the download URL is itself a mod URL of the page's mod -> the page;
+   *   - the download URL is some *other* mod's URL -> that URL;
+   *   - the download URL says nothing (CDN, bare file) -> the page only when
+   *     `trustPage` (the user started this download from that page: armed
+   *     or auto capture), otherwise null so the app falls back to host
+   *     detection, which never yields an id.
+   * @param {{contextPageUrl: string|null, downloadUrl: string|null, trustPage: boolean}} opts
+   * @returns {{pageUrl: string|null, sameModAsPage: boolean}}
+   */
+  function attributeDownload({ contextPageUrl, downloadUrl, trustPage }) {
+    const pageSource = contextPageUrl ? sourceFromPageUrl(contextPageUrl) : null;
+    const linkSource = downloadUrl ? sourceFromPageUrl(downloadUrl) : null;
+    if (linkSource) {
+      return isSameMod(linkSource, pageSource)
+        ? { pageUrl: contextPageUrl, sameModAsPage: true }
+        : { pageUrl: downloadUrl, sameModAsPage: false };
+    }
+    return { pageUrl: trustPage ? contextPageUrl || null : null, sameModAsPage: false };
+  }
+
+  DDMM.sources = { sourceFromPageUrl, providerFromUrl, extractHost, isNumeric, isSameMod, attributeDownload };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

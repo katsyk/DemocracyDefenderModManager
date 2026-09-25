@@ -74,6 +74,14 @@ pub fn resolve_source(page_url: Option<&str>, download_url: Option<&str>, page_v
     })
 }
 
+/// Whether `resolve_source` took its (provider, id) from a recognized
+/// mod-page URL -- the only case where an in-place update is allowed.
+fn source_is_from_mod_page(page_url: Option<&str>) -> bool {
+    page_url
+        .and_then(sources::source_from_page_url)
+        .is_some_and(|s| s.id.is_some())
+}
+
 /// Find an already-installed mod whose recorded sources include the same
 /// `(provider, id)` pair as `source` -- the same "same source -> update in
 /// place" rule "Update from {site}" already uses. Only meaningful when
@@ -147,7 +155,16 @@ pub async fn install_file(
 
     let source = resolve_source(page_url, download_url, page_version);
 
-    let existing_guid = source.as_ref().and_then(|s| find_existing_by_source(mods, s));
+    // Safety net: an in-place update replaces an installed mod's files, so
+    // only do it when the (provider, id) was read off a mod-page URL. A
+    // source derived any other way (downloadUrl host detection, an
+    // unrecognized page) has no trustworthy id and always installs as a
+    // new mod -- never over some other mod that happens to share a host.
+    let existing_guid = if source_is_from_mod_page(page_url) {
+        source.as_ref().and_then(|s| find_existing_by_source(mods, s))
+    } else {
+        None
+    };
 
     let (r#mod, warning) = match existing_guid {
         Some(guid) => install_update_from_archive(state, mods, file, guid)
@@ -347,6 +364,86 @@ mod tests {
         assert_eq!(updated.r#mod.guid(), installed.r#mod.guid());
         assert_eq!(updated.source.as_ref().unwrap().version.as_deref(), Some("1.1"));
         assert_eq!(mods.len(), 1);
+    }
+
+    #[test]
+    fn download_link_to_another_mod_never_resolves_to_the_page_mod() {
+        // On mod A's page (4084), a link to mod B's download: the extension
+        // sends pageUrl: null and the link as downloadUrl. Host detection
+        // alone must not invent an id -- least of all A's.
+        let source = resolve_source(None, Some("https://ayakamods.com/mods/other-mod.5555/download"), None).unwrap();
+        assert_eq!(source.provider, "ayakamods");
+        assert_eq!(source.id, None);
+
+        // When the link itself is B's mod page, it's attributed to B.
+        let source = resolve_source(Some("https://ayakamods.com/mods/other-mod.5555/"), None, None).unwrap();
+        assert_eq!(source.id.as_deref(), Some("5555"));
+    }
+
+    /// Install mod A (ayakamods 4084) from its page, then return the state.
+    async fn install_mod_a(dir: &Path) -> (AppState, Vec<Mod>, uuid::Uuid) {
+        tokio::fs::create_dir_all(dir.join("mods")).await.unwrap();
+        let state = AppState::new(dir.to_path_buf());
+        let mut mods = Vec::new();
+        let a = dir.join("Mod A.zip");
+        make_zip(&a, &[("0123456789abcdef.patch_0", b"A")]);
+        let out = install_file(&state, &mut mods, &a, Some(PAGE_URL), None, Some("1.0"))
+            .await
+            .unwrap();
+        (state, mods, out.r#mod.guid())
+    }
+
+    #[tokio::test]
+    async fn link_to_another_mod_installs_new_and_leaves_the_page_mod_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut mods, a_guid) = install_mod_a(dir.path()).await;
+        let a_dir = mods[0].directory.clone();
+
+        let b = dir.path().join("Mod B.zip");
+        make_zip(&b, &[("fedcba9876543210.patch_0", b"B")]);
+        let out = install_file(
+            &state,
+            &mut mods,
+            &b,
+            None,
+            Some("https://ayakamods.com/mods/other-mod.5555/download"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!out.updated, "a link to mod B must never update mod A");
+        assert_ne!(out.r#mod.guid(), a_guid);
+        assert_eq!(mods.len(), 2);
+        assert_eq!(
+            tokio::fs::read(a_dir.join("0123456789abcdef.patch_0")).await.unwrap(),
+            b"A",
+            "mod A's files must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_id_never_triggers_an_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut mods, a_guid) = install_mod_a(dir.path()).await;
+
+        // Same site, but no parseable mod id anywhere: a forum thread as
+        // pageUrl, and a bare CDN-style download link.
+        for (i, (page, download)) in [
+            (Some("https://ayakamods.com/threads/some-discussion.77/"), None),
+            (None, Some("https://ayakamods.com/attachments/file.zip")),
+            (None, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let f = dir.path().join(format!("unknown-{i}.zip"));
+            make_zip(&f, &[("0123456789abcdef.patch_0", b"other")]);
+            let out = install_file(&state, &mut mods, &f, page, download, None).await.unwrap();
+            assert!(!out.updated, "case {i}: unknown id must install as a new mod");
+            assert_ne!(out.r#mod.guid(), a_guid);
+        }
+        assert_eq!(mods.len(), 4);
     }
 
     #[tokio::test]

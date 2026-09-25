@@ -139,7 +139,20 @@ The extension sends this after a download **has completed** in the browser.
 - `afterInstall`: `null` means "use the app setting". Otherwise one of `"library"`, `"profile"` or `"deploy"`.
 
 If a mod from the same source (provider + id) is already installed, the app performs an **in-place update** (keeping the
-GUID and profile config, like "Update from …") instead of failing with a duplicate.
+GUID and profile config, like "Update from …") instead of failing with a duplicate. Because an update replaces an
+installed mod's files, the app only does it when the id came from a recognized mod-page `pageUrl`. A source derived
+from `downloadUrl` host detection never has an id and always installs as a new mod.
+
+**Which `pageUrl` the extension sends.** The page the user is on is only context, since a link on mod A's page can be
+mod B's file. The extension therefore attributes every download to the mod the *file's* URL names:
+
+- The download/link URL is a mod URL of the page's own mod: the page URL, plus the page's scraped `pageVersion`.
+- The download/link URL is some *other* mod's URL: that URL, with no `pageVersion`.
+- The download/link URL names no mod (CDN, bare file):
+  - right-click installs send `pageUrl: null`, so the app falls back to host detection with no id;
+  - armed/auto capture send the page the download was started from, with no `pageVersion`.
+
+`downloadUrl` is the URL the user chose (the right-clicked link or the page's download link).
 
 **Permission check (app side):** the first time a site (registrable domain of `pageUrl`/`downloadUrl`) sends an install,
 DDMM asks: *"Allow the DDMM browser extension to install mods from **ayakamods.com**?"* with **Always allow**, **Just this

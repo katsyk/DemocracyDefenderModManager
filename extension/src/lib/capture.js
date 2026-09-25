@@ -163,7 +163,7 @@
     constructor(opts = {}) {
       this._now = opts.now || (() => Date.now());
       this._windowMs = opts.windowMs || DEFAULT_ARM_WINDOW_MS;
-      /** @type {Map<string, {tabId: number|null, expiresAt: number, pageUrl: string|null}>} */
+      /** @type {Map<string, {tabId: number|null, expiresAt: number, pageUrl: string|null, pageVersion: string|null}>} */
       this._armed = new Map();
     }
 
@@ -177,6 +177,7 @@
       this._armed.set(site, {
         tabId: opts.tabId ?? null,
         pageUrl: opts.pageUrl ?? null,
+        pageVersion: opts.pageVersion ?? null,
         expiresAt: this._now() + this._windowMs,
       });
     }
@@ -211,7 +212,7 @@
       for (const [site, entry] of this._armed) {
         if (isFromSite(item, site)) {
           this._armed.delete(site);
-          return { site, pageUrl: entry.pageUrl, tabId: entry.tabId };
+          return { site, pageUrl: entry.pageUrl, pageVersion: entry.pageVersion, tabId: entry.tabId };
         }
       }
       return null;

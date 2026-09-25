@@ -40,6 +40,34 @@
   const directDownloads = new Map();
   /** site -> timer that fires if an armed capture never matches. */
   const armTimers = new Map();
+  /**
+   * pageUrl -> the version its content script scraped, from the `ddmm:query`
+   * each mod page sends on load. Lets capture installs send the version of
+   * the page the download came from -- only ever when the file is that same
+   * mod (see sendableVersion).
+   */
+  const pageVersions = new Map();
+  const MAX_PAGE_VERSIONS = 200;
+
+  /** @param {string|null} pageUrl @param {string|null|undefined} version */
+  function rememberPageVersion(pageUrl, version) {
+    if (!pageUrl || !version) return;
+    pageVersions.delete(pageUrl);
+    pageVersions.set(pageUrl, version);
+    if (pageVersions.size > MAX_PAGE_VERSIONS) pageVersions.delete(pageVersions.keys().next().value);
+  }
+
+  /**
+   * The page's scraped version, but only when the download is that page's
+   * mod -- never another mod's version.
+   * @param {{sameModAsPage: boolean}} attribution
+   * @param {string|null} pageUrl
+   * @param {string|null} [explicitVersion]
+   */
+  function sendableVersion(attribution, pageUrl, explicitVersion) {
+    if (!attribution.sameModAsPage || !pageUrl) return null;
+    return explicitVersion || pageVersions.get(pageUrl) || null;
+  }
 
   const EXTENSION_VERSION = api.runtime.getManifest().version;
   const BROWSER_NAME = DDMM.isFirefox ? 'firefox' : 'chrome';
@@ -139,7 +167,7 @@
    */
   async function startDirectDownload(url, context) {
     const downloadId = await api.downloads.download({ url });
-    directDownloads.set(downloadId, context);
+    directDownloads.set(downloadId, { ...context, downloadUrl: url });
     return downloadId;
   }
 
@@ -166,7 +194,9 @@
       const reply = await runInstall({
         file: normalized.filename,
         pageUrl: context.pageUrl,
-        downloadUrl: normalized.finalUrl,
+        // The URL the user actually chose (the right-clicked link, or the
+        // page's download link) -- not wherever it redirected to.
+        downloadUrl: context.downloadUrl || normalized.finalUrl,
         pageVersion: context.pageVersion || null,
       });
       if (context.tabId != null) {
@@ -180,11 +210,17 @@
     const armed = captureRegistry.match(normalized);
     if (armed) {
       clearArmTimer(armed.site);
+      const contextPageUrl = armed.pageUrl || normalized.referrer;
+      const attribution = DDMM.sources.attributeDownload({
+        contextPageUrl,
+        downloadUrl: normalized.finalUrl,
+        trustPage: true,
+      });
       const reply = await runInstall({
         file: normalized.filename,
-        pageUrl: armed.pageUrl || normalized.referrer,
+        pageUrl: attribution.pageUrl,
         downloadUrl: normalized.finalUrl,
-        pageVersion: null,
+        pageVersion: sendableVersion(attribution, contextPageUrl, armed.pageVersion),
       });
       if (armed.tabId != null) {
         sendToTab(armed.tabId, { type: 'ddmm:installResult', reply });
@@ -199,11 +235,16 @@
       if (!DDMM.capture.isArchiveDownload(normalized)) continue;
       // eslint-disable-next-line no-await-in-loop -- at most 5 sites, and short-circuits on the first host match
       if (await DDMM.storage.isAutoCaptureEnabled(site)) {
+        const attribution = DDMM.sources.attributeDownload({
+          contextPageUrl: normalized.referrer,
+          downloadUrl: normalized.finalUrl,
+          trustPage: true,
+        });
         const reply = await runInstall({
           file: normalized.filename,
-          pageUrl: normalized.referrer,
+          pageUrl: attribution.pageUrl,
           downloadUrl: normalized.finalUrl,
-          pageVersion: null,
+          pageVersion: sendableVersion(attribution, normalized.referrer),
         });
         broadcastToSiteTabs(site, { type: 'ddmm:installResult', reply });
       }
@@ -251,6 +292,32 @@
   // Context menu: "Install with DDMM" on any link, any site.
   // ---------------------------------------------------------------------
 
+  /**
+   * What to install a right-clicked link as. The tab is only context: the
+   * link may be a different mod than the page it's on (a "related mods"
+   * link on mod A's page), so the tab URL is never the source unless the
+   * link is that same mod. Otherwise `pageUrl` is the link itself when
+   * it's a recognised mod URL, else null (the app then uses downloadUrl
+   * host detection, which never assigns an id).
+   * @param {{menuItemId: string, linkUrl?: string}} info
+   * @param {{url?: string, id?: number}|undefined} tab
+   * @returns {{pageUrl: string|null, pageVersion: string|null, tabId: number|null}|null}
+   */
+  function contextMenuInstallContext(info, tab) {
+    if (info.menuItemId !== 'ddmm-install-link' || !info.linkUrl) return null;
+    const tabUrl = (tab && tab.url) || null;
+    const attribution = DDMM.sources.attributeDownload({
+      contextPageUrl: tabUrl,
+      downloadUrl: info.linkUrl,
+      trustPage: false,
+    });
+    return {
+      pageUrl: attribution.pageUrl,
+      pageVersion: sendableVersion(attribution, tabUrl),
+      tabId: tab && tab.id != null ? tab.id : null,
+    };
+  }
+
   if (api.contextMenus) {
     api.contextMenus.create({
       id: 'ddmm-install-link',
@@ -259,12 +326,11 @@
     });
 
     api.contextMenus.onClicked.addListener((info, tab) => {
-      if (info.menuItemId !== 'ddmm-install-link' || !info.linkUrl) return;
-      startDirectDownload(info.linkUrl, {
-        pageUrl: tab ? tab.url : null,
-        pageVersion: null,
-        tabId: tab ? tab.id : null,
-      }).catch((e) => notify('DDMM', `Couldn't start that download: ${e.message}`));
+      const payload = contextMenuInstallContext(info, tab);
+      if (!payload) return;
+      startDirectDownload(info.linkUrl, payload).catch((e) =>
+        notify('DDMM', `Couldn't start that download: ${e.message}`),
+      );
     });
   }
 
@@ -284,6 +350,7 @@
         return tryHello();
 
       case 'ddmm:query': {
+        rememberPageVersion(message.pageUrl, message.pageVersion);
         try {
           return await client.query({ pageUrl: message.pageUrl, pageVersion: message.pageVersion ?? null });
         } catch (e) {
@@ -321,7 +388,11 @@
 
       case 'ddmm:armCapture': {
         const tabId = sender.tab ? sender.tab.id : null;
-        captureRegistry.arm(message.site, { tabId, pageUrl: message.pageUrl ?? null });
+        captureRegistry.arm(message.site, {
+          tabId,
+          pageUrl: message.pageUrl ?? null,
+          pageVersion: message.pageVersion ?? null,
+        });
         clearArmTimer(message.site);
         armTimers.set(
           message.site,
@@ -370,5 +441,5 @@
     return true; // keep the message channel open for the async response
   });
 
-  DDMM.background = { handleMessage, runInstall, captureRegistry, directDownloads };
+  DDMM.background = { handleMessage, runInstall, captureRegistry, directDownloads, contextMenuInstallContext };
 })(typeof globalThis !== 'undefined' ? globalThis : this);
