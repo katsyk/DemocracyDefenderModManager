@@ -44,6 +44,10 @@ url = "2.5"
 # OS keychain for the optional Nexus Mods API key (Windows Credential
 # Manager, macOS Keychain, Linux Secret Service). See `secrets.rs`.
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+# PKCE (S256 code challenge) for the optional "Sign in to Nexus Mods". See
+# `nexus_oauth.rs`.
+sha2 = "0.10"
+base64 = "0.22"
 
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"

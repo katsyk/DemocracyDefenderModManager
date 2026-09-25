@@ -13,6 +13,7 @@ pub mod deep_link;
 pub mod auto_import;
 pub mod providers;
 pub mod secrets;
+pub mod nexus_oauth;
 
 use std::{
     path::PathBuf,
@@ -75,6 +76,9 @@ pub struct AppState {
     /// request) -- decides whether a browser update can finish with the
     /// extension's "Update with DDMM" button.
     bridge_last_seen: Mutex<Option<tokio::time::Instant>>,
+    /// Cancels the in-flight "Sign in to Nexus Mods", if any
+    /// (`commands::nexus` only).
+    nexus_sign_in_cancel: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl AppState {
@@ -92,6 +96,7 @@ impl AppState {
             last_update_report: Mutex::default(),
             last_update_check: Mutex::default(),
             bridge_last_seen: Mutex::default(),
+            nexus_sign_in_cancel: Mutex::default(),
         }
     }
 }
@@ -320,6 +325,10 @@ pub fn run() {
             commands::nexus::get_nexus_key_status,
             commands::nexus::set_nexus_api_key,
             commands::nexus::remove_nexus_api_key,
+            commands::nexus::get_nexus_sign_in_status,
+            commands::nexus::nexus_sign_in,
+            commands::nexus::nexus_cancel_sign_in,
+            commands::nexus::nexus_sign_out,
             commands::profiles::load_profiles,
             commands::profiles::save_profiles,
             commands::settings::load_settings,

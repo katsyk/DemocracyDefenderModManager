@@ -1,13 +1,16 @@
-//! Nexus Mods update checks through the public v1 API, using the user's own
-//! *optional* personal API key (see `crate::secrets`). Without a key, Nexus
-//! mods are reported as "needs a Nexus API key (optional) to check" --
-//! never guessed.
+//! Nexus Mods update checks through the public v1 API, using the user's
+//! *optional* Nexus Mods sign-in (OAuth, see `crate::nexus_oauth`) or
+//! personal API key (see `crate::secrets`). Which one is used is decided in
+//! one place, [`crate::nexus_oauth::resolve_auth`]. Without either, Nexus
+//! mods are reported as "optional: sign in or add a key to check" -- never
+//! guessed.
 //!
 //! What this module will and won't do:
 //! - It only ever talks to `https://api.nexusmods.com` (fixed base URL,
 //!   redirects disabled so the key header can't follow one anywhere else).
 //! - It sends the headers Nexus's API Acceptable Use Policy asks for
-//!   (`apikey`, `Application-Name`, `Application-Version`).
+//!   (`Authorization: Bearer <token>` when signed in, else `apikey`; plus
+//!   `Application-Name` and `Application-Version`).
 //! - It reads the `x-rl-*` rate-limit headers on every response and stops
 //!   early rather than run a user's quota down.
 //! - It never downloads anything. Nexus's download-link endpoint is
@@ -33,7 +36,7 @@ use std::time::Duration;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::secrets::{redact, NexusApiKey};
+use crate::secrets::{redact_all, NexusApiKey, Secret};
 
 use super::{compare_versions, file_shape, read_capped, VersionRelation, APP_NAME};
 
@@ -56,9 +59,39 @@ const CATEGORY_OPTIONAL: u32 = 3;
 const CATEGORY_OLD_VERSION: u32 = 4;
 const CATEGORY_MISC: u32 = 5;
 
+/// How DDMM authenticates to the Nexus Mods API. Built only by
+/// `crate::nexus_oauth::resolve_auth` (and tests).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NexusAuth {
+    /// "Sign in to Nexus Mods": an OAuth access token, sent as
+    /// `Authorization: Bearer <token>`.
+    OAuth(Secret),
+    /// A personal API key entered manually, sent as `apikey`.
+    ApiKey(NexusApiKey),
+}
+
+impl NexusAuth {
+    fn secret(&self) -> &str {
+        match self {
+            NexusAuth::OAuth(token) => token.expose(),
+            NexusAuth::ApiKey(key) => key.expose(),
+        }
+    }
+
+    pub fn is_oauth(&self) -> bool {
+        matches!(self, NexusAuth::OAuth(_))
+    }
+}
+
+impl From<NexusApiKey> for NexusAuth {
+    fn from(key: NexusApiKey) -> Self {
+        NexusAuth::ApiKey(key)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NexusError {
-    /// 401/403: the key is wrong, revoked, or expired.
+    /// 401/403: the key or sign-in is wrong, revoked, or expired.
     InvalidKey,
     /// 429, or our own floor on the remaining quota was reached.
     RateLimited,
@@ -187,27 +220,35 @@ pub struct FileUpdate {
 pub struct NexusClient {
     http: reqwest::Client,
     base: reqwest::Url,
-    key: NexusApiKey,
+    auth: NexusAuth,
     pub rate: RateLimit,
 }
 
 impl NexusClient {
-    pub fn new(key: NexusApiKey) -> anyhow::Result<Self> {
-        Self::build(key, API_BASE, true)
+    pub fn new(auth: NexusAuth) -> anyhow::Result<Self> {
+        Self::build(auth, API_BASE, true)
     }
 
     /// Test-only: point at a local mock (plain http allowed).
     #[cfg(test)]
-    pub(crate) fn with_base(key: NexusApiKey, base: &str) -> anyhow::Result<Self> {
-        Self::build(key, base, false)
+    pub(crate) fn with_base(auth: NexusAuth, base: &str) -> anyhow::Result<Self> {
+        Self::build(auth, base, false)
     }
 
-    fn build(key: NexusApiKey, base: &str, https_only: bool) -> anyhow::Result<Self> {
+    pub fn auth(&self) -> &NexusAuth {
+        &self.auth
+    }
+
+    fn build(auth: NexusAuth, base: &str, https_only: bool) -> anyhow::Result<Self> {
         let mut headers = HeaderMap::new();
-        let mut key_value = HeaderValue::from_str(key.expose())
+        let (name, value) = match &auth {
+            NexusAuth::OAuth(token) => (reqwest::header::AUTHORIZATION.as_str(), format!("Bearer {}", token.expose())),
+            NexusAuth::ApiKey(key) => ("apikey", key.expose().to_string()),
+        };
+        let mut key_value = HeaderValue::from_str(&value)
             .map_err(|_| anyhow::anyhow!("the key contains characters that can't be sent"))?;
         key_value.set_sensitive(true);
-        headers.insert("apikey", key_value);
+        headers.insert(name, key_value);
         headers.insert("Application-Name", HeaderValue::from_static(APP_NAME));
         headers.insert("Application-Version", HeaderValue::from_static(env!("CARGO_PKG_VERSION")));
         headers.insert(reqwest::header::ACCEPT, HeaderValue::from_static("application/json"));
@@ -215,8 +256,8 @@ impl NexusClient {
         let http = reqwest::Client::builder()
             .user_agent(super::user_agent())
             .default_headers(headers)
-            // Never follow a redirect: the `apikey` header must only ever
-            // reach api.nexusmods.com.
+            // Never follow a redirect: the `apikey`/`Authorization` header
+            // must only ever reach api.nexusmods.com.
             .redirect(reqwest::redirect::Policy::none())
             .https_only(https_only)
             .timeout(super::REQUEST_TIMEOUT)
@@ -225,7 +266,7 @@ impl NexusClient {
         Ok(Self {
             http,
             base: reqwest::Url::parse(base)?,
-            key,
+            auth,
             rate: RateLimit::default(),
         })
     }
@@ -236,7 +277,7 @@ impl NexusClient {
         }
         let url = self.base.join(path).map_err(|e| NexusError::Other(e.to_string()))?;
         if url.host_str() != self.base.host_str() || url.scheme() != self.base.scheme() {
-            return Err(NexusError::Other("refusing to send the Nexus API key to another host".into()));
+            return Err(NexusError::Other("refusing to send Nexus Mods credentials to another host".into()));
         }
 
         let response = self
@@ -244,7 +285,7 @@ impl NexusClient {
             .get(url)
             .send()
             .await
-            .map_err(|e| NexusError::Other(redact(&format!("couldn't reach Nexus Mods: {}", e.without_url()), &self.key)))?;
+            .map_err(|e| NexusError::Other(redact_all(&format!("couldn't reach Nexus Mods: {}", e.without_url()), &[self.auth.secret()])))?;
 
         self.rate = RateLimit::from_headers(response.headers());
         let status = response.status();
@@ -257,9 +298,9 @@ impl NexusClient {
         }
         let body = read_capped(response)
             .await
-            .map_err(|e| NexusError::Other(redact(&e.to_string(), &self.key)))?;
+            .map_err(|e| NexusError::Other(redact_all(&e.to_string(), &[self.auth.secret()])))?;
         serde_json::from_str(&body)
-            .map_err(|e| NexusError::Other(redact(&format!("unexpected response from Nexus Mods: {e}"), &self.key)))
+            .map_err(|e| NexusError::Other(redact_all(&format!("unexpected response from Nexus Mods: {e}"), &[self.auth.secret()])))
     }
 
     /// `GET /v1/users/validate.json` -- is the key valid, and whose is it?
@@ -770,7 +811,7 @@ mod tests {
     async fn sends_the_required_headers_and_reads_rate_limits() {
         let (base, server) = mock_server("200 OK", r#"{"user_id":1,"key":"K","name":"Tester","is_premium":false,"email":"a@b"}"#).await;
         let key = NexusApiKey::parse("HeaderTestKey").unwrap();
-        let mut client = NexusClient::with_base(key, &base).unwrap();
+        let mut client = NexusClient::with_base(key.into(), &base).unwrap();
         let user = client.validate().await.unwrap();
         assert_eq!(user.name, "Tester");
         assert_eq!(client.rate.hourly_remaining, Some(499));
@@ -795,7 +836,7 @@ mod tests {
     async fn invalid_key_maps_to_invalid_key_error_without_leaking_it() {
         let (base, _server) = mock_server("401 Unauthorized", r#"{"message":"Please provide a valid API Key"}"#).await;
         let key = NexusApiKey::parse("LeakCheckKey").unwrap();
-        let mut client = NexusClient::with_base(key, &base).unwrap();
+        let mut client = NexusClient::with_base(key.into(), &base).unwrap();
         let err = client.validate().await.unwrap_err();
         assert_eq!(err, NexusError::InvalidKey);
         assert!(!err.to_string().contains("LeakCheckKey"));
@@ -804,22 +845,46 @@ mod tests {
     #[tokio::test]
     async fn redirects_are_never_followed() {
         let (base, _server) = mock_server("302 Found\r\nLocation: http://127.0.0.1:9/steal", "").await;
-        let mut client = NexusClient::with_base(NexusApiKey::parse("K").unwrap(), &base).unwrap();
+        let mut client = NexusClient::with_base(NexusApiKey::parse("K").unwrap().into(), &base).unwrap();
         let err = client.validate().await.unwrap_err();
         assert!(matches!(err, NexusError::Other(ref m) if m.contains("302")), "{err:?}");
     }
 
     #[tokio::test]
     async fn stops_before_requesting_when_quota_is_low() {
-        let mut client = NexusClient::new(NexusApiKey::parse("K").unwrap()).unwrap();
+        let mut client = NexusClient::new(NexusApiKey::parse("K").unwrap().into()).unwrap();
         client.rate = RateLimit { hourly_remaining: Some(2), daily_remaining: Some(0) };
         assert_eq!(client.files(1).await.unwrap_err(), NexusError::RateLimited);
     }
 
     #[test]
     fn production_client_only_targets_the_nexus_api_over_https() {
-        let client = NexusClient::new(NexusApiKey::parse("K").unwrap()).unwrap();
+        let client = NexusClient::new(NexusApiKey::parse("K").unwrap().into()).unwrap();
         assert_eq!(client.base.scheme(), "https");
         assert_eq!(client.base.host_str(), Some(API_HOST));
+    }
+
+    #[tokio::test]
+    async fn signed_in_requests_carry_a_bearer_token_and_no_apikey() {
+        let (base, server) = mock_server("200 OK", r#"{"user_id":1,"name":"Tester","is_premium":true}"#).await;
+        let auth = NexusAuth::OAuth(Secret::new("BearerTokenXYZ"));
+        let mut client = NexusClient::with_base(auth, &base).unwrap();
+        client.validate().await.unwrap();
+        let request = server.await.unwrap().join("\n");
+        let lower = request.to_ascii_lowercase();
+        assert!(request.contains("authorization: Bearer BearerTokenXYZ"), "{request}");
+        assert!(!lower.contains("\napikey:"), "{request}");
+        assert!(lower.contains("application-name: democracy defender mod manager"));
+        assert!(lower.contains(&format!("application-version: {}", env!("CARGO_PKG_VERSION"))));
+    }
+
+    #[tokio::test]
+    async fn rejected_sign_in_maps_to_invalid_key_without_leaking_the_token() {
+        let (base, _server) = mock_server("401 Unauthorized", r#"{"message":"Token revoked"}"#).await;
+        let mut client = NexusClient::with_base(NexusAuth::OAuth(Secret::new("LeakyBearer")), &base).unwrap();
+        let err = client.validate().await.unwrap_err();
+        assert_eq!(err, NexusError::InvalidKey);
+        assert!(!format!("{err} {err:?}").contains("LeakyBearer"));
+        assert!(!format!("{:?}", client.auth()).contains("LeakyBearer"));
     }
 }
