@@ -33,6 +33,15 @@
                         "title": "Delete",
                         "question": "Are you sure you want to delete this mod?"
                     },
+                    "close_deploying": {
+                        "title": "Deploy in Progress",
+                        "question": "DDMM is still deploying your mods. Closing now may leave your game files in a broken state. Close anyway?"
+                    },
+                    "close_save_failed": {
+                        "title": "Couldn't Save Profiles",
+                        "question": "Couldn't save your profiles: {error}. Close anyway? Unsaved changes will be lost.",
+                        "timeout_error": "Saving is taking too long"
+                    },
                     "offer_handoff": {
                         "title": "Open in Browser Instead?",
                         "question": "That link didn't serve a downloadable archive directly. Open it on {site} in your browser and let DDMM install it automatically once it downloads?"
