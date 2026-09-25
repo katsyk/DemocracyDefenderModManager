@@ -160,6 +160,12 @@ pub async fn start_handoff(
         .into_ta_result();
     }
 
+    if let Err(e) = crate::commands::settings::check_downloads_path(&state.base_path, &downloads_dir) {
+        let mut guard = state.handoff_cancel.lock().await;
+        *guard = None;
+        return Err(e).into_ta_result();
+    }
+
     let source = sources::source_from_page_url(&page_url).unwrap_or_else(|| Source {
         provider: sources::provider_from_url(&page_url),
         id: None,

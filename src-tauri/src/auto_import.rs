@@ -43,6 +43,7 @@ async fn run(app: AppHandle) {
     // just finished downloading) is never flagged as new.
     let mut baseline_ready = false;
     let mut settings_error: Option<String> = None;
+    let mut downloads_path_error: Option<String> = None;
 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -77,6 +78,22 @@ async fn run(app: AppHandle) {
             pending.clear();
             continue;
         }
+
+        // Never watch DDMM's own mod storage (or a folder inside it): see
+        // `check_downloads_path`. Settings refuses to save such a path, but
+        // an older or hand-edited settings.json could still have one.
+        if let Err(e) = crate::commands::settings::check_downloads_path(&state.base_path, settings.downloads_path()) {
+            // Logged once per distinct problem, not every tick.
+            let message = format!("{e:#}");
+            if downloads_path_error.as_deref() != Some(message.as_str()) {
+                log::warn!("Auto-import paused: {message}");
+                downloads_path_error = Some(message);
+            }
+            baseline_ready = false;
+            pending.clear();
+            continue;
+        }
+        downloads_path_error = None;
 
         let Ok(candidates) = list_candidates(settings.downloads_path()).await else {
             continue;

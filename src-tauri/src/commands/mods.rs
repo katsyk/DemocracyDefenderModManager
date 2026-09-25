@@ -261,7 +261,7 @@ pub(crate) async fn install_from_archive(state: &AppState, mods: &mut Vec<Mod>, 
 
     log::info!("Preparing mod directory...");
     let manifest_file = mod_dir.join(MANIFEST_FILE);
-    prepare_mod_dir(mod_dir.clone(), manifest_file.clone(), name.clone()).await.into_ta_result()?;
+    prepare_mod_dir(archive_file, mod_dir.clone(), manifest_file.clone(), name.clone()).await.into_ta_result()?;
 
     // From here on `mod_dir` is ours (prepare_mod_dir just created it), so
     // a failure must remove it again: a half-written directory with a
@@ -349,7 +349,7 @@ pub async fn add_mods(state: State<'_, AppState>, archive_files: Vec<PathBuf>) -
                         .map(str::to_string)
                         .ok_or(anyhow::anyhow!("file name conversion failed"))
                         .into_ta_result()?;
-                    Ok((archive, name))
+                    Ok((archive, name, archive_file))
                 })
                 .flatten()
         })
@@ -360,11 +360,11 @@ pub async fn add_mods(state: State<'_, AppState>, archive_files: Vec<PathBuf>) -
         .into_iter()
         .map(|result| {
             result
-                .map(|(archive, name)| {
+                .map(|(archive, name, archive_file)| {
                     let mut mod_dir = state.base_path.join(MODS_DIRECTORY);
                     mod_dir.push(&name);
                     let manifest_file = mod_dir.join(MANIFEST_FILE);
-                    (archive, name, mod_dir, manifest_file)
+                    (archive, name, archive_file, mod_dir, manifest_file)
                 })
         })
         .collect::<Vec<_>>();
@@ -373,8 +373,8 @@ pub async fn add_mods(state: State<'_, AppState>, archive_files: Vec<PathBuf>) -
     let data = futures::future::join_all(
         data.into_iter().map(|result| async {
             match result {
-                Ok((archive, name, mod_dir, manifest_file)) => {
-                    prepare_mod_dir(mod_dir.clone(), manifest_file.clone(), name.clone()).await?;
+                Ok((archive, name, archive_file, mod_dir, manifest_file)) => {
+                    prepare_mod_dir(&archive_file, mod_dir.clone(), manifest_file.clone(), name.clone()).await?;
                     Ok((archive, name, mod_dir, manifest_file))
                 }
                 Err(e) => Err(e)
@@ -499,7 +499,22 @@ pub async fn add_mods(state: State<'_, AppState>, archive_files: Vec<PathBuf>) -
     Ok(data)
 }
 
-async fn prepare_mod_dir(mod_dir: PathBuf, manifest_file: PathBuf, name: String) -> TAResult<()> {
+/// Make `mod_dir` ready to install into from `source` (an archive file or a
+/// folder): an existing mod there is an error, a leftover folder without a
+/// manifest is cleared, and the folder is (re)created.
+///
+/// Refuses first if `source` and `mod_dir` overlap -- clearing or copying
+/// into `mod_dir` would then delete the source or copy it into itself.
+async fn prepare_mod_dir(source: &Path, mod_dir: PathBuf, manifest_file: PathBuf, name: String) -> TAResult<()> {
+    if crate::fs_util::path_overlap(source, &mod_dir).into_ta_result()?.is_some() {
+        return anyhow::anyhow!(
+            "can't install {:?}: it is inside (or is) the folder DDMM would install it into ({:?}). \
+             Move it somewhere outside DDMM's mod storage and add it from there.",
+            source,
+            mod_dir
+        )
+        .into_ta_result();
+    }
     if tokio::fs::try_exists(&mod_dir).await.into_ta_result()? {
         if tokio::fs::try_exists(&manifest_file).await.into_ta_result()? {
             return anyhow::anyhow!("mod directory \"{}\" already exists", name).into_ta_result();
@@ -612,36 +627,152 @@ async fn normalize_manifest_file_name(mod_dir: &Path) -> anyhow::Result<()> {
 /// one is generated), and its contents are copied (not moved, symlinks not
 /// followed) into the managed mod directory.
 ///
+/// `folder` must not overlap DDMM's own mod storage (`<data>/mods`), which
+/// is checked before anything on disk is touched:
+/// - the storage folder itself, a folder containing it (such as DDMM's data
+///   folder in a portable install), or a folder deeper inside an installed
+///   mod is refused with an explanation -- copying any of those would copy
+///   the folder into itself, over and over, until the disk is full;
+/// - a mod folder sitting directly in the storage folder is adopted in
+///   place ([`adopt_folder_in_place`]): nothing is copied, it just gets a
+///   manifest and joins the mod list.
+///
 /// Mirrors [`install_from_archive`]'s locking contract: takes the
 /// already-locked mods vector, never locks anything itself.
-async fn install_from_folder(state: &AppState, mods: &mut Vec<Mod>, folder: &Path) -> TAResult<(Mod, Option<String>)> {
+async fn install_from_folder(base_path: &Path, mods: &mut Vec<Mod>, folder: &Path) -> TAResult<(Mod, Option<String>)> {
     log::info!("Adding mod from folder {:?}...", folder);
 
     if !folder.is_dir() {
         return anyhow::anyhow!("path is not a directory").into_ta_result();
     }
 
-    let name = folder
+    let mods_root = base_path.join(MODS_DIRECTORY);
+    let resolved = crate::fs_util::resolve_path(folder).into_ta_result()?;
+
+    let name = resolved
         .file_name()
         .and_then(|n| n.to_str())
         .map(str::to_string)
         .ok_or(anyhow::anyhow!("folder name conversion failed"))?;
 
+    use crate::fs_util::{path_overlap, PathOverlap};
+    match path_overlap(&resolved, &mods_root).into_ta_result()? {
+        None => {}
+        Some(PathOverlap::Same) => {
+            return anyhow::anyhow!(
+                "That folder is DDMM's own mod storage ({}), so there is nothing to copy. \
+                 Mods in it that have a manifest.json are already in your mod list. To add a \
+                 mod folder that is in there without one, pick that mod's own folder instead: \
+                 DDMM will set it up where it is, without copying it.",
+                mods_root.display()
+            )
+            .into_ta_result();
+        }
+        Some(PathOverlap::SecondInsideFirst) => {
+            return anyhow::anyhow!(
+                "DDMM can't add {}: DDMM's own mod storage ({}) is inside it, so adding it would \
+                 copy the folder into itself. Pick a single mod's folder instead.",
+                folder.display(),
+                mods_root.display()
+            )
+            .into_ta_result();
+        }
+        Some(PathOverlap::FirstInsideSecond) => {
+            let directly_in_storage = resolved
+                .parent()
+                .map(|parent| matches!(path_overlap(parent, &mods_root), Ok(Some(PathOverlap::Same))))
+                .unwrap_or(false);
+            if directly_in_storage {
+                return adopt_folder_in_place(mods, &mods_root.join(&name), &name).await;
+            }
+            return anyhow::anyhow!(
+                "{} is inside a mod folder in DDMM's mod storage ({}). Pick that mod's own \
+                 folder (the one directly inside the storage folder), or a folder outside it.",
+                folder.display(),
+                mods_root.display()
+            )
+            .into_ta_result();
+        }
+    }
+
     log::info!("Resolving mod directory...");
-    let mut mod_dir = state.base_path.join(MODS_DIRECTORY);
-    mod_dir.push(&name);
+    let mod_dir = mods_root.join(&name);
 
     log::info!("Preparing mod directory...");
     let manifest_file = mod_dir.join(MANIFEST_FILE);
-    prepare_mod_dir(mod_dir.clone(), manifest_file.clone(), name.clone()).await.into_ta_result()?;
+    prepare_mod_dir(folder, mod_dir.clone(), manifest_file.clone(), name.clone()).await.into_ta_result()?;
 
+    // From here on `mod_dir` is a folder we just created (and, per the
+    // checks above, not the source or anywhere near it), so a failure must
+    // remove it again rather than leave a half-copied mod behind.
     let result = install_from_folder_inner(mods, folder, &name, &mod_dir, &manifest_file).await;
 
     if result.is_err() {
-        let _ = tokio::fs::remove_dir_all(&mod_dir).await;
+        if let Err(cleanup) = tokio::fs::remove_dir_all(&mod_dir).await {
+            log::error!("Failed to clean up {:?} after a failed install: {}", mod_dir, cleanup);
+        }
     }
 
     result
+}
+
+/// Register a folder that already sits directly in DDMM's mod storage as a
+/// mod, without copying it: its own `manifest.json` is used if it has one,
+/// otherwise a local one is generated and written into it (and removed
+/// again if registering fails). Nothing else in the folder is touched, and
+/// the folder is never deleted.
+async fn adopt_folder_in_place(mods: &mut Vec<Mod>, mod_dir: &Path, name: &str) -> TAResult<(Mod, Option<String>)> {
+    use crate::fs_util::{path_overlap, PathOverlap};
+
+    log::info!("{:?} is already in the mod storage; adopting it in place.", mod_dir);
+
+    if let Some(existing) = mods
+        .iter()
+        .find(|m| matches!(path_overlap(&m.directory, mod_dir), Ok(Some(PathOverlap::Same))))
+    {
+        return anyhow::anyhow!("\"{}\" is already installed (it's in your mod list)", existing.name())
+            .into_ta_result();
+    }
+
+    let manifest_file = mod_dir.join(MANIFEST_FILE);
+    let had_manifest = find_manifest_file(mod_dir).await.is_some();
+
+    let result: TAResult<(Mod, Option<String>)> = async {
+        let manifest = resolve_manifest_for_dir(mod_dir, name.to_string(), manifest_file.clone()).await?;
+        let mut r#mod = Mod {
+            manifest,
+            directory: mod_dir.to_path_buf(),
+            sources: Vec::new(),
+        };
+
+        if mods.iter().any(|m| m.guid() == r#mod.guid()) {
+            return anyhow::anyhow!("mod with GUID {{{}}} already exists", r#mod.guid()).into_ta_result();
+        }
+
+        normalize_manifest_file_name(mod_dir).await.into_ta_result()?;
+        let warning = apply_patch_layout(mod_dir, &mut r#mod.manifest).await.into_ta_result()?;
+        Ok((r#mod, warning))
+    }
+    .await;
+
+    let (mut r#mod, warning) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            if !had_manifest {
+                let _ = tokio::fs::remove_file(&manifest_file).await;
+            }
+            return Err(e);
+        }
+    };
+
+    if let Err(e) = r#mod.normalize_paths().await {
+        log::error!("Path normalization failed: {}", e);
+    }
+    r#mod.resolve_sources().await;
+
+    mods.push(r#mod.clone());
+    log::info!("Mod adopted in place.");
+    Ok((r#mod, warning))
 }
 
 async fn install_from_folder_inner(
@@ -695,7 +826,7 @@ pub async fn add_mod_folder(state: State<'_, AppState>, folder: PathBuf) -> TARe
     }
     let mods = mods.as_mut().unwrap();
 
-    let (r#mod, warning) = install_from_folder(&state, mods, &folder).await?;
+    let (r#mod, warning) = install_from_folder(&state.base_path, mods, &folder).await?;
     Ok(InstalledMod { r#mod, warning })
 }
 
@@ -717,7 +848,7 @@ pub async fn add_paths(state: State<'_, AppState>, paths: Vec<PathBuf>) -> TARes
         let result = if is_dir {
             let mut mods = state.mods.lock().await;
             match mods.as_mut() {
-                Some(mods) => install_from_folder(&state, mods, &path).await,
+                Some(mods) => install_from_folder(&state.base_path, mods, &path).await,
                 None => anyhow::anyhow!("mods not read").into_ta_result(),
             }
         } else {
@@ -1158,5 +1289,225 @@ mod tests {
         // Only folders inside mods/ are answered for.
         assert_eq!(resolve_mod_image_path(base.path(), base.path(), "outside.png").await, None);
         assert_eq!(resolve_mod_image_path(base.path(), &base.path().join("mods"), "Cool Mod/Images/Icon.png").await, None);
+    }
+
+    /// (files, total bytes) under `dir`, not following symlinks.
+    fn tree_size(dir: &Path) -> (usize, u64) {
+        let mut out = (0, 0);
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let ft = entry.file_type().unwrap();
+            if ft.is_dir() {
+                let (n, b) = tree_size(&entry.path());
+                out = (out.0 + n, out.1 + b);
+            } else if ft.is_file() {
+                out = (out.0 + 1, out.1 + entry.metadata().unwrap().len());
+            }
+        }
+        out
+    }
+
+    /// DDMM's data folder with mod folders already sitting in `mods/`
+    /// without a manifest.json -- e.g. a portable copy of DDMM dropped next
+    /// to an existing `mods/` folder full of unpacked mods.
+    fn storage_with_loose_mods(base: &Path) -> PathBuf {
+        let storage = base.join(MODS_DIRECTORY);
+        for name in ["ModA", "ModB"] {
+            std::fs::create_dir_all(storage.join(name)).unwrap();
+            std::fs::write(storage.join(name).join(patch_file_name()), vec![7u8; 1000]).unwrap();
+        }
+        storage
+    }
+
+    fn err_text<T: std::fmt::Debug>(r: TAResult<T>) -> String {
+        format!("{:?}", r.unwrap_err())
+    }
+
+    /// The reported bug: "Add folder" on the mod storage folder itself used
+    /// to copy it into `mods/mods`, and the copy kept re-reading what it had
+    /// just written: `mods/mods/mods/...`, a full copy of every mod at every
+    /// level, until the path got too long or the disk filled up.
+    #[tokio::test]
+    async fn adding_the_mod_storage_folder_is_refused_without_copying() {
+        let base = tempfile::tempdir().unwrap();
+        let storage = storage_with_loose_mods(base.path());
+        let before = tree_size(&storage);
+        let mut mods = Vec::new();
+
+        let msg = err_text(install_from_folder(base.path(), &mut mods, &storage).await);
+
+        assert!(msg.contains("own mod storage"), "{msg}");
+        assert!(!storage.join("mods").exists(), "must not nest a copy");
+        assert_eq!(tree_size(&storage), before);
+        assert!(mods.is_empty());
+    }
+
+    /// Same, when the picked folder is DDMM's data folder (it contains
+    /// `mods/`), e.g. a portable install living in the user's mod folder.
+    #[tokio::test]
+    async fn adding_a_folder_that_contains_the_mod_storage_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("MyMods");
+        let storage = storage_with_loose_mods(&base);
+        let before = tree_size(&base);
+        let mut mods = Vec::new();
+
+        let msg = err_text(install_from_folder(&base, &mut mods, &base).await);
+
+        assert!(msg.contains("copy the folder into itself"), "{msg}");
+        assert!(!storage.join("MyMods").exists());
+        assert_eq!(tree_size(&base), before);
+    }
+
+    #[tokio::test]
+    async fn adding_the_mod_storage_via_dotdot_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let storage = storage_with_loose_mods(base.path());
+        let before = tree_size(&storage);
+        let mut mods = Vec::new();
+
+        let roundabout = storage.join("ModA").join("..");
+        assert!(install_from_folder(base.path(), &mut mods, &roundabout).await.is_err());
+        assert_eq!(tree_size(&storage), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adding_the_mod_storage_via_a_symlink_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let storage = storage_with_loose_mods(base.path());
+        let before = tree_size(&storage);
+        let elsewhere = tempfile::tempdir().unwrap();
+        let link = elsewhere.path().join("my mods");
+        std::os::unix::fs::symlink(&storage, &link).unwrap();
+        let mut mods = Vec::new();
+
+        assert!(install_from_folder(base.path(), &mut mods, &link).await.is_err());
+        assert!(!storage.join("my mods").exists());
+        assert_eq!(tree_size(&storage), before);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn adding_the_mod_storage_spelled_in_other_case_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let storage = storage_with_loose_mods(base.path());
+        let before = tree_size(&storage);
+        let mut mods = Vec::new();
+
+        assert!(install_from_folder(base.path(), &mut mods, &base.path().join("MODS")).await.is_err());
+        assert_eq!(tree_size(&storage), before);
+    }
+
+    #[tokio::test]
+    async fn adding_a_folder_deep_inside_a_stored_mod_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let storage = storage_with_loose_mods(base.path());
+        let inner = storage.join("ModA").join("Options");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join(patch_file_name()), b"x").unwrap();
+        let before = tree_size(&storage);
+        let mut mods = Vec::new();
+
+        let msg = err_text(install_from_folder(base.path(), &mut mods, &inner).await);
+
+        assert!(msg.contains("inside a mod folder"), "{msg}");
+        assert_eq!(tree_size(&storage), before);
+    }
+
+    /// A mod folder already directly in the storage is adopted where it is:
+    /// no copy, nothing deleted, just a manifest so it shows up.
+    #[tokio::test]
+    async fn adding_a_loose_folder_in_the_storage_adopts_it_in_place() {
+        let base = tempfile::tempdir().unwrap();
+        let storage = storage_with_loose_mods(base.path());
+        let mut mods = Vec::new();
+
+        let (r#mod, warning) = install_from_folder(base.path(), &mut mods, &storage.join("ModA")).await.unwrap();
+
+        assert!(warning.is_none());
+        assert_eq!(r#mod.name(), "ModA");
+        assert_eq!(r#mod.directory, storage.join("ModA"));
+        assert!(storage.join("ModA").join(MANIFEST_FILE).is_file());
+        assert!(storage.join("ModA").join(patch_file_name()).is_file());
+        assert_eq!(std::fs::read_dir(&storage).unwrap().count(), 2, "no copy was made");
+        assert_eq!(mods.len(), 1);
+
+        // And it loads on the next start like any other mod.
+        let mut state_mods = None;
+        let loaded = ensure_mods_loaded(&mut state_mods, base.path()).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].guid(), r#mod.guid());
+
+        // Adding it a second time is an error, and deletes nothing.
+        let msg = err_text(install_from_folder(base.path(), &mut mods, &storage.join("ModA")).await);
+        assert!(msg.contains("already installed"), "{msg}");
+        assert!(storage.join("ModA").join(patch_file_name()).is_file());
+        assert!(storage.join("ModA").join(MANIFEST_FILE).is_file());
+    }
+
+    #[tokio::test]
+    async fn adding_a_folder_outside_the_storage_still_copies_it() {
+        let base = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let src = elsewhere.path().join("Cool Mod");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join(patch_file_name()), b"p").unwrap();
+        let mut mods = Vec::new();
+
+        let (r#mod, _) = install_from_folder(base.path(), &mut mods, &src).await.unwrap();
+
+        let dst = base.path().join(MODS_DIRECTORY).join("Cool Mod");
+        assert_eq!(r#mod.directory, dst);
+        assert!(dst.join(patch_file_name()).is_file());
+        assert!(src.join(patch_file_name()).is_file(), "source untouched");
+        assert!(!src.join(MANIFEST_FILE).exists(), "source untouched");
+    }
+
+    /// A copy that fails partway must not leave a half-copied mod behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_folder_copy_that_fails_partway_is_cleaned_up() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let src = elsewhere.path().join("Broken");
+        std::fs::create_dir_all(src.join("Options")).unwrap();
+        std::fs::write(src.join(patch_file_name()), b"p").unwrap();
+        let unreadable = src.join("Options").join(patch_file_name());
+        std::fs::write(&unreadable, b"secret").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&unreadable).is_ok() {
+            // Running as root: permissions can't make the copy fail.
+            return;
+        }
+        let mut mods = Vec::new();
+
+        let result = install_from_folder(base.path(), &mut mods, &src).await;
+
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(result.is_err());
+        assert!(!base.path().join(MODS_DIRECTORY).join("Broken").exists());
+        assert!(mods.is_empty());
+    }
+
+    /// An archive picked from inside the folder it would be installed into
+    /// (`mods/Foo/Foo.zip`, with `mods/Foo` not yet a mod) used to have that
+    /// folder, archive included, deleted to make room.
+    #[tokio::test]
+    async fn an_archive_inside_its_own_install_folder_is_refused_and_kept() {
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join(MODS_DIRECTORY).join("Foo");
+        std::fs::create_dir_all(&target).unwrap();
+        let zip = target.join("Foo.zip");
+        make_zip(&zip, &[(&patch_file_name(), b"p")]);
+        let state = AppState::new(base.path().to_path_buf());
+        let mut mods = Vec::new();
+
+        let msg = err_text(install_from_archive(&state, &mut mods, &zip).await);
+
+        assert!(msg.contains("inside"), "{msg}");
+        assert!(zip.is_file(), "the picked archive must survive");
     }
 }
