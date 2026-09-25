@@ -135,7 +135,7 @@ environment), an error like `error while loading shared libraries: libfontconfig
 === "Debian / Ubuntu"
 
     ```sh
-    sudo apt install libgtk-3-0 libegl1 libgles2 libgbm1 libwayland-server0
+    sudo apt install libgtk-3-0 libegl1 libgles2 libgbm1 libwayland-server0 libgpg-error0 libcom-err2
     ```
 
 === "openSUSE"

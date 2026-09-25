@@ -113,7 +113,7 @@ desktop_baseline() {
         arch)   echo gtk3 mesa libglvnd ;;
         # libgtk-3-0 is virtual on 24.04+/13 (libgtk-3-0t64); apt picks the
         # single provider, and this is the name the docs give.
-        debian) echo libgtk-3-0 libegl1 libgles2 libgbm1 libwayland-server0 ;;
+        debian) echo libgtk-3-0 libegl1 libgles2 libgbm1 libwayland-server0 libgpg-error0 libcom-err2 ;;
     esac
 }
 
