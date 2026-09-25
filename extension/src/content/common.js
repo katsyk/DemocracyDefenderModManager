@@ -94,6 +94,9 @@
       padding: 4px 6px;
       max-width: 240px;
     }
+    /* "all: initial; display: block" above would otherwise override the
+       hidden attribute, leaving an empty hint bar under every button. */
+    .ddmm-hint[hidden] { display: none; }
     .ddmm-floating {
       position: fixed;
       right: 16px;
