@@ -13,6 +13,7 @@ vite.config.ts.timestamp-*
 /.idea
 /target/
 *.lock
+!src-tauri/Cargo.lock
 pnpm-lock.yaml
 *.log
 src-tauri/log/
