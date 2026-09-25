@@ -100,6 +100,13 @@ jobs:
 
       - name: Build
         run: pnpm tauri build
+        env:
+          # Public Nexus Mods OAuth client ID for "Sign in to Nexus Mods",
+          # from the repository variable of the same name (Settings ->
+          # Secrets and variables -> Actions -> Variables). Not a secret.
+          # Unset -> empty -> sign-in shows "Coming soon"; the build never
+          # fails over it.
+          DDMM_NEXUS_CLIENT_ID: ${{ vars.DDMM_NEXUS_CLIENT_ID }}
 
       - name: Determine version
         id: version
@@ -173,6 +180,13 @@ jobs:
 
       - name: Build
         run: pnpm tauri build
+        env:
+          # Public Nexus Mods OAuth client ID for "Sign in to Nexus Mods",
+          # from the repository variable of the same name (Settings ->
+          # Secrets and variables -> Actions -> Variables). Not a secret.
+          # Unset -> empty -> sign-in shows "Coming soon"; the build never
+          # fails over it.
+          DDMM_NEXUS_CLIENT_ID: ${{ vars.DDMM_NEXUS_CLIENT_ID }}
 
       - name: Determine version
         id: version
