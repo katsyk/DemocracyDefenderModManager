@@ -618,6 +618,14 @@ fn progress_moves_within_a_big_file_and_permissions_are_kept() {
 }
 
 #[test]
+fn free_space_is_reported_for_a_folder_and_a_not_yet_created_subfolder() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = available_space(dir.path()).expect("free space of the temp dir");
+    assert!(free > 0);
+    assert!(available_space(&dir.path().join("DDMM Data").join("new")).is_some());
+}
+
+#[test]
 fn human_bytes_is_readable() {
     assert_eq!(human_bytes(512), "512 bytes");
     assert_eq!(human_bytes(1536), "1.5 KB");

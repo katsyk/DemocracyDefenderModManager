@@ -957,6 +957,7 @@ dependencies = [
  "dirs 7.0.0",
  "futures",
  "keyring",
+ "libc",
  "log",
  "percent-encoding",
  "rand 0.10.3",
@@ -982,6 +983,7 @@ dependencies = [
  "unrar",
  "url",
  "uuid",
+ "windows-sys 0.60.2",
  "winreg 0.56.0",
  "zip",
 ]

@@ -721,27 +721,48 @@ pub fn run_pending_cleanup(base: &Path) {
     }
 }
 
-/// Free space on the drive holding `path`, if the OS reports it.
+/// Free space (for this user) on the drive holding `path` (or its nearest
+/// existing parent), if the OS reports it.
+///
+/// Asks about that one path only (`statvfs` / `GetDiskFreeSpaceExW`), never
+/// by listing every mounted drive: querying an unrelated network or FUSE
+/// mount can hang for a long time.
 pub fn available_space(path: &Path) -> Option<u64> {
-    let resolved = crate::fs_util::resolve_path(path).ok()?;
-    let normalize = |p: &Path| {
-        let s = p.to_string_lossy().replace('\\', "/");
-        let s = s.strip_prefix("//?/UNC/").map(|r| format!("//{r}")).unwrap_or(s);
-        let s = s.strip_prefix("//?/").map(str::to_string).unwrap_or(s);
-        if cfg!(windows) { s.to_lowercase() } else { s }
-    };
-    let target = normalize(&resolved);
-    let disks = sysinfo::Disks::new_with_refreshed_list();
-    disks
-        .list()
-        .iter()
-        .filter(|d| {
-            let mount = normalize(d.mount_point());
-            let mount = mount.trim_end_matches('/');
-            target == mount || target.starts_with(&format!("{mount}/")) || mount.is_empty()
-        })
-        .max_by_key(|d| d.mount_point().as_os_str().len())
-        .map(|d| d.available_space())
+    let dir = nearest_existing_ancestor(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `c_path` is a valid NUL-terminated string and `stat` is a
+        // plain C struct that statvfs fills in.
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+            return None;
+        }
+        #[allow(clippy::useless_conversion)] // the field types differ by platform
+        Some(u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize)))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let mut free: u64 = 0;
+        // SAFETY: `wide` is NUL-terminated; the unused outputs may be null.
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 { None } else { Some(free) }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        None
+    }
 }
 
 pub fn human_bytes(bytes: u64) -> String {

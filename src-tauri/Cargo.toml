@@ -39,7 +39,7 @@ percent-encoding = "2.3.2"
 dirs = "7"
 tauri-plugin-deep-link = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
-sysinfo = { version = "0.33", default-features = false, features = ["system", "disk"] }
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 url = "2.5"
 # OS keychain for the optional Nexus Mods API key (Windows Credential
 # Manager, macOS Keychain, Linux Secret Service). See `secrets.rs`.
@@ -55,8 +55,14 @@ same-file = "1.0"
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 
+[target."cfg(unix)".dependencies]
+# statvfs: free space on the drive a data folder move goes to (`data_move::available_space`).
+libc = "0.2"
+
 [target."cfg(windows)".dependencies]
 winreg = "0.56.0"
+# Free space on the drive a data folder move goes to (`data_move::available_space`).
+windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
