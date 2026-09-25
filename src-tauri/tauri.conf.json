@@ -40,7 +40,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "appimage", "deb"],
+    "targets": ["nsis", "appimage", "deb", "rpm"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -48,6 +48,11 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "linux": {
+      "rpm": {
+        "depends": ["libwebkit2gtk-4.1.so.0()(64bit)", "libgtk-3.so.0()(64bit)"]
+      }
+    },
     "windows": {
       "nsis": {
         "installMode": "currentUser",

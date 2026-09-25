@@ -172,13 +172,15 @@ jobs:
         id: version
         run: echo "version=$(jq -r .version src-tauri/tauri.conf.json)" >> "$GITHUB_OUTPUT"
 
-      - name: Rename AppImage and deb
+      - name: Rename AppImage, deb and rpm
         run: |
           set -euo pipefail
           appimage=$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' | head -n1)
           cp "$appimage" "DDMM-${{ steps.version.outputs.version }}-linux-x86_64.AppImage"
           deb=$(find src-tauri/target/release/bundle/deb -name '*.deb' | head -n1)
           cp "$deb" "DDMM-${{ steps.version.outputs.version }}-linux-amd64.deb"
+          rpm=$(find src-tauri/target/release/bundle/rpm -name '*.rpm' | head -n1)
+          cp "$rpm" "DDMM-${{ steps.version.outputs.version }}-linux-x86_64.rpm"
 
       - name: Build tar.gz (binary + QUICKSTART.txt)
         run: |
@@ -195,6 +197,7 @@ jobs:
           path: |
             DDMM-*-linux-x86_64.AppImage
             DDMM-*-linux-amd64.deb
+            DDMM-*-linux-x86_64.rpm
             DDMM-*-linux-x64.tar.gz
           if-no-files-found: error
 
