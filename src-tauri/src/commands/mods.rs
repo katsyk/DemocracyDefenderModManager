@@ -142,7 +142,7 @@ pub(crate) async fn ensure_mods_loaded<'a>(
     base_path: &Path,
 ) -> TAResult<&'a mut Vec<Mod>> {
     if state_mods.is_some() {
-        log::info!("Mods already loaded.");
+        log::debug!("Mods already loaded.");
         return Ok(state_mods.as_mut().unwrap());
     }
 

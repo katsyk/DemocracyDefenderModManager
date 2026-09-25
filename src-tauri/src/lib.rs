@@ -26,7 +26,12 @@ use std::{
 use log::LevelFilter;
 use tauri::Manager;
 use tauri_plugin_deep_link::DeepLinkExt;
-use tauri_plugin_log::{Target, TargetKind};
+use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
+
+/// Log rotation: 5 MB per file, keeping the 3 most recent rotated files
+/// alongside the current one.
+const LOG_MAX_FILE_BYTES: u128 = 5 * 1024 * 1024;
+const LOG_KEEP_FILES: usize = 3;
 use tokio::sync::Mutex;
 
 use crate::{bridge::BridgePending, models::Mod};
@@ -173,6 +178,10 @@ pub fn run() {
         .plugin(tauri_plugin_prevent_default::debug())
         .plugin(
             tauri_plugin_log::Builder::new()
+                // The plugin's default is a single 40 KB file, i.e. only a
+                // few minutes of history; keep enough for a bug report.
+                .max_file_size(LOG_MAX_FILE_BYTES)
+                .rotation_strategy(RotationStrategy::KeepSome(LOG_KEEP_FILES))
                 .level(if cfg!(debug_assertions) {
                     LevelFilter::Debug
                 } else {

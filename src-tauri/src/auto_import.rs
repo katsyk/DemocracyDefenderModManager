@@ -42,6 +42,7 @@ async fn run(app: AppHandle) {
     // evaluating, so anything already there (including whatever a handoff
     // just finished downloading) is never flagged as new.
     let mut baseline_ready = false;
+    let mut settings_error: Option<String> = None;
 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -57,8 +58,19 @@ async fn run(app: AppHandle) {
         }
 
         let settings = match do_load_settings(&state.base_path).await {
-            Ok(s) => s,
-            Err(_) => continue,
+            Ok(s) => {
+                settings_error = None;
+                s
+            }
+            Err(e) => {
+                // Log a broken settings file once, not every tick.
+                let message = format!("{e:#}");
+                if settings_error.as_deref() != Some(message.as_str()) {
+                    log::warn!("Auto-import: couldn't read settings: {message}");
+                    settings_error = Some(message);
+                }
+                continue;
+            }
         };
         if !settings.auto_import_enabled() {
             baseline_ready = false;

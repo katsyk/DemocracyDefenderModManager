@@ -13,19 +13,23 @@ pub fn default_downloads_path() -> PathBuf {
     dirs::download_dir().unwrap_or_default()
 }
 
+/// Read settings.json (or the defaults if there's none yet).
+///
+/// Called constantly (the auto-import watcher every 2 s, every browser
+/// extension request, the update-check scheduler), so it logs at debug
+/// level only -- at info it filled and rotated the log file within minutes,
+/// wiping the history users attach to bug reports. Failures are returned
+/// to the caller, which reports them.
 pub async fn do_load_settings(base_path: &Path) -> anyhow::Result<Settings> {
-    log::info!("Loading settings...");
     let settings_file = base_path.join(SETTINGS_FILE);
+    log::debug!("Loading settings from {:?}", &settings_file);
 
-    log::info!("Looking for {:?}", &settings_file);
     let mut settings = if tokio::fs::try_exists(&settings_file).await? {
-        log::info!("Opening...");
         let data = tokio::fs::read(&settings_file).await?;
-
-        log::info!("Deserializing...");
-        serde_json::from_slice(&data)?
+        serde_json::from_slice(&data)
+            .map_err(|e| anyhow::anyhow!("{:?} isn't valid settings JSON: {e}", settings_file))?
     } else {
-        log::info!("Not found. Using default.");
+        log::debug!("No settings file yet; using defaults.");
 
         Settings::V1 {
             game_path: PathBuf::new(),
@@ -47,7 +51,6 @@ pub async fn do_load_settings(base_path: &Path) -> anyhow::Result<Settings> {
         settings.set_downloads_path(default_downloads_path());
     }
 
-    log::info!("Settings loaded.");
     Ok(settings)
 }
 
