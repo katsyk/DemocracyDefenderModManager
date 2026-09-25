@@ -16,7 +16,7 @@ use tokio::{
 };
 
 use crate::{
-    commands::{profiles::do_load_profiles, settings::do_load_settings},
+    commands::{mods::ensure_mods_loaded, profiles::do_load_profiles, settings::do_load_settings},
     AppState,
 };
 
@@ -170,7 +170,13 @@ async fn handle_status(app: &AppHandle, id: String) -> String {
         Some(s) => s.validate().await.is_ok(),
         None => false,
     };
-    let mod_count = state.mods.lock().await.as_ref().map(Vec::len).unwrap_or(0);
+    let mod_count = {
+        let mut mods_guard = state.mods.lock().await;
+        ensure_mods_loaded(&mut mods_guard, &state.base_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
     let active_profile = do_load_profiles(&state.base_path)
         .await
         .ok()
@@ -200,8 +206,11 @@ async fn handle_query(app: &AppHandle, raw: serde_json::Value, id: String) -> St
     };
 
     let state = app.state::<AppState>();
-    let mods_guard = state.mods.lock().await;
-    let mods = mods_guard.as_deref().unwrap_or(&[]);
+    let mut mods_guard = state.mods.lock().await;
+    let mods: &[crate::models::Mod] = match ensure_mods_loaded(&mut mods_guard, &state.base_path).await {
+        Ok(m) => m,
+        Err(e) => return ErrorReply::new(id, ErrorCode::Internal, format!("couldn't read installed mods: {e}")).to_line(),
+    };
 
     let found = source.id.as_ref().and_then(|source_id| {
         mods.iter().find(|m| {
@@ -298,8 +307,11 @@ async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String) -> 
 
     let outcome = {
         let mut mods_guard = state.mods.lock().await;
-        let Some(mods) = mods_guard.as_mut() else {
-            return ErrorReply::new(id, ErrorCode::Internal, "mods not read").to_line();
+        let mods = match ensure_mods_loaded(&mut mods_guard, &state.base_path).await {
+            Ok(m) => m,
+            Err(e) => {
+                return ErrorReply::new(id, ErrorCode::Internal, format!("couldn't read installed mods: {e}")).to_line()
+            }
         };
         install::install_file(
             &state,
@@ -345,11 +357,11 @@ async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String) -> 
         installed_mod: InstalledModSummary {
             guid: outcome.r#mod.guid().to_string(),
             name: outcome.r#mod.name().to_string(),
-            source: outcome.r#mod.sources.first().map(|s| InstalledModSource {
+            source: outcome.source.as_ref().map(|s| InstalledModSource {
                 provider: s.provider.clone(),
-                id: None,
+                id: s.id.clone(),
             }),
-            version: outcome.r#mod.sources.first().and_then(|s| s.version.clone()),
+            version: outcome.source.as_ref().and_then(|s| s.version.clone()),
         },
         updated: outcome.updated,
         added_to_profile: completion.added_to_profile,

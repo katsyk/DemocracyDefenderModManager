@@ -21,6 +21,9 @@ pub struct InstallOutcome {
     pub r#mod: Mod,
     pub updated: bool,
     pub warning: Option<String>,
+    /// The source recorded for this install (provider + id when `pageUrl`
+    /// was a recognized mod page), echoed back in the `installed` reply.
+    pub source: Option<Source>,
 }
 
 /// Everything that can go wrong before/while installing the archive
@@ -34,6 +37,19 @@ pub struct InstallError {
 impl InstallError {
     fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self { code, message: message.into() }
+    }
+
+    /// Map a failure from the shared archive-install path to a protocol
+    /// error code. The archive module rejects path traversal, absolute
+    /// paths and symlink entries with an "unsafe path" error; the protocol
+    /// reports those as `UNSAFE_ARCHIVE` rather than a generic `INTERNAL`.
+    fn from_install_failure(message: String) -> Self {
+        let code = if message.contains("unsafe path") {
+            ErrorCode::UnsafeArchive
+        } else {
+            ErrorCode::Internal
+        };
+        Self { code, message }
     }
 }
 
@@ -136,15 +152,15 @@ pub async fn install_file(
     let (r#mod, warning) = match existing_guid {
         Some(guid) => install_update_from_archive(state, mods, file, guid)
             .await
-            .map_err(|e| InstallError::new(ErrorCode::Internal, e.to_string()))?,
+            .map_err(|e| InstallError::from_install_failure(e.to_string()))?,
         None => install_from_archive(state, mods, file)
             .await
-            .map_err(|e| InstallError::new(ErrorCode::Internal, e.to_string()))?,
+            .map_err(|e| InstallError::from_install_failure(e.to_string()))?,
     };
 
     let mut r#mod = r#mod;
-    if let Some(source) = source {
-        if let Err(e) = sources::write_origin_sidecar(&r#mod.directory, vec![source]).await {
+    if let Some(source) = &source {
+        if let Err(e) = sources::write_origin_sidecar(&r#mod.directory, vec![source.clone()]).await {
             log::error!("Failed to write bridge-install origin sidecar: {}", e);
         }
         r#mod.resolve_sources().await;
@@ -157,6 +173,7 @@ pub async fn install_file(
         r#mod,
         updated: existing_guid.is_some(),
         warning,
+        source,
     })
 }
 
@@ -286,6 +303,66 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::NotArchive);
+    }
+
+    fn make_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, data) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(data).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    const PAGE_URL: &str = "https://ayakamods.com/mods/test-mod.4084/";
+
+    #[tokio::test]
+    async fn install_file_reports_source_and_updates_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("mods")).await.unwrap();
+        let state = AppState::new(dir.path().to_path_buf());
+        let mut mods = Vec::new();
+
+        let first = dir.path().join("Test Mod-4084-1-0.zip");
+        make_zip(&first, &[("0123456789abcdef.patch_0", b"v1")]);
+        let installed = install_file(&state, &mut mods, &first, Some(PAGE_URL), None, Some("1.0"))
+            .await
+            .unwrap();
+        assert!(!installed.updated);
+        let source = installed.source.as_ref().unwrap();
+        assert_eq!(source.provider, "ayakamods");
+        assert_eq!(source.id.as_deref(), Some("4084"));
+        assert_eq!(source.version.as_deref(), Some("1.0"));
+        assert_eq!(mods.len(), 1);
+
+        let second = dir.path().join("Test Mod-4084-1-1.zip");
+        make_zip(&second, &[("0123456789abcdef.patch_0", b"v2")]);
+        let updated = install_file(&state, &mut mods, &second, Some(PAGE_URL), None, Some("1.1"))
+            .await
+            .unwrap();
+        assert!(updated.updated);
+        assert_eq!(updated.r#mod.guid(), installed.r#mod.guid());
+        assert_eq!(updated.source.as_ref().unwrap().version.as_deref(), Some("1.1"));
+        assert_eq!(mods.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn install_file_maps_path_traversal_to_unsafe_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("mods")).await.unwrap();
+        let state = AppState::new(dir.path().to_path_buf());
+        let mut mods = Vec::new();
+
+        let file = dir.path().join("evil.zip");
+        make_zip(&file, &[("../../evil.patch_0", b"evil")]);
+        let err = install_file(&state, &mut mods, &file, Some(PAGE_URL), None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::UnsafeArchive, "{}", err.message);
+        assert!(mods.is_empty());
     }
 
     #[cfg(unix)]
