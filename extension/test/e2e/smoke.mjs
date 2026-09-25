@@ -105,6 +105,18 @@ async function main() {
     }
     console.log('PASS: with no native host present, the button reached the "Get DDMM" state gracefully.');
 
+    // "Get DDMM" is yellow on dark; the emblem must follow the label color.
+    const colors = await button.evaluate((btn) => ({
+      stroke: getComputedStyle(btn.querySelector('svg path')).stroke,
+      color: getComputedStyle(btn).color,
+      background: getComputedStyle(btn).backgroundColor,
+    }));
+    if (colors.stroke !== colors.color || colors.stroke === colors.background) {
+      throw new Error(`emblem not visible on "Get DDMM": ${JSON.stringify(colors)}`);
+    }
+    console.log('PASS: the emblem is visible on the "Get DDMM" button.');
+    if (process.env.SHOT_DIR) await button.screenshot({ path: path.join(process.env.SHOT_DIR, 'e2e-button-unreachable.png') });
+
     await page.waitForTimeout(500);
     if (pageErrors.length > 0) {
       throw new Error(`Unhandled page errors: ${pageErrors.join('; ')}`);

@@ -133,6 +133,30 @@ pub fn platform_app_data_dir() -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("could not determine the OS application data directory"))
 }
 
+/// The directories the webview may read through the asset protocol
+/// (`convertFileSrc`): only the mods folder under the resolved data folder
+/// (portable or app-data, whichever `decide_base_dir` picked), which is where
+/// mod icons and option images live. Nothing else on disk is exposed.
+///
+/// Tauri canonicalizes every requested path before matching it against the
+/// scope, so when the mods folder is reached through a symlink its
+/// canonical form is allowed too. `tauri.conf.json` deliberately grants no
+/// static scope (a relative pattern there, like the old `./**`, matched no
+/// absolute path at all, which broke every mod image in release builds).
+pub fn asset_scope_dirs(base_path: &Path) -> Vec<PathBuf> {
+    let mods_dir = base_path.join(crate::commands::mods::MODS_DIRECTORY);
+    let mods_dir: PathBuf = mods_dir.components().collect();
+    let mut dirs = vec![mods_dir.clone()];
+    if let Ok(canonical) = std::fs::canonicalize(&mods_dir) {
+        // On Windows canonicalize adds a `\\?\` prefix; Tauri's scope
+        // already matches both forms of whatever it's given.
+        if canonical != mods_dir {
+            dirs.push(canonical);
+        }
+    }
+    dirs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +255,43 @@ mod tests {
         }
 
         assert_eq!(dir, PathBuf::from("/opt/apps"));
+    }
+
+    #[test]
+    fn asset_scope_is_only_the_mods_folder() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base.path().join("mods")).unwrap();
+        let dirs = asset_scope_dirs(base.path());
+        let mods = std::fs::canonicalize(base.path().join("mods")).unwrap();
+        assert!(dirs.iter().any(|d| d == &base.path().join("mods")));
+        assert!(dirs.iter().any(|d| d == &mods));
+        for d in &dirs {
+            assert!(d.ends_with("mods"), "unexpected asset scope dir {d:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn asset_scope_includes_the_canonical_mods_folder_behind_a_symlink() {
+        let real = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(real.path().join("mods")).unwrap();
+        let link_parent = tempfile::tempdir().unwrap();
+        let link = link_parent.path().join("data");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        let dirs = asset_scope_dirs(&link);
+        assert!(dirs.contains(&link.join("mods")));
+        assert!(dirs.contains(&std::fs::canonicalize(real.path().join("mods")).unwrap()));
+    }
+
+    #[test]
+    fn tauri_conf_grants_no_static_asset_scope() {
+        // The asset scope is granted at runtime (asset_scope_dirs); a static
+        // pattern here is either too broad or, if relative like the old
+        // "./**", matches nothing and breaks every mod image.
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let asset = &conf["app"]["security"]["assetProtocol"];
+        assert_eq!(asset["enable"], serde_json::Value::Bool(true));
+        assert_eq!(asset["scope"], serde_json::json!([]));
     }
 }

@@ -151,6 +151,69 @@
   }
 
   /**
+   * Nexus Mods' numeric game id for Helldivers 2 (the `game_id` Nexus uses
+   * in its own mod-listing URLs for /helldivers2/). Nexus file-download URLs
+   * carry it as the first path segment after the optional `/cdn/` prefix.
+   */
+  const NEXUS_HD2_GAME_ID = '6119';
+
+  /** Registrable domains Nexus serves mod files from. */
+  const NEXUS_FILE_HOST_ROOTS = ['nexusmods.com', 'nexus-cdn.com'];
+
+  /**
+   * The mod a Nexus file-download URL belongs to, read from the URL itself.
+   * Nexus download URLs look like
+   * `https://cf-files.nexusmods.com/cdn/<gameId>/<modId>/<file>?md5=…&expires=…`
+   * or `https://supporter-files.nexus-cdn.com/<gameId>/<modId>/<file>?…`.
+   * @param {string} rawUrl
+   * @returns {{gameId: string, modId: string}|null}
+   */
+  function nexusFileFromUrl(rawUrl) {
+    let parsed;
+    try {
+      parsed = new URL(rawUrl);
+    } catch {
+      return null;
+    }
+    const host = parsed.hostname.toLowerCase();
+    if (!NEXUS_FILE_HOST_ROOTS.some((r) => host === r || host.endsWith(`.${r}`))) return null;
+    // www.nexusmods.com/<game>/mods/<id> is a page, not a file.
+    if (host === 'nexusmods.com' || host === 'www.nexusmods.com') return null;
+    let segments = pathSegments(parsed);
+    if (segments[0] && segments[0].toLowerCase() === 'cdn') segments = segments.slice(1);
+    // <gameId>/<modId>/<file name>
+    if (segments.length < 3 || !isNumeric(segments[0]) || !isNumeric(segments[1])) return null;
+    return { gameId: segments[0], modId: segments[1] };
+  }
+
+  /**
+   * What a download URL itself says about which mod it is: a mod page URL
+   * (any site), or a Nexus file URL (whose path names the mod). Never
+   * guesses: anything else yields `null`.
+   *
+   * `pageUrl` is the canonical mod page to send to DDMM, or `null` when the
+   * URL names a mod DDMM can't have a page for (a Nexus file of another
+   * game). `source` is non-null whenever the URL names *some* mod, so a
+   * file can be told apart from the page the user was on.
+   * @param {string|null|undefined} rawUrl
+   * @returns {{source: Source, pageUrl: string|null}|null}
+   */
+  function modFromDownloadUrl(rawUrl) {
+    if (!rawUrl) return null;
+    const page = sourceFromPageUrl(rawUrl);
+    if (page) return { source: page, pageUrl: rawUrl };
+    const file = nexusFileFromUrl(rawUrl);
+    if (!file) return null;
+    if (file.gameId !== NEXUS_HD2_GAME_ID) {
+      return { source: { provider: `nexus-game-${file.gameId}`, id: file.modId }, pageUrl: null };
+    }
+    return {
+      source: { provider: 'nexus', id: file.modId },
+      pageUrl: `https://www.nexusmods.com/helldivers2/mods/${file.modId}`,
+    };
+  }
+
+  /**
    * Decide which mod page a downloaded file belongs to, i.e. the `pageUrl`
    * to send with an install, and whether it's the mod of the page the user
    * was on (only then may that page's scraped version be sent).
@@ -160,8 +223,10 @@
    * URL must never be attached to a file that belongs to a different mod
    * (e.g. a link to mod B right-clicked on mod A's page, which would
    * overwrite A with B):
-   *   - the download URL is itself a mod URL of the page's mod -> the page;
-   *   - the download URL is some *other* mod's URL -> that URL;
+   *   - the download URL names the page's mod (a mod URL of it, or a Nexus
+   *     file URL with its mod id) -> the page;
+   *   - the download URL names some *other* mod -> that mod's page (or null
+   *     when it has none DDMM knows);
    *   - the download URL says nothing (CDN, bare file) -> the page only when
    *     `trustPage` (the user started this download from that page: armed
    *     or auto capture), otherwise null so the app falls back to host
@@ -171,14 +236,24 @@
    */
   function attributeDownload({ contextPageUrl, downloadUrl, trustPage }) {
     const pageSource = contextPageUrl ? sourceFromPageUrl(contextPageUrl) : null;
-    const linkSource = downloadUrl ? sourceFromPageUrl(downloadUrl) : null;
-    if (linkSource) {
-      return isSameMod(linkSource, pageSource)
+    const link = modFromDownloadUrl(downloadUrl);
+    if (link) {
+      return isSameMod(link.source, pageSource)
         ? { pageUrl: contextPageUrl, sameModAsPage: true }
-        : { pageUrl: downloadUrl, sameModAsPage: false };
+        : { pageUrl: link.pageUrl, sameModAsPage: false };
     }
     return { pageUrl: trustPage ? contextPageUrl || null : null, sameModAsPage: false };
   }
 
-  DDMM.sources = { sourceFromPageUrl, providerFromUrl, extractHost, isNumeric, isSameMod, attributeDownload };
+  DDMM.sources = {
+    sourceFromPageUrl,
+    providerFromUrl,
+    extractHost,
+    isNumeric,
+    isSameMod,
+    nexusFileFromUrl,
+    modFromDownloadUrl,
+    attributeDownload,
+    NEXUS_HD2_GAME_ID,
+  };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

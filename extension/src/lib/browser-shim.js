@@ -81,6 +81,15 @@
         set: promisify(raw.storage.local.set, raw.storage.local),
         remove: promisify(raw.storage.local.remove, raw.storage.local),
       },
+      // In-memory, browser-session-only storage (Chrome 102+, Firefox 115+).
+      // Used to survive an MV3 service-worker restart; absent -> callers
+      // fall back to memory only.
+      session: raw.storage.session
+        ? {
+            get: promisify(raw.storage.session.get, raw.storage.session),
+            set: promisify(raw.storage.session.set, raw.storage.session),
+          }
+        : undefined,
     },
     tabs: raw.tabs
       ? {

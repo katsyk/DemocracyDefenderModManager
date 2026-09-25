@@ -24,7 +24,8 @@ Clicking **Deploy** (tip: "Install the current selection of mods."):
 5. Copies each group's patch/`.gpu_resources`/`.stream` files into `<Game Path>/data/`, numbering them
    `.patch_0`, `.patch_1`, and so on in your profile's mod order. If a triplet is missing its `.gpu_resources` or
    `.stream` file, DDMM writes an empty placeholder for it instead of skipping it, so the numbering for later
-   mods touching the same patch name stays consistent.
+   mods touching the same patch name stays consistent. Higher numbers override lower ones in game, so the mod
+   lowest in your list wins a conflict (see [Load order and conflicts](profiles.md#load-order-and-conflicts)).
 
 Deploying an empty profile (no mods, or none enabled — same list of `Configs`) shows an error instead of purging
 your game folder for nothing: "Can not deploy empty profile!"

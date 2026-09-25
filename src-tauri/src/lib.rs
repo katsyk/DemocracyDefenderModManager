@@ -123,6 +123,7 @@ pub fn run() {
     }
 
     let base_path = decision.path.clone();
+    let asset_base_path = base_path.clone();
     let log_dir = base_path.join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
 
@@ -172,6 +173,16 @@ pub fn run() {
         )
         .setup(move |app| {
             log::info!("{}", startup_message);
+
+            // Mod icons and option images are shown with the asset protocol;
+            // allow exactly the mods folder under the data folder, nothing
+            // else (tauri.conf.json grants no static scope).
+            let _ = std::fs::create_dir_all(asset_base_path.join(commands::mods::MODS_DIRECTORY));
+            for dir in data_dir::asset_scope_dirs(&asset_base_path) {
+                if let Err(e) = app.asset_protocol_scope().allow_directory(&dir, true) {
+                    log::warn!("Couldn't allow {dir:?} for mod images: {e}");
+                }
+            }
 
             // NSIS/deb register the `ddmm://` scheme at install time (from
             // tauri.conf.json); a portable Windows exe or an AppImage has
@@ -263,6 +274,7 @@ pub fn run() {
         .manage(AppState::new(base_path))
         .invoke_handler(tauri::generate_handler![
             commands::mods::get_mods,
+            commands::mods::resolve_mod_image,
             commands::mods::delete_mod,
             commands::mods::add_mod,
             commands::mods::add_mods,

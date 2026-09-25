@@ -105,3 +105,32 @@ describe('ButtonState', () => {
     expect(s.busy).toBe(true);
   });
 });
+
+describe('ButtonState waiting (capture armed)', () => {
+  it('shows "Click Download on this page…" at once, stays clickable, and holds off refreshes', () => {
+    const s = new ButtonState();
+    s.setQueryResult({ installed: false, updateAvailable: null });
+    s.waitForDownload();
+    expect(s.state).toBe('waiting');
+    expect(s.label).toBe('Click Download on this page…');
+    expect(s.hint).toBe(globalThis.DDMM.buttonHints.WAITING_HINT);
+    expect(s.clickable).toBe(true);
+    expect(s.busy).toBe(true);
+  });
+
+  it('moves to Installing… once the download is caught', () => {
+    const s = new ButtonState();
+    s.setQueryResult({ installed: false, updateAvailable: null });
+    s.waitForDownload();
+    s.startInstalling();
+    expect(s.label).toBe('Installing…');
+  });
+
+  it('moves to Starting DDMM… when DDMM was not running', () => {
+    const s = new ButtonState();
+    s.setAppNotRunning();
+    s.waitForDownload();
+    s.startInstalling();
+    expect(s.label).toBe('Starting DDMM…');
+  });
+});

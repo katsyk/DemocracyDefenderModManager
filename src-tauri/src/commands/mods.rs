@@ -16,7 +16,7 @@ use std::{collections::HashSet, path::{Path, PathBuf}};
 use tauri::State;
 use uuid::Uuid;
 
-const MODS_DIRECTORY: &'static str = "mods/";
+pub(crate) const MODS_DIRECTORY: &'static str = "mods/";
 const MANIFEST_FILE: &'static str = "manifest.json";
 const NO_PATCH_FILES_WARNING: &str = "no Helldivers 2 patch files found in this archive";
 
@@ -92,6 +92,36 @@ impl<S, E, T> ZipResult<S, E, T> for Result<S, E> {
             Err(e) => Err(e)
         }
     }
+}
+
+/// Resolve an image path from a mod's manifest (`IconPath`, an option's
+/// `Image`) to the file on disk, with the same rules as deploy
+/// ([`crate::utils::fix_path_casing`]: `\` separators, any casing, never
+/// outside the mod folder). `None` when there's no such file, so the UI
+/// shows its default icon. Only answers for folders inside `mods/`.
+pub(crate) async fn resolve_mod_image_path(base_path: &Path, mod_directory: &Path, image: &str) -> Option<PathBuf> {
+    let mods_root = tokio::fs::canonicalize(base_path.join(MODS_DIRECTORY)).await.ok()?;
+    let mod_dir = tokio::fs::canonicalize(mod_directory).await.ok()?;
+    if !mod_dir.starts_with(&mods_root) || mod_dir == mods_root {
+        return None;
+    }
+    let relative = crate::utils::fix_path_casing(&mod_dir, Path::new(image)).await.ok()?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    // Hand back the path as the app knows it (not the canonical form, which
+    // is `\\?\C:\…` on Windows); the asset scope allows both.
+    let file = mod_directory.join(relative);
+    tokio::fs::metadata(&file).await.ok().filter(|m| m.is_file()).map(|_| file)
+}
+
+#[tauri::command]
+pub async fn resolve_mod_image(
+    state: State<'_, AppState>,
+    mod_directory: PathBuf,
+    image: String,
+) -> TAResult<Option<PathBuf>> {
+    Ok(resolve_mod_image_path(&state.base_path, &mod_directory, &image).await)
 }
 
 #[tauri::command]
@@ -1080,5 +1110,26 @@ mod tests {
         assert!(old_dir.join(patch_file_name()).is_file());
         let content = tokio::fs::read(old_dir.join(patch_file_name())).await.unwrap();
         assert_eq!(content, b"old content");
+    }
+
+    #[tokio::test]
+    async fn mod_image_resolves_backslashes_and_casing_inside_the_mod() {
+        let base = tempfile::tempdir().unwrap();
+        let mod_dir = base.path().join("mods").join("Cool Mod");
+        tokio::fs::create_dir_all(mod_dir.join("Images")).await.unwrap();
+        tokio::fs::write(mod_dir.join("Images").join("Icon.png"), b"png").await.unwrap();
+        tokio::fs::write(base.path().join("outside.png"), b"png").await.unwrap();
+
+        for written in ["Images/Icon.png", "images\\icon.PNG", ".\\Images\\Icon.png"] {
+            let got = resolve_mod_image_path(base.path(), &mod_dir, written).await;
+            assert_eq!(got, Some(mod_dir.join("Images").join("Icon.png")), "{written}");
+        }
+        assert_eq!(resolve_mod_image_path(base.path(), &mod_dir, "missing.png").await, None);
+        assert_eq!(resolve_mod_image_path(base.path(), &mod_dir, "Images").await, None, "a folder isn't an image");
+        // `..` is dropped by fix_path_casing, so this can't reach outside.png.
+        assert_eq!(resolve_mod_image_path(base.path(), &mod_dir, "../../outside.png").await, None);
+        // Only folders inside mods/ are answered for.
+        assert_eq!(resolve_mod_image_path(base.path(), base.path(), "outside.png").await, None);
+        assert_eq!(resolve_mod_image_path(base.path(), &base.path().join("mods"), "Cool Mod/Images/Icon.png").await, None);
     }
 }
