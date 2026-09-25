@@ -4,6 +4,8 @@ title: Home
 
 # Democracy Defender Mod Manager
 
+*Your mods. Your democracy. Defended.*
+
 **DDMM** is a source-neutral mod manager for **Helldivers 2**. It installs mods from an archive, a plain folder,
 or a direct download link, keeps track of where each mod came from, and deploys them into your game install with
 one click — without ever assuming, or requiring, a particular mod site.
@@ -13,9 +15,12 @@ one click — without ever assuming, or requiring, a particular mod site.
 
     No account on any mod site is ever required to use DDMM.
 
-DDMM is a rewrite and rebrand of [Helldivers 2 Mod Manager](https://github.com/teutinsa/Helldivers2ModManager) by
-teutinsa, built on [Tauri 2](https://tauri.app/) (a Rust backend with a SvelteKit frontend). See
-[Credits & license](about.md) for the full story.
+DDMM is built on [Tauri 2](https://tauri.app/) — a Rust backend with a SvelteKit frontend — and is free, open
+source software under Apache-2.0. See [Credits & license](about.md) for the full story of where it comes from.
+
+!!! tip "Made with love for the AyakaMods community ❤️"
+    AyakaMods is one of the best homes for Helldivers 2 modding, and it's DDMM's first-class citizen — no site
+    is more welcome here. [Visit AyakaMods →](https://ayakamods.com/games/helldivers-2.119/)
 
 ## Quick links
 
@@ -55,6 +60,16 @@ teutinsa, built on [Tauri 2](https://tauri.app/) (a Rust backend with a SvelteKi
 
 </div>
 
+## The DDMM Promise
+
+*Every Helldiver takes an oath. This one's ours.*
+
+- **Every mod is welcome.** DDMM will never block, blacklist, or rank mods or mod sites.
+- **No account, anywhere.** No mod site's login or credentials are ever asked for.
+- **Your files, your choice.** Your mods live in a folder you control.
+- **Open source, forever.** Apache-2.0, today and always.
+- **Updates on your terms.** Update checks run only when you click "Check for Updates" — never in the background.
+
 ## What makes DDMM source-neutral
 
 - **Any archive** (`.zip`, `.7z`, `.rar`) can be added regardless of where it came from.
@@ -69,5 +84,5 @@ teutinsa, built on [Tauri 2](https://tauri.app/) (a Rust backend with a SvelteKi
   archive came from.
 
 !!! warning "Release candidate"
-    DDMM is release-candidate software (currently versioned `2.0.0-rc.3`) — the first release candidate from this
-    community fork. Expect some rough edges, and please [report bugs](help/bugs.md) you run into.
+    DDMM is release-candidate software (currently versioned `2.0.0-rc.3`). Expect some rough edges, and please
+    [report bugs](help/bugs.md) you run into.

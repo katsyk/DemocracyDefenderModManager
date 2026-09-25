@@ -52,6 +52,9 @@ gets an "Open on &lt;site&gt;" menu entry afterward.
 
 ## AyakaMods
 
+Made with love for the AyakaMods community ❤️ — one of the best homes for Helldivers 2 modding, and DDMM's home
+turf. Go say hi: [ayakamods.com/games/helldivers-2](https://ayakamods.com/games/helldivers-2.119/).
+
 [AyakaMods](https://ayakamods.com) is a first-class, built-in `Provider` in DDMM: its page-URL shape
 (`https://ayakamods.com/mods/<slug>.<id>/` or `https://ayakamods.com/mods/<id>/`) is recognized directly, mod
 pages always use the browser handoff above, and [Check for updates](updates.md) reads the same page's published
