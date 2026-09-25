@@ -1484,7 +1484,7 @@
                                             </button>
                                         {/each}
                                     {/if}
-                                    {#if updatesFor(mod.guid).some(u => u.Status.Kind === "UpdateAvailable" || u.Status.Kind === "Skipped" || u.Status.Kind === "NeedsApiKey")}
+                                    {#if updatesFor(mod.guid).some(u => u.Status.Kind === "UpdateAvailable" || u.Status.Kind === "Skipped" || u.Status.Kind === "NeedsApiKey" || u.Status.Kind === "NeedsManualCheck")}
                                         <hr>
                                         {#each updatesFor(mod.guid).filter(u => u.Status.Kind === "UpdateAvailable") as entry}
                                             <button onclick={() => onUpdateEntry(entry)}>
@@ -1502,6 +1502,12 @@
                                                 <span>{t("pages.mods.unskip_version", { version: entry.LatestVersion ?? "" })}</span>
                                             </button>
                                         {/each}
+                                        {#if updatesFor(mod.guid).some(u => u.Status.Kind === "NeedsManualCheck")}
+                                            <button onclick={onCheckUpdates}>
+                                                <ArrowRepeat />
+                                                <span>{t("popup.updates.state.needs_manual_check")}</span>
+                                            </button>
+                                        {/if}
                                         {#if needsNexusKey(mod.guid)}
                                             <button onclick={() => goto("/settings#nexus-api-key")}>
                                                 <Key />
