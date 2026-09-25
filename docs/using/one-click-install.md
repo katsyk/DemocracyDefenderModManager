@@ -57,18 +57,22 @@ installation needs the AMO-signed version, which is coming soon.
 
 | Label | Meaning |
 | --- | --- |
-| Install with DDMM | Not installed yet -- click to install |
+| Install with DDMM | Not installed yet -- click to install. With the hint "DDMM will start", DDMM is closed: clicking starts it and installs in one go |
+| Starting DDMM... | DDMM is starting up for the install you clicked |
 | Installing... | Working on it |
 | Installed (check mark) | Already installed -- click to reinstall |
 | Update with DDMM | A newer version is available -- click to update |
-| Get DDMM | DDMM isn't reachable -- click for setup help |
+| Get DDMM | The extension can't find DDMM on this computer -- click for setup help |
+
+Just visiting a mod page never starts DDMM. Only clicking the button (or **Start DDMM** in the
+extension's popup) does.
 
 ### Troubleshooting
 
 **"DDMM not found" / the button always says "Get DDMM":** Open DDMM at least once so it can
 register itself with your browser, then in DDMM go to **Settings -> Browser integration -> Repair**.
-If that doesn't fix it, make sure DDMM is actually running (the extension talks to a running copy of
-DDMM, not just the installed app) and try again.
+"Get DDMM" means the browser couldn't find DDMM's browser integration at all. A DDMM that's
+installed but closed shows "Install with DDMM" with "DDMM will start" instead.
 
 **The button never appears on a mod page:** Make sure you're on an actual mod page (not a search or
 listing page), and that the extension is enabled for that site in your browser's extension settings.

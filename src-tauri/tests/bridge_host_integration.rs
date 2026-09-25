@@ -47,7 +47,9 @@ fn portable_copy_of_binary() -> (tempfile::TempDir, PathBuf) {
 #[cfg(unix)]
 fn dummy_launch_target(dir: &Path) -> PathBuf {
     let path = dir.join("dummy-launch.sh");
-    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+    // Leaves a marker next to itself so tests can tell whether the host
+    // tried to launch DDMM at all.
+    std::fs::write(&path, "#!/bin/sh\ntouch \"$(dirname \"$0\")/launched\"\nexit 0\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o755);
@@ -214,11 +216,11 @@ fn oversized_frame_is_rejected_without_desyncing_the_stream() {
 
 #[test]
 #[cfg(unix)]
-fn app_not_running_replies_with_error_after_the_configured_timeout() {
+fn install_launches_the_app_and_replies_app_not_running_after_the_configured_timeout() {
     let (dir, exe) = portable_copy_of_binary();
     // No bridge.json is written -- the host must fail to connect, "launch"
     // (the dummy, so no real desktop app starts), poll, time out, and
-    // reply APP_NOT_RUNNING to every request it's holding.
+    // reply APP_NOT_RUNNING.
     let dummy = dummy_launch_target(dir.path());
 
     let started = std::time::Instant::now();
@@ -232,7 +234,7 @@ fn app_not_running_replies_with_error_after_the_configured_timeout() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
 
-    write_frame(&mut stdin, br#"{"id":"1","type":"hello"}"#);
+    write_frame(&mut stdin, br#"{"id":"1","type":"install","file":"/nonexistent.zip"}"#);
     let reply = read_frame_json(&mut stdout);
     let elapsed = started.elapsed();
 
@@ -240,6 +242,40 @@ fn app_not_running_replies_with_error_after_the_configured_timeout() {
     assert_eq!(reply["ok"], false);
     assert_eq!(reply["error"]["code"], "APP_NOT_RUNNING");
     assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}, expected the short configured timeout to apply");
+    assert!(dir.path().join("launched").exists(), "install must launch DDMM");
+
+    drop(stdin);
+    let _ = child.wait_timeout_or_kill();
+}
+
+#[test]
+#[cfg(unix)]
+fn passive_requests_never_launch_the_app() {
+    let (dir, exe) = portable_copy_of_binary();
+    let dummy = dummy_launch_target(dir.path());
+
+    let started = std::time::Instant::now();
+    let mut child = spawn_host(
+        &exe,
+        &[
+            ("APPIMAGE", dummy.to_str().unwrap()),
+            // Long enough that a launch-and-poll would blow the time
+            // assertion below.
+            ("DDMM_BRIDGE_POLL_TIMEOUT_MS", "20000"),
+        ],
+    );
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    for (i, kind) in ["hello", "query", "status"].iter().enumerate() {
+        let msg = format!(r#"{{"id":"{i}","type":"{kind}","pageUrl":"https://ayakamods.com/mods/x.1/"}}"#);
+        write_frame(&mut stdin, msg.as_bytes());
+        let reply = read_frame_json(&mut stdout);
+        assert_eq!(reply["id"], i.to_string());
+        assert_eq!(reply["error"]["code"], "APP_NOT_RUNNING", "{kind}: {reply}");
+    }
+    assert!(started.elapsed() < Duration::from_secs(5), "passive requests must not wait for a launch");
+    assert!(!dir.path().join("launched").exists(), "browsing a mod page must never launch DDMM");
 
     drop(stdin);
     let _ = child.wait_timeout_or_kill();
@@ -283,9 +319,10 @@ fn launched_app_is_reaped_when_it_exits() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
 
-    write_frame(&mut stdin, br#"{"id":"1","type":"hello"}"#);
+    write_frame(&mut stdin, br#"{"id":"1","type":"open"}"#);
     let reply = read_frame_json(&mut stdout);
     assert_eq!(reply["error"]["code"], "APP_NOT_RUNNING");
+    assert!(dir.path().join("launched").exists());
 
     // The host is still alive (stdin open); its launched child must not be
     // left as a zombie.

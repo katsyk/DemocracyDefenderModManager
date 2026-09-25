@@ -101,6 +101,53 @@ describe('ProtocolClient', () => {
     await expect(promise).rejects.toMatchObject({ code: 'DISCONNECTED' });
   });
 
+  it('reports a missing native host as NATIVE_HOST_MISSING, not a plain disconnect', async () => {
+    for (const message of [
+      'Specified native messaging host not found.',
+      'Access to the specified native messaging host is forbidden.',
+      'No such native application io.github.katsyk.ddmm',
+    ]) {
+      port = new FakePort();
+      client = new ProtocolClient({ connectFn: () => port, idFn: () => String(++ids) });
+      const promise = client.hello({ extensionVersion: '1', browser: 'chrome' });
+      globalThis.DDMM.browserApi.runtime.lastError = { message };
+      port.simulateDisconnect();
+      globalThis.DDMM.browserApi.runtime.lastError = null;
+      await expect(promise).rejects.toMatchObject({ code: 'NATIVE_HOST_MISSING' });
+    }
+  });
+
+  it('keeps DISCONNECTED for a host that crashed or exited', async () => {
+    const promise = client.status();
+    globalThis.DDMM.browserApi.runtime.lastError = { message: 'Native host has exited.' };
+    port.simulateDisconnect();
+    globalThis.DDMM.browserApi.runtime.lastError = null;
+    await expect(promise).rejects.toMatchObject({ code: 'DISCONNECTED' });
+  });
+
+  it('open waits up to 60 s (it may be starting DDMM), longer than hello', async () => {
+    vi.useFakeTimers();
+    try {
+      const { OPEN_TIMEOUT_MS, DEFAULT_TIMEOUT_MS } = globalThis.DDMM.protocolConstants;
+      expect(OPEN_TIMEOUT_MS).toBeGreaterThanOrEqual(60_000);
+      expect(DEFAULT_TIMEOUT_MS).toBeLessThan(OPEN_TIMEOUT_MS);
+
+      let settled = false;
+      const promise = client.open().then(
+        (v) => { settled = true; return v; },
+        (e) => { settled = true; throw e; },
+      );
+      expect(port.sent).toEqual([{ id: '1', type: 'open' }]);
+      vi.advanceTimersByTime(45_000);
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      port.reply({ id: '1', ok: true, type: 'opened' });
+      await expect(promise).resolves.toMatchObject({ type: 'opened' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('reconnects lazily on the next send after a disconnect', async () => {
     const ports = [port, new FakePort()];
     let call = 0;

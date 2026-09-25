@@ -230,7 +230,12 @@
     }
 
     const state = new DDMM_NS.ButtonState();
-    widget.render(state);
+    /** Render the state, including its own hint ("DDMM will start"). */
+    function render() {
+      widget.render(state);
+      widget.setHint(state.hint);
+    }
+    render();
 
     const pageVersion = adapter.scrapeVersion ? adapter.scrapeVersion(document) : null;
 
@@ -239,20 +244,34 @@
       return DDMM_NS.browserApi.runtime.sendMessage(message);
     }
 
+    /**
+     * Label the button from DDMM's current state. Only ever *checks* --
+     * hello/query never start DDMM (the host launches it only for
+     * install/open), so merely browsing a mod page can't pop DDMM open.
+     */
     async function refresh() {
       const hello = await send({ type: 'ddmm:hello' });
+      // An install the user already clicked owns the button until its
+      // result arrives; a late check must not overwrite that.
+      if (state.busy) return;
       if (!hello || !hello.ok) {
-        state.setUnreachable();
-        widget.render(state);
+        const code = hello && hello.error && hello.error.code;
+        if (code === 'NATIVE_HOST_MISSING') {
+          state.setUnreachable();
+        } else {
+          state.setAppNotRunning();
+        }
+        render();
         return;
       }
       const result = await send({ type: 'ddmm:query', pageUrl: location.href, pageVersion });
+      if (state.busy) return;
       if (result && result.ok) {
         state.setQueryResult(result);
       } else {
-        state.setUnreachable();
+        state.setAppNotRunning();
       }
-      widget.render(state);
+      render();
     }
 
     widget.onClick(async () => {
@@ -263,8 +282,7 @@
       if (!state.clickable) return;
 
       state.startInstalling();
-      widget.render(state);
-      widget.setHint(null);
+      render();
 
       const directUrl = adapter.findDirectDownloadUrl ? adapter.findDirectDownloadUrl(document) : null;
       if (directUrl) {
@@ -286,16 +304,17 @@
     DDMM_NS.browserApi.runtime.onMessage.addListener((message) => {
       if (!message) return;
       if (message.type === 'ddmm:installResult') {
-        widget.setHint(null);
         if (message.reply && message.reply.ok) {
           state.setInstalled();
         } else {
           const err = message.reply && message.reply.error;
           state.setError(DDMM_NS.errors.describeError(err && err.code, err && err.message));
         }
-        widget.render(state);
+        render();
       } else if (message.type === 'ddmm:captureExpired' && message.site === adapter.name) {
-        widget.setHint(null);
+        // The armed install never happened; release the button and re-check.
+        state.reset();
+        render();
         refresh();
       }
     });

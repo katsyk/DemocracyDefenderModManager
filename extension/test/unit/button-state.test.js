@@ -72,4 +72,36 @@ describe('ButtonState', () => {
     s.reset();
     expect(s.state).toBe('checking');
   });
+
+  it('DDMM not running -> still "Install with DDMM", with the "DDMM will start" hint', () => {
+    const s = new ButtonState();
+    s.setAppNotRunning();
+    expect(s.label).toBe('Install with DDMM');
+    expect(s.hint).toBe('DDMM will start');
+    expect(s.clickable).toBe(true);
+    expect(s.updateAvailable).toBe(false);
+  });
+
+  it('clicking while DDMM is not running -> "Starting DDMM…", not clickable, busy', () => {
+    const s = new ButtonState();
+    s.setAppNotRunning();
+    s.startInstalling();
+    expect(s.state).toBe('starting');
+    expect(s.label).toBe('Starting DDMM…');
+    expect(s.clickable).toBe(false);
+    expect(s.busy).toBe(true);
+    expect(s.hint).toBeNull();
+    s.setInstalled();
+    expect(s.label).toBe('Installed ✓');
+    expect(s.appRunning).toBe(true);
+  });
+
+  it('clicking while DDMM is running -> "Installing…" and no hint', () => {
+    const s = new ButtonState();
+    s.setQueryResult({ installed: false, updateAvailable: null });
+    expect(s.hint).toBeNull();
+    s.startInstalling();
+    expect(s.label).toBe('Installing…');
+    expect(s.busy).toBe(true);
+  });
 });

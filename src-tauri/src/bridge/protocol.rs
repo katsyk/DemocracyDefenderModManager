@@ -99,6 +99,15 @@ pub struct HelloReply {
     pub game_found: bool,
 }
 
+/// Reply to `open`.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenedReply {
+    pub id: String,
+    pub ok: bool,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallRequest {
@@ -303,6 +312,12 @@ mod tests {
         let value = serde_json::to_value(&reply).unwrap();
         assert_eq!(value["mod"]["installedVersion"], "1.0");
         assert!(value["mod"].get("installed_version").is_none());
+    }
+
+    #[test]
+    fn opened_reply_shape() {
+        let value = serde_json::to_value(OpenedReply { id: "9".to_string(), ok: true, kind: "opened" }).unwrap();
+        assert_eq!(value, serde_json::json!({ "id": "9", "ok": true, "type": "opened" }));
     }
 
     #[test]

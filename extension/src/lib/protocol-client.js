@@ -3,8 +3,9 @@
  *
  * Implements the request/reply framing from docs/development/bridge-protocol.md:
  * every request carries a string `id`, every reply echoes it; requests
- * time out client-side (installs get 5 minutes, everything else 10 seconds,
- * per the spec); the port reconnects on disconnect; and installs are
+ * time out client-side (installs get 5 minutes, `open` 60 seconds since it
+ * may be starting DDMM, everything else 10 seconds, per the spec); the port
+ * reconnects on disconnect; and installs are
  * serialized (one in flight at a time), matching the app's own
  * serialization so a burst of clicks can't race it.
  */
@@ -16,6 +17,23 @@
   const HOST_NAME = 'io.github.katsyk.ddmm';
   const INSTALL_TIMEOUT_MS = 5 * 60 * 1000;
   const DEFAULT_TIMEOUT_MS = 10 * 1000;
+  /** `open` may start DDMM; the host waits up to 45 s for it to come up. */
+  const OPEN_TIMEOUT_MS = 60 * 1000;
+
+  /**
+   * Browser `lastError` messages meaning the native host itself is missing
+   * or unusable (DDMM not installed, or its manifest doesn't allow this
+   * extension) -- as opposed to DDMM merely not running, which the host
+   * reports as APP_NOT_RUNNING. Chrome: "Specified native messaging host
+   * not found." / "Access to the specified native messaging host is
+   * forbidden."; Firefox: "No such native application io.github.katsyk.ddmm".
+   */
+  const HOST_MISSING_PATTERN = /not found|forbidden|no such native application/i;
+
+  /** @param {string} reason @returns {string} The error code for a port disconnect. */
+  function disconnectCode(reason) {
+    return HOST_MISSING_PATTERN.test(reason || '') ? 'NATIVE_HOST_MISSING' : 'DISCONNECTED';
+  }
 
   /**
    * @typedef {object} PendingRequest
@@ -77,9 +95,10 @@
       this._port = null;
       const err = DDMM.browserApi.runtime.lastError;
       const reason = err && err.message ? err.message : 'DDMM disconnected';
+      const code = disconnectCode(reason);
       for (const [id, pending] of this._pending) {
         clearTimeout(pending.timer);
-        pending.reject(Object.assign(new Error(reason), { code: 'DISCONNECTED' }));
+        pending.reject(Object.assign(new Error(reason), { code }));
         this._pending.delete(id);
       }
       // Reconnection happens lazily on the next send() call, per the "host
@@ -132,6 +151,16 @@
       return this.send({ type: 'query', ...params }, DEFAULT_TIMEOUT_MS);
     }
 
+    /**
+     * `open` -- bring DDMM to the front, starting it if it isn't running
+     * (the popup's "Start DDMM" button). One of only two requests that may
+     * launch DDMM; see bridge-protocol.md.
+     * @returns {Promise<object>}
+     */
+    open() {
+      return this.send({ type: 'open' }, OPEN_TIMEOUT_MS);
+    }
+
     /** `status` -- current app/game/profile status. @returns {Promise<object>} */
     status() {
       return this.send({ type: 'status' }, DEFAULT_TIMEOUT_MS);
@@ -170,5 +199,6 @@
   }
 
   DDMM.ProtocolClient = ProtocolClient;
-  DDMM.protocolConstants = { HOST_NAME, INSTALL_TIMEOUT_MS, DEFAULT_TIMEOUT_MS };
+  DDMM.protocolConstants = { HOST_NAME, INSTALL_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, OPEN_TIMEOUT_MS };
+  DDMM.protocolDisconnectCode = disconnectCode;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

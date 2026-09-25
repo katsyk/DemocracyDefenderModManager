@@ -69,14 +69,36 @@ The host resolves the data folder with the **same logic as the app** (portable m
 connects, and sends `{"hello": "<token>"}` followed by a newline. The app replies `{"ok": true}` and closes the connection
 on a wrong token. After that, both sides exchange **newline-delimited JSON** (one object per line).
 
-If `bridge.json` is missing, stale (connection refused), or its `pid` is gone, the host **starts DDMM normally** (a
-detached process, so the GUI appears) and polls for a fresh `bridge.json` for up to 20 s before replying with the
-error `APP_NOT_RUNNING`.
+If `bridge.json` is missing, stale (connection refused), or its `pid` is gone, DDMM isn't running. What happens next
+depends on the request:
+
+- **`install` and `open` may start DDMM.** Both are explicit user actions (a click on "Install with DDMM", or
+  "Start DDMM" in the extension popup). The host **starts DDMM normally** (a detached process, so the GUI appears) and
+  polls for a fresh `bridge.json` for up to **45 s** before replying with `APP_NOT_RUNNING`. It won't launch DDMM again
+  within 60 s of a previous launch, so a slow start isn't turned into several.
+- **`hello`, `query` and `status` never start DDMM.** The extension sends them just because a mod page loaded, and
+  browsing a mod site must never pop DDMM open. When DDMM isn't running they get `APP_NOT_RUNNING` **immediately**:
+  no launch, no polling.
 
 The browser can keep one host process alive for much longer than one DDMM session. The host therefore checks the
 connection before relaying each request and, if DDMM has exited since, reconnects the same way (reading a fresh
-`bridge.json`, starting DDMM if needed). It never resends a request the app may already have received; a connection
-lost mid-request gets `APP_NOT_RUNNING` for that request only.
+`bridge.json`, and starting DDMM only for `install`/`open`). It never resends a request the app may already have
+received; a connection lost mid-request gets `APP_NOT_RUNNING` for that request only.
+
+### Client-side timeouts (extension)
+
+| Request | Timeout | Why |
+| --- | --- | --- |
+| `hello`, `query`, `status` | 10 s | Never launch DDMM, so they answer quickly either way |
+| `open` | 60 s | May be starting DDMM (host waits up to 45 s) |
+| `install` | 5 min | May be starting DDMM, then the user may still be answering the consent prompt |
+
+The extension tells two failures apart. If the **native host itself** can't be started (the browser disconnects
+with "native messaging host not found" / "forbidden", meaning DDMM isn't installed or isn't set up for this
+browser), the button reads **Get DDMM** and links to the install docs. If the host answers but DDMM isn't running
+(`APP_NOT_RUNNING`), the button still reads **Install with DDMM** with the hint "DDMM will start". Clicking it sends
+the install, which starts DDMM, and shows **Starting DDMM…** until the result arrives. In that state the extension
+doesn't know whether the mod is installed, and never guesses.
 
 ## Messages
 
@@ -152,6 +174,16 @@ Reply:
 ```
 Reply: `{ "id": "4", "ok": true, "type": "status", "gameFound": true, "activeProfile": "Default", "modCount": 12, "busy": false }`
 
+### `open`
+
+Brings DDMM's window to the front, starting DDMM first if it isn't running (the popup's "Start DDMM" button). It
+installs nothing, so there is no consent prompt; the origin allowlist still applies.
+
+```json
+{ "id": "5", "type": "open" }
+```
+Reply: `{ "id": "5", "ok": true, "type": "opened" }`
+
 ### Errors
 
 ```json
@@ -160,7 +192,7 @@ Reply: `{ "id": "4", "ok": true, "type": "status", "gameFound": true, "activePro
 
 | Code | Meaning |
 | --- | --- |
-| `APP_NOT_RUNNING` | Host couldn't start or reach DDMM |
+| `APP_NOT_RUNNING` | DDMM isn't running (`hello`/`query`/`status`), or the host couldn't start or reach it within 45 s (`install`/`open`) |
 | `BAD_REQUEST` | Malformed message / missing field / message too large |
 | `UNSUPPORTED` | Unknown message type or protocol version |
 | `FORBIDDEN_ORIGIN` | Caller isn't an allowed extension |

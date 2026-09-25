@@ -101,6 +101,20 @@ async fn try_connect(base_path: &Path) -> Option<TcpStream> {
     }
 }
 
+/// How long to wait for a freshly launched DDMM to write `bridge.json`.
+/// Generous on purpose: a cold start on a busy machine (first launch after
+/// boot, antivirus scanning the exe, WebView2 warming up) can take tens of
+/// seconds, and giving up early turns the user's one click into two.
+pub const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Only these request types may start DDMM when it isn't running: both are
+/// explicit user actions (an install the user clicked for, or "Start DDMM"
+/// in the extension popup). `hello`/`query`/`status` are sent just by
+/// browsing a mod page, and browsing must never pop DDMM open.
+pub fn may_launch_app(request_type: &str) -> bool {
+    matches!(request_type, "install" | "open")
+}
+
 /// Don't launch DDMM again within this long of the last launch: a slow
 /// start (it can take longer than the poll timeout on a busy machine) must
 /// not turn every retry into yet another launch.
@@ -191,14 +205,14 @@ fn extract_id(data: &[u8]) -> String {
 
 /// How long to poll for `bridge.json` after launching DDMM, if it wasn't
 /// already running. Overridable via `DDMM_BRIDGE_POLL_TIMEOUT_MS` so the
-/// integration test doesn't have to wait 20 real seconds to see
+/// integration test doesn't have to wait 45 real seconds to see
 /// `APP_NOT_RUNNING`.
 pub fn poll_timeout() -> Duration {
     std::env::var("DDMM_BRIDGE_POLL_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(20))
+        .unwrap_or(DEFAULT_POLL_TIMEOUT)
 }
 
 type AppConnection = (BufReader<OwnedReadHalf>, OwnedWriteHalf);
@@ -225,19 +239,19 @@ fn connection_alive(conn: &mut AppConnection) -> bool {
 ///
 /// The browser keeps this process (and its port) alive for as long as the
 /// extension holds the connection, which can far outlive one DDMM session.
-/// So losing the app is not fatal here: the next request reconnects --
-/// starting DDMM again if it isn't running, exactly as on first contact --
-/// instead of failing with `APP_NOT_RUNNING` because the user closed DDMM
-/// at some point since the browser first launched the host.
+/// So losing the app is not fatal here: the next request reconnects to a
+/// fresh `bridge.json` instead of failing with `APP_NOT_RUNNING` because
+/// the user closed DDMM at some point since the browser launched the host.
+/// If DDMM isn't running at all, only `install`/`open` start it (see
+/// `may_launch_app`); everything else gets `APP_NOT_RUNNING` right away.
 pub async fn run(origin: HostOrigin, base_path: PathBuf) {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
 
     let mut launcher = Launcher::default();
-    let mut conn = launcher
-        .ensure_app_running_and_connect(&base_path, poll_timeout())
-        .await
-        .map(split_connection);
+    // Connect to an already-running DDMM only; launching waits for a
+    // request that's allowed to (see `may_launch_app`).
+    let mut conn = try_connect(&base_path).await.map(split_connection);
 
     loop {
         let data = match read_frame(&mut stdin, MAX_MESSAGE_BYTES).await {
@@ -271,15 +285,23 @@ pub async fn run(origin: HostOrigin, base_path: PathBuf) {
 
         // Only (re)connect *before* sending: a request is never resent
         // after the app may already have received it.
+        let request_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let may_launch = may_launch_app(request_type);
         if !conn.as_mut().is_some_and(connection_alive) {
-            conn = launcher
-                .ensure_app_running_and_connect(&base_path, poll_timeout())
-                .await
-                .map(split_connection);
+            let stream = if may_launch {
+                launcher.ensure_app_running_and_connect(&base_path, poll_timeout()).await
+            } else {
+                try_connect(&base_path).await
+            };
+            conn = stream.map(split_connection);
         }
         let Some((app_reader, app_write)) = conn.as_mut() else {
-            let reply =
-                ErrorReply::new(extract_id(&data), ErrorCode::AppNotRunning, "Host couldn't start or reach DDMM").to_line();
+            let message = if may_launch {
+                "Host couldn't start or reach DDMM"
+            } else {
+                "DDMM isn't running"
+            };
+            let reply = ErrorReply::new(extract_id(&data), ErrorCode::AppNotRunning, message).to_line();
             let _ = write_frame(&mut stdout, reply.as_bytes()).await;
             continue;
         };
@@ -311,6 +333,15 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn only_explicit_user_actions_may_launch_the_app() {
+        assert!(may_launch_app("install"));
+        assert!(may_launch_app("open"));
+        for passive in ["hello", "query", "status", "bogus", ""] {
+            assert!(!may_launch_app(passive), "{passive} must not launch DDMM");
+        }
     }
 
     #[test]
@@ -428,13 +459,13 @@ mod tests {
     static POLL_TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn poll_timeout_defaults_to_20s_without_env_var() {
+    fn poll_timeout_defaults_to_45s_without_env_var() {
         let _guard = POLL_TIMEOUT_ENV_LOCK.lock().unwrap();
         // SAFETY: serialized against the other env-mutating test above by
         // POLL_TIMEOUT_ENV_LOCK; no other test in this crate touches this
         // var.
         unsafe { std::env::remove_var("DDMM_BRIDGE_POLL_TIMEOUT_MS") };
-        assert_eq!(poll_timeout(), Duration::from_secs(20));
+        assert_eq!(poll_timeout(), Duration::from_secs(45));
     }
 
     #[test]

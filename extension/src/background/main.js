@@ -49,14 +49,26 @@
   // ---------------------------------------------------------------------
 
   /**
-   * @returns {Promise<{ok: boolean, appVersion?: string, error?: string}>}
+   * Turns a thrown client error (timeout, port disconnect, host missing)
+   * into the same `{ok: false, error: {code, message}}` shape as an error
+   * reply, so callers only handle one shape.
+   * @param {unknown} e
+   * @returns {{ok: false, error: {code: string, message: string}}}
+   */
+  function errorReply(e) {
+    return { ok: false, error: { code: (e && e.code) || 'INTERNAL', message: (e && e.message) || '' } };
+  }
+
+  /**
+   * Never starts DDMM (the host only launches it for `install`/`open`), so
+   * it's safe to call just because a mod page loaded.
+   * @returns {Promise<object>} The hello reply, or an error reply.
    */
   async function tryHello() {
     try {
-      const reply = await client.hello({ extensionVersion: EXTENSION_VERSION, browser: BROWSER_NAME });
-      return reply;
+      return await client.hello({ extensionVersion: EXTENSION_VERSION, browser: BROWSER_NAME });
     } catch (e) {
-      return { ok: false, error: e && e.message };
+      return errorReply(e);
     }
   }
 
@@ -275,7 +287,7 @@
         try {
           return await client.query({ pageUrl: message.pageUrl, pageVersion: message.pageVersion ?? null });
         } catch (e) {
-          return { ok: false, error: { code: (e && e.code) || 'INTERNAL', message: e && e.message } };
+          return errorReply(e);
         }
       }
 
@@ -283,7 +295,17 @@
         try {
           return await client.status();
         } catch (e) {
-          return { ok: false, error: { code: (e && e.code) || 'INTERNAL', message: e && e.message } };
+          return errorReply(e);
+        }
+      }
+
+      // The popup's "Start DDMM" button: an explicit user action, so it may
+      // launch DDMM (see bridge-protocol.md).
+      case 'ddmm:open': {
+        try {
+          return await client.open();
+        } catch (e) {
+          return errorReply(e);
         }
       }
 

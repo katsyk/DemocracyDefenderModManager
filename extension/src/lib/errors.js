@@ -11,8 +11,8 @@
 
   /** @type {Record<string, string>} */
   const ERROR_MESSAGES = {
-    APP_NOT_RUNNING:
-      "DDMM couldn't be reached. Make sure DDMM is installed, then try again.",
+    APP_NOT_RUNNING: "DDMM didn't start in time. Open DDMM, then try again.",
+    NATIVE_HOST_MISSING: "DDMM isn't installed (or isn't set up for this browser). Get DDMM, then try again.",
     BAD_REQUEST: 'DDMM rejected that request as malformed. This is a DDMM extension bug -- please report it.',
     UNSUPPORTED: 'This version of the DDMM extension is too old (or too new) for your DDMM app. Try updating one of them.',
     FORBIDDEN_ORIGIN: "DDMM didn't recognize this browser extension. Try reinstalling the DDMM extension.",

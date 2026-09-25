@@ -4,8 +4,14 @@
  *
  * States and their labels (see the top-level task spec):
  *   - `checking`     -> "Checking DDMM…"
- *   - `unreachable`  -> "Get DDMM" (links to the docs install page)
- *   - `install`      -> "Install with DDMM"
+ *   - `unreachable`  -> "Get DDMM" (links to the docs install page) -- only
+ *                       when the native host itself is missing, never just
+ *                       because DDMM isn't running
+ *   - `install`      -> "Install with DDMM" (also when DDMM isn't running:
+ *                       then with the hint "DDMM will start", since
+ *                       clicking starts it)
+ *   - `starting`     -> "Starting DDMM…" (clicked while DDMM wasn't running;
+ *                       the install launches it)
  *   - `installed`    -> "Installed ✓" (click -> reinstall/open)
  *   - `update`       -> "Update with DDMM"
  *   - `installing`   -> "Installing…"
@@ -24,7 +30,11 @@
     installed: 'Installed ✓',
     update: 'Update with DDMM',
     installing: 'Installing…',
+    starting: 'Starting DDMM…',
   };
+
+  /** Shown under "Install with DDMM" when DDMM isn't running. */
+  const NOT_RUNNING_HINT = 'DDMM will start';
 
   /** Finite state machine for one button instance. Framework-agnostic. */
   class ButtonState {
@@ -35,6 +45,17 @@
       this.errorMessage = null;
       /** @type {boolean} */
       this.updateAvailable = false;
+      /**
+       * Whether DDMM answered the last check. When it didn't, installed /
+       * update status is unknown and never guessed.
+       * @type {boolean}
+       */
+      this.appRunning = true;
+    }
+
+    /** @returns {string|null} A hint to show under the button, if any. */
+    get hint() {
+      return this.state === 'install' && !this.appRunning ? NOT_RUNNING_HINT : null;
     }
 
     /** @returns {string} The current label to render. */
@@ -45,7 +66,7 @@
 
     /** @returns {boolean} Whether the button should currently accept clicks. */
     get clickable() {
-      return this.state !== 'installing' && this.state !== 'checking';
+      return this.state !== 'installing' && this.state !== 'checking' && this.state !== 'starting';
     }
 
     /** DDMM isn't reachable -> "Get DDMM". */
@@ -55,11 +76,24 @@
     }
 
     /**
+     * The native host answered but DDMM isn't running (APP_NOT_RUNNING, or
+     * it didn't answer in time). Still installable -- the install starts
+     * DDMM -- but whether this mod is installed is unknown, so don't guess.
+     */
+    setAppNotRunning() {
+      this.state = 'install';
+      this.errorMessage = null;
+      this.updateAvailable = false;
+      this.appRunning = false;
+    }
+
+    /**
      * Apply a `queryResult` reply.
      * @param {{installed: boolean, updateAvailable: boolean|null}} result
      */
     setQueryResult(result) {
       this.errorMessage = null;
+      this.appRunning = true;
       if (result && result.installed) {
         this.updateAvailable = Boolean(result.updateAvailable);
         this.state = this.updateAvailable ? 'update' : 'installed';
@@ -69,14 +103,23 @@
       }
     }
 
-    /** Transition to the mid-flight "Installing…" state. */
+    /**
+     * Transition to the mid-flight state: "Installing…", or "Starting DDMM…"
+     * when DDMM wasn't running and this install is what launches it.
+     */
     startInstalling() {
-      this.state = 'installing';
+      this.state = this.appRunning ? 'installing' : 'starting';
       this.errorMessage = null;
+    }
+
+    /** @returns {boolean} Whether an install is in flight. */
+    get busy() {
+      return this.state === 'installing' || this.state === 'starting';
     }
 
     /** Install (or reinstall/update) finished successfully. */
     setInstalled() {
+      this.appRunning = true;
       this.state = 'installed';
       this.errorMessage = null;
       this.updateAvailable = false;
@@ -97,9 +140,11 @@
       this.state = 'checking';
       this.errorMessage = null;
       this.updateAvailable = false;
+      this.appRunning = true;
     }
   }
 
   DDMM.ButtonState = ButtonState;
   DDMM.buttonLabels = LABELS;
+  DDMM.buttonHints = { NOT_RUNNING_HINT };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

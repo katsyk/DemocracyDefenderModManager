@@ -135,6 +135,7 @@ async fn dispatch(app: &AppHandle, line: &str) -> String {
         "install" => handle_install_queued(app, raw, id).await,
         "query" => handle_query(app, raw, id).await,
         "status" => handle_status(app, id).await,
+        "open" => handle_open(app, id),
         other => ErrorReply::new(id, ErrorCode::Unsupported, format!("unknown message type \"{other}\"")).to_line(),
     }
 }
@@ -161,6 +162,14 @@ async fn handle_hello(app: &AppHandle, id: String) -> String {
         game_found,
     };
     serde_json::to_string(&reply).unwrap()
+}
+
+/// `open`: bring DDMM's window to the front (the extension popup's "Start
+/// DDMM" button). Installs nothing, so no consent prompt; the origin
+/// allowlist above still applies.
+fn handle_open(app: &AppHandle, id: String) -> String {
+    focus_main_window(app);
+    serde_json::to_string(&OpenedReply { id, ok: true, kind: "opened" }).unwrap()
 }
 
 async fn handle_status(app: &AppHandle, id: String) -> String {
