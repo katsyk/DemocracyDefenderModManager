@@ -150,7 +150,7 @@ fn has_supported_archive_extension(filename: &str) -> bool {
     lower.ends_with(".zip") || lower.ends_with(".7z") || lower.ends_with(".rar")
 }
 
-fn sniff_archive_extension(header: &[u8]) -> Option<&'static str> {
+pub(crate) fn sniff_archive_extension(header: &[u8]) -> Option<&'static str> {
     if header.starts_with(b"PK\x03\x04") {
         Some("zip")
     } else if header.starts_with(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]) {

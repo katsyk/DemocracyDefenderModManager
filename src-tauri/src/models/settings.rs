@@ -45,7 +45,26 @@ pub enum Settings {
         /// fills in the OS default if it comes back empty.
         #[serde(default)]
         downloads_path: PathBuf,
+        /// What a one-click browser install does after the mod lands:
+        /// `"library"`, `"profile"`, or `"deploy"` (the default -- so a
+        /// browser install really is one click end to end).
+        #[serde(default = "default_after_browser_install")]
+        after_browser_install: String,
+        /// Registrable domains (see `bridge::allowlist::registrable_domain`)
+        /// the user chose "Always allow" for when the bridge asked to
+        /// install from them. Revocable in Settings.
+        #[serde(default)]
+        bridge_allowed_sites: Vec<String>,
+        /// Opt-in: watch `downloads_path` while DDMM is running and offer
+        /// to install any new archive that looks like a Helldivers 2 mod.
+        /// Off by default -- never installs without a click either way.
+        #[serde(default)]
+        auto_import_enabled: bool,
     }
+}
+
+fn default_after_browser_install() -> String {
+    "deploy".to_string()
 }
 
 impl Settings {
@@ -103,6 +122,58 @@ impl Settings {
     pub fn set_downloads_path(&mut self, path: PathBuf) {
         match self {
             Settings::V1 { downloads_path, .. } => *downloads_path = path,
+        }
+    }
+
+    pub fn after_browser_install(&self) -> &str {
+        match self {
+            Settings::V1 { after_browser_install, .. } => after_browser_install.as_str(),
+        }
+    }
+
+    pub fn set_after_browser_install(&mut self, value: String) {
+        match self {
+            Settings::V1 { after_browser_install, .. } => *after_browser_install = value,
+        }
+    }
+
+    pub fn bridge_allowed_sites(&self) -> &[String] {
+        match self {
+            Settings::V1 { bridge_allowed_sites, .. } => bridge_allowed_sites.as_slice(),
+        }
+    }
+
+    pub fn is_bridge_site_allowed(&self, registrable_domain: &str) -> bool {
+        self.bridge_allowed_sites().iter().any(|s| s == registrable_domain)
+    }
+
+    pub fn allow_bridge_site(&mut self, registrable_domain: String) {
+        match self {
+            Settings::V1 { bridge_allowed_sites, .. } => {
+                if !bridge_allowed_sites.contains(&registrable_domain) {
+                    bridge_allowed_sites.push(registrable_domain);
+                }
+            }
+        }
+    }
+
+    pub fn revoke_bridge_site(&mut self, registrable_domain: &str) {
+        match self {
+            Settings::V1 { bridge_allowed_sites, .. } => {
+                bridge_allowed_sites.retain(|s| s != registrable_domain);
+            }
+        }
+    }
+
+    pub fn auto_import_enabled(&self) -> bool {
+        match self {
+            Settings::V1 { auto_import_enabled, .. } => *auto_import_enabled,
+        }
+    }
+
+    pub fn set_auto_import_enabled(&mut self, value: bool) {
+        match self {
+            Settings::V1 { auto_import_enabled, .. } => *auto_import_enabled = value,
         }
     }
 

@@ -73,6 +73,14 @@ impl Mod {
         }
     }
 
+    pub fn name(&self) -> &str {
+        match &self.manifest {
+            Manifest::Legacy(m) => &m.name,
+            Manifest::V1(m) => &m.name,
+            Manifest::V2(m) => &m.name,
+        }
+    }
+
     /// (Re)compute [`Mod::sources`] from the manifest's declared sources,
     /// its legacy `NexusData` (if any), and the `.hd2mm-origin.json`
     /// sidecar (if the manager recorded one when this mod was installed).
