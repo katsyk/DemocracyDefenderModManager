@@ -189,19 +189,16 @@ one works, add it to the `Exec=` line of your menu entry, or put it in a small l
 
 ## Steam installed as a Flatpak
 
-DDMM finds Helldivers 2 in the Flatpak Steam location
-(`~/.var/app/com.valvesoftware.Steam/.local/share/Steam`) as well as the usual `~/.steam/steam` and
-`~/.local/share/Steam`, including extra Steam libraries on other drives. Run DDMM itself natively (from the
-`.rpm`, `.deb`, tar.gz or AppImage), not inside the Steam Flatpak.
-
-If your game lives on a drive that Flatpak Steam was given access to but DDMM doesn't detect it, set the folder
-yourself in **Settings**. It's the one that contains `bin/`, `data/` and `tools/`. See
-[First-time setup](setup.md).
+DDMM's auto-detect also looks in the Flatpak (and Snap) Steam locations and in every extra Steam library, so
+Flatpak Steam needs nothing special. Run DDMM itself natively (from the `.rpm`, `.deb`, tar.gz or AppImage), not
+inside the Steam Flatpak. The exact game path for each kind of Steam install, and what to do when DDMM says the
+path is invalid, are in
+[Troubleshooting → Linux](../help/troubleshooting.md#game-path-is-invalid-even-though-the-path-is-right).
 
 ## Seeing errors: run it from a terminal
 
 If DDMM doesn't start, or starts and closes, run it from a terminal. The terminal shows the same output as the
-[log file](../help/logs.md), plus any error from the system before DDMM's own logging starts (a missing library,
+log file ([where it is on Linux](../help/troubleshooting.md#where-the-log-is-on-linux)), plus any error from the system before DDMM's own logging starts (a missing library,
 for example):
 
 ```sh
