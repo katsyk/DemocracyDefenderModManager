@@ -1,423 +1,1014 @@
-//! Update checks -- only ever run when the user explicitly asks (there is
-//! no background polling, no check at startup). Supports the providers
-//! that expose a way to check without an API key: AyakaMods (scrapes the
-//! JSON-LD `SoftwareApplication` block already on every mod page) and
-//! GitHub (the public releases API). Nexus Mods requires a personal API
-//! key this manager doesn't ask for, so it reports "unsupported" rather
-//! than guessing or erroring.
+//! Mod update checks and one-click updates.
+//!
+//! **Update checks never run unless the user asks**: either by clicking
+//! "Check for Updates", or by turning on "Check for mod updates when DDMM
+//! starts" (and optionally "then every N hours while open") in Settings --
+//! both off by default. See [`spawn_auto_check`].
+//!
+//! Sites checked (see `crate::providers`): AyakaMods (page JSON-LD),
+//! GitHub (latest release), GameBanana (apiv11), ModWorkshop (public API),
+//! and Nexus Mods -- only with the user's own optional API key; without
+//! one, Nexus mods report "needs a Nexus API key (optional)".
+//!
+//! Updating: sites that serve the new file publicly (GitHub release
+//! assets, GameBanana, ModWorkshop) can be updated in place with one click
+//! ([`update_mod_direct`]). Everything else (AyakaMods, Nexus, anything
+//! login-gated) goes through the user's browser -- the extension's "Update
+//! with DDMM" button, or the Downloads-folder handoff.
 
-use std::{collections::HashMap, time::Duration};
+use std::{path::Path, time::Duration};
 
 use anyhow_tauri::{IntoTAResult, TAResult};
-use futures::StreamExt;
-use serde::Serialize;
-use tauri::State;
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
-use crate::{sources, sources::ResolvedSource, AppState};
+use crate::{
+    commands::{
+        mods::{ensure_mods_loaded, install_update_from_archive, InstalledMod},
+        settings::do_load_settings,
+    },
+    models::{manifest::Source, Mod},
+    providers::{
+        self, ayakamods, compare_versions, file_shape, gamebanana, github, modworkshop,
+        nexus::{self, NexusClient, NexusError},
+        Pacer, UpdateFile, VersionRelation,
+    },
+    secrets,
+    sources::{self, InstalledFile, SourceOrigin},
+    AppState,
+};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_PAGE_SIZE: u64 = 5 * 1024 * 1024;
+/// Minimum gap between two requests to the same keyless site.
 const SAME_HOST_DELAY: Duration = Duration::from_secs(1);
 
-/// Providers this manager knows how to check for updates. Anything else is
-/// skipped entirely (no entry produced) rather than reported as
-/// unsupported -- "unsupported" is reserved for providers users would
-/// reasonably expect update checking from (Nexus) but that need
-/// credentials this manager doesn't collect.
-const CHECKABLE_PROVIDERS: [&str; 3] = ["ayakamods", "github", "nexus"];
+/// Providers this manager knows how to check. Anything else is skipped
+/// entirely (no entry produced).
+const CHECKABLE_PROVIDERS: [&str; 5] = ["ayakamods", "github", "gamebanana", "modworkshop", "nexus"];
+/// Providers whose new files DDMM may download itself (public, keyless).
+const DIRECT_PROVIDERS: [&str; 3] = ["github", "gamebanana", "modworkshop"];
 
-#[derive(Debug, Clone, Serialize)]
+pub const CHECKED_EVENT: &str = "updates://checked";
+pub const PROGRESS_EVENT: &str = "updates://progress";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct UpdateStatusEntry {
     pub guid: Uuid,
     pub provider: String,
     pub display_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub installed_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_version: Option<String>,
+    /// The newer file's title, for sites with several files per mod.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_file_name: Option<String>,
     pub status: UpdateState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_url: Option<String>,
+    /// How this update would be installed (only set when one is available
+    /// or skipped).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<UpdateMethod>,
+    /// Direct-download candidates (only for `Method: Direct`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<UpdateFile>,
+    /// The candidate matching the installed file, when one clearly does --
+    /// then no "which file?" question is needed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preselected_file: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "Kind", rename_all = "PascalCase")]
 pub enum UpdateState {
     UpToDate,
     UpdateAvailable,
+    /// An update the user chose "Skip this version" for.
+    Skipped,
     /// Not enough information to say either way (no installed version on
-    /// record, or the remote check came back empty).
+    /// record, or the site didn't say) -- never guessed.
     Unknown,
-    /// A known provider (Nexus) that this manager can't check without
-    /// credentials it doesn't ask for.
+    /// A Nexus Mods source, and no (optional) Nexus API key is set.
+    NeedsApiKey,
+    /// Kept for compatibility; no longer produced.
     Unsupported,
     Error { message: String },
 }
 
-/// Check every installed mod's declared/recorded sources against each
-/// provider's latest published version. Only ever invoked by the user
-/// clicking "Check for updates" -- never on a timer, never at startup.
-#[tauri::command]
-pub async fn check_updates(state: State<'_, AppState>) -> TAResult<Vec<UpdateStatusEntry>> {
-    let mods = {
-        let guard = state.mods.lock().await;
-        guard.clone().unwrap_or_default()
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateMethod {
+    /// DDMM downloads the new file itself and updates in place.
+    Direct,
+    /// Needs the user's browser (login-gated site, or no direct file).
+    Browser,
+}
 
-    let client = build_client().into_ta_result()?;
-    let mut last_request: HashMap<&'static str, tokio::time::Instant> = HashMap::new();
-    let mut results = Vec::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheckTrigger {
+    Manual,
+    Startup,
+    Scheduled,
+}
 
-    for m in &mods {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct UpdateCheckReport {
+    pub trigger: CheckTrigger,
+    /// Unix seconds.
+    pub checked_at: i64,
+    pub results: Vec<UpdateStatusEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nexus_rate_limit: Option<nexus::RateLimit>,
+}
+
+impl UpdateCheckReport {
+    pub fn available_count(&self) -> usize {
+        let mut guids: Vec<Uuid> = self
+            .results
+            .iter()
+            .filter(|r| r.status == UpdateState::UpdateAvailable)
+            .map(|r| r.guid)
+            .collect();
+        guids.sort();
+        guids.dedup();
+        guids.len()
+    }
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// One (mod, source) pair to check.
+#[derive(Debug, Clone)]
+struct Target {
+    guid: Uuid,
+    provider: String,
+    id: String,
+    display_name: String,
+    page_url: Option<String>,
+    installed_version: Option<String>,
+    installed_file: Option<InstalledFile>,
+    skipped_version: Option<String>,
+}
+
+/// Every checkable (provider, id) source of every installed mod, once each.
+/// The installed version prefers what DDMM itself recorded at install time
+/// (it knows what it actually installed) over a manifest-declared one.
+async fn collect_targets(mods: &[Mod]) -> Vec<Target> {
+    let mut targets = Vec::new();
+    for m in mods {
+        let sidecar = sources::load_origin_sidecar(&m.directory).await;
+        let mut seen: Vec<(String, String)> = Vec::new();
         for source in &m.sources {
-            if !CHECKABLE_PROVIDERS.contains(&source.provider.as_str()) {
+            let provider = source.provider.trim().to_ascii_lowercase();
+            if !CHECKABLE_PROVIDERS.contains(&provider.as_str()) {
                 continue;
             }
-
-            if let Some(host) = provider_host(&source.provider) {
-                rate_limit(&mut last_request, host).await;
+            let Some(id) = sources::resolved_source_id(source) else { continue };
+            if seen.iter().any(|(p, i)| p == &provider && i == &id) {
+                continue;
             }
+            seen.push((provider.clone(), id.clone()));
 
-            let (status, latest) = check_source(&client, source).await;
+            let same = |s: &&sources::ResolvedSource| {
+                s.provider.eq_ignore_ascii_case(&provider) && sources::resolved_source_id(s).as_deref() == Some(id.as_str())
+            };
+            let installed_version = m
+                .sources
+                .iter()
+                .filter(same)
+                .filter(|s| s.origin == SourceOrigin::Install)
+                .find_map(|s| s.version.clone())
+                .or_else(|| m.sources.iter().filter(same).find_map(|s| s.version.clone()));
 
-            results.push(UpdateStatusEntry {
+            let installed_file = sidecar
+                .as_ref()
+                .and_then(|s| s.installed_files.iter().find(|f| f.provider.eq_ignore_ascii_case(&provider)).cloned());
+            let skipped_version = sidecar.as_ref().and_then(|s| {
+                s.skipped_versions
+                    .iter()
+                    .find(|v| v.provider.eq_ignore_ascii_case(&provider))
+                    .map(|v| v.version.clone())
+            });
+
+            targets.push(Target {
                 guid: m.guid(),
-                provider: source.provider.clone(),
+                provider,
+                id,
                 display_name: source.display_name.clone(),
-                installed_version: source.version.clone(),
-                latest_version: latest,
-                status,
                 page_url: source.page_url.clone(),
+                installed_version,
+                installed_file,
+                skipped_version,
             });
         }
     }
-
-    Ok(results)
+    targets
 }
 
-async fn rate_limit(last_request: &mut HashMap<&'static str, tokio::time::Instant>, host: &'static str) {
-    if let Some(last) = last_request.get(host) {
-        let elapsed = last.elapsed();
-        if elapsed < SAME_HOST_DELAY {
-            tokio::time::sleep(SAME_HOST_DELAY - elapsed).await;
+fn status_for(installed: Option<&str>, latest: Option<&str>) -> UpdateState {
+    match (installed, latest) {
+        (Some(i), Some(l)) if !l.trim().is_empty() => match compare_versions(i, l) {
+            VersionRelation::Update => UpdateState::UpdateAvailable,
+            VersionRelation::Same | VersionRelation::InstalledNewer => UpdateState::UpToDate,
+        },
+        _ => UpdateState::Unknown,
+    }
+}
+
+fn entry(t: &Target, status: UpdateState, latest: Option<String>) -> UpdateStatusEntry {
+    UpdateStatusEntry {
+        guid: t.guid,
+        provider: t.provider.clone(),
+        display_name: t.display_name.clone(),
+        source_id: Some(t.id.clone()),
+        installed_version: t.installed_version.clone(),
+        latest_version: latest,
+        latest_file_name: None,
+        status,
+        page_url: t.page_url.clone(),
+        method: None,
+        files: Vec::new(),
+        preselected_file: None,
+    }
+}
+
+fn error_entry(t: &Target, e: impl std::fmt::Display) -> UpdateStatusEntry {
+    entry(t, UpdateState::Error { message: e.to_string() }, None)
+}
+
+/// The candidate that clearly corresponds to the installed file: the only
+/// one, or the one with the same label/name shape as what was installed.
+pub fn preselect(files: &[UpdateFile], installed: Option<&InstalledFile>) -> Option<String> {
+    if files.len() == 1 {
+        return Some(files[0].id.clone());
+    }
+    let installed = installed?;
+    if let Some(label) = installed.label.as_deref().filter(|l| !l.trim().is_empty()) {
+        let matches: Vec<_> = files
+            .iter()
+            .filter(|f| f.label.as_deref().is_some_and(|fl| fl.trim().eq_ignore_ascii_case(label.trim())))
+            .collect();
+        if matches.len() == 1 {
+            return Some(matches[0].id.clone());
         }
     }
-    last_request.insert(host, tokio::time::Instant::now());
-}
-
-fn provider_host(provider: &str) -> Option<&'static str> {
-    match provider {
-        "ayakamods" => Some("ayakamods.com"),
-        "github" => Some("api.github.com"),
-        _ => None,
-    }
-}
-
-async fn check_source(client: &reqwest::Client, source: &ResolvedSource) -> (UpdateState, Option<String>) {
-    match source.provider.as_str() {
-        "nexus" => (UpdateState::Unsupported, None),
-        "ayakamods" => {
-            let Some(id) = id_from_page_url(source) else {
-                return (UpdateState::Unknown, None);
-            };
-            match fetch_ayakamods_metadata(client, &id).await {
-                Ok(Some(meta)) => {
-                    let status = compute_status(source.version.as_deref(), meta.latest_version.as_deref());
-                    (status, meta.latest_version)
-                }
-                Ok(None) => (UpdateState::Unknown, None),
-                Err(e) => (UpdateState::Error { message: e.to_string() }, None),
+    if let Some(name) = installed.file_name.as_deref() {
+        let shape = file_shape(name);
+        if !shape.is_empty() {
+            let matches: Vec<_> = files.iter().filter(|f| file_shape(&f.name) == shape).collect();
+            if matches.len() == 1 {
+                return Some(matches[0].id.clone());
             }
-        }
-        "github" => {
-            let Some(id) = id_from_page_url(source) else {
-                return (UpdateState::Unknown, None);
-            };
-            match fetch_github_latest_tag(client, &id).await {
-                Ok(Some(tag)) => {
-                    let status = compute_status(source.version.as_deref(), Some(&tag));
-                    (status, Some(tag))
-                }
-                Ok(None) => (UpdateState::Unknown, None),
-                Err(e) => (UpdateState::Error { message: e.to_string() }, None),
-            }
-        }
-        _ => (UpdateState::Unsupported, None),
-    }
-}
-
-/// Recover the raw provider id (ayakamods numeric id, or `owner/repo` for
-/// GitHub) from a resolved source's page URL by re-parsing it the same way
-/// a pasted page URL would be. `ResolvedSource` doesn't carry the raw id
-/// itself, so this is how update checks get back to it without needing to
-/// widen that (frontend-facing) type.
-fn id_from_page_url(source: &ResolvedSource) -> Option<String> {
-    let page_url = source.page_url.as_ref()?;
-    sources::source_from_page_url(page_url)?.id
-}
-
-fn compute_status(installed: Option<&str>, latest: Option<&str>) -> UpdateState {
-    let (Some(installed), Some(latest)) = (installed, latest) else {
-        return UpdateState::Unknown;
-    };
-    if latest.is_empty() {
-        return UpdateState::Unknown;
-    }
-    if installed == latest {
-        UpdateState::UpToDate
-    } else {
-        UpdateState::UpdateAvailable
-    }
-}
-
-pub(crate) fn build_client() -> anyhow::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .user_agent(format!("ddmm/{}", env!("CARGO_PKG_VERSION")))
-        .timeout(REQUEST_TIMEOUT)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()?)
-}
-
-/// GET `url` (https only), capped at [`MAX_PAGE_SIZE`] bytes (checked
-/// against both `Content-Length` and the actual streamed size, the same
-/// belt-and-braces approach `download::download_archive` uses), returned
-/// as text.
-async fn fetch_capped(client: &reqwest::Client, url: &str) -> anyhow::Result<String> {
-    let parsed = reqwest::Url::parse(url)?;
-    if parsed.scheme() != "https" {
-        anyhow::bail!("only https:// URLs are supported");
-    }
-
-    let response = client.get(parsed).send().await?.error_for_status()?;
-
-    if let Some(len) = response.content_length() {
-        if len > MAX_PAGE_SIZE {
-            anyhow::bail!("page is {} bytes, which exceeds the {} byte limit", len, MAX_PAGE_SIZE);
-        }
-    }
-
-    let mut stream = response.bytes_stream();
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        buf.extend_from_slice(&chunk);
-        if buf.len() as u64 > MAX_PAGE_SIZE {
-            anyhow::bail!("page exceeded the {} byte limit while streaming", MAX_PAGE_SIZE);
-        }
-    }
-
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AyakaModsMetadata {
-    pub name: Option<String>,
-    pub latest_version: Option<String>,
-    pub modified: Option<String>,
-}
-
-pub(crate) async fn fetch_ayakamods_metadata(
-    client: &reqwest::Client,
-    id: &str,
-) -> anyhow::Result<Option<AyakaModsMetadata>> {
-    let url = format!("https://ayakamods.com/mods/{id}/");
-    let html = fetch_capped(client, &url).await?;
-    Ok(parse_ayakamods_page(&html))
-}
-
-/// Extract the mod's `SoftwareApplication` JSON-LD block from a saved (or
-/// freshly-fetched) AyakaMods mod page. `None` for anything that doesn't
-/// parse -- missing/malformed JSON-LD is not an error, it's just
-/// [`UpdateState::Unknown`] to the caller.
-fn parse_ayakamods_page(html: &str) -> Option<AyakaModsMetadata> {
-    for block in extract_ld_json_blocks(html) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&block) else {
-            continue;
-        };
-        if let Some(app) = find_software_application(&value) {
-            return Some(AyakaModsMetadata {
-                name: app.get("name").and_then(|v| v.as_str()).map(str::to_string),
-                latest_version: app
-                    .get("softwareVersion")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                modified: app
-                    .get("dateModified")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-            });
         }
     }
     None
 }
 
-/// Scan `html` for `<script type="application/ld+json">...</script>`
-/// blocks. Deliberately simple (no HTML parser crate, just `regex` -- an
-/// existing dependency): good enough for extracting a well-formed script
-/// tag's contents, not a general HTML parser.
-fn extract_ld_json_blocks(html: &str) -> Vec<String> {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex::Regex::new(r#"(?is)<script[^>]*type\s*=\s*"application/ld\+json"[^>]*>(.*?)</script>"#)
-            .unwrap()
-    });
-    re.captures_iter(html)
-        .filter_map(|cap| cap.get(1))
-        .map(|m| m.as_str().to_string())
-        .collect()
-}
-
-/// Depth-first search through a JSON-LD value (a plain object, an array of
-/// objects/graphs, or an object with an `@graph` array) for the first node
-/// whose `@type` is `SoftwareApplication`.
-fn find_software_application(value: &serde_json::Value) -> Option<&serde_json::Value> {
-    match value {
-        serde_json::Value::Array(items) => items.iter().find_map(find_software_application),
-        serde_json::Value::Object(map) => {
-            if map.get("@type").and_then(|v| v.as_str()) == Some("SoftwareApplication") {
-                return Some(value);
+async fn check_keyless(client: &reqwest::Client, pacer: &mut Pacer, t: &Target) -> UpdateStatusEntry {
+    match t.provider.as_str() {
+        "ayakamods" => {
+            pacer.wait(ayakamods::HOST, SAME_HOST_DELAY).await;
+            match ayakamods::fetch_ayakamods_metadata(client, &t.id).await {
+                Ok(Some(meta)) => {
+                    let status = status_for(t.installed_version.as_deref(), meta.latest_version.as_deref());
+                    let mut e = entry(t, status, meta.latest_version);
+                    e.method = Some(UpdateMethod::Browser);
+                    e
+                }
+                Ok(None) => entry(t, UpdateState::Unknown, None),
+                Err(err) => error_entry(t, err),
             }
-            map.get("@graph").and_then(find_software_application)
         }
-        _ => None,
+        "github" => {
+            pacer.wait(github::API_HOST, SAME_HOST_DELAY).await;
+            match github::latest_release(client, &t.id).await {
+                Ok(Some(release)) => {
+                    let tag = release.tag_name.clone().filter(|t| !t.is_empty());
+                    let status = status_for(t.installed_version.as_deref(), tag.as_deref());
+                    let mut e = entry(t, status, tag);
+                    e.files = github::candidates(&release);
+                    e.method = Some(if e.files.is_empty() { UpdateMethod::Browser } else { UpdateMethod::Direct });
+                    if e.method == Some(UpdateMethod::Browser) {
+                        // Point the browser at the release itself.
+                        e.page_url = release.html_url.clone().or(e.page_url);
+                    }
+                    e
+                }
+                Ok(None) => entry(t, UpdateState::Unknown, None),
+                Err(err) => error_entry(t, err),
+            }
+        }
+        "gamebanana" => {
+            pacer.wait(gamebanana::HOST, SAME_HOST_DELAY).await;
+            match gamebanana::fetch_mod(client, &t.id).await {
+                Ok(m) if !gamebanana::is_available(&m) => {
+                    error_entry(t, "this mod is private, withheld or deleted on GameBanana")
+                }
+                Ok(m) => {
+                    let latest = gamebanana::latest_version(&m);
+                    let status = status_for(t.installed_version.as_deref(), latest.as_deref());
+                    let mut e = entry(t, status, latest);
+                    e.files = gamebanana::candidates(&m);
+                    e.method = Some(if e.files.is_empty() { UpdateMethod::Browser } else { UpdateMethod::Direct });
+                    e
+                }
+                Err(err) => error_entry(t, err),
+            }
+        }
+        "modworkshop" => {
+            pacer.wait(modworkshop::HOST, SAME_HOST_DELAY).await;
+            match modworkshop::fetch_mod(client, &t.id).await {
+                Ok(m) if !modworkshop::is_available(&m) => {
+                    error_entry(t, "this mod is private or suspended on ModWorkshop")
+                }
+                Ok(m) => {
+                    let latest = modworkshop::latest_version(&m);
+                    let status = status_for(t.installed_version.as_deref(), latest.as_deref());
+                    let mut all_files = None;
+                    // The file list costs a second request; only worth it
+                    // when there's an update and more than one file.
+                    if status == UpdateState::UpdateAvailable
+                        && modworkshop::has_direct_files(&m)
+                        && m.files_count.unwrap_or(1) > 1
+                    {
+                        pacer.wait(modworkshop::HOST, SAME_HOST_DELAY).await;
+                        match modworkshop::fetch_files(client, &t.id).await {
+                            Ok(files) => all_files = Some(files),
+                            Err(err) => log::warn!("ModWorkshop file list for mod {}: {err}", t.id),
+                        }
+                    }
+                    let mut e = entry(t, status, latest);
+                    e.files = modworkshop::candidates(&m, all_files.as_deref());
+                    e.method = Some(if e.files.is_empty() { UpdateMethod::Browser } else { UpdateMethod::Direct });
+                    e
+                }
+                Err(err) => error_entry(t, err),
+            }
+        }
+        _ => entry(t, UpdateState::Unknown, None),
     }
 }
 
-async fn fetch_github_latest_tag(client: &reqwest::Client, owner_repo: &str) -> anyhow::Result<Option<String>> {
-    let url = format!("https://api.github.com/repos/{owner_repo}/releases/latest");
-    let body = fetch_capped(client, &url).await?;
-    let value: serde_json::Value = serde_json::from_str(&body)?;
-    Ok(value.get("tag_name").and_then(|v| v.as_str()).map(str::to_string))
+fn nexus_installed(t: &Target) -> nexus::Installed {
+    let file = t.installed_file.as_ref();
+    nexus::Installed {
+        version: t.installed_version.clone(),
+        file_id: file.and_then(|f| f.file_id.as_deref()).and_then(|i| i.parse().ok()),
+        uploaded_at: file.and_then(|f| f.uploaded_at),
+        file_name: file.and_then(|f| f.file_name.clone()),
+    }
+}
+
+fn nexus_entry(t: &Target, d: &nexus::Decision) -> UpdateStatusEntry {
+    let status = match d.state {
+        nexus::DecisionState::UpToDate => UpdateState::UpToDate,
+        nexus::DecisionState::Update => UpdateState::UpdateAvailable,
+        nexus::DecisionState::Unknown => UpdateState::Unknown,
+    };
+    let mut e = entry(t, status, d.latest_version.clone());
+    e.installed_version = d.installed_version.clone().or(e.installed_version);
+    e.latest_file_name = d.latest_file_name.clone();
+    e.method = Some(UpdateMethod::Browser);
+    // Land on the Files tab, where the user clicks Nexus's own download.
+    e.page_url = Some(format!("https://www.nexusmods.com/{}/mods/{}?tab=files", nexus::GAME_DOMAIN, t.id));
+    e
+}
+
+/// Check every installed Nexus mod with as few API calls as possible (see
+/// `providers::nexus` for the budget). Returns entries in `targets` order.
+async fn check_nexus(
+    base_path: &Path,
+    targets: &[&Target],
+) -> (Vec<UpdateStatusEntry>, Option<nexus::RateLimit>) {
+    let Some((key, _)) = secrets::load(base_path).await else {
+        return (targets.iter().map(|t| entry(t, UpdateState::NeedsApiKey, None)).collect(), None);
+    };
+    let mut client = match NexusClient::new(key) {
+        Ok(c) => c,
+        Err(e) => return (targets.iter().map(|t| error_entry(t, &e)).collect(), None),
+    };
+
+    let now = now_unix();
+    let mut cache = nexus::load_cache(base_path).await;
+    let mut pacer = Pacer::default();
+
+    // Ask for the "recently updated" list only when there are cached
+    // results it could let us reuse.
+    let cached_ages: Vec<i64> = targets
+        .iter()
+        .filter_map(|t| {
+            let c = cache.nexus.get(&t.id)?;
+            (c.installed_key == nexus_installed(t).cache_key()).then_some(now - c.checked_at)
+        })
+        .collect();
+    let updated = match nexus::choose_period(&cached_ages) {
+        Some(period) => {
+            pacer.wait(nexus::API_HOST, nexus::REQUEST_GAP).await;
+            match client.updated(period).await {
+                Ok(list) => Some((period, list)),
+                Err(NexusError::InvalidKey) => {
+                    return (
+                        targets.iter().map(|t| error_entry(t, NexusError::InvalidKey)).collect(),
+                        Some(client.rate),
+                    )
+                }
+                Err(e) => {
+                    log::warn!("Nexus updated-mods list unavailable ({e}); checking each mod directly");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    let mut results = Vec::with_capacity(targets.len());
+    let mut stop: Option<NexusError> = None;
+    let mut calls = 0usize;
+    for t in targets {
+        let installed = nexus_installed(t);
+        let key = installed.cache_key();
+        let Ok(mod_id) = t.id.parse::<u64>() else {
+            results.push(entry(t, UpdateState::Unknown, None));
+            continue;
+        };
+
+        if let (Some(cached), Some((period, list))) = (cache.nexus.get(&t.id), &updated) {
+            if nexus::can_reuse(cached, &key, mod_id, list, *period, now) {
+                results.push(nexus_entry(t, &cached.decision));
+                continue;
+            }
+        }
+        if let Some(e) = &stop {
+            results.push(error_entry(t, e));
+            continue;
+        }
+
+        pacer.wait(nexus::API_HOST, nexus::REQUEST_GAP).await;
+        calls += 1;
+        match client.files(mod_id).await {
+            Ok(files) => {
+                let decision = nexus::decide(&installed, &files);
+                cache.nexus.insert(
+                    t.id.clone(),
+                    nexus::CachedDecision { checked_at: now, installed_key: key, decision: decision.clone() },
+                );
+                results.push(nexus_entry(t, &decision));
+            }
+            Err(e @ (NexusError::InvalidKey | NexusError::RateLimited)) => {
+                results.push(error_entry(t, &e));
+                stop = Some(e);
+            }
+            Err(e) => results.push(error_entry(t, e)),
+        }
+    }
+
+    nexus::save_cache(base_path, &cache).await;
+    log::info!(
+        "Nexus update check: {} mod(s), {} files request(s), updated-list {}; quota left: hourly {:?}, daily {:?}",
+        targets.len(),
+        calls,
+        if updated.is_some() { "used" } else { "not needed" },
+        client.rate.hourly_remaining,
+        client.rate.daily_remaining
+    );
+    (results, Some(client.rate))
+}
+
+/// Run one full check. Serialized: a second request waits for the first.
+pub async fn run_check(state: &AppState, trigger: CheckTrigger) -> anyhow::Result<UpdateCheckReport> {
+    let _guard = state.update_check_lock.lock().await;
+    log::info!("Checking for mod updates ({trigger:?})...");
+
+    let mods = {
+        let mut guard = state.mods.lock().await;
+        ensure_mods_loaded(&mut guard, &state.base_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?
+            .clone()
+    };
+    let targets = collect_targets(&mods).await;
+
+    let client = providers::build_client()?;
+    let mut pacer = Pacer::default();
+    let mut by_index: Vec<Option<UpdateStatusEntry>> = vec![None; targets.len()];
+
+    for (i, t) in targets.iter().enumerate().filter(|(_, t)| t.provider != "nexus") {
+        by_index[i] = Some(check_keyless(&client, &mut pacer, t).await);
+    }
+
+    let nexus_targets: Vec<(usize, &Target)> = targets.iter().enumerate().filter(|(_, t)| t.provider == "nexus").collect();
+    let mut nexus_rate = None;
+    if !nexus_targets.is_empty() {
+        let refs: Vec<&Target> = nexus_targets.iter().map(|(_, t)| *t).collect();
+        let (entries, rate) = check_nexus(&state.base_path, &refs).await;
+        nexus_rate = rate;
+        for ((i, _), e) in nexus_targets.iter().zip(entries) {
+            by_index[*i] = Some(e);
+        }
+    }
+
+    let mut results = Vec::with_capacity(targets.len());
+    for (t, e) in targets.iter().zip(by_index) {
+        let mut e = e.unwrap_or_else(|| entry(t, UpdateState::Unknown, None));
+        if e.method == Some(UpdateMethod::Direct) {
+            e.preselected_file = preselect(&e.files, t.installed_file.as_ref());
+        }
+        if e.status == UpdateState::UpdateAvailable {
+            if let (Some(skipped), Some(latest)) = (&t.skipped_version, &e.latest_version) {
+                if skipped == latest {
+                    e.status = UpdateState::Skipped;
+                }
+            }
+        } else {
+            e.method = None;
+            e.files.clear();
+            e.preselected_file = None;
+        }
+        results.push(e);
+    }
+
+    let report = UpdateCheckReport { trigger, checked_at: now_unix(), results, nexus_rate_limit: nexus_rate };
+    log::info!(
+        "Update check done: {} source(s) checked, {} mod(s) with updates.",
+        report.results.len(),
+        report.available_count()
+    );
+    *state.last_update_report.lock().await = Some(report.clone());
+    *state.last_update_check.lock().await = Some(tokio::time::Instant::now());
+    Ok(report)
+}
+
+/// "Check for Updates" button.
+#[tauri::command]
+pub async fn check_updates(state: State<'_, AppState>) -> TAResult<UpdateCheckReport> {
+    run_check(&state, CheckTrigger::Manual).await.into_ta_result()
+}
+
+/// The last check's results (from this session), so the Mods page can show
+/// badges for a check that ran before it was mounted (e.g. at startup).
+#[tauri::command]
+pub async fn get_last_update_report(state: State<'_, AppState>) -> TAResult<Option<UpdateCheckReport>> {
+    Ok(state.last_update_report.lock().await.clone())
+}
+
+/// "Skip this version" (`version: Some`) / "Stop skipping" (`None`).
+#[tauri::command]
+pub async fn skip_update_version(
+    state: State<'_, AppState>,
+    guid: Uuid,
+    provider: String,
+    version: Option<String>,
+) -> TAResult<()> {
+    let dir = {
+        let guard = state.mods.lock().await;
+        guard
+            .as_ref()
+            .and_then(|mods| mods.iter().find(|m| m.guid() == guid))
+            .map(|m| m.directory.clone())
+    }
+    .ok_or_else(|| anyhow::anyhow!("mod {{{guid}}} not found"))
+    .into_ta_result()?;
+    sources::set_skipped_version(&dir, &provider, version.as_deref()).await.into_ta_result()?;
+
+    if let Some(report) = state.last_update_report.lock().await.as_mut() {
+        for e in report.results.iter_mut().filter(|e| e.guid == guid && e.provider.eq_ignore_ascii_case(&provider)) {
+            match (&version, &e.status) {
+                (Some(v), UpdateState::UpdateAvailable) if e.latest_version.as_deref() == Some(v.as_str()) => {
+                    e.status = UpdateState::Skipped
+                }
+                (None, UpdateState::Skipped) => e.status = UpdateState::UpdateAvailable,
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// After any in-place update (direct, bridge or handoff): mark that mod's
+/// entries in the last report as up to date, so its badge goes away.
+pub async fn mark_mod_updated(state: &AppState, old_guid: Uuid, new_guid: Uuid, provider: Option<&str>, version: Option<&str>) {
+    if let Some(report) = state.last_update_report.lock().await.as_mut() {
+        for e in report.results.iter_mut().filter(|e| e.guid == old_guid) {
+            if provider.is_none_or(|p| e.provider.eq_ignore_ascii_case(p)) {
+                e.status = UpdateState::UpToDate;
+                if let Some(v) = version {
+                    e.installed_version = Some(v.to_string());
+                } else {
+                    e.installed_version = e.latest_version.clone();
+                }
+                e.files.clear();
+                e.method = None;
+                e.preselected_file = None;
+            }
+            e.guid = new_guid;
+        }
+    }
+}
+
+/// The newest version the last check found for `(guid, provider)` when it
+/// reported an update -- used to record the installed version of an update
+/// that arrived through the browser without one (e.g. from Nexus).
+pub async fn known_latest_version(state: &AppState, guid: Uuid, provider: &str) -> Option<String> {
+    let guard = state.last_update_report.lock().await;
+    guard.as_ref()?.results.iter().find_map(|e| {
+        (e.guid == guid
+            && e.provider.eq_ignore_ascii_case(provider)
+            && matches!(e.status, UpdateState::UpdateAvailable | UpdateState::Skipped))
+        .then(|| e.latest_version.clone())
+        .flatten()
+    })
+}
+
+/// Whether the last check found an update for `(guid, provider)` -- lets
+/// the extension show "Update with DDMM" on sites whose pages don't expose
+/// a version (Nexus), based on DDMM's own check rather than a guess.
+pub async fn known_update_available(state: &AppState, guid: Uuid, provider: &str) -> bool {
+    let guard = state.last_update_report.lock().await;
+    guard.as_ref().is_some_and(|r| {
+        r.results
+            .iter()
+            .any(|e| e.guid == guid && e.provider.eq_ignore_ascii_case(provider) && e.status == UpdateState::UpdateAvailable)
+    })
+}
+
+/// Best-effort "what version is this?" for a freshly installed mod, so its
+/// first update check has something to compare against. Nexus archives
+/// carry their version and upload time in their own file name (no API
+/// call); the keyless sites are asked for their current version. Never
+/// fails an install.
+pub async fn enrich_install_source(source: &Source, archive_path: Option<&Path>) -> (Source, Vec<InstalledFile>) {
+    let mut source = source.clone();
+    let mut files = Vec::new();
+    let provider = source.provider.to_ascii_lowercase();
+    let file_name = archive_path.and_then(|p| p.file_name()).and_then(|n| n.to_str()).map(str::to_string);
+
+    if provider == "nexus" {
+        if let Some(name) = &file_name {
+            if let Some(parsed) = sources::parse_nexus_archive_name(name) {
+                if source.id.as_deref().is_none_or(|id| id == parsed.mod_id) {
+                    if source.version.is_none() {
+                        source.version = Some(parsed.version.clone());
+                    }
+                    files.push(InstalledFile {
+                        provider: "nexus".into(),
+                        file_id: None,
+                        file_name: Some(name.clone()),
+                        label: None,
+                        uploaded_at: Some(parsed.uploaded_at),
+                    });
+                }
+            }
+        }
+        return (source, files);
+    }
+
+    if let Some(name) = file_name {
+        files.push(InstalledFile { provider: provider.clone(), file_name: Some(name), ..Default::default() });
+    }
+    if source.version.is_some() {
+        return (source, files);
+    }
+    let Some(id) = source.id.clone() else { return (source, files) };
+    let Ok(client) = providers::build_client() else { return (source, files) };
+    source.version = match provider.as_str() {
+        "ayakamods" => ayakamods::fetch_ayakamods_metadata(&client, &id).await.ok().flatten().and_then(|m| m.latest_version),
+        "github" => github::latest_release(&client, &id).await.ok().flatten().and_then(|r| r.tag_name),
+        "gamebanana" => gamebanana::fetch_mod(&client, &id).await.ok().and_then(|m| gamebanana::latest_version(&m)),
+        "modworkshop" => modworkshop::fetch_mod(&client, &id).await.ok().and_then(|m| modworkshop::latest_version(&m)),
+        _ => None,
+    };
+    (source, files)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ProgressEvent {
+    guid: Uuid,
+    downloaded: u64,
+    total: Option<u64>,
+}
+
+/// One-click update for sites with public direct downloads: download the
+/// chosen file (validated host, size cap, archive sniffing), then replace
+/// the mod in place -- same GUID and profile config, same archive
+/// validation as every other install -- and record the new version.
+#[tauri::command]
+pub async fn update_mod_direct(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    guid: Uuid,
+    provider: String,
+    file: UpdateFile,
+    version: Option<String>,
+) -> TAResult<InstalledMod> {
+    let provider = provider.to_ascii_lowercase();
+    if !DIRECT_PROVIDERS.contains(&provider.as_str()) {
+        return anyhow::anyhow!("{provider} updates go through the browser").into_ta_result();
+    }
+    if !providers::is_allowed_download_host(&provider, &file.url) {
+        return anyhow::anyhow!("refusing to download an update for a {provider} mod from {}", crate::download::redact_url(&file.url))
+            .into_ta_result();
+    }
+
+    // Everything needed to rewrite the sidecar, captured before the old
+    // mod directory (which holds the sidecar) is swapped out.
+    let (mod_dir, source_id, old_sidecar) = {
+        let mut guard = state.mods.lock().await;
+        let mods = ensure_mods_loaded(&mut guard, &state.base_path).await?;
+        let m = mods
+            .iter()
+            .find(|m| m.guid() == guid)
+            .ok_or_else(|| anyhow::anyhow!("mod {{{guid}}} not found"))
+            .into_ta_result()?;
+        let id = m
+            .sources
+            .iter()
+            .filter(|s| s.provider.eq_ignore_ascii_case(&provider))
+            .find_map(sources::resolved_source_id)
+            .ok_or_else(|| anyhow::anyhow!("this mod has no {provider} source"))
+            .into_ta_result()?;
+        (m.directory.clone(), id, sources::load_origin_sidecar(&m.directory).await)
+    };
+
+    log::info!("Updating mod {{{guid}}} from {provider} ({})...", crate::download::redact_url(&file.url));
+    let staging_root = state.base_path.join(crate::download::STAGING_DIRECTORY);
+    let mut last_emit = std::time::Instant::now() - Duration::from_secs(1);
+    let app_for_progress = app.clone();
+    let downloaded = crate::download::download_archive_with_progress(&file.url, &staging_root, move |done, total| {
+        let finished = total.is_some_and(|t| done >= t);
+        if finished || done == 0 || last_emit.elapsed() >= Duration::from_millis(100) {
+            last_emit = std::time::Instant::now();
+            let _ = app_for_progress.emit(PROGRESS_EVENT, ProgressEvent { guid, downloaded: done, total });
+        }
+    })
+    .await
+    .into_ta_result()?;
+
+    let result = {
+        let mut guard = state.mods.lock().await;
+        match guard.as_mut() {
+            Some(mods) => install_update_from_archive(&state, mods, &downloaded.path, guid).await,
+            None => anyhow::anyhow!("mods not read").into_ta_result(),
+        }
+    };
+    let _ = tokio::fs::remove_dir_all(&downloaded.temp_dir).await;
+    let (mut r#mod, warning) = result?;
+
+    // Record where it came from and exactly what was installed.
+    let mut recorded_sources: Vec<Source> = old_sidecar.as_ref().map(|s| s.sources.clone()).unwrap_or_default();
+    recorded_sources.retain(|s| !s.provider.eq_ignore_ascii_case(&provider));
+    recorded_sources.push(Source { provider: provider.clone(), id: Some(source_id), url: None, version: version.clone() });
+    let mut installed_files: Vec<InstalledFile> = old_sidecar.map(|s| s.installed_files).unwrap_or_default();
+    installed_files.retain(|f| !f.provider.eq_ignore_ascii_case(&provider));
+    installed_files.push(InstalledFile {
+        provider: provider.clone(),
+        file_id: Some(file.id.clone()),
+        file_name: Some(file.name.clone()),
+        label: file.label.clone(),
+        uploaded_at: file.uploaded_at,
+    });
+    if let Err(e) = sources::write_origin_sidecar_with_files(&r#mod.directory, recorded_sources, installed_files).await {
+        log::error!("Failed to write origin sidecar after update: {e}");
+    }
+    r#mod.resolve_sources().await;
+    {
+        let mut guard = state.mods.lock().await;
+        if let Some(mods) = guard.as_mut() {
+            if let Some(existing) = mods.iter_mut().find(|m| m.guid() == r#mod.guid()) {
+                *existing = r#mod.clone();
+            }
+        }
+    }
+    debug_assert_eq!(r#mod.directory, mod_dir);
+
+    mark_mod_updated(&state, guid, r#mod.guid(), Some(&provider), version.as_deref()).await;
+    log::info!("Mod {{{}}} updated from {provider} to {:?}.", r#mod.guid(), version);
+    Ok(InstalledMod { r#mod, warning })
+}
+
+/// Whether the browser extension has talked to this DDMM session recently
+/// -- if so, a browser-based update can finish with its "Update with DDMM"
+/// button instead of the Downloads-folder handoff.
+#[tauri::command]
+pub async fn browser_extension_active(state: State<'_, AppState>) -> TAResult<bool> {
+    const RECENT: Duration = Duration::from_secs(12 * 60 * 60);
+    Ok(state.bridge_last_seen.lock().await.is_some_and(|t| t.elapsed() < RECENT))
+}
+
+/// Opt-in automatic checks: once at startup and/or every N hours while
+/// open -- only if the user turned them on in Settings (off by default).
+/// Settings are re-read every minute, so toggling takes effect without a
+/// restart (the startup check itself only happens at startup).
+pub fn spawn_auto_check(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        // Let the window come up first.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let base_path = app.state::<AppState>().base_path.clone();
+
+        match do_load_settings(&base_path).await {
+            Ok(s) if s.auto_check_updates() => run_and_emit(&app, CheckTrigger::Startup).await,
+            Ok(_) => log::info!("Automatic update checks are off (Settings); not checking at startup."),
+            Err(e) => log::warn!("Couldn't read settings for automatic update checks: {e:#}"),
+        }
+
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let Ok(settings) = do_load_settings(&base_path).await else { continue };
+            let Some(hours) = settings.auto_check_interval_hours().filter(|_| settings.auto_check_updates()) else {
+                continue;
+            };
+            let due = {
+                let state = app.state::<AppState>();
+                let last = *state.last_update_check.lock().await;
+                last.is_none_or(|t| t.elapsed() >= Duration::from_secs(u64::from(hours) * 3600))
+            };
+            if due {
+                run_and_emit(&app, CheckTrigger::Scheduled).await;
+            }
+        }
+    });
+}
+
+async fn run_and_emit(app: &AppHandle, trigger: CheckTrigger) {
+    let state = app.state::<AppState>();
+    match run_check(&state, trigger).await {
+        Ok(report) => {
+            if let Err(e) = app.emit(CHECKED_EVENT, &report) {
+                log::error!("Failed to emit {CHECKED_EVENT}: {e}");
+            }
+        }
+        Err(e) => {
+            log::warn!("Automatic update check failed: {e:#}");
+            // Don't retry every minute.
+            *state.last_update_check.lock().await = Some(tokio::time::Instant::now());
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const FIXTURE: &str = include_str!("../../tests/fixtures/ayakamods_mod_page.html");
+    use crate::sources::ResolvedSource;
 
     #[test]
-    fn parses_real_ayakamods_fixture() {
-        let meta = parse_ayakamods_page(FIXTURE).expect("should find JSON-LD");
-        assert_eq!(meta.name.as_deref(), Some("HD2 Auto Reload"));
-        assert_eq!(meta.latest_version.as_deref(), Some("2026-09-24"));
-        assert!(meta.modified.is_some());
+    fn status_compares_normalized_versions() {
+        assert_eq!(status_for(Some("1.0"), Some("1.0")), UpdateState::UpToDate);
+        assert_eq!(status_for(Some("v1.0"), Some("1.0.0")), UpdateState::UpToDate);
+        assert_eq!(status_for(Some("1.0"), Some("2.0")), UpdateState::UpdateAvailable);
+        assert_eq!(status_for(Some("2.0"), Some("1.9")), UpdateState::UpToDate);
+        assert_eq!(status_for(None, Some("2.0")), UpdateState::Unknown);
+        assert_eq!(status_for(Some("1.0"), None), UpdateState::Unknown);
+        assert_eq!(status_for(Some("1.0"), Some("  ")), UpdateState::Unknown);
+    }
+
+    fn file(id: &str, name: &str, label: Option<&str>) -> UpdateFile {
+        UpdateFile {
+            id: id.into(),
+            name: name.into(),
+            label: label.map(str::to_string),
+            size: None,
+            uploaded_at: None,
+            url: format!("https://gamebanana.com/dl/{id}"),
+        }
     }
 
     #[test]
-    fn missing_ld_json_is_none_not_error() {
-        let meta = parse_ayakamods_page("<html><body>no json-ld here</body></html>");
-        assert!(meta.is_none());
-    }
+    fn preselects_only_when_unambiguous() {
+        let one = vec![file("1", "mod.zip", None)];
+        assert_eq!(preselect(&one, None).as_deref(), Some("1"));
 
-    #[test]
-    fn malformed_ld_json_is_none_not_error() {
-        let html = r#"<script type="application/ld+json">{ not: valid json </script>"#;
-        let meta = parse_ayakamods_page(html);
-        assert!(meta.is_none());
-    }
+        let many = vec![
+            file("1", "rabu_ss_sa-8_no_helm_8430d.zip", Some("SA-8 NO HELM")),
+            file("2", "rabu_ss_dp-00_1acbd.zip", Some("DP-00")),
+            file("3", "rabu_ss_sa-8_ff3bb.zip", Some("SA-8")),
+        ];
+        assert_eq!(preselect(&many, None), None, "several files and nothing known: ask");
 
-    #[test]
-    fn ld_json_without_software_application_is_none() {
-        let html = r#"<script type="application/ld+json">[{"@type":"Organization","name":"Someone"}]</script>"#;
-        let meta = parse_ayakamods_page(html);
-        assert!(meta.is_none());
-    }
+        let by_label = InstalledFile { provider: "gamebanana".into(), label: Some("dp-00".into()), ..Default::default() };
+        assert_eq!(preselect(&many, Some(&by_label)).as_deref(), Some("2"));
 
-    #[test]
-    fn ld_json_graph_form_is_found() {
-        let html = r#"<script type="application/ld+json">
-            {"@graph": [{"@type":"Organization"}, {"@type":"SoftwareApplication","name":"Graph Mod","softwareVersion":"1.2.3"}]}
-        </script>"#;
-        let meta = parse_ayakamods_page(html).expect("should find nested graph entry");
-        assert_eq!(meta.name.as_deref(), Some("Graph Mod"));
-        assert_eq!(meta.latest_version.as_deref(), Some("1.2.3"));
-    }
-
-    #[test]
-    fn compute_status_up_to_date() {
-        assert_eq!(compute_status(Some("1.0"), Some("1.0")), UpdateState::UpToDate);
-    }
-
-    #[test]
-    fn compute_status_update_available() {
-        assert_eq!(compute_status(Some("1.0"), Some("2.0")), UpdateState::UpdateAvailable);
-    }
-
-    #[test]
-    fn compute_status_unknown_installed() {
-        assert_eq!(compute_status(None, Some("2.0")), UpdateState::Unknown);
-    }
-
-    #[test]
-    fn compute_status_unknown_latest() {
-        assert_eq!(compute_status(Some("1.0"), None), UpdateState::Unknown);
-    }
-
-    #[test]
-    fn compute_status_unknown_when_latest_empty() {
-        assert_eq!(compute_status(Some("1.0"), Some("")), UpdateState::Unknown);
-    }
-
-    #[test]
-    fn id_from_page_url_ayakamods() {
-        let source = ResolvedSource {
-            provider: "ayakamods".to_string(),
-            display_name: "AyakaMods".to_string(),
-            page_url: Some("https://ayakamods.com/mods/4084/".to_string()),
-            version: None,
-            origin: sources::SourceOrigin::Manifest,
+        let by_name = InstalledFile {
+            provider: "gamebanana".into(),
+            file_name: Some("rabu_ss_sa-7_no_helm_00aa1.zip".into()),
+            ..Default::default()
         };
-        assert_eq!(id_from_page_url(&source).as_deref(), Some("4084"));
+        assert_eq!(preselect(&many, Some(&by_name)).as_deref(), Some("1"));
     }
 
-    #[test]
-    fn id_from_page_url_github() {
-        let source = ResolvedSource {
-            provider: "github".to_string(),
-            display_name: "GitHub".to_string(),
-            page_url: Some("https://github.com/someone/example-mod".to_string()),
+    fn mod_with_sources(dir: &Path, sources: Vec<ResolvedSource>) -> Mod {
+        Mod {
+            manifest: crate::models::manifest::Manifest::Legacy(crate::models::manifest::legacy::Manifest {
+                guid: Uuid::new_v4(),
+                name: "M".into(),
+                description: String::new(),
+                icon_path: None,
+                options: None,
+            }),
+            directory: dir.to_path_buf(),
+            sources,
+        }
+    }
+
+    #[tokio::test]
+    async fn targets_dedupe_and_prefer_the_recorded_install_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manifest_src = sources::resolve(&Source {
+            provider: "gamebanana".into(),
+            id: Some("5".into()),
+            url: None,
+            version: Some("1.0".into()),
+        });
+        manifest_src.origin = SourceOrigin::Manifest;
+        let mut install_src = sources::resolve(&Source {
+            provider: "gamebanana".into(),
+            id: Some("5".into()),
+            url: None,
+            version: Some("1.1".into()),
+        });
+        install_src.origin = SourceOrigin::Install;
+        let unsupported = sources::resolve(&Source {
+            provider: "url".into(),
+            id: None,
+            url: Some("https://example.com/x.zip".into()),
             version: None,
-            origin: sources::SourceOrigin::Manifest,
-        };
-        assert_eq!(id_from_page_url(&source).as_deref(), Some("someone/example-mod"));
+        });
+        let m = mod_with_sources(dir.path(), vec![manifest_src, install_src, unsupported]);
+
+        sources::set_skipped_version(dir.path(), "gamebanana", Some("1.2")).await.unwrap();
+        let targets = collect_targets(&[m]).await;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, "5");
+        assert_eq!(targets[0].installed_version.as_deref(), Some("1.1"));
+        assert_eq!(targets[0].skipped_version.as_deref(), Some("1.2"));
     }
 
-    #[test]
-    fn id_from_page_url_none_when_no_page_url() {
-        let source = ResolvedSource {
-            provider: "ayakamods".to_string(),
-            display_name: "AyakaMods".to_string(),
+    #[tokio::test]
+    async fn nexus_without_a_key_needs_one_and_makes_no_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = Target {
+            guid: Uuid::new_v4(),
+            provider: "nexus".into(),
+            id: "1234".into(),
+            display_name: "Nexus Mods".into(),
             page_url: None,
-            version: None,
-            origin: sources::SourceOrigin::Manifest,
+            installed_version: Some("1.0".into()),
+            installed_file: None,
+            skipped_version: None,
         };
-        assert!(id_from_page_url(&source).is_none());
-    }
-
-    /// Real network smoke test against the live page. `#[ignore]`d so the
-    /// normal suite never depends on network access.
-    #[tokio::test]
-    #[ignore]
-    async fn fetches_and_parses_the_real_page() {
-        let client = build_client().unwrap();
-        let meta = fetch_ayakamods_metadata(&client, "hd2-auto-reload.4084")
-            .await
-            .unwrap()
-            .expect("should parse JSON-LD from the live page");
-        assert!(meta.latest_version.is_some());
+        // No fallback file in this data dir. (On a dev machine with a real
+        // keychain entry this would find it -- so only assert when none.)
+        if secrets::load(dir.path()).await.is_none() {
+            let (entries, rate) = check_nexus(dir.path(), &[&t]).await;
+            assert_eq!(entries[0].status, UpdateState::NeedsApiKey);
+            assert!(rate.is_none());
+        }
     }
 
     #[tokio::test]
-    #[ignore]
-    async fn fetches_the_real_github_latest_release_tag() {
-        let client = build_client().unwrap();
-        let tag = fetch_github_latest_tag(&client, "tauri-apps/tauri")
-            .await
-            .unwrap();
-        assert!(tag.is_some());
+    async fn nexus_archive_names_record_version_and_upload_time_offline() {
+        let source = Source { provider: "nexus".into(), id: Some("1234".into()), url: None, version: None };
+        let (s, files) = enrich_install_source(&source, Some(Path::new("/dl/Better Stims-1234-1-1-1718100000.zip"))).await;
+        assert_eq!(s.version.as_deref(), Some("1.1"));
+        assert_eq!(files[0].uploaded_at, Some(1718100000));
+
+        // A file from a *different* Nexus mod never stamps this one.
+        let (s, files) = enrich_install_source(&source, Some(Path::new("/dl/Other-99-2-0-1718100000.zip"))).await;
+        assert_eq!(s.version, None);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn report_counts_mods_not_sources() {
+        let g = Uuid::new_v4();
+        let mk = |status| UpdateStatusEntry {
+            guid: g,
+            provider: "github".into(),
+            display_name: "GitHub".into(),
+            source_id: None,
+            installed_version: None,
+            latest_version: None,
+            latest_file_name: None,
+            status,
+            page_url: None,
+            method: None,
+            files: vec![],
+            preselected_file: None,
+        };
+        let report = UpdateCheckReport {
+            trigger: CheckTrigger::Manual,
+            checked_at: 0,
+            results: vec![mk(UpdateState::UpdateAvailable), mk(UpdateState::UpdateAvailable), mk(UpdateState::Skipped)],
+            nexus_rate_limit: None,
+        };
+        assert_eq!(report.available_count(), 1);
     }
 }

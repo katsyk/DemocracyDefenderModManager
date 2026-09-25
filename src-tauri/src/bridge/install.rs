@@ -122,6 +122,20 @@ pub async fn install_file(
     download_url: Option<&str>,
     page_version: Option<&str>,
 ) -> Result<InstallOutcome, InstallError> {
+    install_file_with(state, mods, file, page_url, download_url, page_version, Vec::new()).await
+}
+
+/// [`install_file`], also recording which exact file was installed (see
+/// `sources::InstalledFile`).
+pub async fn install_file_with(
+    state: &AppState,
+    mods: &mut Vec<Mod>,
+    file: &Path,
+    page_url: Option<&str>,
+    download_url: Option<&str>,
+    page_version: Option<&str>,
+    installed_files: Vec<sources::InstalledFile>,
+) -> Result<InstallOutcome, InstallError> {
     let meta = tokio::fs::symlink_metadata(file)
         .await
         .map_err(|_| InstallError::new(ErrorCode::FileNotFound, "file does not exist"))?;
@@ -153,7 +167,7 @@ pub async fn install_file(
         }
     }
 
-    let source = resolve_source(page_url, download_url, page_version);
+    let mut source = resolve_source(page_url, download_url, page_version);
 
     // Safety net: an in-place update replaces an installed mod's files, so
     // only do it when the (provider, id) was read off a mod-page URL. A
@@ -166,6 +180,14 @@ pub async fn install_file(
         None
     };
 
+    // An update DDMM's own check found, arriving without a version (the
+    // page didn't show one): record the version that check reported.
+    if let (Some(guid), Some(src)) = (existing_guid, source.as_mut()) {
+        if src.version.is_none() {
+            src.version = crate::commands::updates::known_latest_version(state, guid, &src.provider).await;
+        }
+    }
+
     let (r#mod, warning) = match existing_guid {
         Some(guid) => install_update_from_archive(state, mods, file, guid)
             .await
@@ -177,13 +199,26 @@ pub async fn install_file(
 
     let mut r#mod = r#mod;
     if let Some(source) = &source {
-        if let Err(e) = sources::write_origin_sidecar(&r#mod.directory, vec![source.clone()]).await {
+        if let Err(e) =
+            sources::write_origin_sidecar_with_files(&r#mod.directory, vec![source.clone()], installed_files).await
+        {
             log::error!("Failed to write bridge-install origin sidecar: {}", e);
         }
         r#mod.resolve_sources().await;
         if let Some(existing) = mods.iter_mut().find(|m| m.guid() == r#mod.guid()) {
             *existing = r#mod.clone();
         }
+    }
+
+    if let Some(guid) = existing_guid {
+        crate::commands::updates::mark_mod_updated(
+            state,
+            guid,
+            r#mod.guid(),
+            source.as_ref().map(|s| s.provider.as_str()),
+            source.as_ref().and_then(|s| s.version.as_deref()),
+        )
+        .await;
     }
 
     Ok(InstallOutcome {

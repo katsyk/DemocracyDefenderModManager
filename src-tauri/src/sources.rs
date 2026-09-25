@@ -52,6 +52,44 @@ pub struct OriginSidecar {
     #[serde(default)]
     pub sources: Vec<Source>,
     pub installed_at: u64,
+    /// Which exact file (of possibly several on the mod page) was installed,
+    /// per provider, when DDMM knows -- lets update checks follow that file
+    /// rather than guessing, and lets a one-click update pick the matching
+    /// new file. Optional; older sidecars simply don't have it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub installed_files: Vec<InstalledFile>,
+    /// "Skip this version": a provider version the user chose not to be
+    /// told about again. Cleared whenever the mod is (re)installed or
+    /// updated, since the sidecar is rewritten then.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_versions: Vec<SkippedVersion>,
+}
+
+/// The specific file of a mod page that was installed (see
+/// [`OriginSidecar::installed_files`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct InstalledFile {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    /// The file's title/label on the site (e.g. a Nexus file's name or a
+    /// GameBanana file description) -- more stable across versions than the
+    /// archive name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Upload time (Unix seconds) as reported by the site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploaded_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct SkippedVersion {
+    pub provider: String,
+    pub version: String,
 }
 
 /// Only ever allow a page URL through if it is a plain `http(s)` URL. This is
@@ -312,6 +350,15 @@ pub async fn load_origin_sidecar(mod_dir: &Path) -> Option<OriginSidecar> {
 /// Write the `.hd2mm-origin.json` sidecar for a mod directory. Never touches
 /// `manifest.json`.
 pub async fn write_origin_sidecar(mod_dir: &Path, sources: Vec<Source>) -> anyhow::Result<()> {
+    write_origin_sidecar_with_files(mod_dir, sources, Vec::new()).await
+}
+
+/// [`write_origin_sidecar`], also recording which file(s) were installed.
+pub async fn write_origin_sidecar_with_files(
+    mod_dir: &Path,
+    sources: Vec<Source>,
+    installed_files: Vec<InstalledFile>,
+) -> anyhow::Result<()> {
     let installed_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
@@ -319,12 +366,107 @@ pub async fn write_origin_sidecar(mod_dir: &Path, sources: Vec<Source>) -> anyho
     let sidecar = OriginSidecar {
         sources,
         installed_at,
+        installed_files,
+        skipped_versions: Vec::new(),
     };
+    save_origin_sidecar(mod_dir, &sidecar).await
+}
 
+/// Write `sidecar` as-is (used to update skip lists without touching the
+/// recorded sources).
+pub async fn save_origin_sidecar(mod_dir: &Path, sidecar: &OriginSidecar) -> anyhow::Result<()> {
     let path = mod_dir.join(ORIGIN_SIDECAR_FILE);
-    let data = serde_json::to_vec_pretty(&sidecar)?;
+    let data = serde_json::to_vec_pretty(sidecar)?;
     tokio::fs::write(path, data).await?;
     Ok(())
+}
+
+/// Set (`Some`) or clear (`None`) the skipped version for `provider` in a
+/// mod's sidecar, creating an otherwise-empty sidecar if the mod has none
+/// (a mod whose sources all come from its own manifest).
+pub async fn set_skipped_version(mod_dir: &Path, provider: &str, version: Option<&str>) -> anyhow::Result<()> {
+    let mut sidecar = match load_origin_sidecar(mod_dir).await {
+        Some(s) => s,
+        None => OriginSidecar {
+            sources: Vec::new(),
+            installed_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+            installed_files: Vec::new(),
+            skipped_versions: Vec::new(),
+        },
+    };
+    sidecar
+        .skipped_versions
+        .retain(|s| !s.provider.eq_ignore_ascii_case(provider));
+    if let Some(version) = version {
+        sidecar.skipped_versions.push(SkippedVersion {
+            provider: provider.to_string(),
+            version: version.to_string(),
+        });
+    }
+    save_origin_sidecar(mod_dir, &sidecar).await
+}
+
+/// The raw provider id (AyakaMods/Nexus/GameBanana numeric id, ModWorkshop
+/// id, or `owner/repo` for GitHub) behind a resolved source, recovered from
+/// its page URL the same way a pasted page URL is parsed. `ResolvedSource`
+/// doesn't carry the id itself (it's a frontend-facing type).
+pub fn resolved_source_id(source: &ResolvedSource) -> Option<String> {
+    let page_url = source.page_url.as_ref()?;
+    let parsed = source_from_page_url(page_url)?;
+    if !parsed.provider.eq_ignore_ascii_case(&source.provider) {
+        return None;
+    }
+    parsed.id
+}
+
+/// What a Nexus Mods download's file name says about it. Nexus names every
+/// download `<name>-<modId>-<version with dashes>-<uploadUnixTime>.<ext>`
+/// (browsers may append ` (1)` for a duplicate), which is enough to record
+/// the installed version and match the exact file later -- no API call,
+/// no key needed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NexusArchiveName {
+    pub mod_id: String,
+    /// Best-effort: dashes turned back into dots (Nexus replaces both with
+    /// dashes, so "1.0-beta" comes back as "1.0.beta"; version comparison
+    /// treats `-` and `.` alike for this reason).
+    pub version: String,
+    pub uploaded_at: i64,
+}
+
+pub fn parse_nexus_archive_name(file_name: &str) -> Option<NexusArchiveName> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)^.+?-(\d+)-([0-9a-z][0-9a-z-]*?)-(\d{9,11})(?: \(\d+\))?\.(?:zip|7z|rar)$",
+        )
+        .unwrap()
+    });
+    let caps = re.captures(file_name)?;
+    Some(NexusArchiveName {
+        mod_id: caps.get(1)?.as_str().to_string(),
+        version: caps.get(2)?.as_str().replace('-', "."),
+        uploaded_at: caps.get(3)?.as_str().parse().ok()?,
+    })
+}
+
+/// The release tag in a GitHub release-asset download URL
+/// (`https://github.com/<owner>/<repo>/releases/download/<tag>/<file>`).
+pub fn github_tag_from_download_url(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if host != "github.com" && host != "www.github.com" {
+        return None;
+    }
+    let segments: Vec<&str> = parsed.path_segments()?.collect();
+    match segments.as_slice() {
+        [_, _, "releases", "download", tag, file] if !tag.is_empty() && !file.is_empty() => {
+            Some(percent_encoding::percent_decode_str(tag).decode_utf8_lossy().into_owned())
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -511,6 +653,87 @@ mod tests {
             .unwrap();
         let loaded = load_origin_sidecar(dir.path()).await;
         assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn parses_nexus_archive_names() {
+        let n = parse_nexus_archive_name("Better Stims-1234-1-2-0-1718000000.zip").unwrap();
+        assert_eq!(n.mod_id, "1234");
+        assert_eq!(n.version, "1.2.0");
+        assert_eq!(n.uploaded_at, 1718000000);
+
+        let dup = parse_nexus_archive_name("Better Stims-1234-2-0-1718000000 (1).7z").unwrap();
+        assert_eq!(dup.version, "2.0");
+
+        let beta = parse_nexus_archive_name("Mod-with-dashes-77-1-0-beta-1718000000.rar").unwrap();
+        assert_eq!(beta.mod_id, "77");
+        assert_eq!(beta.version, "1.0.beta");
+
+        assert!(parse_nexus_archive_name("cool-mod.zip").is_none());
+        assert!(parse_nexus_archive_name("Test Mod-4084-1-0.zip").is_none());
+        assert!(parse_nexus_archive_name("x-1-1-1718000000.exe").is_none());
+    }
+
+    #[test]
+    fn github_tag_from_asset_urls() {
+        assert_eq!(
+            github_tag_from_download_url("https://github.com/o/r/releases/download/v1.2.3/mod.zip").as_deref(),
+            Some("v1.2.3")
+        );
+        assert_eq!(
+            github_tag_from_download_url("https://github.com/o/r/releases/download/release%2F2/mod.zip").as_deref(),
+            Some("release/2")
+        );
+        assert!(github_tag_from_download_url("https://github.com/o/r/archive/refs/heads/main.zip").is_none());
+        assert!(github_tag_from_download_url("https://example.com/o/r/releases/download/v1/x.zip").is_none());
+    }
+
+    #[test]
+    fn resolved_source_id_requires_matching_provider() {
+        let r = resolve(&source("gamebanana", Some("42"), None));
+        assert_eq!(resolved_source_id(&r).as_deref(), Some("42"));
+        // A "nexus" source whose explicit Url points somewhere else entirely.
+        let r = resolve(&source("nexus", Some("1"), Some("https://gamebanana.com/mods/9")));
+        assert_eq!(resolved_source_id(&r), None);
+    }
+
+    #[tokio::test]
+    async fn old_sidecars_without_new_fields_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join(ORIGIN_SIDECAR_FILE),
+            br#"{"Sources":[{"Provider":"nexus","Id":"5","Version":"1.0"}],"InstalledAt":1}"#,
+        )
+        .await
+        .unwrap();
+        let loaded = load_origin_sidecar(dir.path()).await.unwrap();
+        assert_eq!(loaded.sources.len(), 1);
+        assert!(loaded.installed_files.is_empty());
+        assert!(loaded.skipped_versions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn skipped_version_is_set_replaced_and_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        write_origin_sidecar(dir.path(), vec![source("github", Some("o/r"), None)]).await.unwrap();
+
+        set_skipped_version(dir.path(), "github", Some("v2")).await.unwrap();
+        set_skipped_version(dir.path(), "github", Some("v3")).await.unwrap();
+        let s = load_origin_sidecar(dir.path()).await.unwrap();
+        assert_eq!(s.skipped_versions, vec![SkippedVersion { provider: "github".into(), version: "v3".into() }]);
+        assert_eq!(s.sources.len(), 1, "skipping must not touch the recorded sources");
+
+        set_skipped_version(dir.path(), "github", None).await.unwrap();
+        assert!(load_origin_sidecar(dir.path()).await.unwrap().skipped_versions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn skipping_creates_a_sidecar_when_none_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        set_skipped_version(dir.path(), "nexus", Some("2.0")).await.unwrap();
+        let s = load_origin_sidecar(dir.path()).await.unwrap();
+        assert!(s.sources.is_empty());
+        assert_eq!(s.skipped_versions.len(), 1);
     }
 
     #[test]

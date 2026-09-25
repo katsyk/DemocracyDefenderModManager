@@ -34,6 +34,9 @@ pub async fn do_load_settings(base_path: &Path) -> anyhow::Result<Settings> {
             after_browser_install: "deploy".to_string(),
             bridge_allowed_sites: vec![],
             auto_import_enabled: false,
+            auto_check_updates: false,
+            auto_check_interval_hours: 0,
+            nexus_username: None,
         }
     };
 
@@ -46,6 +49,14 @@ pub async fn do_load_settings(base_path: &Path) -> anyhow::Result<Settings> {
 
     log::info!("Settings loaded.");
     Ok(settings)
+}
+
+/// Write `settings` to settings.json (backend-side changes: the Nexus
+/// account name, "Always allow" sites, ...).
+pub async fn write_settings(base_path: &Path, settings: &Settings) -> anyhow::Result<()> {
+    let data = serde_json::to_vec_pretty(settings)?;
+    tokio::fs::write(base_path.join(SETTINGS_FILE), data).await?;
+    Ok(())
 }
 
 pub async fn do_check_settings(base_path: &Path) -> anyhow::Result<bool> {
@@ -77,9 +88,17 @@ pub async fn load_settings(state: State<'_, AppState>) -> TAResult<Settings> {
 pub async fn save_settings(state: State<'_, AppState>, settings: Settings) -> TAResult<()> {
     log::info!("Saving settings...");
 
+    let mut settings = settings;
+    // The Nexus account name is owned by the backend (set when a key is
+    // saved/removed); a page that loaded settings earlier mustn't clobber it.
+    let on_disk_username = do_load_settings(&state.base_path)
+        .await
+        .ok()
+        .and_then(|s| s.nexus_username().map(str::to_string));
+    settings.set_nexus_username(on_disk_username);
+
     // Store the real game root if the user picked a folder above/below it
     // (e.g. `.../Helldivers 2/data` or `.../steamapps/common`).
-    let mut settings = settings;
     if let Ok(root) = crate::game_path::resolve(settings.game_path()).await {
         if root != settings.game_path() {
             log::info!("Normalizing game path {:?} to {:?}", settings.game_path(), root);

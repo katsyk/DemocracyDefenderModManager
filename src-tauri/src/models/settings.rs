@@ -60,8 +60,29 @@ pub enum Settings {
         /// Off by default -- never installs without a click either way.
         #[serde(default)]
         auto_import_enabled: bool,
+        /// Opt-in: check installed mods for updates when DDMM starts. Off
+        /// by default -- update checks never run unless the user asks
+        /// (this, or clicking "Check for Updates").
+        #[serde(default)]
+        auto_check_updates: bool,
+        /// With `auto_check_updates` on: also re-check every this many
+        /// hours while DDMM stays open. `0` (the default) means only at
+        /// startup.
+        #[serde(default)]
+        auto_check_interval_hours: u32,
+        /// Display name of the Nexus Mods account whose (optional) API key
+        /// is stored -- shown in Settings. The key itself is never stored
+        /// here (see `crate::secrets`). Owned by the backend: `save_settings`
+        /// keeps the value already on disk.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nexus_username: Option<String>,
     }
 }
+
+/// Bounds for [`Settings::auto_check_interval_hours`]: at most once an hour,
+/// at least once a week.
+pub const MIN_AUTO_CHECK_INTERVAL_HOURS: u32 = 1;
+pub const MAX_AUTO_CHECK_INTERVAL_HOURS: u32 = 168;
 
 fn default_after_browser_install() -> String {
     "deploy".to_string()
@@ -157,6 +178,34 @@ impl Settings {
         }
     }
 
+    pub fn auto_check_updates(&self) -> bool {
+        match self {
+            Settings::V1 { auto_check_updates, .. } => *auto_check_updates,
+        }
+    }
+
+    /// The re-check interval, if one is set (clamped to the allowed range).
+    pub fn auto_check_interval_hours(&self) -> Option<u32> {
+        match self {
+            Settings::V1 { auto_check_interval_hours: 0, .. } => None,
+            Settings::V1 { auto_check_interval_hours, .. } => Some(
+                (*auto_check_interval_hours).clamp(MIN_AUTO_CHECK_INTERVAL_HOURS, MAX_AUTO_CHECK_INTERVAL_HOURS),
+            ),
+        }
+    }
+
+    pub fn nexus_username(&self) -> Option<&str> {
+        match self {
+            Settings::V1 { nexus_username, .. } => nexus_username.as_deref(),
+        }
+    }
+
+    pub fn set_nexus_username(&mut self, value: Option<String>) {
+        match self {
+            Settings::V1 { nexus_username, .. } => *nexus_username = value,
+        }
+    }
+
     pub fn has_skip_entry(&self, s: &str) -> bool {
         match self {
             Settings::V1 { skip_list, .. } => {
@@ -167,5 +216,38 @@ impl Settings {
                     .any(|entry| entry == s)
             },
         }
+    }
+}
+#[cfg(test)]
+mod update_setting_tests {
+    use super::*;
+
+    #[test]
+    fn automatic_update_checks_are_off_by_default() {
+        // A settings.json from before these options existed.
+        let old = r#"{"Version":"V1","GamePath":"","SkipList":[]}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert!(!s.auto_check_updates());
+        assert_eq!(s.auto_check_interval_hours(), None);
+        assert_eq!(s.nexus_username(), None);
+    }
+
+    #[test]
+    fn interval_is_clamped() {
+        let s: Settings = serde_json::from_str(
+            r#"{"Version":"V1","GamePath":"","SkipList":[],"AutoCheckUpdates":true,"AutoCheckIntervalHours":100000}"#,
+        )
+        .unwrap();
+        assert!(s.auto_check_updates());
+        assert_eq!(s.auto_check_interval_hours(), Some(MAX_AUTO_CHECK_INTERVAL_HOURS));
+    }
+
+    #[test]
+    fn settings_json_never_has_a_key_field() {
+        let mut s: Settings = serde_json::from_str(r#"{"Version":"V1","GamePath":"","SkipList":[]}"#).unwrap();
+        s.set_nexus_username(Some("Diver".into()));
+        let json = serde_json::to_string(&s).unwrap().to_ascii_lowercase();
+        assert!(json.contains("nexususername"));
+        assert!(!json.contains("apikey") && !json.contains("api_key"), "{json}");
     }
 }

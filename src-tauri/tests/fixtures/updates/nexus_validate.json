@@ -1,0 +1,9 @@
+{
+  "user_id": 4242,
+  "key": "FIXTUREKEY-not-a-real-key",
+  "name": "ExampleDiver",
+  "is_premium": false,
+  "is_supporter": false,
+  "email": "diver@example.invalid",
+  "profile_url": "https://avatars.nexusmods.com/4242/100"
+}

@@ -11,6 +11,8 @@ pub mod steam;
 pub mod bridge;
 pub mod deep_link;
 pub mod auto_import;
+pub mod providers;
+pub mod secrets;
 
 use std::{
     path::PathBuf,
@@ -57,6 +59,17 @@ pub struct AppState {
     /// bridge itself being broken). Reset to `false` each time a new close
     /// is requested; read by the close watchdog in `run()`.
     close_ack: AtomicBool,
+    /// Serializes update checks (manual, startup, scheduled).
+    update_check_lock: Mutex<()>,
+    /// The latest update check's results this session -- see
+    /// `commands::updates`.
+    last_update_report: Mutex<Option<commands::updates::UpdateCheckReport>>,
+    /// When the latest update check ran (for the opt-in re-check interval).
+    last_update_check: Mutex<Option<tokio::time::Instant>>,
+    /// When the browser extension last talked to this session (any bridge
+    /// request) -- decides whether a browser update can finish with the
+    /// extension's "Update with DDMM" button.
+    bridge_last_seen: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl AppState {
@@ -70,6 +83,10 @@ impl AppState {
             bridge_install_lock: Mutex::new(()),
             bridge_frontend_ready: tokio::sync::watch::Sender::new(false),
             close_ack: AtomicBool::new(false),
+            update_check_lock: Mutex::new(()),
+            last_update_report: Mutex::default(),
+            last_update_check: Mutex::default(),
+            bridge_last_seen: Mutex::default(),
         }
     }
 }
@@ -236,6 +253,7 @@ pub fn run() {
             });
 
             auto_import::spawn(app.handle().clone());
+            commands::updates::spawn_auto_check(app.handle().clone());
 
             Ok(())
         })
@@ -286,6 +304,13 @@ pub fn run() {
             commands::handoff::install_handoff_file,
             commands::handoff::classify_download_url,
             commands::updates::check_updates,
+            commands::updates::get_last_update_report,
+            commands::updates::skip_update_version,
+            commands::updates::update_mod_direct,
+            commands::updates::browser_extension_active,
+            commands::nexus::get_nexus_key_status,
+            commands::nexus::set_nexus_api_key,
+            commands::nexus::remove_nexus_api_key,
             commands::profiles::load_profiles,
             commands::profiles::save_profiles,
             commands::settings::load_settings,
