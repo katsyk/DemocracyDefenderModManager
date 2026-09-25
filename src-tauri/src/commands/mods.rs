@@ -198,6 +198,7 @@ pub(crate) async fn ensure_mods_loaded<'a>(
 
 #[tauri::command]
 pub async fn delete_mod(state: State<'_, AppState>, guid: Uuid) -> TAResult<()> {
+    let _data_op = state.data_op().into_ta_result()?;
     let mut mods = state.mods.lock().await;
     if mods.is_none() {
         return anyhow::anyhow!("mods not read").into_ta_result();
@@ -222,6 +223,7 @@ pub async fn delete_mod(state: State<'_, AppState>, guid: Uuid) -> TAResult<()> 
 
 #[tauri::command]
 pub async fn add_mod(state: State<'_, AppState>, archive_file: PathBuf) -> TAResult<InstalledMod> {
+    let _data_op = state.data_op().into_ta_result()?;
     let mut mods = state.mods.lock().await;
     if mods.is_none() {
         return anyhow::anyhow!("mods not read").into_ta_result();
@@ -316,6 +318,7 @@ pub(crate) async fn install_from_archive(state: &AppState, mods: &mut Vec<Mod>, 
 
 #[tauri::command]
 pub async fn add_mods(state: State<'_, AppState>, archive_files: Vec<PathBuf>) -> TAResult<Vec<TAResult<InstalledMod>>> {
+    let _data_op = state.data_op().into_ta_result()?;
     let mut mods = state.mods.lock().await;
     if mods.is_none() {
         return anyhow::anyhow!("mods not read").into_ta_result();
@@ -820,6 +823,7 @@ async fn install_from_folder_inner(
 
 #[tauri::command]
 pub async fn add_mod_folder(state: State<'_, AppState>, folder: PathBuf) -> TAResult<InstalledMod> {
+    let _data_op = state.data_op().into_ta_result()?;
     let mut mods = state.mods.lock().await;
     if mods.is_none() {
         return anyhow::anyhow!("mods not read").into_ta_result();
@@ -836,6 +840,7 @@ pub async fn add_mod_folder(state: State<'_, AppState>, folder: PathBuf) -> TARe
 /// ever nests a lock inside another lock.
 #[tauri::command]
 pub async fn add_paths(state: State<'_, AppState>, paths: Vec<PathBuf>) -> TAResult<Vec<TAResult<InstalledMod>>> {
+    let _data_op = state.data_op().into_ta_result()?;
     log::info!("Adding mods from {} path(s)...", paths.len());
 
     let mut results = Vec::with_capacity(paths.len());
@@ -875,6 +880,7 @@ pub async fn add_paths(state: State<'_, AppState>, paths: Vec<PathBuf>) -> TARes
 /// ever touching the author's own `manifest.json`.
 #[tauri::command]
 pub async fn add_mod_from_url(state: State<'_, AppState>, url: String) -> TAResult<InstalledMod> {
+    let _data_op = state.data_op().into_ta_result()?;
     log::info!("Downloading mod from {}...", download::redact_url(&url));
 
     let staging_root = state.base_path.join(download::STAGING_DIRECTORY);

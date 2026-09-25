@@ -11,6 +11,7 @@ pub mod steam;
 pub mod bridge;
 pub mod deep_link;
 pub mod auto_import;
+pub mod data_move;
 pub mod providers;
 pub mod secrets;
 pub mod nexus_oauth;
@@ -39,6 +40,15 @@ use crate::{bridge::BridgePending, models::Mod};
 
 pub struct AppState {
     base_path: PathBuf,
+    /// How `base_path` was chosen (pointer file, default, problem); see
+    /// `data_dir::decide_data_dir`.
+    data_dir: data_dir::DataDirDecision,
+    /// Read-locked by every operation that writes to the data folder,
+    /// write-locked while it's being moved. See [`AppState::data_op`].
+    data_ops: Arc<tokio::sync::RwLock<()>>,
+    /// Holds the write lock for good once the data folder has been moved
+    /// (until the restart), and in recovery mode.
+    data_ops_frozen: std::sync::Mutex<Option<tokio::sync::OwnedRwLockWriteGuard<()>>>,
     mods: Mutex<Option<Vec<Mod>>>,
     /// Cancellation flag for the single in-flight browser handoff, if any.
     /// `commands::handoff` is the only thing that touches this.
@@ -65,6 +75,9 @@ pub struct AppState {
     /// bridge itself being broken). Reset to `false` each time a new close
     /// is requested; read by the close watchdog in `run()`.
     close_ack: AtomicBool,
+    /// `true` while `commands::data_folder::move_data_folder` is copying;
+    /// closing the window is refused meanwhile.
+    data_move_running: AtomicBool,
     /// Serializes update checks (manual, startup, scheduled).
     update_check_lock: Mutex<()>,
     /// The latest update check's results this session -- see
@@ -81,10 +94,31 @@ pub struct AppState {
     nexus_sign_in_cancel: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
+/// Shown when something that writes to the data folder is attempted while
+/// it's being moved or isn't available.
+pub const DATA_FOLDER_BUSY: &str =
+    "DDMM's data folder is being moved or isn't available right now. Wait for DDMM to restart, then try again.";
+
 impl AppState {
     pub fn new(base_path: PathBuf) -> Self {
+        let decision = data_dir::DataDirDecision {
+            path: base_path.clone(),
+            kind: data_dir::BaseDirKind::AppData,
+            reason: String::new(),
+            default_path: base_path.clone(),
+            pointer_file: base_path.join(data_dir::POINTER_FILENAME),
+            pointed: false,
+            problem: None,
+        };
+        Self::with_decision(decision)
+    }
+
+    pub fn with_decision(decision: data_dir::DataDirDecision) -> Self {
         Self {
-            base_path,
+            base_path: decision.path.clone(),
+            data_dir: decision,
+            data_ops: Arc::new(tokio::sync::RwLock::new(())),
+            data_ops_frozen: std::sync::Mutex::new(None),
             mods: Mutex::default(),
             handoff_cancel: Mutex::default(),
             bridge_pending: Mutex::default(),
@@ -92,11 +126,37 @@ impl AppState {
             bridge_install_lock: Mutex::new(()),
             bridge_frontend_ready: tokio::sync::watch::Sender::new(false),
             close_ack: AtomicBool::new(false),
+            data_move_running: AtomicBool::new(false),
             update_check_lock: Mutex::new(()),
             last_update_report: Mutex::default(),
             last_update_check: Mutex::default(),
             bridge_last_seen: Mutex::default(),
             nexus_sign_in_cancel: Mutex::default(),
+        }
+    }
+
+    /// Permission to write to the data folder, held for the length of one
+    /// operation (installing, deleting, deploying, saving settings, an
+    /// update check, ...). Fails at once, rather than waiting, while the
+    /// data folder is being moved, after a move until the restart, and in
+    /// the missing-folder recovery screen.
+    pub fn data_op(&self) -> anyhow::Result<tokio::sync::OwnedRwLockReadGuard<()>> {
+        self.data_ops.clone().try_read_owned().map_err(|_| anyhow::anyhow!(DATA_FOLDER_BUSY))
+    }
+
+    /// Whether [`AppState::data_op`] would fail right now (background
+    /// tasks use this to skip a tick).
+    pub fn data_ops_paused(&self) -> bool {
+        self.data_ops.try_read().is_err()
+    }
+
+    /// Block every data operation until the app exits (after a successful
+    /// move, and in recovery mode). `guard` is the write lock the caller
+    /// already holds, if any.
+    pub fn freeze_data_ops(&self, guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>) {
+        let guard = guard.or_else(|| self.data_ops.clone().try_write_owned().ok());
+        if let Ok(mut slot) = self.data_ops_frozen.lock() {
+            *slot = guard;
         }
     }
 }
@@ -105,21 +165,17 @@ impl AppState {
 /// without touching Tauri at all -- used both by `run()` before the
 /// builder is constructed and by host mode, which never constructs one.
 fn resolve_base_path() -> PathBuf {
-    let exe_dir = data_dir::resolve_exe_dir();
-    let app_data_dir = data_dir::platform_app_data_dir().unwrap_or_else(|e| {
-        eprintln!("warning: {e}; falling back to the executable directory for app data");
-        exe_dir.clone()
-    });
-    data_dir::decide_base_dir(&exe_dir, &app_data_dir).path
+    data_dir::decide_data_dir_for_this_machine().path
 }
 
 /// Run as the browser's native-messaging host: relay only, no window, no
 /// Tauri runtime at all. Must be checked before anything Tauri-related is
 /// touched, since a host-mode invocation has no display to attach to.
+///
+/// The host only ever reads `bridge.json`; it never creates the data
+/// folder (a chosen folder that's missing must stay missing, see
+/// `data_dir::DataDirProblem`).
 fn run_host_mode(origin: bridge::host::HostOrigin) {
-    let base_path = resolve_base_path();
-    let _ = std::fs::create_dir_all(&base_path);
-
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -127,7 +183,7 @@ fn run_host_mode(origin: bridge::host::HostOrigin) {
             return;
         }
     };
-    runtime.block_on(bridge::host::run(origin, base_path));
+    runtime.block_on(bridge::host::run(origin, resolve_base_path));
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -138,34 +194,51 @@ pub fn run() {
         return;
     }
 
-    let exe_dir = data_dir::resolve_exe_dir();
-    let app_data_dir = data_dir::platform_app_data_dir().unwrap_or_else(|e| {
-        eprintln!("warning: {e}; falling back to the executable directory for app data");
-        exe_dir.clone()
-    });
-
-    let decision = data_dir::decide_base_dir(&exe_dir, &app_data_dir);
-    if let Err(e) = std::fs::create_dir_all(&decision.path) {
-        eprintln!("warning: failed to create data directory {:?}: {}", decision.path, e);
+    let decision = data_dir::decide_data_dir_for_this_machine();
+    // Recovery mode: the chosen data folder is missing (or its pointer file
+    // is unreadable). Never create it -- that would turn an unplugged drive
+    // into an empty mod list -- and start nothing that touches it; the
+    // frontend shows the recovery screen instead (see
+    // `commands::data_folder`).
+    let recovery = decision.problem.is_some();
+    if !recovery {
+        if let Err(e) = std::fs::create_dir_all(&decision.path) {
+            eprintln!("warning: failed to create data directory {:?}: {}", decision.path, e);
+        }
     }
 
     let base_path = decision.path.clone();
     let asset_base_path = base_path.clone();
-    let log_dir = base_path.join("logs");
+    let log_dir = if recovery {
+        std::env::temp_dir().join(format!("{}-logs", data_dir::APP_IDENTIFIER))
+    } else {
+        base_path.join("logs")
+    };
     let _ = std::fs::create_dir_all(&log_dir);
 
     // The base-directory decision itself is logged again once the log
     // plugin (which needs this same `log_dir`) is up, so it actually lands
     // in the log file and not just stdout.
     let startup_message = format!(
-        "Using {} directory: {:?} ({})",
+        "Using {} directory: {:?} ({}){}",
         match decision.kind {
             data_dir::BaseDirKind::Portable => "portable data",
             data_dir::BaseDirKind::AppData => "app data",
         },
         base_path,
-        decision.reason
+        decision.reason,
+        match &decision.problem {
+            None => String::new(),
+            Some(data_dir::DataDirProblem::Missing) => {
+                " -- THE FOLDER IS MISSING; showing the recovery screen".to_string()
+            }
+            Some(data_dir::DataDirProblem::BadPointer(m)) => format!(" -- {m}; showing the recovery screen"),
+        }
     );
+    let app_state = AppState::with_decision(decision.clone());
+    if recovery {
+        app_state.freeze_data_ops(None);
+    }
 
     tauri::Builder::default()
         // Must be registered first (see the plugin's own docs): it needs
@@ -205,9 +278,28 @@ pub fn run() {
         .setup(move |app| {
             log::info!("{}", startup_message);
 
+            if recovery {
+                // Nothing below may touch the (missing) data folder: no
+                // asset scope, bridge, browser registration, deep links,
+                // auto-import or update checks. The recovery screen offers
+                // Retry / Locate / Reset, each of which restarts the app.
+                return Ok(());
+            }
+
+            // Old data a previous data folder move couldn't delete yet
+            // (e.g. a log file Windows still had open). A little later, so
+            // the previous process has certainly exited.
+            let cleanup_base = asset_base_path.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let _ = tokio::task::spawn_blocking(move || data_move::run_pending_cleanup(&cleanup_base)).await;
+            });
+
             // Mod icons and option images are shown with the asset protocol;
             // allow exactly the mods folder under the data folder, nothing
-            // else (tauri.conf.json grants no static scope).
+            // else (tauri.conf.json grants no static scope). After a data
+            // folder move the app restarts, so this always follows the
+            // current folder.
             let _ = std::fs::create_dir_all(asset_base_path.join(commands::mods::MODS_DIRECTORY));
             for dir in data_dir::asset_scope_dirs(&asset_base_path) {
                 if let Err(e) = app.asset_protocol_scope().allow_directory(&dir, true) {
@@ -283,7 +375,16 @@ pub fn run() {
         // waiting on the user, etc. all happen *after* the ack, so they're
         // never affected by it.
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // Closing mid-move would be safe (the old data stays until
+                // the new copy is complete) but would waste the copy and
+                // leave a half-finished folder to clean up; the progress
+                // popup asks the user to wait instead.
+                if window.app_handle().state::<AppState>().data_move_running.load(Ordering::SeqCst) {
+                    log::info!("Close requested while the data folder is being moved; ignoring it.");
+                    api.prevent_close();
+                    return;
+                }
                 let app_handle = window.app_handle().clone();
                 let label = window.label().to_string();
                 app_handle.state::<AppState>().close_ack.store(false, Ordering::SeqCst);
@@ -303,7 +404,7 @@ pub fn run() {
                 });
             }
         })
-        .manage(AppState::new(base_path))
+        .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             commands::mods::get_mods,
             commands::mods::resolve_mod_image,
@@ -335,6 +436,13 @@ pub fn run() {
             commands::settings::save_settings,
             commands::settings::check_settings,
             commands::settings::get_data_dir,
+            commands::data_folder::get_data_folder_info,
+            commands::data_folder::plan_data_folder_move,
+            commands::data_folder::move_data_folder,
+            commands::data_folder::adopt_data_folder,
+            commands::data_folder::retry_data_folder,
+            commands::data_folder::locate_data_folder,
+            commands::data_folder::reset_data_folder_location,
             commands::settings::detect_game_path,
             commands::settings::validate_game_path,
             commands::settings::auto_detect_and_save_game_path,

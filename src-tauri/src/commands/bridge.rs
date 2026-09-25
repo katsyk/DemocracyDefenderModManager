@@ -85,6 +85,7 @@ pub async fn get_bridge_allowed_sites(state: State<'_, AppState>) -> TAResult<Ve
 
 #[tauri::command]
 pub async fn revoke_bridge_site(state: State<'_, AppState>, site: String) -> TAResult<()> {
+    let _data_op = state.data_op().into_ta_result()?;
     let mut settings = do_load_settings(&state.base_path).await.into_ta_result()?;
     settings.revoke_bridge_site(&site);
     let data = serde_json::to_vec_pretty(&settings).into_ta_result()?;
@@ -109,6 +110,11 @@ pub async fn repair_browser_integration(state: State<'_, AppState>) -> TAResult<
 }
 
 pub async fn run_registration(state: &AppState) -> Vec<BrowserIntegrationStatus> {
+    // On Windows the manifests are written into the data folder; never do
+    // that while it's being moved, or when it's missing (recovery screen).
+    let Ok(_data_op) = state.data_op() else {
+        return Vec::new();
+    };
     let exe = crate::bridge::exe_path();
     let outcomes = native_messaging::register_all(&exe, &state.base_path).await;
 

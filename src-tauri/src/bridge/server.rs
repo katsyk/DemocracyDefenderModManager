@@ -312,6 +312,15 @@ async fn handle_install_queued(app: &AppHandle, raw: serde_json::Value, id: Stri
     }
 
     let _permit = state.bridge_install_lock.lock().await;
+    let Ok(_data_op) = state.data_op() else {
+        state.bridge_queue_depth.fetch_sub(1, Ordering::SeqCst);
+        return ErrorReply::new(
+            id,
+            ErrorCode::Busy,
+            "DDMM is moving its data folder; try again once it has restarted",
+        )
+        .to_line();
+    };
     let result = handle_install(app, raw, id.clone()).await;
     state.bridge_queue_depth.fetch_sub(1, Ordering::SeqCst);
     result
