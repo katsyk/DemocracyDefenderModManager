@@ -228,7 +228,7 @@
             },
             "skip_version": "Skip version {version}",
             "unskip_version": "Stop skipping {version}",
-            "needs_nexus_key": "Add a Nexus API key (optional) to check for updates"
+            "needs_nexus_key": "Optional: sign in to Nexus Mods or add a key to check for updates"
         },
         "settings": {
             "popup": {
@@ -354,9 +354,9 @@
                     "label_after": "hours while DDMM is open"
                 },
                 "nexus": {
-                    "title": "Nexus Mods API key (optional)",
-                    "description": "Optional. Only used to check your Nexus Mods mods for updates.",
-                    "where_to_get": "Enter it manually: on Nexus Mods, open your account's API Keys page (Get a key), copy the Personal API Key at the bottom, and paste it here. DDMM checks it with Nexus before saving. Remove it here any time.",
+                    "title": "Nexus Mods (optional)",
+                    "description": "Optional. Only used to check your Nexus Mods mods for updates. Sign in, or enter a personal API key, or do neither: everything else in DDMM works the same.",
+                    "where_to_get": "On Nexus Mods, open your account's API Keys page (Get a key), copy the Personal API Key at the bottom, and paste it here. DDMM checks it with Nexus before saving. Remove it here any time.",
                     "placeholder": "Paste your personal Nexus Mods API key",
                     "save_button": {
                         "text": "Save & verify"
@@ -373,7 +373,30 @@
                     "remove_button": {
                         "text": "Remove key"
                     },
-                    "privacy": "Nexus is only contacted when you click Check for Updates or Save & verify, never by automatic checks. The key is only sent to api.nexusmods.com over HTTPS, and isn't written to settings.json or logs."
+                    "privacy": "Nexus is only contacted when you click Check for Updates, Sign in, Sign out, or Save & verify, never by automatic checks. Your sign-in and key are only sent to Nexus Mods (users.nexusmods.com and api.nexusmods.com) over HTTPS, and aren't written to settings.json or logs.",
+                    "sign_in": {
+                        "button": {
+                            "text": "Sign in to Nexus Mods",
+                            "tip": "Opens Nexus Mods in your browser, where you approve DDMM. Optional."
+                        },
+                        "coming_soon": "Coming soon",
+                        "coming_soon_tip": "Signing in to Nexus Mods isn't available in this version yet. You can enter a personal API key below instead.",
+                        "waiting": "Waiting for you to approve DDMM in your browser... This stops after 5 minutes.",
+                        "cancel_button": {
+                            "text": "Cancel"
+                        },
+                        "signed_in": "Signed in to Nexus Mods as {name}.",
+                        "signed_in_unknown": "Signed in to Nexus Mods.",
+                        "sign_out_button": {
+                            "text": "Sign out"
+                        },
+                        "stored_keychain": "Your sign-in is stored in your system's keychain (credential store), not in DDMM's settings.",
+                        "stored_file": "No system keychain was available, so your sign-in is stored as a file readable only by you (nexus-oauth-tokens in DDMM's data folder).",
+                        "key_not_used": "While you're signed in, your personal API key below is kept but not used."
+                    },
+                    "manual": {
+                        "summary": "Or enter a personal API key manually"
+                    }
                 }
             }
         }
@@ -474,7 +497,7 @@
             "state": {
                 "update_available": "Update available",
                 "skipped": "Skipping {version}",
-                "needs_api_key": "Needs a Nexus API key (optional) to check",
+                "needs_api_key": "Optional: sign in or add a key to check",
                 "error": "Couldn't check: {message}",
                 "unknown": "Unknown",
                 "unknown_tip": "DDMM doesn't know which version is installed (or the site didn't say), so it won't guess.",
@@ -491,12 +514,12 @@
             "unskip_button": {
                 "text": "Stop skipping"
             },
-            "needs_key_hint": "Nexus Mods only answers update checks for people with an API key. Adding one in Settings is optional and only used for Nexus update checks.",
+            "needs_key_hint": "Nexus Mods only answers update checks for people who are signed in or have an API key. Signing in or adding a key in Settings is optional and only used for Nexus update checks.",
             "update_all_button": {
                 "text": "Update all ({count})"
             },
             "nexus_settings_button": {
-                "text": "Nexus API key settings"
+                "text": "Nexus Mods settings"
             },
             "close_button": {
                 "text": "Close"

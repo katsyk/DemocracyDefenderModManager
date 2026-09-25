@@ -7,8 +7,9 @@
 //!
 //! Sites checked (see `crate::providers`): AyakaMods (page JSON-LD),
 //! GitHub (latest release), GameBanana (apiv11), ModWorkshop (public API),
-//! and Nexus Mods -- only with the user's own optional API key; without
-//! one, Nexus mods report "needs a Nexus API key (optional)".
+//! and Nexus Mods -- only when the user has (optionally) signed in to Nexus
+//! Mods or added a personal API key; without either, Nexus mods report
+//! "optional: sign in or add a key to check".
 //!
 //! Updating: sites that serve the new file publicly (GitHub release
 //! assets, GameBanana, ModWorkshop) can be updated in place with one click
@@ -31,10 +32,10 @@ use crate::{
     models::{manifest::Source, Mod},
     providers::{
         self, ayakamods, compare_versions, file_shape, gamebanana, github, modworkshop,
-        nexus::{self, NexusClient, NexusError},
+        nexus::{self, NexusAuth, NexusClient, NexusError},
         Pacer, UpdateFile, VersionRelation,
     },
-    secrets,
+    nexus_oauth::{self, ResolvedAuth},
     sources::{self, InstalledFile, SourceOrigin},
     AppState,
 };
@@ -92,7 +93,8 @@ pub enum UpdateState {
     /// Not enough information to say either way (no installed version on
     /// record, or the site didn't say) -- never guessed.
     Unknown,
-    /// A Nexus Mods source, and no (optional) Nexus API key is set.
+    /// A Nexus Mods source, and the user neither signed in to Nexus Mods
+    /// nor added a personal API key (both optional).
     NeedsApiKey,
     /// A Nexus Mods source during an automatic check. Nexus's API
     /// Acceptable Use Policy only allows using a user's key for actions the
@@ -130,7 +132,7 @@ impl CheckTrigger {
 /// Makes the Nexus API client for a check. Production always uses
 /// [`NexusClient::new`] (fixed `https://api.nexusmods.com` base); tests
 /// substitute a local mock to count requests.
-type NexusClientFactory = dyn Fn(secrets::NexusApiKey) -> anyhow::Result<NexusClient> + Send + Sync;
+type NexusClientFactory = dyn Fn(NexusAuth) -> anyhow::Result<NexusClient> + Send + Sync;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -421,14 +423,32 @@ struct NexusOutcome {
 /// mods it lists as changed since their last check get a `files.json`
 /// request. Returns entries in `targets` order.
 async fn check_nexus(base_path: &Path, targets: &[&Target], make_client: &NexusClientFactory) -> NexusOutcome {
-    let Some((key, _)) = secrets::load(base_path).await else {
-        return NexusOutcome {
-            entries: targets.iter().map(|t| entry(t, UpdateState::NeedsApiKey, None)).collect(),
-            rate: None,
-            all_recent: false,
-        };
+    // The one place that decides how Nexus requests authenticate: signed
+    // in (refreshed if about to expire) > personal API key > nothing.
+    let auth = match nexus_oauth::resolve_auth(base_path).await {
+        ResolvedAuth::Auth(auth) => auth,
+        ResolvedAuth::NoCredentials => {
+            return NexusOutcome {
+                entries: targets.iter().map(|t| entry(t, UpdateState::NeedsApiKey, None)).collect(),
+                rate: None,
+                all_recent: false,
+            }
+        }
+        ResolvedAuth::SignedOut(message) | ResolvedAuth::Unavailable(message) => {
+            return NexusOutcome { entries: targets.iter().map(|t| error_entry(t, &message)).collect(), rate: None, all_recent: false }
+        }
     };
-    let mut client = match make_client(key) {
+    let signed_in = auth.is_oauth();
+    // A 401/403 on a signed-in request means the sign-in was revoked: say
+    // so (the sign-in is removed below) instead of talking about a key.
+    let describe = |e: &NexusError| -> String {
+        if signed_in && *e == NexusError::InvalidKey {
+            nexus_oauth::SIGNED_OUT_MESSAGE.to_string()
+        } else {
+            e.to_string()
+        }
+    };
+    let mut client = match make_client(auth) {
         Ok(c) => c,
         Err(e) => {
             return NexusOutcome { entries: targets.iter().map(|t| error_entry(t, &e)).collect(), rate: None, all_recent: false }
@@ -483,8 +503,11 @@ async fn check_nexus(base_path: &Path, targets: &[&Target], make_client: &NexusC
                 }
             }
             Err(e @ NexusError::InvalidKey) => {
+                if signed_in {
+                    nexus_oauth::handle_rejected_sign_in(base_path).await;
+                }
                 return NexusOutcome {
-                    entries: targets.iter().map(|t| error_entry(t, &e)).collect(),
+                    entries: targets.iter().map(|t| error_entry(t, describe(&e))).collect(),
                     rate: Some(client.rate),
                     all_recent: false,
                 }
@@ -521,7 +544,7 @@ async fn check_nexus(base_path: &Path, targets: &[&Target], make_client: &NexusC
         }
 
         if let Some(e) = &stop {
-            results.push(error_entry(t, e));
+            results.push(error_entry(t, describe(e)));
             continue;
         }
         if !fetched.contains_key(mod_id) {
@@ -539,11 +562,14 @@ async fn check_nexus(base_path: &Path, targets: &[&Target], make_client: &NexusC
                 results.push(nexus_entry(t, &decision));
             }
             Err(e @ (NexusError::InvalidKey | NexusError::RateLimited)) => {
-                results.push(error_entry(t, e));
+                results.push(error_entry(t, describe(e)));
                 stop = Some(e.clone());
             }
             Err(e) => results.push(error_entry(t, e)),
         }
+    }
+    if signed_in && stop == Some(NexusError::InvalidKey) {
+        nexus_oauth::handle_rejected_sign_in(base_path).await;
     }
 
     nexus::save_cache(base_path, &cache).await;
@@ -606,7 +632,7 @@ async fn run_check_with(
         // Automatic check: no Nexus API calls at all (the user didn't start
         // it). Keep what a check the user ran earlier this session found;
         // otherwise say how to check. Reading whether a key exists is local.
-        let has_key = secrets::load(&state.base_path).await.is_some();
+        let has_key = nexus_oauth::has_credentials(&state.base_path).await;
         let previous = state.last_update_report.lock().await.clone();
         for (i, t) in &nexus_targets {
             let carried = previous.as_ref().and_then(|r| {
@@ -971,6 +997,7 @@ async fn run_and_emit(app: &AppHandle, trigger: CheckTrigger) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets;
     use crate::sources::ResolvedSource;
 
     #[test]
@@ -1187,6 +1214,81 @@ mod tests {
         tokio::fs::write(dir.path().join(secrets::FALLBACK_FILE_NAME), "TestKeyForAupCheck").await.unwrap();
         let state = AppState::new(dir.path().to_path_buf());
         (dir, state, guid)
+    }
+
+    /// A mock Nexus API that rejects every request (revoked credentials).
+    async fn mock_nexus_rejecting() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"message":"Token revoked"}"#;
+                let resp = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}/v1/")
+    }
+
+    #[tokio::test]
+    async fn signed_in_checks_use_the_sign_in_over_the_key_and_sign_out_when_revoked() {
+        use crate::secrets::Secret;
+        use std::sync::{Arc, Mutex};
+        let (_dir, state, guid) = nexus_only_state().await; // also has a personal key
+        let tokens = nexus_oauth::Tokens {
+            access_token: Secret::new("ACCESS-TOKEN-UPD"),
+            refresh_token: Some(Secret::new("REFRESH-TOKEN-UPD")),
+            expires_at: now_unix() + 3600,
+            scope: nexus_oauth::SCOPES.into(),
+            username: Some("Diver".into()),
+            is_premium: false,
+        };
+        nexus_oauth::store_tokens(&state.base_path, &tokens).await.unwrap();
+
+        let used: Arc<Mutex<Vec<NexusAuth>>> = Arc::default();
+        let (base, seen) = mock_nexus("[]".into()).await;
+        let log = used.clone();
+        let factory = move |auth: NexusAuth| {
+            log.lock().unwrap().push(auth.clone());
+            NexusClient::with_base(auth, &base)
+        };
+        let report = run_check_with(&state, CheckTrigger::Manual, &factory).await.unwrap();
+        assert_eq!(used.lock().unwrap().as_slice(), &[NexusAuth::OAuth(Secret::new("ACCESS-TOKEN-UPD"))]);
+        assert!(!seen.lock().unwrap().is_empty());
+        assert!(report.results.iter().any(|e| e.guid == guid && e.status == UpdateState::UpdateAvailable));
+
+        // Revoked on Nexus's side: the API answers 401 -> signed out, told why.
+        backdate_nexus_checks(&state, 40 * 86_400).await;
+        let rejecting = mock_nexus_rejecting().await;
+        let factory = move |auth: NexusAuth| NexusClient::with_base(auth, &rejecting);
+        let report = run_check_with(&state, CheckTrigger::Manual, &factory).await.unwrap();
+        let nexus = report.results.iter().find(|e| e.guid == guid).unwrap();
+        match &nexus.status {
+            UpdateState::Error { message } => {
+                assert_eq!(message, nexus_oauth::SIGNED_OUT_MESSAGE);
+                assert!(!message.contains("ACCESS-TOKEN-UPD"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(nexus_oauth::load_tokens(&state.base_path).await.is_none(), "sign-in removed");
+
+        // The personal key takes over from then on.
+        let used: Arc<Mutex<Vec<NexusAuth>>> = Arc::default();
+        let log = used.clone();
+        let (base, _seen) = mock_nexus("[]".into()).await;
+        let factory = move |auth: NexusAuth| {
+            log.lock().unwrap().push(auth.clone());
+            NexusClient::with_base(auth, &base)
+        };
+        backdate_nexus_checks(&state, 40 * 86_400).await;
+        run_check_with(&state, CheckTrigger::Manual, &factory).await.unwrap();
+        assert!(matches!(used.lock().unwrap().as_slice(), [NexusAuth::ApiKey(_)]));
     }
 
     #[tokio::test]

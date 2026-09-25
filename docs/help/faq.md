@@ -8,7 +8,8 @@ title: FAQ
 
 No. DDMM never asks for your login on any mod site. Sites that require being logged in to download hand the
 actual download off to your own browser session — see [Mod sites](../using/mod-sites.md). The one optional
-extra is a personal Nexus Mods API key, used only to check Nexus mods for updates; see
+extra is signing in to Nexus Mods (on the Nexus Mods website, not in DDMM) or adding a personal Nexus Mods API
+key, used only to check Nexus mods for updates; see
 [Updating mods](../using/updating-mods.md#nexus-mods-and-the-optional-api-key).
 
 ### Where does DDMM store my mods and settings?

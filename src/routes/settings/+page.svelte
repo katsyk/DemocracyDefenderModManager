@@ -11,7 +11,8 @@
         getBridgeAllowedSites, revokeBridgeSite, repairBrowserIntegration, removeBrowserIntegration,
         repairBrowserIntegrationOne, removeBrowserIntegrationOne,
         getNexusKeyStatus, setNexusApiKey, removeNexusApiKey,
-        type BrowserIntegrationStatus, type NexusKeyStatus
+        getNexusSignInStatus, nexusSignIn, nexusCancelSignIn, nexusSignOut,
+        type BrowserIntegrationStatus, type NexusKeyStatus, type NexusSignInStatus
     } from "$lib/utils/commands";
     import { Dash, Plus, ThreeDots, Search, Folder2Open, ArrowRepeat, BoxArrowUpRight } from "svelte-bootstrap-icons";
     import { usePopup } from "$lib/state/popup.svelte";
@@ -42,6 +43,10 @@
     let nexusKeyInput = $state<string>("");
     let nexusBusy = $state<boolean>(false);
     let nexusError = $state<string | undefined>();
+    let signIn = $state<NexusSignInStatus>({ Available: false, SignedIn: false, Port: 28647 });
+    let signingIn = $state<boolean>(false);
+    let signInBusy = $state<boolean>(false);
+    let signInError = $state<string | undefined>();
     let browserIntegration = $state<BrowserIntegrationStatus[]>([]);
     let browserIntegrationBusy = $state<boolean>(false);
     let gamePathErrors = $state<string[]>([]);
@@ -156,6 +161,11 @@
         } catch {
             // Show as "no key"; never blocks Settings.
         }
+        try {
+            signIn = await getNexusSignInStatus();
+        } catch {
+            // Show as "not signed in"; never blocks Settings.
+        }
 
 
         // Also registers (idempotently) as a side effect -- see
@@ -189,6 +199,38 @@
             nexusError = ex instanceof Error ? ex.message : String(ex);
         } finally {
             nexusBusy = false;
+        }
+    }
+
+    async function onNexusSignIn() {
+        signingIn = true;
+        signInError = undefined;
+        try {
+            signIn = await nexusSignIn();
+        } catch (ex: unknown) {
+            signInError = ex instanceof Error ? ex.message : String(ex);
+        } finally {
+            signingIn = false;
+        }
+    }
+
+    async function onNexusCancelSignIn() {
+        try {
+            await nexusCancelSignIn();
+        } catch {
+            // The sign-in call itself reports how it ended.
+        }
+    }
+
+    async function onNexusSignOut() {
+        signInBusy = true;
+        signInError = undefined;
+        try {
+            signIn = await nexusSignOut();
+        } catch (ex: unknown) {
+            signInError = ex instanceof Error ? ex.message : String(ex);
+        } finally {
+            signInBusy = false;
         }
     }
 
@@ -470,56 +512,111 @@
 
                 <h3 id="nexus-api-key" class="text-zinc-300 text-base mt-2">{t("pages.settings.updates.nexus.title")}</h3>
                 <p class="text-zinc-400 text-sm max-w-lg">{t("pages.settings.updates.nexus.description")}</p>
-                <p class="text-zinc-500 text-xs max-w-lg">{t("pages.settings.updates.nexus.where_to_get")}</p>
-                {#if nexusStatus.Present}
-                    <p class="text-sm text-green-400">
-                        {nexusStatus.Username
-                            ? t("pages.settings.updates.nexus.connected", { name: nexusStatus.Username })
-                            : t("pages.settings.updates.nexus.connected_unknown")}
-                    </p>
-                    <p class="text-zinc-400 text-xs max-w-lg">
-                        {nexusStatus.Storage === "File"
-                            ? t("pages.settings.updates.nexus.stored_file")
-                            : t("pages.settings.updates.nexus.stored_keychain")}
-                    </p>
-                    <div class="flex flex-row gap-1">
-                        <button class="hd2mm-button" disabled={nexusBusy} onclick={onRemoveNexusKey}>
-                            {t("pages.settings.updates.nexus.remove_button.text")}
-                        </button>
+                <div id="nexus-sign-in" class="flex flex-col gap-1 max-w-lg">
+                    {#if signIn.SignedIn}
+                        <p class="text-sm text-green-400">
+                            {signIn.Username
+                                ? t("pages.settings.updates.nexus.sign_in.signed_in", { name: signIn.Username })
+                                : t("pages.settings.updates.nexus.sign_in.signed_in_unknown")}
+                        </p>
+                        <p class="text-zinc-400 text-xs">
+                            {signIn.Storage === "File"
+                                ? t("pages.settings.updates.nexus.sign_in.stored_file")
+                                : t("pages.settings.updates.nexus.sign_in.stored_keychain")}
+                        </p>
+                        {#if nexusStatus.Present}
+                            <p class="text-zinc-500 text-xs">{t("pages.settings.updates.nexus.sign_in.key_not_used")}</p>
+                        {/if}
+                        <div class="flex flex-row gap-1">
+                            <button class="hd2mm-button" disabled={signInBusy} onclick={onNexusSignOut}>
+                                {t("pages.settings.updates.nexus.sign_in.sign_out_button.text")}
+                            </button>
+                        </div>
+                    {:else if !signIn.Available}
+                        <div class="flex flex-row gap-2 items-center">
+                            <button class="hd2mm-button" disabled title={t("pages.settings.updates.nexus.sign_in.coming_soon_tip")}>
+                                {t("pages.settings.updates.nexus.sign_in.button.text")}
+                            </button>
+                            <span class="text-zinc-400 text-xs italic">{t("pages.settings.updates.nexus.sign_in.coming_soon")}</span>
+                        </div>
+                    {:else if signingIn}
+                        <p class="text-zinc-300 text-sm">{t("pages.settings.updates.nexus.sign_in.waiting")}</p>
+                        <div class="flex flex-row gap-1">
+                            <button class="hd2mm-button" onclick={onNexusCancelSignIn}>
+                                {t("pages.settings.updates.nexus.sign_in.cancel_button.text")}
+                            </button>
+                        </div>
+                    {:else}
+                        <div class="flex flex-row gap-1">
+                            <button
+                                class="hd2mm-button flex flex-row gap-1 items-center"
+                                title={t("pages.settings.updates.nexus.sign_in.button.tip")}
+                                onclick={onNexusSignIn}
+                            >
+                                <BoxArrowUpRight />
+                                {t("pages.settings.updates.nexus.sign_in.button.text")}
+                            </button>
+                        </div>
+                    {/if}
+                    {#if signInError}
+                        <p class="text-red-500 text-sm">{signInError}</p>
+                    {/if}
+                </div>
+                <details class="max-w-lg" open={nexusStatus.Present && !signIn.SignedIn}>
+                    <summary class="text-zinc-300 text-sm cursor-pointer select-none">{t("pages.settings.updates.nexus.manual.summary")}</summary>
+                    <div class="flex flex-col gap-1 mt-1">
+                        <p class="text-zinc-500 text-xs max-w-lg">{t("pages.settings.updates.nexus.where_to_get")}</p>
+                        {#if nexusStatus.Present}
+                            <p class="text-sm text-green-400">
+                                {nexusStatus.Username
+                                    ? t("pages.settings.updates.nexus.connected", { name: nexusStatus.Username })
+                                    : t("pages.settings.updates.nexus.connected_unknown")}
+                            </p>
+                            <p class="text-zinc-400 text-xs max-w-lg">
+                                {nexusStatus.Storage === "File"
+                                    ? t("pages.settings.updates.nexus.stored_file")
+                                    : t("pages.settings.updates.nexus.stored_keychain")}
+                            </p>
+                            <div class="flex flex-row gap-1">
+                                <button class="hd2mm-button" disabled={nexusBusy} onclick={onRemoveNexusKey}>
+                                    {t("pages.settings.updates.nexus.remove_button.text")}
+                                </button>
+                            </div>
+                        {:else}
+                            <div class="flex flex-row gap-1 max-w-lg">
+                                <input
+                                    type="password"
+                                    class="hd2mm-input flex-1"
+                                    placeholder={t("pages.settings.updates.nexus.placeholder")}
+                                    autocomplete="off"
+                                    autocorrect="off"
+                                    autocapitalize="off"
+                                    spellcheck="false"
+                                    bind:value={nexusKeyInput}
+                                    onkeydown={(e) => { if (e.key === "Enter") onSaveNexusKey(); }}
+                                />
+                                <button
+                                    class="hd2mm-button"
+                                    disabled={nexusBusy || nexusKeyInput.trim().length === 0}
+                                    onclick={onSaveNexusKey}
+                                >
+                                    {nexusBusy ? t("pages.settings.updates.nexus.checking") : t("pages.settings.updates.nexus.save_button.text")}
+                                </button>
+                                <button
+                                    class="hd2mm-button flex flex-row gap-1 items-center"
+                                    title={t("pages.settings.updates.nexus.open_page_button.tip")}
+                                    onclick={() => openUrl(NEXUS_API_KEYS_URL)}
+                                >
+                                    <BoxArrowUpRight />
+                                    {t("pages.settings.updates.nexus.open_page_button.text")}
+                                </button>
+                            </div>
+                        {/if}
+                        {#if nexusError}
+                            <p class="text-red-500 text-sm max-w-lg">{nexusError}</p>
+                        {/if}
                     </div>
-                {:else}
-                    <div class="flex flex-row gap-1 max-w-lg">
-                        <input
-                            type="password"
-                            class="hd2mm-input flex-1"
-                            placeholder={t("pages.settings.updates.nexus.placeholder")}
-                            autocomplete="off"
-                            autocorrect="off"
-                            autocapitalize="off"
-                            spellcheck="false"
-                            bind:value={nexusKeyInput}
-                            onkeydown={(e) => { if (e.key === "Enter") onSaveNexusKey(); }}
-                        />
-                        <button
-                            class="hd2mm-button"
-                            disabled={nexusBusy || nexusKeyInput.trim().length === 0}
-                            onclick={onSaveNexusKey}
-                        >
-                            {nexusBusy ? t("pages.settings.updates.nexus.checking") : t("pages.settings.updates.nexus.save_button.text")}
-                        </button>
-                        <button
-                            class="hd2mm-button flex flex-row gap-1 items-center"
-                            title={t("pages.settings.updates.nexus.open_page_button.tip")}
-                            onclick={() => openUrl(NEXUS_API_KEYS_URL)}
-                        >
-                            <BoxArrowUpRight />
-                            {t("pages.settings.updates.nexus.open_page_button.text")}
-                        </button>
-                    </div>
-                {/if}
-                {#if nexusError}
-                    <p class="text-red-500 text-sm max-w-lg">{nexusError}</p>
-                {/if}
+                </details>
                 <p class="text-zinc-500 text-xs max-w-lg">{t("pages.settings.updates.nexus.privacy")}</p>
             </div>
             <div class="flex flex-col gap-1">

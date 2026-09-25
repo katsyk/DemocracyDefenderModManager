@@ -214,6 +214,40 @@ export async function removeNexusApiKey(): Promise<NexusKeyStatus> {
     return await invoke<NexusKeyStatus>("remove_nexus_api_key");
 }
 
+/** The optional "Sign in to Nexus Mods". Never carries a token. */
+export type NexusSignInStatus = {
+    /** This build can sign in (has a Nexus client ID); else "Coming soon". */
+    Available: boolean,
+    SignedIn: boolean,
+    Username?: string,
+    Storage?: "Keychain" | "File",
+    Port: number
+};
+
+export async function getNexusSignInStatus(): Promise<NexusSignInStatus> {
+    return await invoke<NexusSignInStatus>("get_nexus_sign_in_status");
+}
+
+/** Opens Nexus Mods in the system browser and resolves once the user has
+ * approved DDMM there (or rejects on decline, cancel or the 5-minute
+ * timeout). */
+export async function nexusSignIn(): Promise<NexusSignInStatus> {
+    log.debug("Invoking `nexus_sign_in`.");
+    return await invoke<NexusSignInStatus>("nexus_sign_in");
+}
+
+export async function nexusCancelSignIn(): Promise<void> {
+    log.debug("Invoking `nexus_cancel_sign_in`.");
+    await invoke("nexus_cancel_sign_in");
+}
+
+/** Revokes the sign-in with Nexus (best effort) and always deletes it
+ * from this computer. */
+export async function nexusSignOut(): Promise<NexusSignInStatus> {
+    log.debug("Invoking `nexus_sign_out`.");
+    return await invoke<NexusSignInStatus>("nexus_sign_out");
+}
+
 export async function loadProfiles(): Promise<ProfilesConfig> {
     log.debug("Invoking `load_profiles`.");
     return await invoke<ProfilesConfig>("load_profiles");

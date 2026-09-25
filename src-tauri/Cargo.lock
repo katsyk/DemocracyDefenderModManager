@@ -953,6 +953,7 @@ version = "2.0.0-rc.6"
 dependencies = [
  "anyhow",
  "anyhow-tauri",
+ "base64 0.22.1",
  "dirs 7.0.0",
  "futures",
  "keyring",
@@ -964,6 +965,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sevenz-rust2",
+ "sha2 0.10.9",
  "sysinfo",
  "tauri",
  "tauri-build",
