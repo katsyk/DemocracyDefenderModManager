@@ -30,6 +30,26 @@ use super::{
 
 const CONSENT_TIMEOUT: Duration = Duration::from_secs(120);
 const INSTALL_COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long an install waits for the Mods page to be ready to handle the
+/// consent prompt / afterInstall step -- mostly a cold start, where the
+/// install arrives while the webview is still loading.
+const FRONTEND_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Wait (up to `FRONTEND_READY_TIMEOUT`) until the frontend can handle
+/// bridge events. Emitting before that loses the event: nothing is
+/// listening yet, so a consent prompt would never appear (and time out as
+/// Deny) and the afterInstall step would silently not happen.
+async fn wait_for_frontend(app: &AppHandle) -> bool {
+    let rx = app.state::<AppState>().bridge_frontend_ready.subscribe();
+    wait_until_ready(rx, FRONTEND_READY_TIMEOUT).await
+}
+
+/// `true` as soon as `rx` holds `true` (immediately if it already does),
+/// `false` if that doesn't happen within `timeout`.
+async fn wait_until_ready(mut rx: tokio::sync::watch::Receiver<bool>, timeout: Duration) -> bool {
+    let ready = tokio::time::timeout(timeout, async { rx.wait_for(|ready| *ready).await.is_ok() }).await;
+    matches!(ready, Ok(true))
+}
 
 /// Start the bridge: bind a loopback listener on a random port, write
 /// `bridge.json`, and start accepting connections in the background.
@@ -299,6 +319,14 @@ async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String) -> 
 
     if let Some(site) = &site {
         if !is_site_allowed(app, site).await {
+            if !wait_for_frontend(app).await {
+                return ErrorReply::new(
+                    id,
+                    ErrorCode::Internal,
+                    "DDMM couldn't show the permission prompt. Open DDMM's Mods page and try again.",
+                )
+                .to_line();
+            }
             match request_consent(app, &id, site).await {
                 ConsentDecision::Deny => {
                     return ErrorReply::new(id, ErrorCode::Declined, "You chose not to install this mod.").to_line();
@@ -345,7 +373,15 @@ async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String) -> 
         .or_else(|| settings.as_ref().map(|s| s.after_browser_install().to_string()))
         .unwrap_or_else(|| "deploy".to_string());
 
-    let completion = request_install_completion(app, &id, &outcome, &after_install).await;
+    let completion = if wait_for_frontend(app).await {
+        request_install_completion(app, &id, &outcome, &after_install).await
+    } else {
+        log::warn!("Frontend never became ready; skipping the afterInstall step for a bridge install");
+        InstallCompletion {
+            warnings: vec!["Installed to the library only: DDMM's Mods page wasn't open to add it to a profile.".to_string()],
+            ..InstallCompletion::default()
+        }
+    };
 
     let mut warnings = completion.warnings.clone();
     if let Some(w) = &outcome.warning {
@@ -473,5 +509,33 @@ pub fn focus_main_window(app: &AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wait_until_ready_returns_at_once_when_already_ready() {
+        let tx = tokio::sync::watch::Sender::new(true);
+        assert!(wait_until_ready(tx.subscribe(), Duration::from_millis(10)).await);
+    }
+
+    #[tokio::test]
+    async fn wait_until_ready_waits_for_the_frontend() {
+        let tx = tokio::sync::watch::Sender::new(false);
+        let rx = tx.subscribe();
+        let waiter = tokio::spawn(wait_until_ready(rx, Duration::from_secs(5)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "must not proceed before the frontend is ready");
+        tx.send_replace(true);
+        assert!(waiter.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn wait_until_ready_times_out() {
+        let tx = tokio::sync::watch::Sender::new(false);
+        assert!(!wait_until_ready(tx.subscribe(), Duration::from_millis(30)).await);
     }
 }

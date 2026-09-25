@@ -41,6 +41,13 @@ pub struct AppState {
     bridge_queue_depth: AtomicUsize,
     /// Serializes actual bridge installs to one at a time.
     bridge_install_lock: Mutex<()>,
+    /// `true` while the Mods page is mounted with its bridge listeners
+    /// registered and profiles loaded -- i.e. while a consent prompt or an
+    /// `afterInstall` step emitted now would actually be handled. Set by
+    /// `commands::bridge::set_bridge_frontend_ready`; awaited by
+    /// `bridge::server` before emitting either event (on a cold start the
+    /// extension's install arrives before the webview has loaded).
+    bridge_frontend_ready: tokio::sync::watch::Sender<bool>,
     /// Set by `commands::ack_close_requested` -- the frontend's close
     /// handler calls it as the very first thing it does, so this being
     /// `true` proves the frontend is alive and actually handling the close
@@ -59,6 +66,7 @@ impl AppState {
             bridge_pending: Mutex::default(),
             bridge_queue_depth: AtomicUsize::new(0),
             bridge_install_lock: Mutex::new(()),
+            bridge_frontend_ready: tokio::sync::watch::Sender::new(false),
             close_ack: AtomicBool::new(false),
         }
     }
@@ -284,6 +292,7 @@ pub fn run() {
             commands::bridge::remove_browser_integration_one,
             commands::bridge::focus_main_window,
             commands::bridge::is_game_running,
+            commands::bridge::set_bridge_frontend_ready,
             commands::force_exit,
             commands::ack_close_requested,
         ])

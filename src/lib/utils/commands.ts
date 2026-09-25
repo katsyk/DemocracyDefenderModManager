@@ -182,6 +182,13 @@ export async function purge(): Promise<void> {
 
 export type BridgeConsentDecision = "AlwaysAllow" | "JustOnce" | "Deny";
 
+/** Tells the backend whether this page can handle bridge events right now
+ * (listeners registered, profiles loaded). Browser installs wait for this
+ * before asking for consent or running the afterInstall step. */
+export async function setBridgeFrontendReady(ready: boolean): Promise<void> {
+    await invoke<void>("set_bridge_frontend_ready", { ready });
+}
+
 /** Answers a pending `bridge://consent-request` -- see BridgeConsentPopup. */
 export async function resolveBridgeConsent(requestId: string, decision: BridgeConsentDecision): Promise<void> {
     log.debug("Invoking `resolve_bridge_consent`.");

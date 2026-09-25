@@ -15,6 +15,7 @@
         addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles,
         loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath,
         resolveBridgeConsent, resolveBridgeInstallCompletion, isGameRunning, forceExit, ackCloseRequested,
+        setBridgeFrontendReady,
         type UpdateStatusEntry, type BridgeConsentDecision, type BridgeSoftError
     } from "$lib/utils/commands";
     import type { UUID } from "$lib/types/uuid";
@@ -188,7 +189,17 @@
             (e) => onAutoImportCandidate(e.payload),
         );
 
+        // Only now can a browser install's consent prompt / afterInstall
+        // step actually be handled; the backend holds them until then (on a
+        // cold start the install arrives before this page has loaded).
+        Promise.all([initPromise, unlistenBridgeConsent, unlistenBridgeInstalled])
+            .then(() => {
+                if (profilesLoaded) return setBridgeFrontendReady(true);
+            })
+            .catch((ex: unknown) => log.error(`Failed to mark the bridge frontend ready: ${errorMessage(ex)}`));
+
         return () => {
+            setBridgeFrontendReady(false).catch(() => {});
             unlisten.then(f => f());
             unlistenDragDrop.then(f => f());
             unlistenBridgeConsent.then(f => f());

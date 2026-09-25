@@ -14,6 +14,14 @@ use crate::{
 
 const SETTINGS_FILE: &str = "settings.json";
 
+/// The Mods page reports whether it can currently handle bridge events
+/// (listeners registered, profiles loaded). See `AppState::bridge_frontend_ready`.
+#[tauri::command]
+pub fn set_bridge_frontend_ready(state: State<'_, AppState>, ready: bool) {
+    log::debug!("Bridge frontend ready: {ready}");
+    state.bridge_frontend_ready.send_replace(ready);
+}
+
 /// Resolve a pending `bridge://consent-request` -- the frontend calls this
 /// after the user clicks Always allow / Just this once / Deny.
 #[tauri::command]
