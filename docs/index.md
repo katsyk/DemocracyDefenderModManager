@@ -84,5 +84,5 @@ source software under Apache-2.0. See [Credits & license](about.md) for the full
   archive came from.
 
 !!! warning "Release candidate"
-    DDMM is release-candidate software (currently versioned `2.0.0-rc.4`). Expect some rough edges, and please
+    DDMM is release-candidate software (currently versioned `2.0.0-rc.5`). Expect some rough edges, and please
     [report bugs](help/bugs.md) you run into.
