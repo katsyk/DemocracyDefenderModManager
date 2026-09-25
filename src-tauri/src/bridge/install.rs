@@ -363,6 +363,8 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::UnsafeArchive, "{}", err.message);
         assert!(mods.is_empty());
+        // No half-installed "ghost" mod directory may be left behind.
+        assert!(!dir.path().join("mods").join("evil").exists());
     }
 
     #[cfg(unix)]

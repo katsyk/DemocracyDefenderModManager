@@ -219,26 +219,44 @@ pub(crate) async fn install_from_archive(state: &AppState, mods: &mut Vec<Mod>, 
     let manifest_file = mod_dir.join(MANIFEST_FILE);
     prepare_mod_dir(mod_dir.clone(), manifest_file.clone(), name.clone()).await.into_ta_result()?;
 
-    log::info!("Resolving manifest...");
-    let (archive, manifest) = resolve_manifest(archive, name.clone(), manifest_file.clone()).await.into_ta_result()?;
+    // From here on `mod_dir` is ours (prepare_mod_dir just created it), so
+    // a failure must remove it again: a half-written directory with a
+    // manifest.json would otherwise show up as an empty "ghost" mod on the
+    // next launch and block retrying the same file with "mod directory
+    // already exists" (e.g. after an archive was rejected as unsafe).
+    let prepared: TAResult<(Mod, Option<String>)> = async {
+        log::info!("Resolving manifest...");
+        let (archive, manifest) = resolve_manifest(archive, name.clone(), manifest_file.clone()).await.into_ta_result()?;
 
-    let mut r#mod = Mod {
-        manifest,
-        directory: mod_dir.clone(),
-        sources: Vec::new(),
-    };
+        let mut r#mod = Mod {
+            manifest,
+            directory: mod_dir.clone(),
+            sources: Vec::new(),
+        };
 
-    log::info!("Checking for duplicate...");
-    if mods.iter().any(|m| m.guid() == r#mod.guid()) {
-        return anyhow::anyhow!("mod with GUID {{{}}} already exists", r#mod.guid())
-            .into_ta_result();
+        log::info!("Checking for duplicate...");
+        if mods.iter().any(|m| m.guid() == r#mod.guid()) {
+            return anyhow::anyhow!("mod with GUID {{{}}} already exists", r#mod.guid())
+                .into_ta_result();
+        }
+
+        log::info!("Extracting archive...");
+        extract_archive(archive, mod_dir.clone()).await?;
+
+        log::debug!("Detecting patch file layout...");
+        let warning = apply_patch_layout(&mod_dir, &mut r#mod.manifest).await.into_ta_result()?;
+        Ok((r#mod, warning))
     }
-
-    log::info!("Extracting archive...");
-    extract_archive(archive, mod_dir.clone()).await?;
-
-    log::debug!("Detecting patch file layout...");
-    let warning = apply_patch_layout(&mod_dir, &mut r#mod.manifest).await.into_ta_result()?;
+    .await;
+    let (mut r#mod, warning) = match prepared {
+        Ok(v) => v,
+        Err(e) => {
+            if let Err(cleanup) = tokio::fs::remove_dir_all(&mod_dir).await {
+                log::error!("Failed to clean up {:?} after a failed install: {}", mod_dir, cleanup);
+            }
+            return Err(e);
+        }
+    };
 
     log::debug!("Normalizing paths...");
     if let Err(e) = r#mod.normalize_paths().await {
