@@ -13,6 +13,23 @@ export const SITE_MATCHES = [
   '*://github.com/*',
 ];
 
+/**
+ * Library scripts the background script depends on, in load order, as
+ * paths relative to the extension root. Chrome's service worker pulls them
+ * in itself with `importScripts` (see background/main.js); Firefox's MV3
+ * event page is a plain page with no `importScripts`, so they have to be
+ * listed in `background.scripts` ahead of main.js instead.
+ */
+export const BACKGROUND_LIBS = [
+  'lib/browser-shim.js',
+  'lib/sources.js',
+  'lib/errors.js',
+  'lib/protocol-client.js',
+  'lib/capture.js',
+  'lib/downloads-adapter.js',
+  'lib/storage.js',
+];
+
 /** Manifest fields identical on every browser. */
 function baseManifest(version) {
   return {
@@ -163,7 +180,7 @@ export function buildFirefoxManifest({ version, geckoId, minFirefoxVersion }) {
   // sharing one global scope, which is exactly the loading model the rest
   // of this codebase already uses (see extension/README.md).
   manifest.background = {
-    scripts: ['background/main.js'],
+    scripts: [...BACKGROUND_LIBS, 'background/main.js'],
   };
   manifest.browser_specific_settings = {
     gecko: {

@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { buildChromeManifest, buildFirefoxManifest, extensionIdFromKey, SITE_MATCHES } from '../../scripts/manifest.mjs';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  BACKGROUND_LIBS,
+  buildChromeManifest,
+  buildFirefoxManifest,
+  extensionIdFromKey,
+  SITE_MATCHES,
+} from '../../scripts/manifest.mjs';
+
+const BACKGROUND_MAIN = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'src', 'background', 'main.js');
 
 // The real key, from /home/rabite/dev/ddmm-secrets/manifest-key.txt (base64
 // DER SubjectPublicKeyInfo). Safe to hardcode: it's a *public* key, and this
@@ -87,7 +98,14 @@ describe('buildFirefoxManifest', () => {
   });
 
   it('uses background.scripts, not a service_worker', () => {
-    expect(manifest.background).toEqual({ scripts: ['background/main.js'] });
+    expect(manifest.background.service_worker).toBeUndefined();
+    expect(manifest.background.scripts.at(-1)).toBe('background/main.js');
+  });
+
+  // Firefox's event page has no importScripts, so every library main.js
+  // needs must be listed ahead of it -- otherwise DDMM is undefined there.
+  it('loads every background library before main.js', () => {
+    expect(manifest.background).toEqual({ scripts: [...BACKGROUND_LIBS, 'background/main.js'] });
   });
 
   it('requests exactly the specified permissions and host permissions', () => {
@@ -101,5 +119,25 @@ describe('buildFirefoxManifest', () => {
     expect(manifest.permissions).toEqual(chrome.permissions);
     expect(manifest.content_scripts).toEqual(chrome.content_scripts);
     expect(manifest.icons).toEqual(chrome.icons);
+  });
+});
+
+describe('background/main.js dependency loading', () => {
+  const source = readFileSync(BACKGROUND_MAIN, 'utf8');
+
+  it("importScripts the same libraries, in the same order, as Firefox's background.scripts", () => {
+    const call = source.match(/importScripts\(([\s\S]*?)\);/);
+    expect(call).not.toBeNull();
+    const imported = [...call[1].matchAll(/'\.\.\/(lib\/[^']+)'/g)].map((m) => m[1]);
+    expect(imported).toEqual(BACKGROUND_LIBS);
+  });
+
+  // Chrome now exposes a `browser` namespace in extension service workers,
+  // so gating importScripts on `!browser` skipped it and left DDMM
+  // undefined ("Uncaught ReferenceError: DDMM is not defined").
+  it('does not gate importScripts on the browser namespace', () => {
+    const guard = source.match(/if \(typeof importScripts === 'function'[^)]*\)/);
+    expect(guard).not.toBeNull();
+    expect(guard[0]).not.toMatch(/browser/);
   });
 });

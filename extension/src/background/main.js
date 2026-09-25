@@ -14,10 +14,13 @@
 
   // Chrome's MV3 service worker is a classic script (no `type: module` is
   // declared for it), so it loads its dependencies with importScripts;
-  // Firefox lists the same files directly in `background.scripts` and they
-  // share this global scope already, making importScripts both unavailable
-  // and unnecessary there.
-  if (typeof importScripts === 'function' && !root.browser) {
+  // Firefox lists the same files directly in `background.scripts` (see
+  // BACKGROUND_LIBS in scripts/manifest.mjs) and they share this global
+  // scope already, making importScripts both unavailable and unnecessary
+  // there. Don't key this off `browser` being defined: current Chrome
+  // exposes a `browser` namespace in the service worker too, which left
+  // DDMM undefined and the whole background script dead.
+  if (typeof importScripts === 'function') {
     importScripts(
       '../lib/browser-shim.js',
       '../lib/sources.js',
