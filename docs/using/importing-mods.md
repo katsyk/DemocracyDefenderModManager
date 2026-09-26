@@ -31,7 +31,7 @@ right away. Nexus Mods checks still need the optional sign-in or API key.
 
 The Import window lists what it found on this PC:
 
-- **Mods installed with another mod manager:** the folder where another Helldivers 2 mod manager keeps the
+- **Mods installed with another mod manager:** the folder where another mod manager for Helldivers 2 keeps the
   mods it installed.
 - **Archives downloaded by another mod manager:** the folder where one keeps the original downloads.
 - **Your downloads folder:** the Downloads folder from DDMM's Settings, or your system's.
