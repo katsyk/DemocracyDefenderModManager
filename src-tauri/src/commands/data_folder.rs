@@ -11,7 +11,7 @@ use std::{
 use anyhow::Context;
 use anyhow_tauri::{IntoTAResult, TAResult};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
     commands::settings::do_load_settings,
@@ -149,11 +149,16 @@ fn commit_location(state_dir: &data_dir::DataDirDecision, target: &Path, is_rese
     }
 }
 
+/// Exit through the normal path (bridge shutdown, single-instance lock
+/// released) and start the app again with **no arguments**: not
+/// `AppHandle::request_restart`, which replays this process's arguments
+/// (a `ddmm://` link would prompt again). See `app_lifecycle`.
 fn restart_soon(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(RESTART_DELAY).await;
         log::info!("Restarting to use the new data folder.");
-        app.request_restart();
+        app.state::<AppState>().relaunch_on_exit.store(true, std::sync::atomic::Ordering::SeqCst);
+        app.exit(0);
     });
 }
 

@@ -12,6 +12,7 @@ pub mod bridge;
 pub mod deep_link;
 pub mod auto_import;
 pub mod data_move;
+pub mod app_lifecycle;
 pub mod providers;
 pub mod secrets;
 pub mod nexus_oauth;
@@ -78,6 +79,9 @@ pub struct AppState {
     /// `true` while `commands::data_folder::move_data_folder` is copying;
     /// closing the window is refused meanwhile.
     data_move_running: AtomicBool,
+    /// Set once a data folder change is committed: on exit, start the app
+    /// again (with no arguments; see `app_lifecycle::relaunch_command`).
+    relaunch_on_exit: AtomicBool,
     /// Serializes update checks (manual, startup, scheduled).
     update_check_lock: Mutex<()>,
     /// The latest update check's results this session -- see
@@ -127,6 +131,7 @@ impl AppState {
             bridge_frontend_ready: tokio::sync::watch::Sender::new(false),
             close_ack: AtomicBool::new(false),
             data_move_running: AtomicBool::new(false),
+            relaunch_on_exit: AtomicBool::new(false),
             update_check_lock: Mutex::new(()),
             last_update_report: Mutex::default(),
             last_update_check: Mutex::default(),
@@ -380,7 +385,8 @@ pub fn run() {
                 // the new copy is complete) but would waste the copy and
                 // leave a half-finished folder to clean up; the progress
                 // popup asks the user to wait instead.
-                if window.app_handle().state::<AppState>().data_move_running.load(Ordering::SeqCst) {
+                let moving = window.app_handle().state::<AppState>().data_move_running.load(Ordering::SeqCst);
+                if !app_lifecycle::close_allowed(moving) {
                     log::info!("Close requested while the data folder is being moved; ignoring it.");
                     api.prevent_close();
                     return;
@@ -392,9 +398,14 @@ pub fn run() {
                     const ACK_TIMEOUT: Duration = Duration::from_secs(10);
                     tokio::time::sleep(ACK_TIMEOUT).await;
 
-                    let acked = app_handle.state::<AppState>().close_ack.load(Ordering::SeqCst);
+                    let state = app_handle.state::<AppState>();
+                    let acked = state.close_ack.load(Ordering::SeqCst);
+                    let moving = state.data_move_running.load(Ordering::SeqCst);
                     let still_open = app_handle.get_webview_window(&label).is_some();
-                    if still_open && !acked {
+                    if moving && still_open && !acked {
+                        log::info!("Close watchdog: a data folder move is running; not forcing exit.");
+                    }
+                    if app_lifecycle::watchdog_should_force_exit(still_open, acked, moving) {
                         log::warn!(
                             "Close watchdog: window '{label}' got no acknowledgement from the \
                              frontend within {ACK_TIMEOUT:?} of a close request; forcing exit."
@@ -464,9 +475,34 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app_handle, event| {
-            if let tauri::RunEvent::Exit = event {
-                tauri::async_runtime::block_on(bridge::server::shutdown(app_handle));
+        .run(|app_handle, event| match event {
+            // Any exit (last window closed, the close watchdog, the
+            // frontend's force-exit fallback) waits while a data folder
+            // move is copying. See `app_lifecycle`.
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                let moving = app_handle.state::<AppState>().data_move_running.load(Ordering::SeqCst);
+                if !app_lifecycle::exit_allowed(moving) {
+                    log::warn!("Exit requested while the data folder is being moved; ignoring it.");
+                    api.prevent_exit();
+                }
             }
+            tauri::RunEvent::Exit => {
+                tauri::async_runtime::block_on(bridge::server::shutdown(app_handle));
+                // Plugins have already handled `Exit` by now (Tauri runs them
+                // before this callback), so the single-instance lock is
+                // released and the new process won't hand off to this one.
+                if app_handle.state::<AppState>().relaunch_on_exit.load(Ordering::SeqCst) {
+                    let relaunch = app_lifecycle::relaunch_command(
+                        &std::env::current_exe().unwrap_or_default(),
+                        std::env::var_os("APPIMAGE").as_deref(),
+                        &std::env::args_os().collect::<Vec<_>>(),
+                    );
+                    log::info!("Relaunching {:?} (no arguments) for the new data folder.", relaunch.program);
+                    if let Err(e) = app_lifecycle::spawn_relaunch(&relaunch) {
+                        log::error!("Couldn't relaunch DDMM ({:?}): {e}. Start it again by hand.", relaunch.program);
+                    }
+                }
+            }
+            _ => {}
         });
 }
