@@ -533,12 +533,16 @@ pub fn run() {
                         &std::env::args_os().collect::<Vec<_>>(),
                         &unshown_links,
                     );
+                    let left_out = unshown_links.len() - relaunch.args.len();
+                    if left_out > 0 {
+                        log::warn!("{left_out} install link(s) not shown yet are too long to pass on; dropping them.");
+                    }
                     log::info!(
                         "Relaunching {:?} for the new data folder ({} install link(s) not shown yet passed on).",
                         relaunch.program,
                         relaunch.args.len()
                     );
-                    if let Err(e) = app_lifecycle::spawn_relaunch(&relaunch) {
+                    if let Err(e) = app_lifecycle::spawn_relaunch_or_plain(&relaunch, app_lifecycle::spawn_relaunch) {
                         log::error!("Couldn't relaunch DDMM ({:?}): {e}. Start it again by hand.", relaunch.program);
                     }
                 }

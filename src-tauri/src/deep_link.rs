@@ -61,16 +61,44 @@ pub struct DeepLinkQueue {
     pending: Vec<String>,
 }
 
+/// At most this many install links wait at once. They pile up only while
+/// the Mods page isn't shown (Settings, the recovery screen); anything
+/// beyond this is dropped rather than growing without bound.
+pub const MAX_PENDING_LINKS: usize = 16;
+
+/// Install targets longer than this (in bytes) are refused. Real mod pages
+/// and downloads are far shorter; this keeps a queued link, and the
+/// relaunch arguments built from it, reasonably small.
+pub const MAX_TARGET_LEN: usize = 2048;
+
+/// What [`DeepLinkQueue::push`] did with a link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushOutcome {
+    Queued,
+    /// The same target is already waiting (e.g. a cold-start link seen both
+    /// in argv and through the deep-link plugin).
+    Duplicate,
+    /// [`MAX_PENDING_LINKS`] are already waiting; this one was dropped.
+    QueueFull,
+    /// Longer than [`MAX_TARGET_LEN`]; refused.
+    TooLong,
+}
+
 impl DeepLinkQueue {
-    /// Queue an install target. `false` if the same target is already
-    /// waiting (e.g. a cold-start link seen both in argv and through the
-    /// deep-link plugin).
-    pub fn push(&mut self, target: String) -> bool {
+    /// Queue an install target, unless it's too long, already waiting, or
+    /// the queue is full.
+    pub fn push(&mut self, target: String) -> PushOutcome {
+        if target.len() > MAX_TARGET_LEN {
+            return PushOutcome::TooLong;
+        }
         if self.pending.contains(&target) {
-            return false;
+            return PushOutcome::Duplicate;
+        }
+        if self.pending.len() >= MAX_PENDING_LINKS {
+            return PushOutcome::QueueFull;
         }
         self.pending.push(target);
-        true
+        PushOutcome::Queued
     }
 
     /// Everything waiting, oldest first, which is then no longer waiting.
@@ -127,11 +155,27 @@ pub fn handle(app: &AppHandle, urls: Vec<Url>) {
                 crate::bridge::server::focus_main_window(app);
                 let state = app.state::<AppState>();
                 let mut queue = state.deep_links.lock().unwrap_or_else(|e| e.into_inner());
-                if queue.push(target) {
-                    log::info!("Install link queued for confirmation: {url}");
-                    queued = true;
-                } else {
-                    log::info!("Ignoring a repeat of an install link already waiting: {url}");
+                let target_len = target.len();
+                match queue.push(target) {
+                    PushOutcome::Queued => {
+                        log::info!("Install link queued for confirmation: {url}");
+                        queued = true;
+                    }
+                    PushOutcome::Duplicate => {
+                        log::info!("Ignoring a repeat of an install link already waiting: {url}");
+                    }
+                    PushOutcome::QueueFull => {
+                        log::warn!(
+                            "Ignoring an install link: {MAX_PENDING_LINKS} are already waiting to be shown: {url}"
+                        );
+                    }
+                    PushOutcome::TooLong => {
+                        // Not logged in full: it's over the limit by definition.
+                        log::warn!(
+                            "Ignoring an install link whose target is {target_len} characters long \
+                             (the limit is {MAX_TARGET_LEN})."
+                        );
+                    }
                 }
             }
             None => {
@@ -210,8 +254,8 @@ mod tests {
     fn queued_links_wait_until_taken_then_come_out_once_in_order() {
         let mut q = DeepLinkQueue::default();
         // A cold start: links arrive before anything can take them.
-        assert!(q.push(A.into()));
-        assert!(q.push(B.into()));
+        assert_eq!(q.push(A.into()), PushOutcome::Queued);
+        assert_eq!(q.push(B.into()), PushOutcome::Queued);
         // The page becomes ready and takes them, oldest first.
         assert_eq!(q.take_all(), vec![A.to_string(), B.to_string()]);
         // Asking again (a second `pending` event, the page remounting)
@@ -224,22 +268,22 @@ mod tests {
     fn the_same_link_waiting_twice_is_queued_once() {
         let mut q = DeepLinkQueue::default();
         // E.g. the cold-start link seen both in argv and via get_current().
-        assert!(q.push(A.into()));
-        assert!(!q.push(A.into()));
-        assert!(q.push(B.into()));
-        assert!(!q.push(B.into()));
+        assert_eq!(q.push(A.into()), PushOutcome::Queued);
+        assert_eq!(q.push(A.into()), PushOutcome::Duplicate);
+        assert_eq!(q.push(B.into()), PushOutcome::Queued);
+        assert_eq!(q.push(B.into()), PushOutcome::Duplicate);
         assert_eq!(q.take_all(), vec![A.to_string(), B.to_string()]);
     }
 
     #[test]
     fn links_arriving_after_a_take_are_queued_for_the_next_one() {
         let mut q = DeepLinkQueue::default();
-        assert!(q.push(A.into()));
+        assert_eq!(q.push(A.into()), PushOutcome::Queued);
         assert_eq!(q.take_all(), vec![A.to_string()]);
         // Clicking it again later is a new request (the page, not the
         // queue, skips it while its first prompt is still open).
-        assert!(q.push(A.into()));
-        assert!(q.push(B.into()));
+        assert_eq!(q.push(A.into()), PushOutcome::Queued);
+        assert_eq!(q.push(B.into()), PushOutcome::Queued);
         assert_eq!(q.take_all(), vec![A.to_string(), B.to_string()]);
     }
 
@@ -247,7 +291,7 @@ mod tests {
     fn links_still_waiting_survive_a_relaunch_as_ddmm_links() {
         let mut q = DeepLinkQueue::default();
         let odd = "https://example.com/dl?id=4&name=a b&x=%2F";
-        assert!(q.push(odd.into()));
+        assert_eq!(q.push(odd.into()), PushOutcome::Queued);
         let links = q.pending_links();
         assert_eq!(links.len(), 1);
         // The relaunched DDMM reads them back to exactly the same target.
@@ -256,6 +300,37 @@ mod tests {
         // Once handed to the page, it isn't carried over any more.
         q.take_all();
         assert!(q.pending_links().is_empty());
+    }
+
+    #[test]
+    fn the_queue_is_capped_and_drops_new_links_when_full() {
+        let mut q = DeepLinkQueue::default();
+        let target = |i: usize| format!("https://example.com/mods/{i}.zip");
+        for i in 0..MAX_PENDING_LINKS {
+            assert_eq!(q.push(target(i)), PushOutcome::Queued, "link {i}");
+        }
+        // Full: the newest is dropped, the ones already waiting are kept.
+        assert_eq!(q.push(target(MAX_PENDING_LINKS)), PushOutcome::QueueFull);
+        assert_eq!(q.push(target(MAX_PENDING_LINKS + 1)), PushOutcome::QueueFull);
+        // A repeat of a waiting link is still reported as a repeat.
+        assert_eq!(q.push(target(0)), PushOutcome::Duplicate);
+        let taken = q.take_all();
+        assert_eq!(taken, (0..MAX_PENDING_LINKS).map(target).collect::<Vec<_>>());
+        // Once taken, there's room again.
+        assert_eq!(q.push(target(MAX_PENDING_LINKS)), PushOutcome::Queued);
+    }
+
+    #[test]
+    fn overlong_targets_are_refused() {
+        let mut q = DeepLinkQueue::default();
+        let base = "https://example.com/";
+        let at_limit = format!("{base}{}", "a".repeat(MAX_TARGET_LEN - base.len()));
+        let over = format!("{at_limit}a");
+        assert_eq!(at_limit.len(), MAX_TARGET_LEN);
+        assert_eq!(q.push(over), PushOutcome::TooLong);
+        assert!(q.pending_links().is_empty(), "a refused link is never queued");
+        assert_eq!(q.push(at_limit.clone()), PushOutcome::Queued);
+        assert_eq!(q.take_all(), vec![at_limit]);
     }
 
     #[test]

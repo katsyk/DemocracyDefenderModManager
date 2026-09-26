@@ -27,6 +27,11 @@ pub struct Relaunch {
 /// environment is inherited as is, which keeps what portable/AppImage
 /// detection needs (`APPIMAGE`).
 ///
+/// The links passed on are limited to [`RELAUNCH_ARGS_BUDGET`] in total,
+/// oldest first; a link that doesn't fit is left out (and a later, shorter
+/// one may still fit). Too long a command line would make the relaunch
+/// itself fail (Windows' 32,767-character limit, `E2BIG` on Linux).
+///
 /// For an AppImage the program is the `.AppImage` file itself (`$APPIMAGE`),
 /// not the binary inside its temporary mount, which is gone once this
 /// process exits.
@@ -41,7 +46,52 @@ pub fn relaunch_command(
         Some(a) if !a.is_empty() => PathBuf::from(a),
         _ => current_exe.to_path_buf(),
     };
-    Relaunch { program, args: unshown_links.iter().map(OsString::from).collect() }
+    Relaunch { program, args: links_within_budget(unshown_links, RELAUNCH_ARGS_BUDGET) }
+}
+
+/// Total size the relaunch's link arguments may take, including
+/// [`RELAUNCH_ARG_OVERHEAD`] per argument. Far below any OS limit, together
+/// with the program path.
+pub const RELAUNCH_ARGS_BUDGET: usize = 8 * 1024;
+
+/// What each argument costs besides its own text: a separating space and,
+/// on Windows, the quotes around it.
+pub const RELAUNCH_ARG_OVERHEAD: usize = 3;
+
+/// The links, oldest first, that fit in `budget` together.
+fn links_within_budget(links: &[String], budget: usize) -> Vec<OsString> {
+    let mut used = 0;
+    let mut args = Vec::new();
+    for link in links {
+        let cost = link.len() + RELAUNCH_ARG_OVERHEAD;
+        if used + cost <= budget {
+            used += cost;
+            args.push(OsString::from(link));
+        }
+    }
+    args
+}
+
+/// Start `relaunch`; if that fails while it carries links, try once more
+/// with no arguments, so a problem with the links can never keep DDMM from
+/// coming back. `spawn` is [`spawn_relaunch`] outside of tests. Returns the
+/// command that was started, or the last error.
+pub fn spawn_relaunch_or_plain(
+    relaunch: &Relaunch,
+    mut spawn: impl FnMut(&Relaunch) -> std::io::Result<()>,
+) -> std::io::Result<Relaunch> {
+    match spawn(relaunch) {
+        Ok(()) => Ok(relaunch.clone()),
+        Err(e) if relaunch.args.is_empty() => Err(e),
+        Err(e) => {
+            log::warn!(
+                "Couldn't relaunch DDMM with {} install link(s) ({e}); relaunching without them.",
+                relaunch.args.len()
+            );
+            let plain = Relaunch { program: relaunch.program.clone(), args: Vec::new() };
+            spawn(&plain).map(|()| plain)
+        }
+    }
 }
 
 /// Whether a window close request may go ahead. Closing is ignored while a
@@ -120,6 +170,75 @@ mod tests {
             &unshown,
         );
         assert_eq!(r.args, args(&["ddmm://install?url=https%3A%2F%2Fexample.org%2Fb.zip"]));
+    }
+
+    /// A `ddmm://install` link `len` bytes long.
+    fn link_of_len(len: usize) -> String {
+        let head = "ddmm://install?url=https%3A%2F%2Fexample.com%2F";
+        format!("{head}{}", "a".repeat(len - head.len()))
+    }
+
+    #[test]
+    fn relaunch_links_stay_within_the_argument_budget() {
+        let exe = Path::new("/opt/ddmm/ddmm");
+        // The worst the queue can hold: 16 links whose 2048-character
+        // targets roughly triple in length when encoded again.
+        let many: Vec<String> = (0..16).map(|_| link_of_len(3 * 2048 + 40)).collect();
+        let r = relaunch_command(exe, None, &[], &many);
+        let total: usize = r.args.iter().map(|a| a.len() + RELAUNCH_ARG_OVERHEAD).sum();
+        assert!(total <= RELAUNCH_ARGS_BUDGET, "{total}");
+        assert_eq!(r.args.len(), 1, "one ~6 KB link fits, a second doesn't");
+
+        // Oldest first; one that doesn't fit is skipped, a later short one still fits.
+        let small_a = link_of_len(100);
+        let huge = link_of_len(RELAUNCH_ARGS_BUDGET);
+        let small_b = link_of_len(200);
+        let r = relaunch_command(exe, None, &[], &[small_a.clone(), huge, small_b.clone()]);
+        assert_eq!(r.args, vec![OsString::from(small_a), OsString::from(small_b)]);
+
+        // Exactly at the budget still fits; one byte over doesn't.
+        let exact = link_of_len(RELAUNCH_ARGS_BUDGET - RELAUNCH_ARG_OVERHEAD);
+        assert_eq!(relaunch_command(exe, None, &[], &[exact]).args.len(), 1);
+        let over = link_of_len(RELAUNCH_ARGS_BUDGET - RELAUNCH_ARG_OVERHEAD + 1);
+        assert!(relaunch_command(exe, None, &[], &[over]).args.is_empty());
+    }
+
+    #[test]
+    fn a_failed_relaunch_with_links_is_retried_once_without_them() {
+        let with_links = Relaunch { program: PathBuf::from("/opt/ddmm/ddmm"), args: args(&["ddmm://install?url=x"]) };
+        let mut attempts = Vec::new();
+        let started = spawn_relaunch_or_plain(&with_links, |r| {
+            attempts.push(r.clone());
+            if r.args.is_empty() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("argument list too long"))
+            }
+        })
+        .unwrap();
+        assert!(started.args.is_empty());
+        assert_eq!(started.program, with_links.program);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0], with_links);
+
+        // Success the first time: no retry.
+        let mut calls = 0;
+        let started = spawn_relaunch_or_plain(&with_links, |_| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((calls, started), (1, with_links.clone()));
+
+        // With no links there's nothing to drop: a failure is final, not retried.
+        let plain = Relaunch { program: with_links.program.clone(), args: Vec::new() };
+        let mut calls = 0;
+        assert!(spawn_relaunch_or_plain(&plain, |_| {
+            calls += 1;
+            Err(std::io::Error::other("no such file"))
+        })
+        .is_err());
+        assert_eq!(calls, 1);
     }
 
     #[test]
