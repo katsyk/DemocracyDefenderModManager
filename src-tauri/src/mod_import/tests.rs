@@ -698,7 +698,7 @@ fn arsenal_data_folder(local: &Path) -> PathBuf {
             {{ "name": "Silver", "description": "", "include": ["Shiny/Silver"], "enabled": false, "iconPath": null }} ] }}
        ], "contentHash": "abc", "addedAt": "2026-06-01T00:00:00Z" }},
     {{ "uuid": "5d6e7f80-1111-4222-8333-944455566677", "path": "{flat_path}", "label": "My Local Mod",
-       "description": "", "iconPath": null, "tags": ["misc"], "nexusData": null, "options": [] }},
+       "description": "Made it myself", "iconPath": null, "tags": ["misc"], "nexusData": null, "options": [] }},
     {{ "uuid": "99999999-1111-4222-8333-944455566677", "path": "{gone_path}", "label": "Deleted", "options": [] }}
   ],
   "modsList": {{
@@ -755,6 +755,7 @@ async fn imports_an_arsenal_library_with_names_nexus_ids_order_and_options() {
     let local_mod = report.imported.iter().find(|m| m.name == "My Local Mod").unwrap();
     assert_eq!(local_mod.guid.to_string(), "5d6e7f80-1111-4222-8333-944455566677");
     assert_eq!((local_mod.enabled, local_mod.order), (Some(false), Some(0)));
+    assert!(matches!(&local_mod.config, Some(Config::Legacy { enabled: false, .. })));
 
     // The written manifest carries Arsenal's options, so deploy uses them.
     let mods = state.mods.lock().await.clone().unwrap();
@@ -768,6 +769,8 @@ async fn imports_an_arsenal_library_with_names_nexus_ids_order_and_options() {
         }
         other => panic!("expected a v1 manifest, got {other:?}"),
     }
+    let own = mods.iter().find(|m| m.name() == "My Local Mod").unwrap();
+    assert!(matches!(&own.manifest, Manifest::Legacy(l) if l.description == "Made it myself"));
     let sidecar = sources::load_origin_sidecar(&m.directory).await.unwrap();
     assert_eq!(sidecar.installed_files[0].file_id.as_deref(), Some("17001"));
     assert_eq!(sidecar.installed_files[0].uploaded_at, Some(1719000000));

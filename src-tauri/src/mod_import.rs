@@ -331,6 +331,9 @@ pub struct ScanItem {
     /// source manager knows about it (its name and options).
     #[serde(skip)]
     pub manifest_override: Option<Manifest>,
+    /// The source manager's description of a mod that has no manifest.
+    #[serde(skip)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -581,6 +584,7 @@ fn inspect(id: usize, candidate: &Candidate) -> ScanItem {
         sha256: None,
         local_guid: false,
         manifest_override: None,
+        description: None,
     };
 
     let result = match candidate.kind {
@@ -995,6 +999,7 @@ fn apply_arsenal(item: &mut ScanItem, m: &layouts::ArsenalMod) {
             item.guid = Some(guid);
         }
         item.manifest_override = layouts::arsenal_manifest(m);
+        item.description = Some(m.description.clone()).filter(|d| !d.trim().is_empty());
     }
 }
 
@@ -1270,6 +1275,9 @@ async fn apply_manifest_override(state: &AppState, item: &ScanItem, installed: &
         (None, Some(guid)) if !guid_is_local(&guid) => {
             let Manifest::Legacy(mut m) = installed.manifest.clone() else { return Ok(()) };
             m.guid = guid;
+            if let Some(description) = &item.description {
+                m.description = description.clone();
+            }
             Manifest::Legacy(m)
         }
         _ => return Ok(()),

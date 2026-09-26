@@ -78,7 +78,13 @@
         return parts.join(" · ");
     }
 
-    let items = $derived(w.scan?.Items ?? []);
+    /** New first, then what needs a look, then what's already here or
+     * can't be imported; by name within each group. */
+    const STATUS_ORDER = ["New", "InstalledOtherVersion", "OlderVersion", "NotAMod", "Installed", "Duplicate", "Unreadable"];
+    let items = $derived(
+        [...(w.scan?.Items ?? [])].sort((a, b) =>
+            STATUS_ORDER.indexOf(a.Status.Kind) - STATUS_ORDER.indexOf(b.Status.Kind) || a.Name.localeCompare(b.Name, undefined, { numeric: true }))
+    );
     let visible = $derived(
         filter.trim().length === 0
             ? items
@@ -101,7 +107,7 @@
 </script>
 
 <PopupBase>
-    <div class="flex flex-col gap-2 w-[min(46rem,85vw)]" data-testid="import-popup">
+    <div class="flex flex-col gap-2 w-[min(46rem,85vw)] min-h-0 max-h-[calc(83vh-1rem)]" data-testid="import-popup">
         <span class="text-xl text-yellow-300 font-blockletter self-center">{t("popup.import.title")}</span>
 
         {#if w.error}
@@ -168,7 +174,7 @@
                         <input class="bg-transparent text-sm outline-none w-40" placeholder={t("popup.import.filter_placeholder")} bind:value={filter} />
                     </div>
                 </div>
-                <ul class="max-h-[45vh] overflow-y-auto border border-zinc-600 divide-y divide-zinc-700" data-testid="import-items">
+                <ul class="min-h-24 shrink overflow-y-auto border border-zinc-600 divide-y divide-zinc-700" data-testid="import-items">
                     {#each visible as item (item.Id)}
                         <li class="flex flex-row gap-2 items-start px-2 py-1 text-sm" class:opacity-60={blocked(item)}>
                             <input
@@ -264,7 +270,7 @@
                 </p>
             {/if}
             {#if w.report.Failed.length > 0}
-                <ul class="max-h-[35vh] overflow-y-auto border border-zinc-600 divide-y divide-zinc-700" data-testid="import-failures">
+                <ul class="min-h-16 shrink overflow-y-auto border border-zinc-600 divide-y divide-zinc-700" data-testid="import-failures">
                     {#each w.report.Failed as failure (failure.Id)}
                         <li class="flex flex-col px-2 py-1 text-sm">
                             <span class="text-zinc-200">{failure.Name}</span>
