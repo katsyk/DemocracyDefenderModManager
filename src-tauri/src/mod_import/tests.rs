@@ -850,3 +850,43 @@ fn a_folder_of_mod_folders_is_not_one_mod() {
     names.sort();
     assert_eq!(names, vec!["One", "Two"]);
 }
+
+/// The shapes `src/lib/utils/commands.ts` reads.
+#[test]
+fn json_shapes_match_the_frontend_types() {
+    let v = serde_json::to_value(ItemStatus::Installed { name: "A".into() }).unwrap();
+    assert_eq!(v, serde_json::json!({ "Kind": "Installed", "Name": "A" }));
+    let v = serde_json::to_value(ItemStatus::Unreadable { reason: "r".into() }).unwrap();
+    assert_eq!(v, serde_json::json!({ "Kind": "Unreadable", "Reason": "r" }));
+    assert_eq!(serde_json::to_value(ItemStatus::New).unwrap(), serde_json::json!({ "Kind": "New" }));
+
+    let item = inspect(0, &Candidate { kind: ItemKind::Archive, path: PathBuf::from("/nonexistent/X-12-1-0-1712345678.zip") });
+    let v = serde_json::to_value(&item).unwrap();
+    for key in ["Id", "Kind", "Path", "Name", "Size", "FileSize", "Status", "Nexus"] {
+        assert!(v.get(key).is_some(), "{key} missing from {v}");
+    }
+    assert_eq!(v["Kind"], "Archive");
+    assert_eq!(v["Nexus"]["ModId"], "12");
+    assert!(v.get("Sha256").is_none() && v.get("CarriedSidecar").is_none());
+
+    let report = ImportReport {
+        imported: vec![ImportedMod {
+            id: 1,
+            name: "n".into(),
+            guid: Uuid::nil(),
+            enabled: Some(true),
+            order: Some(0),
+            config: Some(Config::Legacy { guid: Uuid::nil(), enabled: true, selected: 0 }),
+            warning: None,
+        }],
+        ..Default::default()
+    };
+    let v = serde_json::to_value(&report).unwrap();
+    assert_eq!(v["Imported"][0]["Config"]["For"], "Legacy");
+    assert_eq!(v["Imported"][0]["Enabled"], true);
+    for key in ["Imported", "Failed", "NotStarted", "Cancelled"] {
+        assert!(v.get(key).is_some(), "{key} missing from {v}");
+    }
+    let d = serde_json::to_value(DetectedSource { kind: SourceKind::ManagerMods, path: "/x".into(), count: 3 }).unwrap();
+    assert_eq!(d, serde_json::json!({ "Kind": "ManagerMods", "Path": "/x", "Count": 3 }));
+}

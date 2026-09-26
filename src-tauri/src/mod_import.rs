@@ -247,7 +247,7 @@ pub struct NexusRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "Kind", rename_all = "PascalCase")]
+#[serde(tag = "Kind", rename_all_fields = "PascalCase")]
 pub enum ItemStatus {
     /// Not in DDMM yet: selected by default.
     New,

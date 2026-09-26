@@ -499,3 +499,93 @@ export async function forceExit(): Promise<void> {
 export async function ackCloseRequested(): Promise<void> {
     await invoke<void>("ack_close_requested");
 }
+// --- Import mods (see `commands::import` / `mod_import` on the Rust side) ---
+
+/** A folder that looks like somewhere mods can be imported from. `Kind`
+ * never names another tool: the UI only ever says "another mod manager". */
+export type ImportSource = {
+    Kind: "ManagerMods" | "ManagerDownloads" | "Downloads";
+    Path: string;
+    Count: number;
+};
+
+export type ImportItemStatus =
+    | { Kind: "New" }
+    | { Kind: "Installed"; Name: string }
+    | { Kind: "InstalledOtherVersion"; Name: string }
+    | { Kind: "Duplicate"; Of: string }
+    | { Kind: "OlderVersion"; Of: string }
+    | { Kind: "NotAMod" }
+    | { Kind: "Unreadable"; Reason: string };
+
+export type ImportItem = {
+    Id: number;
+    Kind: "Archive" | "Folder";
+    Path: string;
+    Name: string;
+    /** Bytes once installed (unpacked). */
+    Size: number;
+    FileSize: number;
+    Guid?: UUID;
+    Nexus?: { ModId: string; FileId?: string; Version?: string; UploadedAt?: number; FileName?: string };
+    Status: ImportItemStatus;
+    Profile?: { Enabled: boolean; Order: number };
+};
+
+export type ImportScan = {
+    Root: string | null;
+    Items: ImportItem[];
+    ProfileName?: string;
+    Truncated: boolean;
+    FreeBytes: number | null;
+    Cancelled: boolean;
+};
+
+export type ImportProgress = {
+    Done: number;
+    Total: number;
+    BytesDone: number;
+    BytesTotal: number;
+    Current: string | null;
+};
+
+export type ImportedMod = {
+    Id: number;
+    Name: string;
+    Guid: UUID;
+    Enabled?: boolean;
+    Order?: number;
+    Config?: Config;
+    Warning?: string;
+};
+
+export type ImportReport = {
+    Imported: ImportedMod[];
+    Failed: { Id: number; Name: string; Reason: string }[];
+    NotStarted: number;
+    Cancelled: boolean;
+    RolledBack?: string;
+};
+
+export async function detectImportSources(): Promise<ImportSource[]> {
+    return await invoke<ImportSource[]>("detect_import_sources");
+}
+
+export async function scanImportFolder(folder: string): Promise<ImportScan> {
+    log.info(`Scanning ${folder} for mods to import.`);
+    return await invoke<ImportScan>("scan_import_folder", { folder });
+}
+
+export async function scanImportPaths(paths: string[]): Promise<ImportScan> {
+    log.info(`Scanning ${paths.length} picked file(s) for mods to import.`);
+    return await invoke<ImportScan>("scan_import_paths", { paths });
+}
+
+export async function runImport(ids: number[]): Promise<ImportReport> {
+    log.info(`Importing ${ids.length} mod(s).`);
+    return await invoke<ImportReport>("run_import", { ids });
+}
+
+export async function cancelImport(): Promise<void> {
+    await invoke<void>("cancel_import");
+}
