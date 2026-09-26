@@ -19,6 +19,13 @@ per-user application data directory. Either way: mods in `mods/`, settings in `s
 `profiles.json`, logs in `logs/`. Open **Settings** and check **Data Folder** to see exactly which one, or see
 [Data location](../getting-started/download.md#data-location) for the full rules.
 
+### I have hundreds of mods already. Do I have to add them one by one?
+
+No. Click **Import** on the Mods page. If another mod manager already has your mods, DDMM finds its folder and
+lists what's there. Otherwise, point it at the folder with your downloaded archives. You pick from a checklist,
+and DDMM imports them all with one progress bar, keeping Nexus Mods ids and versions for update checks. See
+[Importing mods](../using/importing-mods.md).
+
 ### Can I mix mods from different sites in one profile?
 
 Yes — DDMM doesn't care where a mod came from. A profile can freely mix mods installed from AyakaMods, Nexus Mods,

@@ -11,7 +11,12 @@ with AyakaMods, Nexus Mods, ModWorkshop, GameBanana, GitHub and more."
 ## Add (archive files)
 
 Click **Add** (tip: "Add a mod to the library.") to open a file picker filtered to `.zip`, `.7z`, and `.rar`. You
-can select one file or several at once — DDMM installs every archive you pick.
+can select one file or several at once — DDMM installs every archive you pick. With 10 or more files (picked or
+dragged in), DDMM first shows the [import checklist](importing-mods.md), so duplicates and mods you already have
+are sorted out before anything is installed.
+
+Moving a whole collection over (another mod manager's mods, or a folder with hundreds of downloaded archives)?
+Use [**Import**](importing-mods.md) instead.
 
 ## Add Folder
 

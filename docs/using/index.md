@@ -5,6 +5,7 @@ title: Using DDMM
 # Using DDMM
 
 - [Adding mods](adding-mods.md) — every way to get a mod into DDMM
+- [Importing mods](importing-mods.md) — bring over hundreds of mods at once from another mod manager or a folder of downloads
 - [Mod sites](mod-sites.md) — AyakaMods, Nexus Mods, ModWorkshop, GameBanana, GitHub, and everything else
 - [One-click install](one-click-install.md) — the browser extension and `ddmm://` links
 - [Profiles](profiles.md) — separate, reorderable mod loadouts
