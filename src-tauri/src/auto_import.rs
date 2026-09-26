@@ -50,6 +50,13 @@ async fn run(app: AppHandle) {
 
         let state = app.state::<AppState>();
 
+        // Paused while the data folder is being moved (or is missing).
+        if state.data_ops_paused() {
+            baseline_ready = false;
+            pending.clear();
+            continue;
+        }
+
         // The one active handoff (if any) polls this same folder for its
         // own candidate; staying out of its way entirely is simpler and
         // safer than trying to distinguish "its" file from any other.

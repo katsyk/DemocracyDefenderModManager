@@ -275,10 +275,25 @@
             },
             "data_dir": {
                 "title": "Data Folder",
-                "description": "Where DDMM keeps your mods, settings, profiles and logs.",
+                "description": "Where DDMM keeps your mods, settings, profiles and logs. Change moves all of it to another folder or drive.",
                 "open_button": {
                     "text": "Open Folder",
                     "tip": "Open this folder in your file manager."
+                },
+                "change_button": {
+                    "text": "Change...",
+                    "tip": "Move DDMM's data to another folder or drive, or switch to DDMM data that's already there."
+                },
+                "reset_button": {
+                    "text": "Reset to Default",
+                    "tip": "Move DDMM's data back to its default location."
+                },
+                "custom_hint": "You chose this folder. The default location is {default}.",
+                "popup": {
+                    "refused": "DDMM can't use that folder:\n\n{detail}",
+                    "restarting": "Restarting DDMM...",
+                    "adopt_failed": "DDMM couldn't switch to that folder. Nothing was changed.\n\n{detail}",
+                    "move_failed": "Moving the data folder failed. Your data is still in the old folder and nothing was changed.\n\n{detail}"
                 }
             },
             "skip_list": {
@@ -544,6 +559,40 @@
             "progress": "{done} / {total} MB ({percent}%)",
             "progress_unknown": "{done} MB"
         },
+        "data_folder_move": {
+            "title": "Move Data Folder",
+            "reset_title": "Move Back to Default",
+            "adopt_title": "Existing DDMM Data Found",
+            "from": "From",
+            "to": "To",
+            "size": "Size",
+            "size_value": "{size} in {files} files",
+            "free": "Free space there",
+            "free_unknown": "unknown",
+            "subfolder_note": "{picked} already has other files in it, so DDMM will keep its data in a new \"DDMM Data\" folder inside it instead of mixing them.",
+            "what_happens": "What happens:",
+            "step_copy": "DDMM copies your mods, settings, profiles and logs to the new folder.",
+            "step_verify": "It checks that every file arrived complete.",
+            "step_switch": "It switches to the new folder.",
+            "step_delete": "Only then does it delete the old copy.",
+            "step_restart": "DDMM restarts using the new folder.",
+            "failure_note": "If anything goes wrong, the partial copy is removed and your data stays where it is. Mod operations are paused until DDMM restarts.",
+            "adopt_message": "{target} already holds DDMM data (mods, settings or profiles). Use the existing data there?",
+            "adopt_detail": "DDMM will switch to that folder and restart. Nothing is copied or deleted: your current data stays in {source}.",
+            "move_button": "Move",
+            "adopt_button": "Use the Existing Data",
+            "cancel_button": "Cancel"
+        },
+        "data_folder_progress": {
+            "title": "Moving Data Folder",
+            "copying": "Copying your data...",
+            "verifying": "Checking the copy...",
+            "finishing": "Switching to the new folder...",
+            "restarting": "Done. DDMM is restarting...",
+            "progress": "{done} / {total} ({files} of {total_files} files, {percent}%)",
+            "leftovers": "{count} old item(s) couldn't be deleted yet (probably still in use); DDMM will try again at the next start.",
+            "dont_close": "Please don't close DDMM until this finishes."
+        },
         "browser_update": {
             "title": "Update in your browser",
             "title_bulk": "Update {index} of {total}",
@@ -590,6 +639,25 @@
             "bulk_done": "{count} mod(s) updated.",
             "redeployed": "Redeployed with the updated mods.",
             "game_running": "Mods updated, but Helldivers 2 is running: deploy after closing it to use the new versions."
+        }
+    },
+    "recovery": {
+        "data_folder": {
+            "title": "Data Folder Not Found",
+            "missing_message": "DDMM keeps your mods, settings and profiles in this folder, but it isn't there right now:",
+            "missing_hint": "If it's on a USB stick or an external or network drive, connect it and click Retry. If you moved or renamed the folder yourself, click Locate Folder and pick it.",
+            "bad_pointer_message": "The file that tells DDMM where its data folder is can't be read:",
+            "nothing_changed": "DDMM hasn't created, changed or deleted anything.",
+            "retry_button": "Retry",
+            "locate_button": "Locate Folder...",
+            "reset_button": "Use the Default Location",
+            "quit_button": "Quit",
+            "reset_hint": "The default location is {default}.",
+            "reset_confirm": {
+                "title": "Use the Default Location",
+                "question": "DDMM will forget the chosen folder and restart with the data in {default} (which may be empty). The missing folder isn't touched; you can switch back to it later with Change in Settings."
+            },
+            "restarting": "Restarting DDMM..."
         }
     }
 }

@@ -132,6 +132,7 @@ pub async fn load_settings(state: State<'_, AppState>) -> TAResult<Settings> {
 
 #[tauri::command]
 pub async fn save_settings(state: State<'_, AppState>, settings: Settings) -> TAResult<()> {
+    let _data_op = state.data_op().into_ta_result()?;
     log::info!("Saving settings...");
 
     let mut settings = settings;
@@ -210,6 +211,7 @@ pub async fn detect_game_path() -> Option<String> {
 /// it.
 #[tauri::command]
 pub async fn auto_detect_and_save_game_path(state: State<'_, AppState>) -> TAResult<Option<String>> {
+    let _data_op = state.data_op().into_ta_result()?;
     let Some(path) = crate::steam::detect_game_path().await else {
         return Ok(None);
     };

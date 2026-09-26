@@ -597,6 +597,7 @@ async fn run_check_with(
     trigger: CheckTrigger,
     make_nexus_client: &NexusClientFactory,
 ) -> anyhow::Result<UpdateCheckReport> {
+    let _data_op = state.data_op()?;
     let _guard = state.update_check_lock.lock().await;
     log::info!("Checking for mod updates ({trigger:?})...");
 
@@ -708,6 +709,7 @@ pub async fn skip_update_version(
     provider: String,
     version: Option<String>,
 ) -> TAResult<()> {
+    let _data_op = state.data_op().into_ta_result()?;
     let dir = {
         let guard = state.mods.lock().await;
         guard
@@ -850,6 +852,7 @@ pub async fn update_mod_direct(
     file: UpdateFile,
     version: Option<String>,
 ) -> TAResult<InstalledMod> {
+    let _data_op = state.data_op().into_ta_result()?;
     let provider = provider.to_ascii_lowercase();
     if !DIRECT_PROVIDERS.contains(&provider.as_str()) {
         return anyhow::anyhow!("{provider} updates go through the browser").into_ta_result();
@@ -962,6 +965,9 @@ pub fn spawn_auto_check(app: AppHandle) {
 
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
+            if app.state::<AppState>().data_ops_paused() {
+                continue; // the data folder is being moved
+            }
             let Ok(settings) = do_load_settings(&base_path).await else { continue };
             let Some(hours) = settings.auto_check_interval_hours().filter(|_| settings.auto_check_updates()) else {
                 continue;

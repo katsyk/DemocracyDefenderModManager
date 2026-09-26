@@ -55,8 +55,14 @@ same-file = "1.0"
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 
+[target."cfg(unix)".dependencies]
+# statvfs: free space on the drive a data folder move goes to (`data_move::available_space`).
+libc = "0.2"
+
 [target."cfg(windows)".dependencies]
 winreg = "0.56.0"
+# Free space on the drive a data folder move goes to (`data_move::available_space`).
+windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

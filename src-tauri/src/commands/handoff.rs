@@ -138,6 +138,7 @@ pub async fn start_handoff(
     page_url: String,
     existing_guid: Option<Uuid>,
 ) -> TAResult<()> {
+    let _data_op = state.data_op().into_ta_result()?;
     let cancel = {
         let mut guard = state.handoff_cancel.lock().await;
         if guard.is_some() {
@@ -212,6 +213,7 @@ pub async fn install_handoff_file(
     page_url: String,
     existing_guid: Option<Uuid>,
 ) -> TAResult<crate::commands::mods::InstalledMod> {
+    let _data_op = state.data_op().into_ta_result()?;
     let source = sources::source_from_page_url(&page_url).unwrap_or_else(|| Source {
         provider: sources::provider_from_url(&page_url),
         id: None,

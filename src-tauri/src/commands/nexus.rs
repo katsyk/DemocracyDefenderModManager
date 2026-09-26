@@ -56,6 +56,7 @@ pub async fn get_nexus_key_status(state: State<'_, AppState>) -> TAResult<NexusK
 /// Errors never contain the key.
 #[tauri::command]
 pub async fn set_nexus_api_key(state: State<'_, AppState>, key: String) -> TAResult<NexusKeyStatus> {
+    let _data_op = state.data_op().into_ta_result()?;
     let key = match NexusApiKey::parse(&key) {
         Ok(k) => k,
         Err(reason) => return anyhow::anyhow!("That doesn't look like a Nexus Mods API key: {reason}.").into_ta_result(),
@@ -107,6 +108,7 @@ pub async fn validate_and_store(state: &AppState, key: NexusApiKey) -> anyhow::R
 /// Forget the key everywhere it could be stored.
 #[tauri::command]
 pub async fn remove_nexus_api_key(state: State<'_, AppState>) -> TAResult<NexusKeyStatus> {
+    let _data_op = state.data_op().into_ta_result()?;
     secrets::remove(&state.base_path).await;
     let _ = tokio::fs::remove_file(state.base_path.join("update-cache.json")).await;
     let mut settings = do_load_settings(&state.base_path).await.into_ta_result()?;
@@ -153,6 +155,7 @@ pub async fn get_nexus_sign_in_status(state: State<'_, AppState>) -> TAResult<Ne
 /// minutes) for the user to approve. User-initiated only.
 #[tauri::command]
 pub async fn nexus_sign_in(app: AppHandle, state: State<'_, AppState>) -> TAResult<NexusSignInStatus> {
+    let _data_op = state.data_op().into_ta_result()?;
     let Some(client_id) = nexus_oauth::client_id() else {
         return anyhow::anyhow!(SignInError::NoClientId.to_string()).into_ta_result();
     };
@@ -217,6 +220,7 @@ pub async fn nexus_cancel_sign_in(state: State<'_, AppState>) -> TAResult<()> {
 /// delete it from this computer.
 #[tauri::command]
 pub async fn nexus_sign_out(state: State<'_, AppState>) -> TAResult<NexusSignInStatus> {
+    let _data_op = state.data_op().into_ta_result()?;
     if let Some((tokens, _)) = nexus_oauth::load_tokens(&state.base_path).await {
         if let Some(client_id) = nexus_oauth::client_id() {
             nexus_oauth::revoke(&nexus_oauth::Endpoints::nexus(), &client_id, &tokens).await;

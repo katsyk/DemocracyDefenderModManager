@@ -32,7 +32,7 @@ const KEYRING_SERVICE: &str = "io.github.katsyk.ddmm";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Slot {
     keyring_user: &'static str,
-    file_name: &'static str,
+    pub(crate) file_name: &'static str,
 }
 
 /// The personal API key.

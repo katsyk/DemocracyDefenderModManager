@@ -129,8 +129,8 @@ impl Launcher {
     /// Reach the running app, starting it (detached, no window is opened by
     /// *this* process either way -- the launched instance runs normally) and
     /// polling for up to `poll_timeout` if it isn't already up.
-    async fn ensure_app_running_and_connect(&mut self, base_path: &Path, poll_timeout: Duration) -> Option<TcpStream> {
-        if let Some(stream) = try_connect(base_path).await {
+    async fn ensure_app_running_and_connect(&mut self, resolve_base: fn() -> PathBuf, poll_timeout: Duration) -> Option<TcpStream> {
+        if let Some(stream) = try_connect(&resolve_base()).await {
             return Some(stream);
         }
 
@@ -147,7 +147,7 @@ impl Launcher {
         let deadline = tokio::time::Instant::now() + poll_timeout;
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(400)).await;
-            if let Some(stream) = try_connect(base_path).await {
+            if let Some(stream) = try_connect(&resolve_base()).await {
                 return Some(stream);
             }
         }
@@ -244,14 +244,19 @@ fn connection_alive(conn: &mut AppConnection) -> bool {
 /// the user closed DDMM at some point since the browser launched the host.
 /// If DDMM isn't running at all, only `install`/`open` start it (see
 /// `may_launch_app`); everything else gets `APP_NOT_RUNNING` right away.
-pub async fn run(origin: HostOrigin, base_path: PathBuf) {
+///
+/// `resolve_base` finds the data folder (and so `bridge.json`) again for
+/// every (re)connect rather than once: if the user moves DDMM's data folder
+/// while the browser keeps this host alive, the restarted app writes its
+/// `bridge.json` to the new folder and this finds it there.
+pub async fn run(origin: HostOrigin, resolve_base: fn() -> PathBuf) {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
 
     let mut launcher = Launcher::default();
     // Connect to an already-running DDMM only; launching waits for a
     // request that's allowed to (see `may_launch_app`).
-    let mut conn = try_connect(&base_path).await.map(split_connection);
+    let mut conn = try_connect(&resolve_base()).await.map(split_connection);
 
     loop {
         let data = match read_frame(&mut stdin, MAX_MESSAGE_BYTES).await {
@@ -289,9 +294,9 @@ pub async fn run(origin: HostOrigin, base_path: PathBuf) {
         let may_launch = may_launch_app(request_type);
         if !conn.as_mut().is_some_and(connection_alive) {
             let stream = if may_launch {
-                launcher.ensure_app_running_and_connect(&base_path, poll_timeout()).await
+                launcher.ensure_app_running_and_connect(resolve_base, poll_timeout()).await
             } else {
-                try_connect(&base_path).await
+                try_connect(&resolve_base()).await
             };
             conn = stream.map(split_connection);
         }

@@ -175,7 +175,15 @@ normally `~/.local/share/io.github.katsyk.ddmm/`, so the log is
 `.tar.gz` into a folder you can write to that already has DDMM data (`mods/`, `settings.json`) or a
 `portable.txt` next to the executable, DDMM runs portable and the log is in `logs/` next to the executable. The
 first lines of the log say which one it picked; **Open Folder** next to **Data Folder** in Settings always opens
-the right one.
+the right one. If you [moved the data folder](../using/data-folder.md), the log is in `logs/` inside the folder you
+chose.
+
+### "Data Folder Not Found" when DDMM starts
+
+DDMM's data is in a folder you chose, and that folder isn't there: typically a USB or external drive that isn't
+connected, or a changed drive letter. DDMM hasn't created or deleted anything. Connect the drive and click
+**Retry**, or use **Locate Folder...** to point DDMM at where the data is now. See
+[If the folder is missing at startup](../using/data-folder.md#if-the-folder-is-missing-at-startup).
 
 Running DDMM from a terminal (`./ddmm`) also prints the log live.
 

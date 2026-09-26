@@ -42,6 +42,7 @@ pub async fn load_profiles(state: State<'_, AppState>) -> TAResult<ProfilesConfi
 
 #[tauri::command]
 pub async fn save_profiles(state: State<'_, AppState>, config: ProfilesConfig) -> TAResult<()> {
+    let _data_op = state.data_op().into_ta_result()?;
     log::info!("Saving profiles...");
     
     if log::log_enabled!(log::Level::Debug) {

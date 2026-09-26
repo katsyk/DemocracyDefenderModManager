@@ -95,6 +95,7 @@ nav:
       - Mod options & variants: using/options-variants.md
       - Deploy & purge: using/deploy-purge.md
       - Updating mods: using/updating-mods.md
+      - Data folder: using/data-folder.md
       - Settings reference: using/settings.md
   - For Mod Authors:
       - authors/index.md

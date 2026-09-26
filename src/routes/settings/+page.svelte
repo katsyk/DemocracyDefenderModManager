@@ -12,11 +12,17 @@
         repairBrowserIntegrationOne, removeBrowserIntegrationOne,
         getNexusKeyStatus, setNexusApiKey, removeNexusApiKey,
         getNexusSignInStatus, nexusSignIn, nexusCancelSignIn, nexusSignOut,
-        type BrowserIntegrationStatus, type NexusKeyStatus, type NexusSignInStatus
+        getDataFolderInfo, planDataFolderMove, adoptDataFolder,
+        type BrowserIntegrationStatus, type NexusKeyStatus, type NexusSignInStatus, type DataFolderInfo
     } from "$lib/utils/commands";
-    import { Dash, Plus, ThreeDots, Search, Folder2Open, ArrowRepeat, BoxArrowUpRight } from "svelte-bootstrap-icons";
+    import type { Settings } from "$lib/models/settings";
+    import {
+        Dash, Plus, ThreeDots, Search, Folder2Open, ArrowRepeat, BoxArrowUpRight, FolderSymlink, ArrowCounterclockwise
+    } from "svelte-bootstrap-icons";
     import { usePopup } from "$lib/state/popup.svelte";
-    import { InputPopup, NotificationPopup } from "$lib/types/popup";
+    import {
+        InputPopup, NotificationPopup, WaitPopup, DataFolderMovePopup, DataFolderProgressPopup
+    } from "$lib/types/popup";
     import Select from "$lib/components/Select.svelte";
     import ToggleSwitch from "$lib/components/ToggleSwitch.svelte";
 
@@ -70,6 +76,9 @@
         }
     }
     let dataDir = $state<string>("");
+    let dataFolderInfo = $state<DataFolderInfo | null>(null);
+    let dataDirBusy = $state(false);
+    let dataFolderMoving = false;
     let initPromise = $state<Promise<void>>(init());
     // Linked from the Mods page ("add a Nexus API key"): scroll there once
     // the page has actually rendered (it only renders after init).
@@ -123,8 +132,8 @@
         ));
     });
 
-    onNavigate(async () => {
-        await saveSettings({
+    function currentSettings(): Settings {
+        return {
             Version: "V1",
             GamePath: resolvedGamePath ?? gamePath,
             SkipList: skipList,
@@ -134,11 +143,21 @@
             AutoImportEnabled: autoImportEnabled,
             AutoCheckUpdates: autoCheckUpdates,
             AutoCheckIntervalHours: autoCheckIntervalEnabled ? clampInterval(autoCheckIntervalHours) : 0
-        });
+        };
+    }
+
+    onNavigate(async () => {
+        // After a data folder move the old folder is read-only until the
+        // restart; nothing to save then.
+        if (dataFolderMoving) return;
+        await saveSettings(currentSettings());
     })
 
     async function init() {
-        const [settings, resolvedDataDir] = await Promise.all([loadSettings(), getDataDir()]);
+        const [settings, resolvedDataDir, folderInfo] = await Promise.all([
+            loadSettings(), getDataDir(), getDataFolderInfo()
+        ]);
+        dataFolderInfo = folderInfo;
         switch (settings.Version) {
             case "V1":
                 gamePath = settings.GamePath;
@@ -329,6 +348,58 @@
         await openPath(dataDir);
     }
 
+    function errorText(ex: unknown): string {
+        return ex instanceof Error ? ex.message : String(ex);
+    }
+
+    /** Change / Reset: save pending settings (they're part of what moves),
+     * validate on the backend, confirm with sizes and free space, then
+     * move (or adopt existing data). The app restarts itself afterwards. */
+    async function startDataFolderMove(destination: string | null, reset: boolean) {
+        dataDirBusy = true;
+        let plan;
+        try {
+            await saveSettings(currentSettings());
+            plan = await planDataFolderMove(destination, reset);
+        } catch (ex: unknown) {
+            showPopup(new NotificationPopup("error", t("pages.settings.data_dir.popup.refused", { detail: errorText(ex) })));
+            return;
+        } finally {
+            dataDirBusy = false;
+        }
+
+        const decision = await showPopup(new DataFolderMovePopup(plan));
+        if (decision === "adopt") {
+            const wait = new WaitPopup(t("pages.settings.data_dir.popup.restarting"));
+            showPopup(wait);
+            try {
+                dataFolderMoving = true;
+                await adoptDataFolder(destination, reset);
+            } catch (ex: unknown) {
+                dataFolderMoving = false;
+                wait.close();
+                showPopup(new NotificationPopup("error", t("pages.settings.data_dir.popup.adopt_failed", { detail: errorText(ex) })));
+            }
+        } else if (decision === "move") {
+            dataFolderMoving = true;
+            const result = await showPopup(new DataFolderProgressPopup(destination, reset, plan.TotalBytes));
+            if (!result.ok) {
+                dataFolderMoving = false;
+                showPopup(new NotificationPopup("error", t("pages.settings.data_dir.popup.move_failed", { detail: result.message })));
+            }
+        }
+    }
+
+    async function onChangeDataDir() {
+        const path = await open({ directory: true, multiple: false });
+        if (!path) return;
+        await startDataFolderMove(path, false);
+    }
+
+    async function onResetDataDir() {
+        await startDataFolderMove(null, true);
+    }
+
     async function onBrowseDownloads() {
         const path = await open({
             directory: true,
@@ -430,7 +501,32 @@
                         <Folder2Open />
                         {t("pages.settings.data_dir.open_button.text")}
                     </button>
+                    <button
+                        class="hd2mm-button flex flex-row gap-1 items-center"
+                        title={t("pages.settings.data_dir.change_button.tip")}
+                        onclick={onChangeDataDir}
+                        disabled={dataDirBusy}
+                    >
+                        <FolderSymlink />
+                        {t("pages.settings.data_dir.change_button.text")}
+                    </button>
                 </div>
+                {#if dataFolderInfo?.IsCustom}
+                    <div class="flex flex-row gap-2 items-center flex-wrap">
+                        <p class="text-zinc-400 text-sm">
+                            {t("pages.settings.data_dir.custom_hint", { default: dataFolderInfo.DefaultPath })}
+                        </p>
+                        <button
+                            class="hd2mm-button flex flex-row gap-1 items-center"
+                            title={t("pages.settings.data_dir.reset_button.tip")}
+                            onclick={onResetDataDir}
+                            disabled={dataDirBusy}
+                        >
+                            <ArrowCounterclockwise />
+                            {t("pages.settings.data_dir.reset_button.text")}
+                        </button>
+                    </div>
+                {/if}
             </div>
             <div class="flex flex-col gap-1">
                 <h2 class="text-zinc-300 text-xl">{t("pages.settings.downloads_path.title")}</h2>

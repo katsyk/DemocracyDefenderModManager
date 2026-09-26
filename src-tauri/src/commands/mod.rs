@@ -13,6 +13,7 @@ pub mod handoff;
 pub mod updates;
 pub mod nexus;
 pub mod bridge;
+pub mod data_folder;
 
 static INDEX_REGEX: OnceLock<Regex> = OnceLock::new();
 
@@ -305,6 +306,7 @@ async fn collect_files_for_mod(
 
 #[tauri::command]
 pub async fn deploy(state: State<'_, AppState>, configs: Vec<Config>) -> TAResult<()> {
+    let _data_op = state.data_op().into_ta_result()?;
     let mods = state.inner().mods.lock().await;
     if mods.is_none() {
         return anyhow::anyhow!("mods not read").into_ta_result();
@@ -382,6 +384,7 @@ pub async fn deploy(state: State<'_, AppState>, configs: Vec<Config>) -> TAResul
 
 #[tauri::command]
 pub async fn purge(state: State<'_, AppState>) -> TAResult<()> {
+    let _data_op = state.data_op().into_ta_result()?;
     let settings = do_load_settings(&state.base_path).await.into_ta_result()?;
     let game_root = match settings.validate().await {
         Ok(root) => root,

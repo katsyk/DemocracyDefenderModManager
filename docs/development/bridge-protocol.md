@@ -66,8 +66,11 @@ When DDMM starts it listens on `127.0.0.1:<random free port>` (never `0.0.0.0`) 
 The file is created with owner-only permissions (0600 on Unix, and inherited per-user ACLs under the user profile on
 Windows) and deleted on clean exit. The token is regenerated on every start.
 
-The host resolves the data folder with the **same logic as the app** (portable marker / app-data), reads `bridge.json`,
-connects, and sends `{"hello": "<token>"}` followed by a newline. The app replies `{"ok": true}` and closes the connection
+The host resolves the data folder with the **same logic as the app** (a `ddmm-data-location.json` pointer, the
+portable marker, app-data; see [Data folder](../using/data-folder.md#how-ddmm-remembers-the-folder)), reads
+`bridge.json`, connects, and sends `{"hello": "<token>"}` followed by a newline. It resolves the folder again for every
+(re)connect, so a host the browser kept alive finds the app after the user moves the data folder (the app restarts
+after a move and writes a fresh `bridge.json` in the new folder). The host never creates the data folder. The app replies `{"ok": true}` and closes the connection
 on a wrong token. After that, both sides exchange **newline-delimited JSON** (one object per line).
 
 If `bridge.json` is missing, stale (connection refused), or its `pid` is gone, DDMM isn't running. What happens next

@@ -84,7 +84,7 @@ fn portable_reason(exe_dir: &Path) -> Option<&'static str> {
 /// Best-effort writability probe: try to create (and immediately remove) a
 /// throwaway file. There's no portable, race-free "can I write here" check
 /// in std, so this is it.
-fn is_dir_writable(dir: &Path) -> bool {
+pub(crate) fn is_dir_writable(dir: &Path) -> bool {
     let probe = dir.join(format!(".ddmm-write-test-{}", std::process::id()));
     match std::fs::File::create(&probe) {
         Ok(_) => {
@@ -93,6 +93,206 @@ fn is_dir_writable(dir: &Path) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// The file that records a user-chosen data folder ("Change" next to the
+/// data folder in Settings). It lives outside the data folder it points at,
+/// so it survives the move and is read before any data is: next to the
+/// executable for a portable copy (so the portable folder stays
+/// self-describing), and in [`installed_pointer_dir`] otherwise.
+pub const POINTER_FILENAME: &str = "ddmm-data-location.json";
+
+/// Contents of [`POINTER_FILENAME`]. A relative `path` is relative to the
+/// folder the pointer file is in: a portable copy whose data folder is
+/// inside the portable folder keeps working when the whole portable folder
+/// is moved.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PointerFile {
+    pub version: u32,
+    pub path: PathBuf,
+}
+
+pub const POINTER_VERSION: u32 = 1;
+
+/// Where an installed (non-portable) DDMM keeps its pointer file: the OS
+/// per-user config directory plus [`APP_IDENTIFIER`] (`%APPDATA%` on
+/// Windows, `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME` or
+/// `~/.config` on Linux).
+pub fn installed_pointer_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join(APP_IDENTIFIER))
+}
+
+/// Why the chosen data folder can't be used this session. DDMM then starts
+/// in a recovery screen instead of silently creating an empty folder (and
+/// appearing to have lost every mod, e.g. with a USB drive unplugged).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataDirProblem {
+    /// The pointer names a folder that doesn't exist (or isn't a folder).
+    Missing,
+    /// The pointer file exists but can't be read or parsed.
+    BadPointer(String),
+}
+
+/// The full data-folder decision: [`decide_base_dir`] plus any pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataDirDecision {
+    /// The data folder to use this session.
+    pub path: PathBuf,
+    /// Portable (pointer next to the exe) or installed (pointer in the
+    /// config dir). Decides where a new pointer is written.
+    pub kind: BaseDirKind,
+    pub reason: String,
+    /// Where the data lives without a pointer ("Reset to default").
+    pub default_path: PathBuf,
+    /// Where this mode's pointer file is (or would be written).
+    pub pointer_file: PathBuf,
+    /// `path` came from a pointer file.
+    pub pointed: bool,
+    pub problem: Option<DataDirProblem>,
+}
+
+/// Read a pointer file. `Ok(None)` when there is none.
+pub fn read_pointer(pointer_file: &Path) -> Result<Option<PathBuf>, String> {
+    let data = match std::fs::read(pointer_file) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("couldn't read {}: {e}", pointer_file.display())),
+    };
+    let parsed: PointerFile = serde_json::from_slice(&data)
+        .map_err(|e| format!("{} isn't a valid data-location file: {e}", pointer_file.display()))?;
+    if parsed.path.as_os_str().is_empty() {
+        return Err(format!("{} doesn't name a folder", pointer_file.display()));
+    }
+    let dir = pointer_file.parent().unwrap_or(Path::new("."));
+    Ok(Some(if parsed.path.is_absolute() { parsed.path } else { dir.join(parsed.path) }))
+}
+
+/// Write a pointer file atomically (temp file, then rename over the old
+/// one), creating its folder if needed. A `target` inside the pointer's own
+/// folder is stored relative to it (see [`PointerFile`]).
+pub fn write_pointer(pointer_file: &Path, target: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let dir = pointer_file.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir).with_context(|| format!("couldn't create {}", dir.display()))?;
+    let stored = relative_if_inside(target, dir).unwrap_or_else(|| target.to_path_buf());
+    let data = serde_json::to_vec_pretty(&PointerFile { version: POINTER_VERSION, path: stored })?;
+    let tmp = pointer_file.with_extension("json.tmp");
+    std::fs::write(&tmp, data).with_context(|| format!("couldn't write {}", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, pointer_file) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("couldn't write {}", pointer_file.display()));
+    }
+    Ok(())
+}
+
+/// Remove a pointer file ("Reset to default"). Already gone is fine.
+pub fn remove_pointer(pointer_file: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(pointer_file) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::anyhow!("couldn't remove {}: {e}", pointer_file.display())),
+    }
+}
+
+fn relative_if_inside(target: &Path, dir: &Path) -> Option<PathBuf> {
+    use crate::fs_util::{path_overlap, resolve_path, PathOverlap};
+    match path_overlap(target, dir).ok()? {
+        Some(PathOverlap::FirstInsideSecond) => {
+            let (t, d) = (resolve_path(target).ok()?, resolve_path(dir).ok()?);
+            t.strip_prefix(&d).ok().map(Path::to_path_buf)
+        }
+        _ => None,
+    }
+}
+
+/// Decide the data folder, pointer files included. Precedence, highest
+/// first (documented in `docs/using/data-folder.md`):
+///
+/// 1. a pointer file next to the executable (a portable copy whose data was
+///    moved; the executable's folder doesn't need to be writable any more);
+/// 2. a portable copy's own folder (see [`decide_base_dir`]);
+/// 3. a pointer file in the installed pointer folder (an installed copy
+///    whose data was moved);
+/// 4. the per-user app data folder.
+///
+/// So a pointer always beats the default of its own mode. A pointed folder
+/// that is missing, or a pointer that can't be read, is reported as a
+/// [`DataDirProblem`], never replaced with a new empty folder.
+pub fn decide_data_dir(exe_dir: &Path, app_data_dir: &Path, installed_pointer_dir: &Path) -> DataDirDecision {
+    let portable_pointer = exe_dir.join(POINTER_FILENAME);
+    let installed_pointer = installed_pointer_dir.join(POINTER_FILENAME);
+
+    let pointed = |pointer_file: PathBuf, kind: BaseDirKind, default_path: &Path| -> Option<DataDirDecision> {
+        match read_pointer(&pointer_file) {
+            Ok(None) => None,
+            Ok(Some(path)) => {
+                let problem = (!path.is_dir()).then_some(DataDirProblem::Missing);
+                Some(DataDirDecision {
+                    path,
+                    kind,
+                    reason: format!("chosen in Settings ({})", pointer_file.display()),
+                    default_path: default_path.to_path_buf(),
+                    pointer_file,
+                    pointed: true,
+                    problem,
+                })
+            }
+            Err(message) => Some(DataDirDecision {
+                path: default_path.to_path_buf(),
+                kind,
+                reason: "unreadable data-location file".to_string(),
+                default_path: default_path.to_path_buf(),
+                pointer_file,
+                pointed: true,
+                problem: Some(DataDirProblem::BadPointer(message)),
+            }),
+        }
+    };
+
+    if let Some(d) = pointed(portable_pointer.clone(), BaseDirKind::Portable, exe_dir) {
+        return d;
+    }
+
+    let base = decide_base_dir(exe_dir, app_data_dir);
+    if base.kind == BaseDirKind::Portable {
+        return DataDirDecision {
+            path: base.path,
+            kind: base.kind,
+            reason: base.reason.to_string(),
+            default_path: exe_dir.to_path_buf(),
+            pointer_file: portable_pointer,
+            pointed: false,
+            problem: None,
+        };
+    }
+
+    if let Some(d) = pointed(installed_pointer.clone(), BaseDirKind::AppData, app_data_dir) {
+        return d;
+    }
+
+    DataDirDecision {
+        path: base.path,
+        kind: base.kind,
+        reason: base.reason.to_string(),
+        default_path: app_data_dir.to_path_buf(),
+        pointer_file: installed_pointer,
+        pointed: false,
+        problem: None,
+    }
+}
+
+/// [`decide_data_dir`] for this machine (the real executable, app data and
+/// config folders). Used by the app at startup and by the browser's native
+/// messaging host, so both always agree on where `bridge.json` is.
+pub fn decide_data_dir_for_this_machine() -> DataDirDecision {
+    let exe_dir = resolve_exe_dir();
+    let app_data_dir = platform_app_data_dir().unwrap_or_else(|e| {
+        eprintln!("warning: {e}; falling back to the executable directory for app data");
+        exe_dir.clone()
+    });
+    let pointer_dir = installed_pointer_dir().unwrap_or_else(|| app_data_dir.clone());
+    decide_data_dir(&exe_dir, &app_data_dir, &pointer_dir)
 }
 
 /// The directory containing the running executable.
@@ -293,5 +493,155 @@ mod tests {
         let asset = &conf["app"]["security"]["assetProtocol"];
         assert_eq!(asset["enable"], serde_json::Value::Bool(true));
         assert_eq!(asset["scope"], serde_json::json!([]));
+    }
+
+    // ---- pointer files ------------------------------------------------
+
+    struct Dirs {
+        _root: tempfile::TempDir,
+        exe: PathBuf,
+        app_data: PathBuf,
+        config: PathBuf,
+        custom: PathBuf,
+    }
+
+    fn dirs() -> Dirs {
+        let root = tempfile::tempdir().unwrap();
+        let d = Dirs {
+            exe: root.path().join("exe"),
+            app_data: root.path().join("appdata"),
+            config: root.path().join("config"),
+            custom: root.path().join("custom"),
+            _root: root,
+        };
+        for p in [&d.exe, &d.app_data, &d.config, &d.custom] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn no_pointer_keeps_the_existing_defaults() {
+        let d = dirs();
+        let decision = decide_data_dir(&d.exe, &d.app_data, &d.config);
+        assert_eq!(decision.path, d.app_data);
+        assert!(!decision.pointed && decision.problem.is_none());
+        assert_eq!(decision.default_path, d.app_data);
+        assert_eq!(decision.pointer_file, d.config.join(POINTER_FILENAME));
+
+        std::fs::write(d.exe.join(PORTABLE_MARKER_FILENAME), b"").unwrap();
+        let decision = decide_data_dir(&d.exe, &d.app_data, &d.config);
+        assert_eq!(decision.path, d.exe);
+        assert_eq!(decision.kind, BaseDirKind::Portable);
+        assert_eq!(decision.pointer_file, d.exe.join(POINTER_FILENAME));
+    }
+
+    #[test]
+    fn installed_pointer_beats_the_app_data_default() {
+        let d = dirs();
+        write_pointer(&d.config.join(POINTER_FILENAME), &d.custom).unwrap();
+        let decision = decide_data_dir(&d.exe, &d.app_data, &d.config);
+        assert_eq!(decision.path, d.custom);
+        assert_eq!(decision.kind, BaseDirKind::AppData);
+        assert!(decision.pointed && decision.problem.is_none());
+        assert_eq!(decision.default_path, d.app_data);
+    }
+
+    #[test]
+    fn portable_folder_ignores_the_installed_pointer() {
+        let d = dirs();
+        std::fs::write(d.exe.join(PORTABLE_MARKER_FILENAME), b"").unwrap();
+        write_pointer(&d.config.join(POINTER_FILENAME), &d.custom).unwrap();
+        let decision = decide_data_dir(&d.exe, &d.app_data, &d.config);
+        assert_eq!(decision.path, d.exe);
+        assert!(!decision.pointed);
+    }
+
+    #[test]
+    fn portable_pointer_beats_everything() {
+        let d = dirs();
+        std::fs::write(d.exe.join(PORTABLE_MARKER_FILENAME), b"").unwrap();
+        std::fs::create_dir(d.exe.join("mods")).unwrap();
+        let other = d._root.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        write_pointer(&d.config.join(POINTER_FILENAME), &other).unwrap();
+        write_pointer(&d.exe.join(POINTER_FILENAME), &d.custom).unwrap();
+        let decision = decide_data_dir(&d.exe, &d.app_data, &d.config);
+        assert_eq!(decision.path, d.custom);
+        assert_eq!(decision.kind, BaseDirKind::Portable);
+        assert_eq!(decision.default_path, d.exe);
+        assert!(decision.pointed);
+    }
+
+    #[test]
+    fn portable_pointer_alone_marks_the_folder_portable() {
+        // A legacy portable copy (detected by its mods/ folder) whose data
+        // was moved out: the pointer next to the exe keeps it portable.
+        let d = dirs();
+        write_pointer(&d.exe.join(POINTER_FILENAME), &d.custom).unwrap();
+        let decision = decide_data_dir(&d.exe, &d.app_data, &d.config);
+        assert_eq!(decision.kind, BaseDirKind::Portable);
+        assert_eq!(decision.path, d.custom);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_pointer_works_from_a_read_only_exe_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dirs();
+        write_pointer(&d.exe.join(POINTER_FILENAME), &d.custom).unwrap();
+        let mut perms = std::fs::metadata(&d.exe).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&d.exe, perms.clone()).unwrap();
+        let decision = decide_data_dir(&d.exe, &d.app_data, &d.config);
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&d.exe, perms).unwrap();
+        assert_eq!(decision.path, d.custom);
+        assert!(decision.problem.is_none());
+    }
+
+    #[test]
+    fn pointed_folder_inside_the_portable_folder_is_stored_relative() {
+        let d = dirs();
+        let inside = d.exe.join("Data");
+        std::fs::create_dir(&inside).unwrap();
+        write_pointer(&d.exe.join(POINTER_FILENAME), &inside).unwrap();
+        let raw: PointerFile =
+            serde_json::from_slice(&std::fs::read(d.exe.join(POINTER_FILENAME)).unwrap()).unwrap();
+        assert_eq!(raw.path, PathBuf::from("Data"));
+
+        // Moving the whole portable folder keeps it working.
+        let moved = d._root.path().join("moved-exe");
+        std::fs::rename(&d.exe, &moved).unwrap();
+        let decision = decide_data_dir(&moved, &d.app_data, &d.config);
+        assert_eq!(decision.path, moved.join("Data"));
+        assert!(decision.problem.is_none());
+    }
+
+    #[test]
+    fn missing_pointed_folder_is_reported_and_never_created() {
+        let d = dirs();
+        let usb = d._root.path().join("usb-drive").join("DDMM Data");
+        write_pointer(&d.config.join(POINTER_FILENAME), &usb).unwrap();
+        let decision = decide_data_dir(&d.exe, &d.app_data, &d.config);
+        assert_eq!(decision.problem, Some(DataDirProblem::Missing));
+        assert_eq!(decision.path, usb);
+        assert!(!usb.exists(), "deciding must never create the folder");
+
+        // Plugged back in: fine again.
+        std::fs::create_dir_all(&usb).unwrap();
+        assert_eq!(decide_data_dir(&d.exe, &d.app_data, &d.config).problem, None);
+    }
+
+    #[test]
+    fn unreadable_pointer_is_a_problem_not_a_silent_default() {
+        let d = dirs();
+        std::fs::write(d.config.join(POINTER_FILENAME), b"not json").unwrap();
+        let decision = decide_data_dir(&d.exe, &d.app_data, &d.config);
+        assert!(matches!(decision.problem, Some(DataDirProblem::BadPointer(_))));
+
+        remove_pointer(&d.config.join(POINTER_FILENAME)).unwrap();
+        remove_pointer(&d.config.join(POINTER_FILENAME)).unwrap(); // already gone: fine
+        assert_eq!(decide_data_dir(&d.exe, &d.app_data, &d.config).problem, None);
     }
 }
