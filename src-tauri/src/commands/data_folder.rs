@@ -150,7 +150,8 @@ fn commit_location(state_dir: &data_dir::DataDirDecision, target: &Path, is_rese
 }
 
 /// Exit through the normal path (bridge shutdown, single-instance lock
-/// released) and start the app again with **no arguments**: not
+/// released) and start the app again **without this process's
+/// arguments** (only install links that were never shown): not
 /// `AppHandle::request_restart`, which replays this process's arguments
 /// (a `ddmm://` link would prompt again). See `app_lifecycle`.
 fn restart_soon(app: AppHandle) {

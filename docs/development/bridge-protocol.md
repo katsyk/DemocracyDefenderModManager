@@ -254,6 +254,12 @@ DDMM **always** shows a confirmation ("A link wants to install a mod from **exam
 
 Deep links reach an already-running DDMM through the single-instance mechanism. A second window is never opened.
 
+A link that starts DDMM arrives before the window has loaded, and the Mods page may not be showing when one arrives
+(Settings, or the data folder recovery screen). So the app queues install links, and the Mods page takes them and
+shows the confirmation once it's ready. Each link is shown once. The same link arriving again while it's still
+waiting, or while its confirmation or install is still in progress, is ignored. Links that arrive on the recovery
+screen are passed on to the restart that follows it.
+
 ## Security checklist
 
 - TCP listener bound to loopback only, random port, per-run 256-bit token, constant-time token compare.

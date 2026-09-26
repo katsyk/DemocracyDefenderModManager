@@ -82,7 +82,8 @@ pub struct AppState {
     /// closing the window is refused meanwhile.
     data_move_running: AtomicBool,
     /// Set once a data folder change is committed: on exit, start the app
-    /// again (with no arguments; see `app_lifecycle::relaunch_command`).
+    /// again (without this process's arguments; see
+    /// `app_lifecycle::relaunch_command`).
     relaunch_on_exit: AtomicBool,
     /// Serializes update checks (manual, startup, scheduled).
     update_check_lock: Mutex<()>,
@@ -103,6 +104,9 @@ pub struct AppState {
     import_cancel: std::sync::Mutex<Option<Arc<AtomicBool>>>,
     /// The latest import scan, which `run_import` imports from by item id.
     import_scan: Mutex<Option<mod_import::ScanResult>>,
+    /// `ddmm://install` links waiting for the Mods page's confirmation
+    /// (`deep_link` only).
+    deep_links: std::sync::Mutex<deep_link::DeepLinkQueue>,
 }
 
 /// Shown when something that writes to the data folder is attempted while
@@ -146,6 +150,7 @@ impl AppState {
             nexus_sign_in_cancel: Mutex::default(),
             import_cancel: std::sync::Mutex::default(),
             import_scan: Mutex::default(),
+            deep_links: std::sync::Mutex::default(),
         }
     }
 
@@ -292,11 +297,36 @@ pub fn run() {
         .setup(move |app| {
             log::info!("{}", startup_message);
 
+            // `ddmm://` links. Taken in even on the recovery screen (they
+            // touch no data folder): they're only queued, and the Mods
+            // page takes them once it's up -- after the restart that
+            // Retry / Locate / Reset do, which passes on any still waiting
+            // (see `app_lifecycle::relaunch_command`).
+            //
+            // A link that started this process is in argv (Windows/Linux;
+            // `get_current()` has it too, and the deep-link plugin already
+            // emitted it -- to no one, as nothing was listening yet). This
+            // runs long before the webview has loaded, which is why links
+            // are queued rather than sent to the page (issue #32). A link
+            // opened while DDMM is running reaches `on_open_url`: from a
+            // second instance via tauri-plugin-single-instance (registered
+            // above, with its `deep-link` feature), or from the OS on
+            // macOS. The queue drops the same link seen twice.
+            let mut startup_links = deep_link::links_from_args(std::env::args());
+            if let Ok(Some(urls)) = app.deep_link().get_current() {
+                startup_links.extend(urls);
+            }
+            deep_link::handle(app.handle(), startup_links);
+            let handle = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                deep_link::handle(&handle, event.urls());
+            });
+
             if recovery {
                 // Nothing below may touch the (missing) data folder: no
-                // asset scope, bridge, browser registration, deep links,
-                // auto-import or update checks. The recovery screen offers
-                // Retry / Locate / Reset, each of which restarts the app.
+                // asset scope, bridge, browser registration, auto-import
+                // or update checks. The recovery screen offers Retry /
+                // Locate / Reset, each of which restarts the app.
                 return Ok(());
             }
 
@@ -334,22 +364,6 @@ pub fn run() {
                     log::warn!("Failed to register the ddmm:// scheme: {e}");
                 }
             }
-
-            // On Windows/Linux (unlike macOS/iOS) the deep-link plugin
-            // doesn't scan argv on its own; a cold start via a `ddmm://`
-            // link needs this explicit check. A second-instance launch is
-            // instead caught by tauri-plugin-single-instance (registered
-            // above, with its `deep-link` feature forwarding it into this
-            // same `on_open_url`/`get_current` machinery).
-            app.deep_link().handle_cli_arguments(std::env::args());
-            if let Ok(Some(urls)) = app.deep_link().get_current() {
-                deep_link::handle(app.handle(), urls);
-            }
-
-            let handle = app.handle().clone();
-            app.deep_link().on_open_url(move |event| {
-                deep_link::handle(&handle, event.urls());
-            });
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -484,6 +498,7 @@ pub fn run() {
             commands::bridge::focus_main_window,
             commands::bridge::is_game_running,
             commands::bridge::set_bridge_frontend_ready,
+            deep_link::take_pending_deep_links,
             commands::force_exit,
             commands::ack_close_requested,
         ])
@@ -506,12 +521,23 @@ pub fn run() {
                 // before this callback), so the single-instance lock is
                 // released and the new process won't hand off to this one.
                 if app_handle.state::<AppState>().relaunch_on_exit.load(Ordering::SeqCst) {
+                    let unshown_links = app_handle
+                        .state::<AppState>()
+                        .deep_links
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .pending_links();
                     let relaunch = app_lifecycle::relaunch_command(
                         &std::env::current_exe().unwrap_or_default(),
                         std::env::var_os("APPIMAGE").as_deref(),
                         &std::env::args_os().collect::<Vec<_>>(),
+                        &unshown_links,
                     );
-                    log::info!("Relaunching {:?} (no arguments) for the new data folder.", relaunch.program);
+                    log::info!(
+                        "Relaunching {:?} for the new data folder ({} install link(s) not shown yet passed on).",
+                        relaunch.program,
+                        relaunch.args.len()
+                    );
                     if let Err(e) = app_lifecycle::spawn_relaunch(&relaunch) {
                         log::error!("Couldn't relaunch DDMM ({:?}): {e}. Start it again by hand.", relaunch.program);
                     }

@@ -400,6 +400,14 @@ export async function setBridgeFrontendReady(ready: boolean): Promise<void> {
     await invoke<void>("set_bridge_frontend_ready", { ready });
 }
 
+/** `ddmm://install` targets (https URLs) waiting for their confirmation,
+ * oldest first. Taking them removes them, so each is returned once; see
+ * `deep_link::DeepLinkQueue` on the Rust side. */
+export async function takePendingDeepLinks(): Promise<string[]> {
+    log.debug("Invoking `take_pending_deep_links`.");
+    return await invoke<string[]>("take_pending_deep_links");
+}
+
 /** Answers a pending `bridge://consent-request` -- see BridgeConsentPopup. */
 export async function resolveBridgeConsent(requestId: string, decision: BridgeConsentDecision): Promise<void> {
     log.debug("Invoking `resolve_bridge_consent`.");

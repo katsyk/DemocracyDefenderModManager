@@ -17,23 +17,31 @@ pub struct Relaunch {
 
 /// The relaunch after a data folder change (move, adopt, locate, reset).
 ///
-/// Always starts the app with **no arguments**, whatever this process was
-/// started with (`original_args`, taken only to make that explicit): a
-/// `ddmm://` link would show its install prompt again, and native-messaging
-/// host arguments would start a windowless relay instead of the app. The
+/// Never passes on what this process was started with (`original_args`,
+/// taken only to make that explicit): a `ddmm://` link would show its
+/// install prompt again, and native-messaging host arguments would start a
+/// windowless relay instead of the app. The only arguments are
+/// `unshown_links`: `ddmm://install` links that arrived but were never
+/// shown (e.g. while the data-folder recovery screen was up), so they
+/// aren't lost -- see `deep_link::DeepLinkQueue::pending_links`. The
 /// environment is inherited as is, which keeps what portable/AppImage
 /// detection needs (`APPIMAGE`).
 ///
 /// For an AppImage the program is the `.AppImage` file itself (`$APPIMAGE`),
 /// not the binary inside its temporary mount, which is gone once this
 /// process exits.
-pub fn relaunch_command(current_exe: &Path, appimage: Option<&OsStr>, original_args: &[OsString]) -> Relaunch {
+pub fn relaunch_command(
+    current_exe: &Path,
+    appimage: Option<&OsStr>,
+    original_args: &[OsString],
+    unshown_links: &[String],
+) -> Relaunch {
     let _ = original_args;
     let program = match appimage {
         Some(a) if !a.is_empty() => PathBuf::from(a),
         _ => current_exe.to_path_buf(),
     };
-    Relaunch { program, args: Vec::new() }
+    Relaunch { program, args: unshown_links.iter().map(OsString::from).collect() }
 }
 
 /// Whether a window close request may go ahead. Closing is ignored while a
@@ -94,10 +102,24 @@ mod tests {
             args(&["ddmm", "chrome-extension://inomhciahaeeefhgdkiaabdponcfdane/", "--parent-window=0"]),
             args(&["ddmm", "/home/u/.mozilla/native-messaging-hosts/io.github.katsyk.ddmm.json", "ddmm@katsyk.github.io"]),
         ] {
-            let r = relaunch_command(exe, None, &original);
+            let r = relaunch_command(exe, None, &original, &[]);
             assert!(r.args.is_empty(), "{original:?} -> {r:?}");
             assert_eq!(r.program, exe);
         }
+    }
+
+    #[test]
+    fn relaunch_passes_on_only_links_never_shown() {
+        // Started by a link that was already shown: it isn't replayed; a
+        // link that arrived on the recovery screen and was never shown is.
+        let unshown = vec!["ddmm://install?url=https%3A%2F%2Fexample.org%2Fb.zip".to_string()];
+        let r = relaunch_command(
+            Path::new("/opt/ddmm/ddmm"),
+            None,
+            &args(&["ddmm", "ddmm://install?url=https%3A%2F%2Fexample.com%2Fa.zip"]),
+            &unshown,
+        );
+        assert_eq!(r.args, args(&["ddmm://install?url=https%3A%2F%2Fexample.org%2Fb.zip"]));
     }
 
     #[test]
@@ -106,11 +128,12 @@ mod tests {
             Path::new("/tmp/.mount_DDMMxyz/usr/bin/ddmm"),
             Some(OsStr::new("/home/u/Apps/DDMM-x86_64.AppImage")),
             &args(&["ddmm", "ddmm://open"]),
+            &[],
         );
         assert_eq!(r.program, PathBuf::from("/home/u/Apps/DDMM-x86_64.AppImage"));
         assert!(r.args.is_empty());
         // An empty APPIMAGE is ignored.
-        let r = relaunch_command(Path::new("/opt/ddmm/ddmm"), Some(OsStr::new("")), &[]);
+        let r = relaunch_command(Path::new("/opt/ddmm/ddmm"), Some(OsStr::new("")), &[], &[]);
         assert_eq!(r.program, PathBuf::from("/opt/ddmm/ddmm"));
     }
 
