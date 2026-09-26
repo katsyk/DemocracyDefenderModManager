@@ -16,7 +16,7 @@
         loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath,
         resolveBridgeConsent, resolveBridgeInstallCompletion, isGameRunning, forceExit, ackCloseRequested,
         setBridgeFrontendReady, getLastUpdateReport, skipUpdateVersion, browserExtensionActive,
-        detectImportSources, type ImportSource,
+        detectImportSources, takePendingDeepLinks, type ImportSource,
         type UpdateStatusEntry, type UpdateCheckReport, type BridgeConsentDecision, type BridgeSoftError
     } from "$lib/utils/commands";
     import type { UUID } from "$lib/types/uuid";
@@ -90,6 +90,9 @@
      * close and a stray second click both firing before the first request
      * has been resolved). */
     let closeRequestInFlight = false;
+    /** Set when this page is left; queued `ddmm://` links then stay queued
+     * until it's shown again. */
+    let unmounted = false;
     /** True while the "Import mods" popup is open (an import may be
      * running in it); closing then asks first, like during a deploy. */
     let importing = $state<boolean>(false);
@@ -203,10 +206,12 @@
             "bridge://mod-installed",
             (e) => onBridgeModInstalled(e.payload),
         );
-        // ddmm:// deep links (see deep_link.rs on the Rust side).
-        const unlistenDeepLinkInstall = listen<{ url: string }>(
-            "deep-link://install-request",
-            (e) => onDeepLinkInstallRequest(e.payload),
+        // ddmm:// deep links (see deep_link.rs on the Rust side): the
+        // backend queues them and says so; this page takes them once it's
+        // ready (below) and whenever a new one is queued.
+        const unlistenDeepLinkPending = listen(
+            "deep-link://pending",
+            () => showPendingDeepLinks(),
         );
         // Auto-import from Downloads (see auto_import.rs on the Rust side;
         // opt-in, off by default).
@@ -230,13 +235,21 @@
             })
             .catch((ex: unknown) => log.error(`Failed to mark the bridge frontend ready: ${errorMessage(ex)}`));
 
+        // Links that arrived before this page could show them: the one DDMM
+        // was started with (issue #32), or any that came in while another
+        // page or the data-folder recovery screen was shown.
+        unlistenDeepLinkPending
+            .then(() => showPendingDeepLinks())
+            .catch((ex: unknown) => log.error(`Failed to listen for ddmm:// links: ${errorMessage(ex)}`));
+
         return () => {
+            unmounted = true;
             setBridgeFrontendReady(false).catch(() => {});
             unlisten.then(f => f());
             unlistenDragDrop.then(f => f());
             unlistenBridgeConsent.then(f => f());
             unlistenBridgeInstalled.then(f => f());
-            unlistenDeepLinkInstall.then(f => f());
+            unlistenDeepLinkPending.then(f => f());
             unlistenAutoImport.then(f => f());
             unlistenUpdatesChecked.then(f => f());
         };
@@ -697,24 +710,65 @@
         }
     }
 
-    /** `deep-link://install-request` -- a `ddmm://install?url=` link.
+    /** Show the confirmation for every queued `ddmm://install` link, once
+     * this page is ready for it (profiles loaded; not when init sent the
+     * user to Settings instead). Called on mount and on each
+     * `deep-link://pending`. The backend hands each link out only once, so
+     * overlapping calls can't show one twice, and a link that arrives
+     * before the page is ready simply waits in the queue. */
+    async function showPendingDeepLinks() {
+        try {
+            await initPromise;
+        } catch {
+            return;
+        }
+        if (unmounted || !profilesLoaded) return;
+
+        let urls: string[];
+        try {
+            urls = await takePendingDeepLinks();
+        } catch (ex: unknown) {
+            log.error(`Failed to get pending ddmm:// links: ${errorMessage(ex)}`);
+            return;
+        }
+        for (const url of urls) {
+            onDeepLinkInstallRequest({ url })
+                .catch((ex: unknown) => log.error(`ddmm:// install failed: ${errorMessage(ex)}`));
+        }
+    }
+
+    /** `ddmm://install` targets whose confirmation (or the install after
+     * it) is still in progress -- the same link arriving again meanwhile
+     * (one click delivered twice) isn't shown a second time. */
+    const deepLinksInProgress = new Set<string>();
+
+    /** A `ddmm://install?url=` link (see `showPendingDeepLinks`).
      * Always confirms (no "always allow"), then runs the same flow as
      * manually pasting the URL into "Add URL". */
     async function onDeepLinkInstallRequest(payload: { url: string }) {
-        let site: string;
-        try {
-            site = new URL(payload.url).hostname;
-        } catch {
-            site = payload.url;
+        if (deepLinksInProgress.has(payload.url)) {
+            log.info("This ddmm:// link is already being handled; not asking again.");
+            return;
         }
+        deepLinksInProgress.add(payload.url);
+        try {
+            let site: string;
+            try {
+                site = new URL(payload.url).hostname;
+            } catch {
+                site = payload.url;
+            }
 
-        const confirmed = await showPopup(new ConfirmPopup(
-            t("pages.mods.popup.confirm.deep_link_install.title"),
-            t("pages.mods.popup.confirm.deep_link_install.question", { site }),
-        ));
-        if (!confirmed) return;
+            const confirmed = await showPopup(new ConfirmPopup(
+                t("pages.mods.popup.confirm.deep_link_install.title"),
+                t("pages.mods.popup.confirm.deep_link_install.question", { site }),
+            ));
+            if (!confirmed) return;
 
-        await installFromUrl(payload.url);
+            await installFromUrl(payload.url);
+        } finally {
+            deepLinksInProgress.delete(payload.url);
+        }
     }
 
     /** `auto-import://candidate` -- a new, finished archive appeared in
