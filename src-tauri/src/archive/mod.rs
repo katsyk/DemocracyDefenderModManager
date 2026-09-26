@@ -938,20 +938,60 @@ mod tests {
     }
 
     #[test]
-    fn rejects_traversal_and_absolute_paths_in_rar_before_writing_anything() {
-        let tmp = tempfile::tempdir().unwrap();
-        let absolute = format!("{}/evil.txt", tmp.path().display());
-        for evil in ["../evil.txt", "ok/../../evil.txt", absolute.as_str(), "C:\\evil.txt", "C:evil.txt"] {
+    fn rejects_traversal_in_rar_before_writing_anything() {
+        for evil in ["../evil.txt", "ok/../../evil.txt"] {
+            let tmp = tempfile::tempdir().unwrap();
             let path = write(tmp.path(), "mal.rar", &rar5(&[("good.txt", b"fine"), (evil, b"evil")]));
-            let dest = tmp.path().join("dest");
-            let _ = std::fs::remove_dir_all(&dest);
-            std::fs::create_dir(&dest).unwrap();
+            let dest = fresh_dest(tmp.path(), "dest");
             let err = Archive::open(&path).unwrap().extract_to(&dest).unwrap_err();
             assert!(err.to_string().contains("unsafe path"), "{evil}: {err}");
             assert_eq!(hint_of(&err), Some(errors::HINT_UNSAFE));
             assert!(!tmp.path().join("evil.txt").exists(), "{evil}");
             assert!(!dest.join("good.txt").exists(), "{evil}: nothing may be extracted");
         }
+    }
+
+    /// Absolute and drive-letter names: unrar reports them as stored on
+    /// Linux (so they are rejected up front), while unrar on Windows
+    /// already rewrites characters Windows forbids in names (`:` -> `_`),
+    /// turning them into plain relative paths. Either way, nothing may be
+    /// written outside the destination.
+    #[test]
+    fn absolute_and_drive_letter_paths_in_rar_never_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let absolute = format!("{}/evil.txt", outside.display());
+        for evil in [absolute.as_str(), "C:\\evil.txt", "C:evil.txt", "\\\\server\\share\\evil.txt"] {
+            let path = write(tmp.path(), "mal.rar", &rar5(&[(evil, b"evil")]));
+            let dest = tmp.path().join("dest");
+            let _ = std::fs::remove_dir_all(&dest);
+            std::fs::create_dir(&dest).unwrap();
+            match Archive::open(&path).unwrap().extract_to(&dest) {
+                Err(e) => assert!(e.to_string().contains("unsafe path"), "{evil}: {e}"),
+                Ok(()) => {
+                    let landed = walk_files(&dest);
+                    assert_eq!(landed.len(), 1, "{evil}: {landed:?}");
+                    assert_eq!(std::fs::read(&landed[0]).unwrap(), b"evil");
+                }
+            }
+            assert!(!outside.join("evil.txt").exists(), "{evil}");
+            #[cfg(windows)]
+            assert!(!Path::new(r"C:\evil.txt").exists(), "{evil}");
+        }
+    }
+
+    fn walk_files(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk_files(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
     }
 
     /// A literal backslash in a RAR 5 name is a separator for unrar on
