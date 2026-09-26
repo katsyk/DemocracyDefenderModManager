@@ -16,6 +16,7 @@ pub mod app_lifecycle;
 pub mod providers;
 pub mod secrets;
 pub mod nexus_oauth;
+pub mod mod_import;
 
 use std::{
     path::PathBuf,
@@ -96,6 +97,11 @@ pub struct AppState {
     /// Cancels the in-flight "Sign in to Nexus Mods", if any
     /// (`commands::nexus` only).
     nexus_sign_in_cancel: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Cancel flag of the running import scan or import, if any
+    /// (`commands::import` only; one at a time).
+    import_cancel: std::sync::Mutex<Option<Arc<AtomicBool>>>,
+    /// The latest import scan, which `run_import` imports from by item id.
+    import_scan: Mutex<Option<mod_import::ScanResult>>,
 }
 
 /// Shown when something that writes to the data folder is attempted while
@@ -137,6 +143,8 @@ impl AppState {
             last_update_check: Mutex::default(),
             bridge_last_seen: Mutex::default(),
             nexus_sign_in_cancel: Mutex::default(),
+            import_cancel: std::sync::Mutex::default(),
+            import_scan: Mutex::default(),
         }
     }
 
@@ -425,6 +433,11 @@ pub fn run() {
             commands::mods::add_mod_folder,
             commands::mods::add_paths,
             commands::mods::add_mod_from_url,
+            commands::import::detect_import_sources,
+            commands::import::scan_import_folder,
+            commands::import::scan_import_paths,
+            commands::import::run_import,
+            commands::import::cancel_import,
             commands::handoff::start_handoff,
             commands::handoff::cancel_handoff,
             commands::handoff::install_handoff_file,

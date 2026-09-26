@@ -1,6 +1,6 @@
 <script lang="ts">
     import { SvelteMap } from "svelte/reactivity";
-    import { Plus, Dash, Backspace, ArrowBarRight, ArrowBarLeft, Arrow90degLeft, ArrowReturnLeft, PencilSquare, Download, ThreeDotsVertical, CaretUpFill, CaretDownFill, Trash3, ArrowBarUp, ArrowBarDown, CaretUp, CaretDown, Eraser, FolderPlus, Link45deg, BoxArrowUpRight, ArrowRepeat, CloudArrowDownFill, GripVertical, InfoCircle, SkipForward, ArrowCounterclockwise, Key } from "svelte-bootstrap-icons";
+    import { Plus, Dash, Backspace, ArrowBarRight, ArrowBarLeft, Arrow90degLeft, ArrowReturnLeft, PencilSquare, Download, ThreeDotsVertical, CaretUpFill, CaretDownFill, Trash3, ArrowBarUp, ArrowBarDown, CaretUp, CaretDown, Eraser, FolderPlus, Link45deg, BoxArrowUpRight, ArrowRepeat, CloudArrowDownFill, GripVertical, InfoCircle, SkipForward, ArrowCounterclockwise, Key, BoxArrowInDown } from "svelte-bootstrap-icons";
     import { getCurrentWindow } from "@tauri-apps/api/window";
     import { getCurrentWebview } from "@tauri-apps/api/webview";
     import { listen } from "@tauri-apps/api/event";
@@ -16,6 +16,7 @@
         loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath,
         resolveBridgeConsent, resolveBridgeInstallCompletion, isGameRunning, forceExit, ackCloseRequested,
         setBridgeFrontendReady, getLastUpdateReport, skipUpdateVersion, browserExtensionActive,
+        detectImportSources, type ImportSource,
         type UpdateStatusEntry, type UpdateCheckReport, type BridgeConsentDecision, type BridgeSoftError
     } from "$lib/utils/commands";
     import type { UUID } from "$lib/types/uuid";
@@ -35,7 +36,8 @@
         UpdatesPopup,
         UpdateFilePickPopup,
         UpdateDownloadPopup,
-        BrowserUpdatePopup
+        BrowserUpdatePopup,
+        ImportPopup
     } from "$lib/types/popup";
     import type { HandoffResult } from "$lib/types/popup";
     import type { AfterBrowserInstall } from "$lib/models/settings";
@@ -88,6 +90,12 @@
      * close and a stray second click both firing before the first request
      * has been resolved). */
     let closeRequestInFlight = false;
+    /** True while the "Import mods" popup is open (an import may be
+     * running in it); closing then asks first, like during a deploy. */
+    let importing = $state<boolean>(false);
+    /** Other mod managers' folders (or Downloads) with mods in them, shown
+     * on the empty mod list as a way in. */
+    let importSources = $state<ImportSource[]>([]);
 
     let currentProfile = $derived<Profile | undefined>(profiles[activeProfile]);
     let profileMods = $derived<Mod[]>(profileConfigs.map(config => mods.find(m => m.guid === config.Guid)).filter((m): m is Mod => m !== undefined));
@@ -172,7 +180,11 @@
                     break;
                 case "drop":
                     isDragging = false;
-                    await doAddPaths(...e.payload.paths);
+                    if (e.payload.paths.length >= BULK_ADD_THRESHOLD) {
+                        await onImport(e.payload.paths);
+                    } else {
+                        await doAddPaths(...e.payload.paths);
+                    }
                     break;
                 case "leave":
                     isDragging = false;
@@ -292,6 +304,13 @@
             if (last) updateStatuses = last.Results;
         } catch (ex: unknown) {
             log.warn(`Couldn't load the last update check: ${errorMessage(ex)}`);
+        }
+
+        // An empty library: offer what can be imported right away.
+        if (loadedMods.length === 0) {
+            detectImportSources()
+                .then(found => importSources = found)
+                .catch((ex: unknown) => log.warn(`Couldn't look for mods to import: ${errorMessage(ex)}`));
         }
 
         log.info("Initialization complete.");
@@ -798,7 +817,17 @@
     }
 
     async function handleCloseRequest() {
-        log.info(`Handling close request (deploying=${deploying}, profilesLoaded=${profilesLoaded}).`);
+        log.info(`Handling close request (deploying=${deploying}, importing=${importing}, profilesLoaded=${profilesLoaded}).`);
+        if (importing) {
+            const confirmed = await showPopup(new ConfirmPopup(
+                t("pages.mods.popup.confirm.close_importing.title"),
+                t("pages.mods.popup.confirm.close_importing.question"),
+            ));
+            if (!confirmed) {
+                log.info("Close cancelled: import window open.");
+                return;
+            }
+        }
         if (deploying) {
             const confirmed = await showPopup(new ConfirmPopup(
                 t("pages.mods.popup.confirm.close_deploying.title"),
@@ -1183,6 +1212,50 @@
         await showUpdatesPopup(report);
     }
 
+    /** From this many files on, Add (and drag & drop) go through the import
+     * checklist instead of installing straight away: duplicates and
+     * already-installed mods are sorted out first, with progress, cancel and
+     * one summary instead of a wall of results. */
+    const BULK_ADD_THRESHOLD = 10;
+
+    /** "Import mods": scan another mod manager's folder, a folder of
+     * archives, or `paths`; then add what was imported to the active
+     * profile (keeping the source's order, on/off state and options). */
+    async function onImport(paths?: string[]) {
+        importing = true;
+        let result;
+        try {
+            result = await showPopup(new ImportPopup(currentProfile?.Name, paths));
+        } finally {
+            importing = false;
+        }
+        mods = await getMods();
+        importSources = [];
+        if (!result || result.report.Imported.length === 0) return;
+        await refreshUpdateStatuses();
+
+        if (result.addToProfile && currentProfile) {
+            // Ones with a known place in the source's load order first, in
+            // that order; the rest after them, in import order.
+            const imported = [...result.report.Imported].sort((a, b) =>
+                (a.Order ?? Number.MAX_SAFE_INTEGER) - (b.Order ?? Number.MAX_SAFE_INTEGER));
+            for (const entry of imported) {
+                if (profileConfigs.some(c => c.Guid === entry.Guid)) continue;
+                const mod = mods.find(m => m.guid === entry.Guid);
+                if (!mod) continue;
+                const config = entry.Config ?? makeConfigForMod(mod);
+                if (!entry.Config && entry.Enabled !== undefined) config.Enabled = entry.Enabled;
+                profileConfigs.push(config);
+            }
+            const saved = await doSaveProfiles();
+            if (saved.ok) {
+                showToast("info", t("toast.import.added_to_profile", { profile: currentProfile.Name }));
+            } else {
+                showPopup(new NotificationPopup("warning", t("toast.import.profile_save_failed", { error: saved.error })));
+            }
+        }
+    }
+
     async function onAddMod() {
         const filenames = await open({
             multiple: true,
@@ -1196,7 +1269,9 @@
         });
         if (!filenames) return;
 
-        if (filenames.length == 1) {
+        if (filenames.length >= BULK_ADD_THRESHOLD) {
+            await onImport(filenames);
+        } else if (filenames.length == 1) {
             await doAddMod(filenames[0]);
         } else {
             await doAddMods(...filenames);
@@ -1358,6 +1433,18 @@
                     <div class="h-full flex flex-col items-center justify-center gap-1 text-center px-4">
                         <span class="text-zinc-400 text-lg">{t("pages.mods.empty_state.title")}</span>
                         <span class="text-zinc-500 text-sm max-w-100">{t("pages.mods.empty_state.works_with")}</span>
+                        <span class="text-zinc-400 text-sm max-w-100 mt-4">{t("pages.mods.empty_state.import_hint")}</span>
+                        {#each importSources.slice(0, 3) as source (source.Path)}
+                            <span class="text-zinc-500 text-xs max-w-120 break-all" data-testid="empty-import-found">
+                                {source.Count === 1
+                                    ? t("pages.mods.empty_state.import_found_one", { path: source.Path })
+                                    : t("pages.mods.empty_state.import_found", { count: source.Count, path: source.Path })}
+                            </span>
+                        {/each}
+                        <button class="hd2mm-button flex flex-row gap-1 items-center mt-1" onclick={() => onImport()} data-testid="empty-import-button">
+                            <BoxArrowInDown />
+                            {t("pages.mods.empty_state.import_button")}
+                        </button>
                     </div>
                 {/if}
                 {#if profileEntries.length > 0}
@@ -1616,6 +1703,15 @@
             >
                 <Link45deg />
                 {t("pages.mods.add_url_button.text")}
+            </button>
+            <button
+                class="hd2mm-button flex flex-row gap-1 items-center"
+                title={t("pages.mods.import_button.tip")}
+                onclick={() => onImport()}
+                data-testid="import-button"
+            >
+                <BoxArrowInDown />
+                {t("pages.mods.import_button.text")}
             </button>
             <button
                 class="hd2mm-button flex flex-row gap-1 items-center"

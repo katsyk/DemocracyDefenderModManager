@@ -89,6 +89,7 @@ nav:
   - Using DDMM:
       - using/index.md
       - Adding mods: using/adding-mods.md
+      - Importing mods: using/importing-mods.md
       - Mod sites: using/mod-sites.md
       - One-click install: using/one-click-install.md
       - Profiles: using/profiles.md

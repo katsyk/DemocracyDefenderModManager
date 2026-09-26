@@ -53,6 +53,10 @@
                     "redeploy_after_update": {
                         "title": "Redeploy?",
                         "question": "Updated mods are in your active profile. Deploy now so the game uses the new versions?"
+                    },
+                    "close_importing": {
+                        "title": "Import in Progress",
+                        "question": "The Import Mods window is still open. If mods are being imported, closing now may leave the one being copied half-finished. Close anyway?"
                     }
                 },
                 "input": {
@@ -169,6 +173,10 @@
                 "text": "Add URL",
                 "tip": "Add a mod from a direct download link."
             },
+            "import_button": {
+                "text": "Import",
+                "tip": "Import many mods at once: from another mod manager, or from a folder of downloaded archives."
+            },
             "open_source_page": "Open on {name}",
             "update_available_badge": {
                 "tip": "Update available"
@@ -210,7 +218,11 @@
             "drop_message": "Drop archives or folders to add",
             "empty_state": {
                 "title": "No mods yet",
-                "works_with": "Works with AyakaMods, Nexus Mods, ModWorkshop, GameBanana, GitHub and more."
+                "works_with": "Works with AyakaMods, Nexus Mods, ModWorkshop, GameBanana, GitHub and more.",
+                "import_hint": "Moving from another mod manager, or have a folder full of downloaded mods?",
+                "import_button": "Import Mods",
+                "import_found": "Found {count} mods in {path}",
+                "import_found_one": "Found 1 mod in {path}"
             },
             "load_order": {
                 "hint": "Load order: when two mods change the same game file, the one lower in the list wins.",
@@ -618,6 +630,73 @@
             "close_button": {
                 "text": "Close"
             }
+        },
+        "import": {
+            "title": "Import Mods",
+            "intro": "Bring over the mods you already have, all at once: from another mod manager, or from a folder of downloaded archives. Nothing is downloaded, and the original files are only read, never changed or moved.",
+            "looking": "Looking for mods on this PC...",
+            "none_found": "No other mod manager's mods were found in the usual places on this PC. Choose the folder where your mods or downloaded archives are.",
+            "source": {
+                "manager_mods": "Mods installed with another mod manager",
+                "manager_downloads": "Archives downloaded by another mod manager",
+                "downloads": "Your downloads folder"
+            },
+            "found": "Found {count} mods in {path}",
+            "found_one": "Found 1 mod in {path}",
+            "scan_button": "Scan",
+            "folder_hint": "Any folder works: another mod manager's mods folder, or a folder with hundreds of .zip/.7z/.rar files (subfolders are searched too). You'll see a list to pick from before anything is imported.",
+            "choose_folder": "Choose a Folder...",
+            "close_button": "Close",
+            "back_button": "Back",
+            "cancel_button": "Cancel",
+            "scanning": "Looking for mods...",
+            "scanning_progress": "Reading {done} of {total}...",
+            "nothing_found": "No mods found there. Pick the folder that holds the mod folders or the downloaded archives.",
+            "summary": "{total} found: {new} new, {installed} already in DDMM, {other} skipped.",
+            "truncated": "That folder holds a lot; only the first 5000 items are listed. Pick a more specific folder to see the rest.",
+            "linkable": "{count} mods you already have will get their Nexus Mods info added, so update checks cover them. Nothing else about them changes.",
+            "linkable_one": "1 mod you already have will get its Nexus Mods info added, so update checks cover it. Nothing else about it changes.",
+            "select_all": "Select All",
+            "select_none": "Select None",
+            "select_new": "Only New",
+            "filter_placeholder": "Filter",
+            "status": {
+                "new": "New",
+                "installed": "Already in DDMM as \"{name}\"",
+                "installed_add_source": "Already in DDMM (\"{name}\"): will add Nexus info",
+                "installed_other_version": "Another version is in DDMM (\"{name}\")",
+                "duplicate": "Same as \"{name}\"",
+                "older_version": "Older download of \"{name}\"",
+                "not_a_mod": "No Helldivers 2 mod files inside",
+                "unreadable": "Can't read: {reason}"
+            },
+            "nexus": "Nexus Mods #{id}",
+            "nexus_version": "Nexus Mods #{id}, version {version}",
+            "was_enabled": "was on",
+            "was_disabled": "was off",
+            "selection": "{count} selected, {size} once installed",
+            "free": "{size} free",
+            "add_to_profile": "Also add them to the profile \"{profile}\"",
+            "keeps_order": "Keeps the load order, on/off state and chosen options from \"{profile}\".",
+            "keeps_order_unnamed": "Keeps the load order, on/off state and chosen options the other mod manager had.",
+            "read_only_note": "The originals stay where they are; DDMM copies what it imports into its own mods folder.",
+            "import_button": "Import {count} Mods",
+            "import_button_one": "Import 1 Mod",
+            "importing": "Importing...",
+            "importing_progress": "Importing {done} of {total}...",
+            "stopping": "Stopping after the current mod...",
+            "done_imported": "Imported {count} mods.",
+            "done_imported_one": "Imported 1 mod.",
+            "done_linked": "Added Nexus Mods info to {count} mods you already had.",
+            "done_linked_one": "Added Nexus Mods info to 1 mod you already had.",
+            "done_failed": "{count} couldn't be imported:",
+            "done_failed_one": "1 couldn't be imported:",
+            "done_cancelled": "Cancelled: {count} mods weren't imported. Run the import again to get them; what's already imported is recognized and skipped.",
+            "done_cancelled_one": "Cancelled: 1 mod wasn't imported. Run the import again to get it; what's already imported is recognized and skipped.",
+            "done_rolled_back": "\"{name}\", which was being imported, was removed again.",
+            "done_warnings": "{count} have no Helldivers 2 patch files and won't change anything when deployed.",
+            "done_warnings_one": "1 has no Helldivers 2 patch files and won't change anything when deployed.",
+            "finish_button": "Done"
         }
     },
     "toast": {
@@ -639,6 +718,10 @@
             "bulk_done": "{count} mod(s) updated.",
             "redeployed": "Redeployed with the updated mods.",
             "game_running": "Mods updated, but Helldivers 2 is running: deploy after closing it to use the new versions."
+        },
+        "import": {
+            "added_to_profile": "Imported mods were added to \"{profile}\". Deploy to use them.",
+            "profile_save_failed": "The mods were imported, but the profile couldn't be saved: {error}"
         }
     },
     "recovery": {

@@ -15,11 +15,13 @@ import UpdateDownloadPopupComponent from "$lib/components/popups/UpdateDownloadP
 import BrowserUpdatePopupComponent from "$lib/components/popups/BrowserUpdatePopup.svelte";
 import DataFolderMovePopupComponent from "$lib/components/popups/DataFolderMovePopup.svelte";
 import DataFolderProgressPopupComponent from "$lib/components/popups/DataFolderProgressPopup.svelte";
+import ImportPopupComponent from "$lib/components/popups/ImportPopup.svelte";
+import { ImportWizard } from "$lib/state/importWizard.svelte";
 import type { ModAddResult } from "./results";
 import type { Config } from "$lib/models/profile";
 import type { Mod } from "$lib/models/mod";
 import type { UUID } from "./uuid";
-import type { BridgeConsentDecision, UpdateCheckReport, UpdateFile, UpdateStatusEntry, DataFolderMovePlan, DataFolderMoveResult } from "$lib/utils/commands";
+import type { BridgeConsentDecision, UpdateCheckReport, UpdateFile, UpdateStatusEntry, DataFolderMovePlan, DataFolderMoveResult, ImportReport } from "$lib/utils/commands";
 
 export abstract class Popup<T = void> {
     abstract component: Component<any, any, any>;
@@ -268,6 +270,32 @@ export class BrowserUpdatePopup extends Popup<BrowserUpdateDecision> {
         public readonly entry: UpdateStatusEntry,
         public readonly extensionActive: boolean,
         public readonly position?: { index: number; total: number }
+    ) {
+        super();
+    }
+}
+
+
+export type ImportPopupResult = { report: ImportReport; addToProfile: boolean } | null;
+
+/**
+ * "Import mods": bring over many mods at once from another mod manager's
+ * folder or a folder of downloaded archives (or from many picked files),
+ * with a checklist, progress, cancel and a summary. `null` when closed
+ * before anything was imported. See `docs/using/importing-mods.md`.
+ */
+export class ImportPopup extends Popup<ImportPopupResult> {
+    component = ImportPopupComponent;
+    readonly wizard = new ImportWizard();
+    /** Set once the first scan (for `paths`) has been started, so a
+     * remount never starts it twice. */
+    started = false;
+
+    constructor(
+        /** The active profile's name, for "Also add them to ...". */
+        public readonly profileName: string | undefined,
+        /** Start by scanning these files (many picked with Add, or dropped). */
+        public readonly paths?: string[]
     ) {
         super();
     }
