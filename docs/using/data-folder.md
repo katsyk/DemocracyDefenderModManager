@@ -39,6 +39,12 @@ If anything fails before step 5 (the drive fills up or is unplugged, a file can'
 removes its partial copy, leaves your data exactly where it was, and tells you what went wrong. Nothing is ever
 deleted from the old folder until the new one is complete and in use.
 
+If DDMM is killed during the copy anyway (Task Manager, a crash, a power cut), your data is still safe: the old
+folder and DDMM's record of where the data is haven't changed yet, so DDMM starts normally with your data where it
+was. The destination is left with an unfinished copy (a `.ddmm-move-incomplete` file and a `.ddmm-move-...` folder)
+that DDMM never uses; delete it before picking that folder again. If it's killed after the switch (step 4) but
+before the old copy is deleted, DDMM starts with the new folder, and the old copy is simply left over.
+
 Moving between drives (for example from `C:` to `D:`, or to a USB drive) works the same way.
 
 Only DDMM's own files are moved: `mods/`, `settings.json`, `profiles.json`, `logs/`, the update-check cache, and
@@ -68,7 +74,7 @@ DDMM says why and changes nothing when the folder you pick:
 - **can't be written to** (a read-only drive, or a folder you don't have permission for).
 - **is on a drive without enough free space** for the data plus 64 MB of headroom.
 - **contains an unfinished move** from an earlier attempt that was interrupted (for example by a power cut).
-  Delete that folder after checking there's nothing in it you need, then try again.
+  Delete the `.ddmm-move-incomplete` file and `.ddmm-move-...` folder(s) there (DDMM never uses them), then try again.
 - **contains a symbolic link or junction** inside DDMM's data. DDMM won't follow or drop links; replace the link
   with the real folder first, or move the data by hand.
 

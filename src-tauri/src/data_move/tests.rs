@@ -175,6 +175,60 @@ fn rejects_a_leftover_unfinished_move() {
     assert!(plan_err(&input(&data, &dest, &root.path().join("default"))).contains("unfinished"));
 }
 
+/// What a process killed in the middle of the copy leaves behind: the
+/// marker and a half-filled temp folder in the destination. The old data
+/// and pointer were never touched (the commit comes last), and picking
+/// that destination again is refused instead of treating it as "a
+/// non-empty folder" and nesting a `DDMM Data` next to the leftovers.
+#[test]
+fn a_move_killed_mid_copy_leaves_old_data_and_is_refused_until_cleaned_up() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    make_data(&data);
+    let before = snapshot(&data);
+    let dest = root.path().join("usb");
+    std::fs::create_dir(&dest).unwrap();
+    let p = plan(&input(&data, &dest, &root.path().join("default")), &no_free_space_info).unwrap();
+
+    // Stop right after a few files were copied, as a SIGKILL would: the
+    // copy "never returns", so no rollback and no commit run. Simulated by
+    // unwinding out of the copy callback.
+    let calls = AtomicUsize::new(0);
+    let killing_copy = |a: &Path, b: &Path, _: &mut dyn FnMut(u64)| {
+        if calls.fetch_add(1, Ordering::SeqCst) == 3 {
+            std::panic::panic_any("killed");
+        }
+        std::fs::copy(a, b)
+    };
+    let ops = MoveOps { copy_file: &killing_copy, rename: &|a, b| std::fs::rename(a, b) };
+    let mut committed = false;
+    let killed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = execute(
+            &p,
+            &ops,
+            &mut |_: &Path| {
+                committed = true;
+                Ok(())
+            },
+            &mut |_| {},
+        );
+    }));
+    assert!(killed.is_err());
+    assert!(!committed, "the pointer is only written at the very end");
+    assert_eq!(snapshot(&data), before, "old data untouched");
+    assert!(dest.join(INCOMPLETE_MARKER).exists());
+
+    let msg = plan_err(&input(&data, &dest, &root.path().join("default")));
+    assert!(msg.contains("unfinished") && msg.contains(INCOMPLETE_MARKER), "{msg}");
+
+    // Once the user deletes the leftovers, the folder can be used again.
+    for e in std::fs::read_dir(&dest).unwrap() {
+        let e = e.unwrap();
+        remove_any(&e.path()).unwrap();
+    }
+    assert_eq!(plan(&input(&data, &dest, &root.path().join("default")), &no_free_space_info).unwrap().target, dest);
+}
+
 #[test]
 fn rejects_symlinks_inside_the_data() {
     let root = tempfile::tempdir().unwrap();

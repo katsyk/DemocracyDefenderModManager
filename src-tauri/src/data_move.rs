@@ -134,12 +134,20 @@ pub fn plan(input: &PlanInput, free_space: &dyn Fn(&Path) -> Option<u64>) -> any
     };
     check_not_overlapping_current(current, &target)?;
 
-    if target.join(INCOMPLETE_MARKER).exists() {
-        bail!(
-            "{} contains an unfinished data folder move from an earlier attempt. Delete that \
-             folder (after checking it doesn't hold anything you need) and try again.",
-            target.display()
-        );
+    // An interrupted move (DDMM killed, power cut) leaves its marker in the
+    // folder it was copying into: the picked folder itself, or its
+    // `DDMM Data` subfolder. Never treat either as empty, adoptable or
+    // usable until the user has cleaned it up.
+    for dir in [picked, target.as_path()] {
+        if dir.join(INCOMPLETE_MARKER).exists() {
+            bail!(
+                "{} holds an unfinished copy from an earlier data folder move that was interrupted: \
+                 the \"{}\" file and \"{}...\" folder(s). DDMM never uses them; delete them, then try again.",
+                dir.display(),
+                INCOMPLETE_MARKER,
+                TEMP_PREFIX
+            );
+        }
     }
 
     let existing_data = target.is_dir() && is_ddmm_data_dir(&target);
