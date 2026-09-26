@@ -63,6 +63,22 @@ pub struct OriginSidecar {
     /// updated, since the sidecar is rewritten then.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped_versions: Vec<SkippedVersion>,
+    /// The archive a mod was imported from (bulk import only), so importing
+    /// the same file again is recognized as "already in DDMM". Dropped
+    /// when the mod is updated, since the sidecar is rewritten then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_archive: Option<ArchiveFingerprint>,
+}
+
+/// Size and SHA-256 of an archive file (see
+/// [`OriginSidecar::imported_archive`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ArchiveFingerprint {
+    pub size: u64,
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
 }
 
 /// The specific file of a mod page that was installed (see
@@ -368,6 +384,7 @@ pub async fn write_origin_sidecar_with_files(
         installed_at,
         installed_files,
         skipped_versions: Vec::new(),
+        imported_archive: None,
     };
     save_origin_sidecar(mod_dir, &sidecar).await
 }
@@ -394,6 +411,7 @@ pub async fn set_skipped_version(mod_dir: &Path, provider: &str, version: Option
                 .as_secs(),
             installed_files: Vec::new(),
             skipped_versions: Vec::new(),
+            imported_archive: None,
         },
     };
     sidecar
@@ -421,34 +439,69 @@ pub fn resolved_source_id(source: &ResolvedSource) -> Option<String> {
     parsed.id
 }
 
-/// What a Nexus Mods download's file name says about it. Nexus names every
-/// download `<name>-<modId>-<version with dashes>-<uploadUnixTime>.<ext>`
-/// (browsers may append ` (1)` for a duplicate), which is enough to record
-/// the installed version and match the exact file later -- no API call,
-/// no key needed.
+/// What a Nexus Mods download's file name says about it -- enough to
+/// record the installed version and match the exact file later, with no
+/// API call and no key needed. Nexus has used two naming schemes:
+///
+/// - until June 2026: `<name>-<modId>-<version with dashes>-<uploadUnixTime>.<ext>`
+///   (e.g. `Better Stims-1234-1-2-0-1718000000.zip`);
+/// - since 11 June 2026: `<name> <modId> <version> <YYYY-MM-DDTHH-MMZ> <slug>.<ext>`,
+///   space-separated (e.g. `PawnCompanion 1377 1.35 2026-06-24T03-45Z G8alq8bQH.zip`).
+///   The name itself may contain spaces and version-like parts, so this is
+///   parsed from the right.
+///
+/// Browsers may append ` (1)` for a duplicate download; that's ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NexusArchiveName {
     pub mod_id: String,
-    /// Best-effort: dashes turned back into dots (Nexus replaces both with
-    /// dashes, so "1.0-beta" comes back as "1.0.beta"; version comparison
-    /// treats `-` and `.` alike for this reason).
+    /// The old scheme replaces dots with dashes; they're turned back into
+    /// dots (best-effort: "1.0-beta" comes back as "1.0.beta"; version
+    /// comparison treats `-` and `.` alike for this reason).
     pub version: String,
-    pub uploaded_at: i64,
+    /// The exact upload time (Unix seconds) -- old scheme only. The new
+    /// scheme's time has minute precision, which would never match the
+    /// API's exact timestamp, so it is left out here (see `upload_order`).
+    pub uploaded_at: Option<i64>,
+    /// Upload time to the second (old scheme) or minute (new scheme), for
+    /// telling which of two downloads of the same file is newer.
+    pub upload_order: i64,
+    /// The name part (before the mod id).
+    pub name: String,
 }
 
 pub fn parse_nexus_archive_name(file_name: &str) -> Option<NexusArchiveName> {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
+    static OLD: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static NEW: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let old = OLD.get_or_init(|| {
         regex::Regex::new(
-            r"(?i)^.+?-(\d+)-([0-9a-z][0-9a-z-]*?)-(\d{9,11})(?: \(\d+\))?\.(?:zip|7z|rar)$",
+            r"(?i)^(.+?)-(\d+)-([0-9a-z][0-9a-z-]*?)-(\d{9,11})(?: \(\d+\))?\.(?:zip|7z|rar)$",
         )
         .unwrap()
     });
-    let caps = re.captures(file_name)?;
+    if let Some(caps) = old.captures(file_name) {
+        let ts: i64 = caps.get(4)?.as_str().parse().ok()?;
+        return Some(NexusArchiveName {
+            mod_id: caps.get(2)?.as_str().to_string(),
+            version: caps.get(3)?.as_str().replace('-', "."),
+            uploaded_at: Some(ts),
+            upload_order: ts,
+            name: caps.get(1)?.as_str().to_string(),
+        });
+    }
+    let new = NEW.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)^(.+) (\d+) (\S+) (\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})Z [0-9a-z_-]{4,24}(?: \(\d+\))?\.(?:zip|7z|rar)$",
+        )
+        .unwrap()
+    });
+    let caps = new.captures(file_name)?;
+    let iso = format!("{}T{}:{}:00Z", caps.get(4)?.as_str(), caps.get(5)?.as_str(), caps.get(6)?.as_str());
     Some(NexusArchiveName {
-        mod_id: caps.get(1)?.as_str().to_string(),
-        version: caps.get(2)?.as_str().replace('-', "."),
-        uploaded_at: caps.get(3)?.as_str().parse().ok()?,
+        mod_id: caps.get(2)?.as_str().to_string(),
+        version: caps.get(3)?.as_str().to_string(),
+        uploaded_at: None,
+        upload_order: crate::providers::parse_iso_utc(&iso)?,
+        name: caps.get(1)?.as_str().to_string(),
     })
 }
 
@@ -660,7 +713,7 @@ mod tests {
         let n = parse_nexus_archive_name("Better Stims-1234-1-2-0-1718000000.zip").unwrap();
         assert_eq!(n.mod_id, "1234");
         assert_eq!(n.version, "1.2.0");
-        assert_eq!(n.uploaded_at, 1718000000);
+        assert_eq!(n.uploaded_at, Some(1718000000));
 
         let dup = parse_nexus_archive_name("Better Stims-1234-2-0-1718000000 (1).7z").unwrap();
         assert_eq!(dup.version, "2.0");
@@ -668,6 +721,19 @@ mod tests {
         let beta = parse_nexus_archive_name("Mod-with-dashes-77-1-0-beta-1718000000.rar").unwrap();
         assert_eq!(beta.mod_id, "77");
         assert_eq!(beta.version, "1.0.beta");
+        assert_eq!(beta.name, "Mod-with-dashes");
+        assert_eq!(beta.uploaded_at, Some(1718000000));
+
+        // The scheme Nexus switched to in June 2026 (examples from Nexus's
+        // announcement thread): space-separated, minute-precision time,
+        // no exact upload time to match on.
+        let n = parse_nexus_archive_name("PawnCompanion 1377 1.35 2026-06-24T03-45Z G8alq8bQH.zip").unwrap();
+        assert_eq!((n.name.as_str(), n.mod_id.as_str(), n.version.as_str()), ("PawnCompanion", "1377", "1.35"));
+        assert_eq!(n.uploaded_at, None);
+        assert_eq!(n.upload_order, 1782272700);
+        let n = parse_nexus_archive_name("GiftOfSpellCraft 0.0.1 184672 1 2026-07-07T17-09Z GkqKVMPSF (1).zip").unwrap();
+        assert_eq!((n.name.as_str(), n.mod_id.as_str(), n.version.as_str()), ("GiftOfSpellCraft 0.0.1", "184672", "1"));
+        assert!(parse_nexus_archive_name("SkyUI_6.11_trg5df.zip").is_none());
 
         assert!(parse_nexus_archive_name("cool-mod.zip").is_none());
         assert!(parse_nexus_archive_name("Test Mod-4084-1-0.zip").is_none());

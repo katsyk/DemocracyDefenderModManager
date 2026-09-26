@@ -18,7 +18,9 @@ impl Archive {
         if !path.is_file() {
             return Err(anyhow::anyhow!("path is not a file"));
         }
-        match path.extension().and_then(OsStr::to_str) {
+        // `MOD.ZIP` is as much a zip as `mod.zip` (Windows never cared).
+        let extension = path.extension().and_then(OsStr::to_str).map(str::to_ascii_lowercase);
+        match extension.as_deref() {
             Some("zip") => {
                 let file = File::open(path)?;
                 let archive = zip::ZipArchive::new(file)?;
@@ -370,6 +372,7 @@ impl<'a> Iterator for ArchiveIter<'a> {
                             // reject the archive.
                             path: PathBuf::from(file.name()),
                             is_symlink: file.is_symlink(),
+                            size: file.size(),
                         })
                         .map_err(anyhow::Error::from);
                     *index += 1;
@@ -385,6 +388,7 @@ impl<'a> Iterator for ArchiveIter<'a> {
                     Some(Ok(ArchiveEntry {
                         is_directory: file.is_directory(),
                         path: PathBuf::from(file.name()),
+                        size: file.size(),
                         // sevenz_rust2's `ArchiveEntry` doesn't expose a
                         // clean symlink flag (only raw Windows attributes),
                         // so this can't be detected pre-extraction; the
@@ -408,6 +412,7 @@ impl<'a> Iterator for ArchiveIter<'a> {
                     }
                     Some(Ok(entry)) => Some(Ok(ArchiveEntry {
                         is_directory: entry.is_directory(),
+                        size: entry.unpacked_size,
                         path: entry.filename,
                         // Same story as 7z: `file_attr`'s meaning depends on
                         // the archive's host-OS byte, which this crate
@@ -427,6 +432,7 @@ pub struct ArchiveEntry {
     is_directory: bool,
     path: PathBuf,
     is_symlink: bool,
+    size: u64,
 }
 
 impl ArchiveEntry {
@@ -436,6 +442,11 @@ impl ArchiveEntry {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Uncompressed size in bytes, as the archive's own index states it.
+    pub fn size(&self) -> u64 {
+        self.size
     }
 
     /// Whether this entry is a symlink. Only zip entries can be identified

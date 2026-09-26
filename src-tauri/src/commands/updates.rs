@@ -805,7 +805,7 @@ pub async fn enrich_install_source(source: &Source, archive_path: Option<&Path>)
                         file_id: None,
                         file_name: Some(name.clone()),
                         label: None,
-                        uploaded_at: Some(parsed.uploaded_at),
+                        uploaded_at: parsed.uploaded_at,
                     });
                 }
             }

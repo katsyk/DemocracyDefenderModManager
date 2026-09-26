@@ -17,7 +17,7 @@ use tauri::State;
 use uuid::Uuid;
 
 pub(crate) const MODS_DIRECTORY: &'static str = "mods/";
-const MANIFEST_FILE: &'static str = "manifest.json";
+pub(crate) const MANIFEST_FILE: &'static str = "manifest.json";
 const NO_PATCH_FILES_WARNING: &str = "no Helldivers 2 patch files found in this archive";
 
 /// The JSON shape returned by every install command: a [`Mod`] plus an
@@ -244,21 +244,35 @@ pub async fn add_mod(state: State<'_, AppState>, archive_file: PathBuf) -> TARes
 /// item without ever calling back into another `#[tauri::command]` while
 /// holding the mutex.
 pub(crate) async fn install_from_archive(state: &AppState, mods: &mut Vec<Mod>, archive_file: &Path) -> TAResult<(Mod, Option<String>)> {
-    log::info!("Adding mod from {:?}...", archive_file);
-
-    log::debug!("Opening archive...");
-    let archive = Archive::open(archive_file)?;
-
     log::debug!("Obtaining name...");
     let name = archive_file
-        .file_prefix()
-        .unwrap()
+        .file_stem()
+        .ok_or(anyhow::anyhow!("archive path has no file name"))?
         .to_str()
         .map(str::to_string)
         .ok_or(anyhow::anyhow!("file name conversion failed"))?;
 
+    install_from_archive_as(&state.base_path, mods, archive_file, &name).await
+}
+
+/// [`install_from_archive`] into `mods/<name>` (also the generated
+/// manifest's name when the archive ships none) instead of a folder named
+/// after the archive -- used by the bulk import, which picks a readable,
+/// unique name itself.
+pub(crate) async fn install_from_archive_as(
+    base_path: &Path,
+    mods: &mut Vec<Mod>,
+    archive_file: &Path,
+    name: &str,
+) -> TAResult<(Mod, Option<String>)> {
+    log::info!("Adding mod from {:?}...", archive_file);
+
+    log::debug!("Opening archive...");
+    let archive = Archive::open(archive_file)?;
+    let name = name.to_string();
+
     log::info!("Resolving mod directory...");
-    let mut mod_dir = state.base_path.join(MODS_DIRECTORY);
+    let mut mod_dir = base_path.join(MODS_DIRECTORY);
     mod_dir.push(&name);
 
     log::info!("Preparing mod directory...");
@@ -346,7 +360,7 @@ pub async fn add_mods(state: State<'_, AppState>, archive_files: Vec<PathBuf>) -
                 .zip_value(archive_file)
                 .map(|(archive, archive_file)| {
                     let name = archive_file
-                        .file_prefix()
+                        .file_stem()
                         .unwrap()
                         .to_str()
                         .map(str::to_string)
@@ -643,6 +657,18 @@ async fn normalize_manifest_file_name(mod_dir: &Path) -> anyhow::Result<()> {
 /// Mirrors [`install_from_archive`]'s locking contract: takes the
 /// already-locked mods vector, never locks anything itself.
 async fn install_from_folder(base_path: &Path, mods: &mut Vec<Mod>, folder: &Path) -> TAResult<(Mod, Option<String>)> {
+    install_from_folder_as(base_path, mods, folder, None).await
+}
+
+/// [`install_from_folder`], optionally into `mods/<name>` instead of a
+/// folder named after the source folder (the bulk import picks unique
+/// names itself).
+pub(crate) async fn install_from_folder_as(
+    base_path: &Path,
+    mods: &mut Vec<Mod>,
+    folder: &Path,
+    name_override: Option<&str>,
+) -> TAResult<(Mod, Option<String>)> {
     log::info!("Adding mod from folder {:?}...", folder);
 
     if !folder.is_dir() {
@@ -685,7 +711,7 @@ async fn install_from_folder(base_path: &Path, mods: &mut Vec<Mod>, folder: &Pat
                 .parent()
                 .map(|parent| matches!(path_overlap(parent, &mods_root), Ok(Some(PathOverlap::Same))))
                 .unwrap_or(false);
-            if directly_in_storage {
+            if directly_in_storage && name_override.is_none() {
                 return adopt_folder_in_place(mods, &mods_root.join(&name), &name).await;
             }
             return anyhow::anyhow!(
@@ -698,6 +724,7 @@ async fn install_from_folder(base_path: &Path, mods: &mut Vec<Mod>, folder: &Pat
         }
     }
 
+    let name = name_override.map(str::to_string).unwrap_or(name);
     log::info!("Resolving mod directory...");
     let mod_dir = mods_root.join(&name);
 
@@ -1074,7 +1101,7 @@ async fn stage_update(staging_dir: &Path, archive_path: &Path) -> TAResult<(Mani
     let archive = Archive::open(archive_path)?;
     let manifest_file = staging_dir.join(MANIFEST_FILE);
     let name = archive_path
-        .file_prefix()
+        .file_stem()
         .and_then(|n| n.to_str())
         .map(str::to_string)
         .unwrap_or_else(|| "update".to_string());
@@ -1107,6 +1134,23 @@ mod tests {
 
     fn patch_file_name() -> String {
         "0123456789abcdef.patch_0".to_string()
+    }
+
+    /// Nexus's newer download names are full of dots
+    /// (`Name 1377 1.35 2026-06-24T03-45Z slug.zip`): the mod keeps the
+    /// whole name, not just what comes before the first dot.
+    #[tokio::test]
+    async fn dotted_archive_names_keep_their_full_name() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let archive = src.path().join("PawnCompanion 1377 1.35 2026-06-24T03-45Z G8alq8bQH.zip");
+        make_zip(&archive, &[(&patch_file_name(), b"x")]);
+        let state = AppState::new(base.path().to_path_buf());
+        let mut guard = state.mods.lock().await;
+        let mods = ensure_mods_loaded(&mut guard, base.path()).await.unwrap();
+        let (m, _) = install_from_archive(&state, mods, &archive).await.unwrap();
+        assert_eq!(m.name(), "PawnCompanion 1377 1.35 2026-06-24T03-45Z G8alq8bQH");
+        assert_eq!(m.directory.file_name().unwrap(), "PawnCompanion 1377 1.35 2026-06-24T03-45Z G8alq8bQH");
     }
 
     async fn make_existing_mod(base: &Path, name: &str) -> (Uuid, PathBuf) {
