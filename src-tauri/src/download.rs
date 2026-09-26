@@ -157,18 +157,34 @@ async fn download_archive_into(
         .unwrap_or_else(|| "download".to_string());
     let mut filename = sanitize_filename(&raw_name);
 
-    if !has_supported_archive_extension(&filename) {
-        let mut header = [0u8; 8];
-        let read = {
-            use tokio::io::AsyncReadExt;
-            let mut f = tokio::fs::File::open(&staging_path).await?;
-            f.read(&mut header).await?
-        };
-        match sniff_archive_extension(&header[..read]) {
-            Some(ext) => filename = format!("{}.{}", filename, ext),
-            None => anyhow::bail!(
-                "downloaded file is not a supported archive (zip/7z/rar)"
-            ),
+    // What arrived, by content: a site that wants a login or shows a
+    // "please wait" page sends HTML even for a URL ending in `.zip`.
+    let header = {
+        use tokio::io::AsyncReadExt;
+        let mut header = Vec::with_capacity(crate::archive::SNIFF_LEN);
+        tokio::fs::File::open(&staging_path)
+            .await?
+            .take(crate::archive::SNIFF_LEN as u64)
+            .read_to_end(&mut header)
+            .await?;
+        header
+    };
+    match crate::archive::sniff(&header) {
+        crate::archive::Sniffed::Archive(format) => {
+            if !has_supported_archive_extension(&filename) {
+                filename = format!("{}.{}", filename, format.name());
+            }
+        }
+        crate::archive::Sniffed::NotArchive(what) => {
+            anyhow::bail!("downloaded file is not a supported archive (zip/7z/rar): {host} sent {what}")
+        }
+        crate::archive::Sniffed::Empty => {
+            anyhow::bail!("downloaded file is not a supported archive (zip/7z/rar): {host} sent an empty file")
+        }
+        // Possibly a zip with something in front of it; opening it will tell.
+        crate::archive::Sniffed::Unknown | crate::archive::Sniffed::Zeros if filename.to_ascii_lowercase().ends_with(".zip") => {}
+        crate::archive::Sniffed::Unknown | crate::archive::Sniffed::Zeros => {
+            anyhow::bail!("downloaded file is not a supported archive (zip/7z/rar)")
         }
     }
 
@@ -205,18 +221,6 @@ fn sanitize_filename(raw: &str) -> String {
 fn has_supported_archive_extension(filename: &str) -> bool {
     let lower = filename.to_ascii_lowercase();
     lower.ends_with(".zip") || lower.ends_with(".7z") || lower.ends_with(".rar")
-}
-
-pub(crate) fn sniff_archive_extension(header: &[u8]) -> Option<&'static str> {
-    if header.starts_with(b"PK\x03\x04") {
-        Some("zip")
-    } else if header.starts_with(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]) {
-        Some("7z")
-    } else if header.starts_with(b"Rar!\x1a\x07") {
-        Some("rar")
-    } else {
-        None
-    }
 }
 
 fn last_path_segment(url: &reqwest::Url) -> Option<String> {
@@ -278,6 +282,13 @@ mod tests {
     #[test]
     fn sanitize_filename_keeps_plain_names() {
         assert_eq!(sanitize_filename("cool-mod_v2.zip"), "cool-mod_v2.zip");
+    }
+
+    fn sniff_archive_extension(header: &[u8]) -> Option<&'static str> {
+        match crate::archive::sniff(header) {
+            crate::archive::Sniffed::Archive(format) => Some(format.name()),
+            _ => None,
+        }
     }
 
     #[test]

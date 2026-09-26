@@ -477,7 +477,7 @@
         "handoff": {
             "title": "Browser Handoff",
             "message": "Download the mod in the browser tab that just opened for {site}. DDMM installs it automatically as soon as it lands in {downloadsPath}.",
-            "error_message": "Something went wrong watching for the download from {site}.",
+            "error_message": "Installing the mod from {site} didn't work:",
             "timed_out_message": "Gave up waiting for the download after 15 minutes.",
             "status": {
                 "waiting": "Waiting for the download...",

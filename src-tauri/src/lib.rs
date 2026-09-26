@@ -17,6 +17,7 @@ pub mod providers;
 pub mod secrets;
 pub mod nexus_oauth;
 pub mod mod_import;
+pub mod install_error;
 
 use std::{
     path::PathBuf,

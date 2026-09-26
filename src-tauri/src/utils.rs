@@ -115,7 +115,7 @@ fn path_to_rel_string(path: &Path) -> String {
 /// Compare two strings "naturally": runs of ASCII digits compare by numeric
 /// value rather than character-by-character, so `"Option 2"` sorts before
 /// `"Option 10"`. Non-digit runs compare case-insensitively.
-fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+pub(crate) fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
     let mut ai = a.chars().peekable();

@@ -33,9 +33,15 @@ yourself, or click **Auto-detect** again after installing/moving the game — se
 DDMM reads each mod's `manifest.json` when you add the mod and every time it starts. It accepts the usual
 hand-editing quirks — a UTF-8 byte-order mark, UTF-16 files, `//` comments, trailing commas, `GUID`/`iconPath`
 style key spellings, `"Version": "1"`, a missing `Description`, `Manifest.json` instead of `manifest.json`, and
-Windows `\` paths. When a manifest still can't be read, the error names the file (and the archive it came from)
-and, for a JSON syntax error, the line and column, e.g.
-`manifest.json in archive "Some Mod" is not valid JSON: expected ',' or '}' at line 4 column 5`.
+Windows `\` paths. When a manifest still can't be read, the error names the mod and, for a JSON syntax error,
+the line and column, e.g.
+
+```text
+Couldn't install "Some Mod.zip".
+Step: reading its manifest.json
+Cause: manifest.json is not valid JSON: expected ',' or '}' at line 4 column 5
+Hint: The mod's manifest.json is broken: let the mod's author know. ...
+```
 
 If that happens while **adding** a mod, the mod isn't installed; the popup and the [log](logs.md) show the reason.
 Report it to the mod's author (and to us, see [Reporting bugs](bugs.md), if you think DDMM should accept it).
@@ -44,6 +50,36 @@ If an already-installed mod's manifest becomes unreadable (e.g. you edited it by
 when loading the list and logs `Skipping mod in "...": <reason>` — the rest of your mods still load. Fix or
 re-download that mod: click **Open Folder** next to **Data Folder** in Settings, go into `mods/`, and fix or
 delete its folder.
+
+## A mod won't install
+
+When adding a mod fails, the popup (and the [log](logs.md)) says which file, which step failed (downloading it,
+opening the archive, reading its manifest.json, extracting it, copying its files, ...), why in plain words, and
+what to do about it:
+
+```text
+Couldn't install "koyuki launcher.zip".
+Step: opening the archive
+Cause: the zip archive is incomplete or damaged: its table of contents (at the end of the file) is missing, which
+usually means the download didn't finish (invalid Zip archive: Could not find EOCD)
+Hint: Download the mod again and add the new file. ...
+```
+
+The text in parentheses is the archive tool's own message; include it if you [report a bug](bugs.md). Common
+causes:
+
+- **The download didn't finish**, or the site sent a web page (a login or "please wait" page) instead of the
+  file. Download it again from the mod's page.
+- **Password-protected archives**, **archives split into parts** (`.7z.001`, `.z01`, `.part2.rar` missing) and
+  7z archives packed with **Deflate64** can't be installed directly. Extract them yourself (for example with
+  7-Zip), then add the extracted folder with [Add Folder](../using/adding-mods.md).
+- **Two mods with the same ID.** Some authors copy one mod's `manifest.json` into their next mod, so both claim
+  the same GUID. DDMM names the mod already using it. Tell the author; to install it anyway, extract the
+  archive, delete its `manifest.json`, and add the folder with Add Folder (DDMM then gives it an ID of its own).
+- **An archive of archives** (one zip per variant inside the download) installs with a warning that names the
+  inner archives. Extract the one you want and add that instead.
+
+DDMM opens a zip, 7z or RAR by what's inside, not by its name, so a RAR uploaded as `.zip` installs fine.
 
 ## A mod I added doesn't show up
 

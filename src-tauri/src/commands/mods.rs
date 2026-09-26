@@ -1,6 +1,7 @@
 use crate::{
     archive::Archive,
     download,
+    install_error::{subject_of, InstallContext, InstallError, InstallStep},
     models::{
         manifest::{legacy, Manifest, Source},
         Mod,
@@ -9,10 +10,11 @@ use crate::{
     utils::{copy_dir_recursive, detect_patch_layout, PatchLayout},
     AppState,
 };
+use anyhow::Context;
 use anyhow_tauri::{IntoTAResult, TAResult};
 use rand::{rngs::SysRng, TryRng};
 use serde::Serialize;
-use std::{collections::HashSet, path::{Path, PathBuf}};
+use std::path::{Path, PathBuf};
 use tauri::State;
 use uuid::Uuid;
 
@@ -66,8 +68,46 @@ async fn apply_patch_layout(mod_dir: &Path, manifest: &mut Manifest) -> anyhow::
             tokio::fs::write(manifest_file, data).await?;
             Ok(None)
         }
-        PatchLayout::NoneFound => Ok(Some(NO_PATCH_FILES_WARNING.to_string())),
+        PatchLayout::NoneFound => {
+            let nested = find_nested_archives(mod_dir).await;
+            if nested.is_empty() {
+                Ok(Some(NO_PATCH_FILES_WARNING.to_string()))
+            } else {
+                Ok(Some(format!(
+                    "{NO_PATCH_FILES_WARNING}. It contains other archives ({}): it's probably a pack of several \
+                     versions or parts. Extract the one you want with 7-Zip and add that to DDMM instead.",
+                    nested.join(", ")
+                )))
+            }
+        }
     }
+}
+
+/// Up to five archive files anywhere in `dir` (a few levels deep): a mod
+/// that ships its variants as archives inside the archive. They are never
+/// unpacked automatically (an archive inside an archive is also the
+/// classic way to sneak past size and path checks); the warning names them
+/// so the user knows what to do.
+async fn find_nested_archives(dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((current, depth)) = stack.pop() {
+        let Ok(mut entries) = tokio::fs::read_dir(&current).await else { continue };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Ok(file_type) = entry.file_type().await else { continue };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if file_type.is_dir() && depth < 4 {
+                stack.push((entry.path(), depth + 1));
+            } else if file_type.is_file()
+                && crate::commands::handoff::ARCHIVE_SUFFIXES.iter().any(|s| name.to_ascii_lowercase().ends_with(s))
+            {
+                found.push(name);
+            }
+        }
+    }
+    found.sort_by(|a, b| crate::utils::natural_cmp(a, b));
+    found.truncate(5);
+    found
 }
 
 #[allow(dead_code)]
@@ -266,9 +306,26 @@ pub(crate) async fn install_from_archive_as(
     name: &str,
 ) -> TAResult<(Mod, Option<String>)> {
     log::info!("Adding mod from {:?}...", archive_file);
+    let subject = subject_of(archive_file);
+    install_archive_steps(base_path, mods, archive_file, name, &subject).await.map_err(report)
+}
 
+/// Log a failed install (the whole message: which mod, which step, why)
+/// and hand it to the frontend unchanged.
+fn report(e: InstallError) -> anyhow_tauri::TACommandError {
+    log::error!("{e}");
+    anyhow_tauri::TACommandError(anyhow::Error::new(e))
+}
+
+async fn install_archive_steps(
+    base_path: &Path,
+    mods: &mut Vec<Mod>,
+    archive_file: &Path,
+    name: &str,
+    subject: &str,
+) -> Result<(Mod, Option<String>), InstallError> {
     log::debug!("Opening archive...");
-    let archive = Archive::open(archive_file)?;
+    let archive = Archive::open(archive_file).install_step(subject, InstallStep::OpenArchive)?;
     let name = name.to_string();
 
     log::info!("Resolving mod directory...");
@@ -277,16 +334,18 @@ pub(crate) async fn install_from_archive_as(
 
     log::info!("Preparing mod directory...");
     let manifest_file = mod_dir.join(MANIFEST_FILE);
-    prepare_mod_dir(archive_file, mod_dir.clone(), manifest_file.clone(), name.clone()).await.into_ta_result()?;
+    prepare_mod_dir(archive_file, &mod_dir, &manifest_file, &name, subject).await?;
 
     // From here on `mod_dir` is ours (prepare_mod_dir just created it), so
     // a failure must remove it again: a half-written directory with a
     // manifest.json would otherwise show up as an empty "ghost" mod on the
     // next launch and block retrying the same file with "mod directory
     // already exists" (e.g. after an archive was rejected as unsafe).
-    let prepared: TAResult<(Mod, Option<String>)> = async {
+    let prepared: Result<(Mod, Option<String>), InstallError> = async {
         log::info!("Resolving manifest...");
-        let (archive, manifest) = resolve_manifest(archive, name.clone(), manifest_file.clone()).await.into_ta_result()?;
+        let (archive, manifest) = resolve_manifest(archive, name.clone(), manifest_file.clone())
+            .await
+            .map_err(|e| manifest_failure(subject, e))?;
 
         let mut r#mod = Mod {
             manifest,
@@ -295,16 +354,15 @@ pub(crate) async fn install_from_archive_as(
         };
 
         log::info!("Checking for duplicate...");
-        if mods.iter().any(|m| m.guid() == r#mod.guid()) {
-            return anyhow::anyhow!("mod with GUID {{{}}} already exists", r#mod.guid())
-                .into_ta_result();
-        }
+        check_not_installed(mods, &r#mod, subject)?;
 
         log::info!("Extracting archive...");
-        extract_archive(archive, mod_dir.clone()).await?;
+        extract_archive(archive, mod_dir.clone()).await.install_step(subject, InstallStep::Extract)?;
 
         log::debug!("Detecting patch file layout...");
-        let warning = apply_patch_layout(&mod_dir, &mut r#mod.manifest).await.into_ta_result()?;
+        let warning = apply_patch_layout(&mod_dir, &mut r#mod.manifest)
+            .await
+            .install_step(subject, InstallStep::FindPatchFiles)?;
         Ok((r#mod, warning))
     }
     .await;
@@ -330,6 +388,42 @@ pub(crate) async fn install_from_archive_as(
     Ok((r#mod, warning))
 }
 
+/// Reading the manifest out of an archive fails either because the
+/// archive can't be read (encrypted, damaged, an unsupported method: an
+/// extraction problem) or because the manifest itself is broken.
+fn manifest_failure(subject: &str, e: anyhow::Error) -> InstallError {
+    let step = if crate::archive::is_archive_problem(&e) { InstallStep::Extract } else { InstallStep::ReadManifest };
+    InstallError::new(subject, step, e)
+}
+
+/// Refuse a mod whose GUID is already in the mod list, saying which mod
+/// has it and what to do: the same mod again, or -- when the names differ
+/// -- a different mod whose author reused another mod's manifest.json.
+fn check_not_installed(mods: &[Mod], new: &Mod, subject: &str) -> Result<(), InstallError> {
+    let Some(existing) = mods.iter().find(|m| m.guid() == new.guid()) else {
+        return Ok(());
+    };
+    let cause = anyhow::anyhow!(
+        "its manifest.json gives it the ID (GUID) {{{}}}, and \"{}\" in your mod list already has that ID",
+        new.guid(),
+        existing.name()
+    );
+    let hint = if existing.name().trim().eq_ignore_ascii_case(new.name().trim()) {
+        format!(
+            "\"{}\" is already installed. To replace it with this file, remove it first (or use Update on it).",
+            existing.name()
+        )
+    } else {
+        format!(
+            "Two different mods can't share an ID: the mod's author probably copied another mod's manifest.json, \
+             so let them know. To install it anyway, remove \"{}\" first, or extract this archive, delete its \
+             manifest.json, and add the extracted folder with Add Folder (DDMM then gives it an ID of its own).",
+            existing.name()
+        )
+    };
+    Err(InstallError::new(subject, InstallStep::Register, cause).with_hint(hint))
+}
+
 #[tauri::command]
 pub async fn add_mods(state: State<'_, AppState>, archive_files: Vec<PathBuf>) -> TAResult<Vec<TAResult<InstalledMod>>> {
     let _data_op = state.data_op().into_ta_result()?;
@@ -339,181 +433,19 @@ pub async fn add_mods(state: State<'_, AppState>, archive_files: Vec<PathBuf>) -
     }
     let mods = mods.as_mut().unwrap();
 
-    log::info!("Adding mods from:",);
+    log::info!("Adding {} mod(s)...", archive_files.len());
+
+    // One after another through the single-archive install, so every file
+    // gets exactly the same checks, cleanup and error messages as Add; a
+    // failure only affects its own file.
+    let mut results = Vec::with_capacity(archive_files.len());
     for archive_file in &archive_files {
-        log::info!(" - {:?}", archive_file);
-    }
-    
-    log::debug!("Opening archives...");
-    let data = archive_files
-        .iter()
-        .map(|archive_file| Archive::open(archive_file).into_ta_result())
-        .collect::<Vec<_>>();
-
-    log::debug!("Obtaining names...");
-    let data = archive_files
-        .iter()
-        .cloned()
-        .zip(data)
-        .map(|(archive_file, result)| {
-            result
-                .zip_value(archive_file)
-                .map(|(archive, archive_file)| {
-                    let name = archive_file
-                        .file_stem()
-                        .unwrap()
-                        .to_str()
-                        .map(str::to_string)
-                        .ok_or(anyhow::anyhow!("file name conversion failed"))
-                        .into_ta_result()?;
-                    Ok((archive, name, archive_file))
-                })
-                .flatten()
-        })
-        .collect::<Vec<_>>();
-
-    log::info!("Resolving mod directories...");
-    let data = data
-        .into_iter()
-        .map(|result| {
-            result
-                .map(|(archive, name, archive_file)| {
-                    let mut mod_dir = state.base_path.join(MODS_DIRECTORY);
-                    mod_dir.push(&name);
-                    let manifest_file = mod_dir.join(MANIFEST_FILE);
-                    (archive, name, archive_file, mod_dir, manifest_file)
-                })
-        })
-        .collect::<Vec<_>>();
-
-    log::info!("Preparing mod directories...");
-    let data = futures::future::join_all(
-        data.into_iter().map(|result| async {
-            match result {
-                Ok((archive, name, archive_file, mod_dir, manifest_file)) => {
-                    prepare_mod_dir(&archive_file, mod_dir.clone(), manifest_file.clone(), name.clone()).await?;
-                    Ok((archive, name, mod_dir, manifest_file))
-                }
-                Err(e) => Err(e)
-            }
-        })
-    ).await;
-
-    log::info!("Resolving manifests...");
-    let data = futures::future::join_all(
-        data.into_iter().map(|result| async {
-            match result {
-                Ok((archive, name, mod_dir, manifest_file)) => {
-                    let (archive, manifest) = resolve_manifest(archive, name, manifest_file).await?;
-                    Ok((archive, mod_dir, manifest))
-                }
-                Err(e) => Err(e)
-            }
-        })
-    ).await;
-    
-    let data = data
-        .into_iter()
-        .map(|result| {
-            result.map(|(archive, mod_dir, manifest)| {
-                let r#mod = Mod {
-                    manifest,
-                    directory: mod_dir,
-                    sources: Vec::new(),
-                };
-                (archive, r#mod)
-            })
-        })
-        .collect::<Vec<_>>();
-    
-    log::info!("Checking for duplicates...");
-    let mut guids: HashSet<Uuid> = mods.iter().map(|m| m.guid()).collect();
-    let data = data
-        .into_iter()
-        .map(|result| {
-            result.map(|(archive, r#mod)| {
-                let guid = r#mod.guid();
-                if guids.insert(guid) {
-                    Ok((archive, r#mod))
-                } else {
-                    anyhow_tauri::bail!("mod with GUID {{{}}} already exists", guid)
-                }
-            })
-            .flatten()
-        })
-        .collect::<Vec<_>>();
-
-    let mut guids = HashSet::<Uuid>::new();
-    let data = data
-        .into_iter()
-        .map(|result| {
-            result.map(|(archive, r#mod)| {
-                let guid = r#mod.guid();
-                if guids.insert(guid) {
-                    Ok((archive, r#mod))
-                } else {
-                    anyhow_tauri::bail!("already adding mod with GUID {{{}}}", guid)
-                }
-            })
-            .flatten()
-        })
-        .collect::<Vec<_>>();
-
-    log::info!("Extracting archives...");
-    let data = futures::future::join_all(
-        data.into_iter().map(|result| async {
-            match result {
-                Ok((archive, r#mod)) => {
-                    extract_archive(archive, r#mod.directory.clone()).await?;
-                    Ok(r#mod)
-                }
-                Err(e) => Err(e)
-            }
-        })
-    ).await;
-
-    log::debug!("Detecting patch file layouts and normalizing paths...");
-    let data = futures::future::join_all(
-        data.into_iter().map(|result| async {
-            match result {
-                Ok(mut r#mod) => {
-                    let warning = match apply_patch_layout(&r#mod.directory.clone(), &mut r#mod.manifest).await {
-                        Ok(w) => w,
-                        Err(e) => {
-                            log::error!("Patch layout detection failed for \"{}\": {}", r#mod.guid(), e);
-                            None
-                        }
-                    };
-                    if let Err(e) = r#mod.normalize_paths().await {
-                        log::error!("Path normalization failed for \"{}\": {}", r#mod.guid(), e);
-                    }
-                    r#mod.resolve_sources().await;
-                    Ok((r#mod, warning))
-                }
-                Err(e) => Err(e)
-            }
-        })
-    ).await;
-
-    for (r#mod, _) in data.iter().flatten() {
-        mods.push(r#mod.clone());
+        let result = install_from_archive(&state, mods, archive_file).await;
+        log::info!(" - {:?} : {}", archive_file, if result.is_ok() { "Ok" } else { "Err" });
+        results.push(result.map(|(r#mod, warning)| InstalledMod { r#mod, warning }));
     }
 
-    log::info!("Adding complete.");
-    for (p, r) in archive_files.iter().zip(&data) {
-        if let Err(e) = r {
-            log::info!(" - {:?} : Err -> {}", p, e);
-        } else {
-            log::info!(" - {:?} : Ok", p);
-        }
-    }
-
-    let data = data
-        .into_iter()
-        .map(|result| result.map(|(r#mod, warning)| InstalledMod { r#mod, warning }))
-        .collect::<Vec<_>>();
-
-    Ok(data)
+    Ok(results)
 }
 
 /// Make `mod_dir` ready to install into from `source` (an archive file or a
@@ -522,24 +454,38 @@ pub async fn add_mods(state: State<'_, AppState>, archive_files: Vec<PathBuf>) -
 ///
 /// Refuses first if `source` and `mod_dir` overlap -- clearing or copying
 /// into `mod_dir` would then delete the source or copy it into itself.
-async fn prepare_mod_dir(source: &Path, mod_dir: PathBuf, manifest_file: PathBuf, name: String) -> TAResult<()> {
-    if crate::fs_util::path_overlap(source, &mod_dir).into_ta_result()?.is_some() {
-        return anyhow::anyhow!(
-            "can't install {:?}: it is inside (or is) the folder DDMM would install it into ({:?}). \
-             Move it somewhere outside DDMM's mod storage and add it from there.",
-            source,
-            mod_dir
+async fn prepare_mod_dir(
+    source: &Path,
+    mod_dir: &Path,
+    manifest_file: &Path,
+    name: &str,
+    subject: &str,
+) -> Result<(), InstallError> {
+    let step = InstallStep::PrepareFolder;
+    if crate::fs_util::path_overlap(source, mod_dir).install_step(subject, step)?.is_some() {
+        return Err(InstallError::new(
+            subject,
+            step,
+            anyhow::anyhow!(
+                "it is inside (or is) the folder DDMM would install it into ({:?})",
+                mod_dir
+            ),
         )
-        .into_ta_result();
+        .with_hint("Move it somewhere outside DDMM's mod storage and add it from there."));
     }
-    if tokio::fs::try_exists(&mod_dir).await.into_ta_result()? {
-        if tokio::fs::try_exists(&manifest_file).await.into_ta_result()? {
-            return anyhow::anyhow!("mod directory \"{}\" already exists", name).into_ta_result();
+    if tokio::fs::try_exists(mod_dir).await.install_step(subject, step)? {
+        if tokio::fs::try_exists(manifest_file).await.install_step(subject, step)? {
+            return Err(InstallError::new(
+                subject,
+                step,
+                anyhow::anyhow!("mod directory \"{}\" already exists: another mod is installed under that name", name),
+            )
+            .with_hint("It is probably already in your mod list. Remove that mod first, or rename the file and add it again."));
         } else {
-            tokio::fs::remove_dir_all(&mod_dir).await.into_ta_result()?;
+            tokio::fs::remove_dir_all(mod_dir).await.install_step(subject, step)?;
         }
     }
-    tokio::fs::create_dir_all(&mod_dir).await.into_ta_result()
+    tokio::fs::create_dir_all(mod_dir).await.install_step(subject, step)
 }
 
 /// Generate the same "no manifest present" local legacy manifest, whether
@@ -559,19 +505,18 @@ fn generate_local_manifest(name: String) -> anyhow::Result<Manifest> {
     }))
 }
 
-async fn resolve_manifest(mut archive: Archive, name: String, manifest_file: PathBuf) -> TAResult<(Archive, Manifest)> {
+async fn resolve_manifest(mut archive: Archive, name: String, manifest_file: PathBuf) -> anyhow::Result<(Archive, Manifest)> {
     if let Some(entry) = archive.find_root_file_ci(MANIFEST_FILE)? {
         let manifest_data = archive.read_path(&entry)?;
-        let origin = format!("{} in archive \"{}\"", entry.display(), name);
-        let manifest = Manifest::parse(&manifest_data, &origin).into_ta_result()?;
+        let manifest = Manifest::parse(&manifest_data, &entry.to_string_lossy())?;
         Ok((archive, manifest))
     } else {
-        let manifest = generate_local_manifest(name).into_ta_result()?;
+        let manifest = generate_local_manifest(name)?;
 
-        let manifest_data = serde_json::to_vec_pretty(&manifest).into_ta_result()?;
+        let manifest_data = serde_json::to_vec_pretty(&manifest)?;
         tokio::fs::write(&manifest_file, manifest_data)
             .await
-            .into_ta_result()?;
+            .with_context(|| format!("couldn't write {:?}", manifest_file))?;
 
         Ok((archive, manifest))
     }
@@ -581,28 +526,30 @@ async fn resolve_manifest(mut archive: Archive, name: String, manifest_file: Pat
 /// `manifest.json` from the source folder if present, otherwise generate a
 /// local one and write it straight into the (already-created) destination
 /// mod directory.
-async fn resolve_manifest_for_dir(source_dir: &Path, name: String, manifest_file: PathBuf) -> TAResult<Manifest> {
+async fn resolve_manifest_for_dir(source_dir: &Path, name: String, manifest_file: PathBuf) -> anyhow::Result<Manifest> {
     let source_manifest = find_manifest_file(source_dir).await;
     if let Some(source_manifest) = source_manifest {
-        let manifest_data = tokio::fs::read(&source_manifest).await.into_ta_result()?;
-        let manifest = Manifest::parse(&manifest_data, &source_manifest.to_string_lossy()).into_ta_result()?;
+        let manifest_data = tokio::fs::read(&source_manifest)
+            .await
+            .with_context(|| format!("couldn't read {:?}", source_manifest))?;
+        let manifest = Manifest::parse(&manifest_data, &source_manifest.to_string_lossy())?;
         Ok(manifest)
     } else {
-        let manifest = generate_local_manifest(name).into_ta_result()?;
+        let manifest = generate_local_manifest(name)?;
 
-        let manifest_data = serde_json::to_vec_pretty(&manifest).into_ta_result()?;
+        let manifest_data = serde_json::to_vec_pretty(&manifest)?;
         tokio::fs::write(&manifest_file, manifest_data)
             .await
-            .into_ta_result()?;
+            .with_context(|| format!("couldn't write {:?}", manifest_file))?;
 
         Ok(manifest)
     }
 }
 
-async fn extract_archive(mut archive: Archive, mod_dir: PathBuf) -> TAResult<()> {
+async fn extract_archive(mut archive: Archive, mod_dir: PathBuf) -> anyhow::Result<()> {
     let dir = mod_dir.clone();
-    tokio::task::spawn_blocking(move || archive.extract_to(dir).into_ta_result()).await.into_ta_result()??;
-    normalize_manifest_file_name(&mod_dir).await.into_ta_result()
+    tokio::task::spawn_blocking(move || archive.extract_to(dir)).await??;
+    normalize_manifest_file_name(&mod_dir).await
 }
 
 /// `dir`'s manifest file: `manifest.json`, or failing that a case variant
@@ -670,41 +617,51 @@ pub(crate) async fn install_from_folder_as(
     name_override: Option<&str>,
 ) -> TAResult<(Mod, Option<String>)> {
     log::info!("Adding mod from folder {:?}...", folder);
+    let subject = subject_of(folder);
+    install_folder_steps(base_path, mods, folder, name_override, &subject).await.map_err(report)
+}
+
+async fn install_folder_steps(
+    base_path: &Path,
+    mods: &mut Vec<Mod>,
+    folder: &Path,
+    name_override: Option<&str>,
+    subject: &str,
+) -> Result<(Mod, Option<String>), InstallError> {
+    let refuse = |cause: anyhow::Error| InstallError::new(subject, InstallStep::PrepareFolder, cause);
 
     if !folder.is_dir() {
-        return anyhow::anyhow!("path is not a directory").into_ta_result();
+        return Err(refuse(anyhow::anyhow!("{:?} is not a folder (or no longer exists)", folder)));
     }
 
     let mods_root = base_path.join(MODS_DIRECTORY);
-    let resolved = crate::fs_util::resolve_path(folder).into_ta_result()?;
+    let resolved = crate::fs_util::resolve_path(folder).install_step(subject, InstallStep::PrepareFolder)?;
 
     let name = resolved
         .file_name()
         .and_then(|n| n.to_str())
         .map(str::to_string)
-        .ok_or(anyhow::anyhow!("folder name conversion failed"))?;
+        .ok_or_else(|| refuse(anyhow::anyhow!("the folder's name can't be read")))?;
 
     use crate::fs_util::{path_overlap, PathOverlap};
-    match path_overlap(&resolved, &mods_root).into_ta_result()? {
+    match path_overlap(&resolved, &mods_root).install_step(subject, InstallStep::PrepareFolder)? {
         None => {}
         Some(PathOverlap::Same) => {
-            return anyhow::anyhow!(
+            return Err(refuse(anyhow::anyhow!(
                 "That folder is DDMM's own mod storage ({}), so there is nothing to copy. \
                  Mods in it that have a manifest.json are already in your mod list. To add a \
                  mod folder that is in there without one, pick that mod's own folder instead: \
                  DDMM will set it up where it is, without copying it.",
                 mods_root.display()
-            )
-            .into_ta_result();
+            )));
         }
         Some(PathOverlap::SecondInsideFirst) => {
-            return anyhow::anyhow!(
+            return Err(refuse(anyhow::anyhow!(
                 "DDMM can't add {}: DDMM's own mod storage ({}) is inside it, so adding it would \
                  copy the folder into itself. Pick a single mod's folder instead.",
                 folder.display(),
                 mods_root.display()
-            )
-            .into_ta_result();
+            )));
         }
         Some(PathOverlap::FirstInsideSecond) => {
             let directly_in_storage = resolved
@@ -712,15 +669,14 @@ pub(crate) async fn install_from_folder_as(
                 .map(|parent| matches!(path_overlap(parent, &mods_root), Ok(Some(PathOverlap::Same))))
                 .unwrap_or(false);
             if directly_in_storage && name_override.is_none() {
-                return adopt_folder_in_place(mods, &mods_root.join(&name), &name).await;
+                return adopt_folder_in_place(mods, &mods_root.join(&name), &name, subject).await;
             }
-            return anyhow::anyhow!(
+            return Err(refuse(anyhow::anyhow!(
                 "{} is inside a mod folder in DDMM's mod storage ({}). Pick that mod's own \
                  folder (the one directly inside the storage folder), or a folder outside it.",
                 folder.display(),
                 mods_root.display()
-            )
-            .into_ta_result();
+            )));
         }
     }
 
@@ -730,12 +686,12 @@ pub(crate) async fn install_from_folder_as(
 
     log::info!("Preparing mod directory...");
     let manifest_file = mod_dir.join(MANIFEST_FILE);
-    prepare_mod_dir(folder, mod_dir.clone(), manifest_file.clone(), name.clone()).await.into_ta_result()?;
+    prepare_mod_dir(folder, &mod_dir, &manifest_file, &name, subject).await?;
 
     // From here on `mod_dir` is a folder we just created (and, per the
     // checks above, not the source or anywhere near it), so a failure must
     // remove it again rather than leave a half-copied mod behind.
-    let result = install_from_folder_inner(mods, folder, &name, &mod_dir, &manifest_file).await;
+    let result = install_from_folder_inner(mods, folder, &name, &mod_dir, &manifest_file, subject).await;
 
     if result.is_err() {
         if let Err(cleanup) = tokio::fs::remove_dir_all(&mod_dir).await {
@@ -751,7 +707,12 @@ pub(crate) async fn install_from_folder_as(
 /// otherwise a local one is generated and written into it (and removed
 /// again if registering fails). Nothing else in the folder is touched, and
 /// the folder is never deleted.
-async fn adopt_folder_in_place(mods: &mut Vec<Mod>, mod_dir: &Path, name: &str) -> TAResult<(Mod, Option<String>)> {
+async fn adopt_folder_in_place(
+    mods: &mut Vec<Mod>,
+    mod_dir: &Path,
+    name: &str,
+    subject: &str,
+) -> Result<(Mod, Option<String>), InstallError> {
     use crate::fs_util::{path_overlap, PathOverlap};
 
     log::info!("{:?} is already in the mod storage; adopting it in place.", mod_dir);
@@ -760,27 +721,32 @@ async fn adopt_folder_in_place(mods: &mut Vec<Mod>, mod_dir: &Path, name: &str) 
         .iter()
         .find(|m| matches!(path_overlap(&m.directory, mod_dir), Ok(Some(PathOverlap::Same))))
     {
-        return anyhow::anyhow!("\"{}\" is already installed (it's in your mod list)", existing.name())
-            .into_ta_result();
+        return Err(InstallError::new(
+            subject,
+            InstallStep::Register,
+            anyhow::anyhow!("\"{}\" is already installed (it's in your mod list)", existing.name()),
+        ));
     }
 
     let manifest_file = mod_dir.join(MANIFEST_FILE);
     let had_manifest = find_manifest_file(mod_dir).await.is_some();
 
-    let result: TAResult<(Mod, Option<String>)> = async {
-        let manifest = resolve_manifest_for_dir(mod_dir, name.to_string(), manifest_file.clone()).await?;
+    let result: Result<(Mod, Option<String>), InstallError> = async {
+        let manifest = resolve_manifest_for_dir(mod_dir, name.to_string(), manifest_file.clone())
+            .await
+            .install_step(subject, InstallStep::ReadManifest)?;
         let mut r#mod = Mod {
             manifest,
             directory: mod_dir.to_path_buf(),
             sources: Vec::new(),
         };
 
-        if mods.iter().any(|m| m.guid() == r#mod.guid()) {
-            return anyhow::anyhow!("mod with GUID {{{}}} already exists", r#mod.guid()).into_ta_result();
-        }
+        check_not_installed(mods, &r#mod, subject)?;
 
-        normalize_manifest_file_name(mod_dir).await.into_ta_result()?;
-        let warning = apply_patch_layout(mod_dir, &mut r#mod.manifest).await.into_ta_result()?;
+        normalize_manifest_file_name(mod_dir).await.install_step(subject, InstallStep::ReadManifest)?;
+        let warning = apply_patch_layout(mod_dir, &mut r#mod.manifest)
+            .await
+            .install_step(subject, InstallStep::FindPatchFiles)?;
         Ok((r#mod, warning))
     }
     .await;
@@ -811,9 +777,12 @@ async fn install_from_folder_inner(
     name: &str,
     mod_dir: &Path,
     manifest_file: &Path,
-) -> TAResult<(Mod, Option<String>)> {
+    subject: &str,
+) -> Result<(Mod, Option<String>), InstallError> {
     log::info!("Resolving manifest...");
-    let manifest = resolve_manifest_for_dir(folder, name.to_string(), manifest_file.to_path_buf()).await?;
+    let manifest = resolve_manifest_for_dir(folder, name.to_string(), manifest_file.to_path_buf())
+        .await
+        .install_step(subject, InstallStep::ReadManifest)?;
 
     let mut r#mod = Mod {
         manifest,
@@ -822,19 +791,26 @@ async fn install_from_folder_inner(
     };
 
     log::info!("Checking for duplicate...");
-    if mods.iter().any(|m| m.guid() == r#mod.guid()) {
-        return anyhow::anyhow!("mod with GUID {{{}}} already exists", r#mod.guid())
-            .into_ta_result();
-    }
+    check_not_installed(mods, &r#mod, subject)?;
 
     log::info!("Copying folder contents...");
     copy_dir_recursive(folder, mod_dir, &[sources::ORIGIN_SIDECAR_FILE])
         .await
-        .into_ta_result()?;
-    normalize_manifest_file_name(mod_dir).await.into_ta_result()?;
+        .map_err(|e| {
+            // Same plain-language treatment as an archive's I/O errors
+            // (disk full, access denied, path too long).
+            match e.downcast::<std::io::Error>() {
+                Ok(io) => crate::archive::io_error(io, "copying a file failed"),
+                Err(e) => e,
+            }
+        })
+        .install_step(subject, InstallStep::Copy)?;
+    normalize_manifest_file_name(mod_dir).await.install_step(subject, InstallStep::Copy)?;
 
     log::debug!("Detecting patch file layout...");
-    let warning = apply_patch_layout(mod_dir, &mut r#mod.manifest).await.into_ta_result()?;
+    let warning = apply_patch_layout(mod_dir, &mut r#mod.manifest)
+        .await
+        .install_step(subject, InstallStep::FindPatchFiles)?;
 
     log::debug!("Normalizing paths...");
     if let Err(e) = r#mod.normalize_paths().await {
@@ -891,9 +867,6 @@ pub async fn add_paths(state: State<'_, AppState>, paths: Vec<PathBuf>) -> TARes
             }
         };
 
-        if let Err(e) = &result {
-            log::error!("Adding {:?} failed: {}", path, e);
-        }
         results.push(result.map(|(r#mod, warning)| InstalledMod { r#mod, warning }));
     }
 
@@ -911,7 +884,20 @@ pub async fn add_mod_from_url(state: State<'_, AppState>, url: String) -> TAResu
     log::info!("Downloading mod from {}...", download::redact_url(&url));
 
     let staging_root = state.base_path.join(download::STAGING_DIRECTORY);
-    let downloaded = download::download_archive(&url, &staging_root).await.into_ta_result()?;
+    let downloaded = match download::download_archive(&url, &staging_root).await {
+        Ok(d) => d,
+        Err(e) => {
+            let subject = download::redact_url(&url);
+            let mut err = InstallError::new(subject, InstallStep::Download, e);
+            if format!("{err}").contains("not a supported archive") {
+                err = err.with_hint(
+                    "The link doesn't lead straight to the file. Download the mod from its page in your browser, \
+                     then add the downloaded file with Add.",
+                );
+            }
+            return Err(report(err));
+        }
+    };
 
     let install_result = {
         let mut mods = state.mods.lock().await;
@@ -990,21 +976,34 @@ pub(crate) async fn install_update_from_archive(
     archive_path: &Path,
     existing_guid: Uuid,
 ) -> TAResult<(Mod, Option<String>)> {
+    log::info!("Updating mod {{{}}} from {:?}...", existing_guid, archive_path);
+    let subject = subject_of(archive_path);
+    install_update_steps(state, mods, archive_path, existing_guid, &subject).await.map_err(report)
+}
+
+async fn install_update_steps(
+    state: &AppState,
+    mods: &mut Vec<Mod>,
+    archive_path: &Path,
+    existing_guid: Uuid,
+    subject: &str,
+) -> Result<(Mod, Option<String>), InstallError> {
+    let replace = InstallStep::Replace;
     let old_mod = mods
         .iter()
         .find(|m| m.guid() == existing_guid)
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("mod with GUID {{{}}} not found", existing_guid))
-        .into_ta_result()?;
+        .ok_or_else(|| anyhow::anyhow!("the mod to update (GUID {{{}}}) is no longer in the mod list", existing_guid))
+        .install_step(subject, replace)?;
     let old_dir = old_mod.directory.clone();
 
     let staging_dir = state
         .base_path
         .join(MODS_DIRECTORY)
         .join(format!(".update-{}", Uuid::new_v4()));
-    tokio::fs::create_dir_all(&staging_dir).await.into_ta_result()?;
+    tokio::fs::create_dir_all(&staging_dir).await.install_step(subject, InstallStep::PrepareFolder)?;
 
-    let staged = stage_update(&staging_dir, archive_path).await;
+    let staged = stage_update(&staging_dir, archive_path, subject).await;
 
     let (mut manifest, warning) = match staged {
         Ok(ok) => ok,
@@ -1048,12 +1047,12 @@ pub(crate) async fn install_update_from_archive(
         Ok(d) => d,
         Err(e) => {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return Err(e).into_ta_result();
+            return Err(InstallError::new(subject, replace, e));
         }
     };
     if let Err(e) = tokio::fs::write(staging_dir.join(MANIFEST_FILE), manifest_data).await {
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-        return Err(e).into_ta_result();
+        return Err(InstallError::new(subject, replace, e));
     }
 
     log::info!("Swapping in updated content for mod {{{}}}...", final_guid);
@@ -1064,14 +1063,14 @@ pub(crate) async fn install_update_from_archive(
 
     if let Err(e) = crate::fs_util::move_path(&old_dir, &backup_dir).await {
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-        return Err(e).into_ta_result();
+        return Err(InstallError::new(subject, replace, e));
     }
 
     if let Err(e) = crate::fs_util::move_path(&staging_dir, &old_dir).await {
         // Roll back: put the old content back where it was.
         let _ = crate::fs_util::move_path(&backup_dir, &old_dir).await;
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-        return Err(e).into_ta_result();
+        return Err(InstallError::new(subject, replace, e));
     }
 
     let _ = tokio::fs::remove_dir_all(&backup_dir).await;
@@ -1097,8 +1096,12 @@ pub(crate) async fn install_update_from_archive(
 /// Extract `archive_path` into `staging_dir` and resolve its manifest
 /// (generating a local one, with patch-layout auto-detection, if it ships
 /// none), without touching anything outside `staging_dir`.
-async fn stage_update(staging_dir: &Path, archive_path: &Path) -> TAResult<(Manifest, Option<String>)> {
-    let archive = Archive::open(archive_path)?;
+async fn stage_update(
+    staging_dir: &Path,
+    archive_path: &Path,
+    subject: &str,
+) -> Result<(Manifest, Option<String>), InstallError> {
+    let archive = Archive::open(archive_path).install_step(subject, InstallStep::OpenArchive)?;
     let manifest_file = staging_dir.join(MANIFEST_FILE);
     let name = archive_path
         .file_stem()
@@ -1106,11 +1109,15 @@ async fn stage_update(staging_dir: &Path, archive_path: &Path) -> TAResult<(Mani
         .map(str::to_string)
         .unwrap_or_else(|| "update".to_string());
 
-    let (archive, mut manifest) = resolve_manifest(archive, name, manifest_file).await?;
+    let (archive, mut manifest) = resolve_manifest(archive, name, manifest_file)
+        .await
+        .map_err(|e| manifest_failure(subject, e))?;
 
-    extract_archive(archive, staging_dir.to_path_buf()).await?;
+    extract_archive(archive, staging_dir.to_path_buf()).await.install_step(subject, InstallStep::Extract)?;
 
-    let warning = apply_patch_layout(staging_dir, &mut manifest).await.into_ta_result()?;
+    let warning = apply_patch_layout(staging_dir, &mut manifest)
+        .await
+        .install_step(subject, InstallStep::FindPatchFiles)?;
 
     Ok((manifest, warning))
 }
@@ -1151,6 +1158,262 @@ mod tests {
         let (m, _) = install_from_archive(&state, mods, &archive).await.unwrap();
         assert_eq!(m.name(), "PawnCompanion 1377 1.35 2026-06-24T03-45Z G8alq8bQH");
         assert_eq!(m.directory.file_name().unwrap(), "PawnCompanion 1377 1.35 2026-06-24T03-45Z G8alq8bQH");
+    }
+
+    // --- issue #33: the reported mods' layouts, and saying why an install failed ---
+
+    use crate::archive::test_fixtures::{as_entries, plushie_mod, rar5, v1_manifest, zip as zip_bytes};
+
+    const KOYUKI_GUID: &str = "3f2b1c9e-8a7d-4e6f-9b0a-1c2d3e4f5a6b";
+
+    async fn fresh_library(base: &Path) -> AppState {
+        let state = AppState::new(base.to_path_buf());
+        {
+            let mut guard = state.mods.lock().await;
+            ensure_mods_loaded(&mut guard, base).await.unwrap();
+        }
+        state
+    }
+
+    async fn install(state: &AppState, archive: &Path) -> TAResult<(Mod, Option<String>)> {
+        let mut guard = state.mods.lock().await;
+        install_from_archive(state, guard.as_mut().unwrap(), archive).await
+    }
+
+    fn message<T: std::fmt::Debug>(r: TAResult<T>) -> String {
+        r.unwrap_err().to_string()
+    }
+
+    /// "koyuki launcher" (zip) and "yuuka hammer" (RAR), as their archives
+    /// are laid out: manifest.json, icon.png and the patch files at the
+    /// root, including a zero-byte `.stream`.
+    #[tokio::test]
+    async fn plushie_mods_with_manifest_install_from_zip_and_rar() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+
+        let koyuki = plushie_mod(&v1_manifest(KOYUKI_GUID, "koyuki launcher"));
+        let zip_path = src.path().join("koyuki launcher-12052-1-2-1777494703.zip");
+        std::fs::write(&zip_path, zip_bytes(&as_entries(&koyuki))).unwrap();
+        let yuuka = plushie_mod(&v1_manifest("9d1e5b7a-2c4f-4a8e-b6d0-7f3a1c5e9b2d", "yuuka hammer"));
+        let rar_path = src.path().join("yuuka hammer-12640-1-1-1777494836.rar");
+        std::fs::write(&rar_path, rar5(&as_entries(&yuuka))).unwrap();
+
+        for (path, files, name) in [(&zip_path, &koyuki, "koyuki launcher"), (&rar_path, &yuuka, "yuuka hammer")] {
+            let (m, warning) = install(&state, path).await.unwrap();
+            assert_eq!(m.name(), name);
+            assert_eq!(warning, None);
+            for (file, data) in files {
+                assert_eq!(&std::fs::read(m.directory.join(file)).unwrap(), data, "{file}");
+            }
+        }
+        assert_eq!(state.mods.lock().await.as_ref().unwrap().len(), 2);
+    }
+
+    /// The Nexus voice pack's layout: two root-level patch files, no
+    /// manifest.
+    #[tokio::test]
+    async fn root_level_patch_zip_without_manifest_installs() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let path = src.path().join("EAGLE-2 - GERMAN-1065-V1-1-1752788163.zip");
+        std::fs::write(
+            &path,
+            zip_bytes(&[("9ba626afa44a3aa3.patch_0", &[1u8; 512][..]), ("9ba626afa44a3aa3.patch_0.stream", &[2u8; 4096][..])]),
+        )
+        .unwrap();
+        let (m, warning) = install(&state, &path).await.unwrap();
+        assert_eq!(m.name(), "EAGLE-2 - GERMAN-1065-V1-1-1752788163");
+        assert_eq!(warning, None);
+        assert!(m.directory.join("9ba626afa44a3aa3.patch_0.stream").is_file());
+    }
+
+    /// A RAR uploaded as `.zip` (or saved so by a browser) installs.
+    #[tokio::test]
+    async fn rar_named_zip_installs() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let path = src.path().join("yuuka hammer.zip");
+        std::fs::write(&path, rar5(&as_entries(&plushie_mod(&v1_manifest(KOYUKI_GUID, "yuuka hammer"))))).unwrap();
+        let (m, _) = install(&state, &path).await.unwrap();
+        assert_eq!(m.name(), "yuuka hammer");
+    }
+
+    #[tokio::test]
+    async fn damaged_download_error_names_the_mod_step_cause_and_hint() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let full = zip_bytes(&as_entries(&plushie_mod(&v1_manifest(KOYUKI_GUID, "koyuki launcher"))));
+        let path = src.path().join("koyuki launcher.zip");
+        std::fs::write(&path, &full[..full.len() / 2]).unwrap();
+
+        assert_eq!(
+            message(install(&state, &path).await),
+            "Couldn't install \"koyuki launcher.zip\".\n\
+             Step: opening the archive\n\
+             Cause: the zip archive is incomplete or damaged: its table of contents (at the end of the file) is \
+             missing, which usually means the download didn't finish (invalid Zip archive: Could not find EOCD)\n\
+             Hint: Download the mod again and add the new file. If that doesn't help, the file on the mod page \
+             itself is probably broken: let the mod's author know."
+        );
+        assert!(!base.path().join(MODS_DIRECTORY).join("koyuki launcher").exists());
+    }
+
+    /// Two different mods whose author reused one manifest.json (same
+    /// GUID): the second says which installed mod has that ID and what to
+    /// do, instead of "mod with GUID {...} already exists".
+    #[tokio::test]
+    async fn reused_manifest_guid_names_the_other_mod() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let first = src.path().join("koyuki launcher.zip");
+        std::fs::write(&first, zip_bytes(&as_entries(&plushie_mod(&v1_manifest(KOYUKI_GUID, "koyuki launcher"))))).unwrap();
+        let second = src.path().join("yuuka hammer.rar");
+        std::fs::write(&second, rar5(&as_entries(&plushie_mod(&v1_manifest(KOYUKI_GUID, "yuuka hammer"))))).unwrap();
+
+        install(&state, &first).await.unwrap();
+        assert_eq!(
+            message(install(&state, &second).await),
+            format!(
+                "Couldn't install \"yuuka hammer.rar\".\n\
+                 Step: adding it to the mod list\n\
+                 Cause: its manifest.json gives it the ID (GUID) {{{KOYUKI_GUID}}}, and \"koyuki launcher\" in your \
+                 mod list already has that ID\n\
+                 Hint: Two different mods can't share an ID: the mod's author probably copied another mod's \
+                 manifest.json, so let them know. To install it anyway, remove \"koyuki launcher\" first, or \
+                 extract this archive, delete its manifest.json, and add the extracted folder with Add Folder \
+                 (DDMM then gives it an ID of its own)."
+            )
+        );
+        assert!(!base.path().join(MODS_DIRECTORY).join("yuuka hammer").exists());
+
+        // The same mod a second time (another download of it) says that instead.
+        let again = src.path().join("koyuki launcher (1).zip");
+        std::fs::copy(&first, &again).unwrap();
+        let msg = message(install(&state, &again).await);
+        assert!(
+            msg.ends_with(
+                "Hint: \"koyuki launcher\" is already installed. To replace it with this file, remove it first (or \
+                 use Update on it)."
+            ),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn broken_manifest_error_names_the_step_and_a_way_out() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let path = src.path().join("broken.zip");
+        std::fs::write(&path, zip_bytes(&[("manifest.json", b"{ \"Guid\": \"not-a-guid\", \"Name\": \"x\" }")])).unwrap();
+        let msg = message(install(&state, &path).await);
+        assert!(msg.starts_with("Couldn't install \"broken.zip\".\nStep: reading its manifest.json\nCause: manifest.json: "), "{msg}");
+        assert!(
+            msg.ends_with(
+                "Hint: The mod's manifest.json is broken: let the mod's author know. To install it anyway, extract \
+                 the archive, delete manifest.json, and add the extracted folder with Add Folder."
+            ),
+            "{msg}"
+        );
+    }
+
+    /// An encrypted archive fails at "opening", not as a manifest problem.
+    #[tokio::test]
+    async fn password_protected_zip_error() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let path = src.path().join("locked.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let options = zip::write::SimpleFileOptions::default().with_aes_encryption(zip::AesMode::Aes256, "pw");
+        writer.start_file("manifest.json", options).unwrap();
+        writer.write_all(b"{}").unwrap();
+        writer.finish().unwrap();
+        assert_eq!(
+            message(install(&state, &path).await),
+            "Couldn't install \"locked.zip\".\n\
+             Step: opening the archive\n\
+             Cause: the archive is password-protected (unsupported Zip archive: Password required to decrypt file)\n\
+             Hint: DDMM can't install password-protected archives. Extract it yourself with the password (for \
+             example with 7-Zip), then add the extracted folder with Add Folder."
+        );
+    }
+
+    #[tokio::test]
+    async fn pack_of_variant_archives_warns_with_their_names() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let inner = zip_bytes(&[("0123456789abcdef.patch_0", b"p")]);
+        let path = src.path().join("pack.zip");
+        std::fs::write(&path, zip_bytes(&[("Variants/Red.zip", &inner[..]), ("Variants/Blue.7z", &inner[..])])).unwrap();
+        let (_, warning) = install(&state, &path).await.unwrap();
+        assert_eq!(
+            warning.as_deref(),
+            Some(
+                "no Helldivers 2 patch files found in this archive. It contains other archives (Blue.7z, Red.zip): \
+                 it's probably a pack of several versions or parts. Extract the one you want with 7-Zip and add that \
+                 to DDMM instead."
+            )
+        );
+    }
+
+    /// Add with several files: each gets its own result, a bad one doesn't
+    /// stop the others, and its error names it.
+    #[tokio::test]
+    async fn adding_several_archives_reports_each_failure_by_name() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let good = src.path().join("good.zip");
+        make_zip(&good, &[(&patch_file_name(), b"x")]);
+        let empty = src.path().join("still downloading.zip");
+        std::fs::write(&empty, b"").unwrap();
+
+        let mut guard = state.mods.lock().await;
+        let mods = guard.as_mut().unwrap();
+        let mut results = Vec::new();
+        for f in [&empty, &good] {
+            results.push(install_from_archive(&state, mods, f).await);
+        }
+        assert!(message(results.remove(0)).starts_with(
+            "Couldn't install \"still downloading.zip\".\nStep: opening the archive\nCause: the file is empty (0 bytes)"
+        ));
+        assert!(results.remove(0).is_ok());
+    }
+
+    #[tokio::test]
+    async fn folder_install_errors_use_the_same_shape() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let folder = src.path().join("My Mod");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("manifest.json"), b"{ not json").unwrap();
+        let mut guard = state.mods.lock().await;
+        let msg = message(install_from_folder(base.path(), guard.as_mut().unwrap(), &folder).await);
+        assert!(msg.starts_with("Couldn't install \"My Mod\".\nStep: reading its manifest.json\nCause: "), "{msg}");
+        assert!(msg.contains("is not valid JSON"), "{msg}");
+    }
+
+    /// The whole message reaches the frontend: anyhow-tauri serializes the
+    /// error with `{:#}` (also in release builds, via its
+    /// `show_errs_in_release` feature, which Cargo.toml enables).
+    #[test]
+    fn install_errors_serialize_whole_for_the_frontend() {
+        let err = anyhow_tauri::TACommandError(anyhow::Error::new(
+            InstallError::new("m.zip", InstallStep::Extract, anyhow::anyhow!("inner cause")).with_hint("do this"),
+        ));
+        assert_eq!(
+            serde_json::to_string(&err).unwrap(),
+            "\"Couldn't install \\\"m.zip\\\".\\nStep: extracting the archive\\nCause: inner cause\\nHint: do this\""
+        );
     }
 
     async fn make_existing_mod(base: &Path, name: &str) -> (Uuid, PathBuf) {
