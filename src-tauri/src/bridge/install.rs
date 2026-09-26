@@ -152,18 +152,27 @@ pub async fn install_file_with(
         ));
     }
 
-    let mut header = [0u8; 8];
     {
         use tokio::io::AsyncReadExt;
-        let mut f = tokio::fs::File::open(file)
+        let f = tokio::fs::File::open(file)
             .await
             .map_err(|_| InstallError::new(ErrorCode::FileNotFound, "could not open file"))?;
-        let read = f
-            .read(&mut header)
+        let mut header = Vec::with_capacity(crate::archive::SNIFF_LEN);
+        f.take(crate::archive::SNIFF_LEN as u64)
+            .read_to_end(&mut header)
             .await
             .map_err(|_| InstallError::new(ErrorCode::FileNotFound, "could not read file"))?;
-        if download::sniff_archive_extension(&header[..read]).is_none() {
-            return Err(InstallError::new(ErrorCode::NotArchive, "not a zip/7z/rar archive"));
+        let what = match crate::archive::sniff(&header) {
+            crate::archive::Sniffed::Archive(_) => None,
+            crate::archive::Sniffed::NotArchive(what) => Some(what),
+            crate::archive::Sniffed::Empty => Some("an empty file (the download didn't finish)"),
+            crate::archive::Sniffed::Unknown => Some("not a file DDMM recognizes"),
+        };
+        if let Some(what) = what {
+            return Err(InstallError::new(
+                ErrorCode::NotArchive,
+                format!("not a zip/7z/rar archive: the downloaded file is {what}"),
+            ));
         }
     }
 

@@ -602,7 +602,11 @@ fn inspect(id: usize, candidate: &Candidate) -> ScanItem {
         ItemKind::Folder => inspect_folder(&mut item),
     };
     if let Err(e) = result {
-        item.status = ItemStatus::Unreadable { reason: format!("{e:#}") };
+        let reason = match crate::archive::hint_of(&e) {
+            Some(hint) => format!("{e:#}\nHint: {hint}"),
+            None => format!("{e:#}"),
+        };
+        item.status = ItemStatus::Unreadable { reason };
     }
     item
 }
@@ -630,12 +634,12 @@ fn apply_manifest(item: &mut ScanItem, manifest: &Manifest) {
 
 fn inspect_archive(item: &mut ScanItem) -> anyhow::Result<()> {
     item.file_size = std::fs::metadata(&item.path)?.len();
-    let mut archive = Archive::open(&item.path).map_err(|e| anyhow::anyhow!("can't open the archive: {e:#}"))?;
+    let mut archive = Archive::open(&item.path).map_err(|e| e.context("can't open the archive"))?;
     archive.validate_entries()?;
     let mut unpacked = 0u64;
     let mut has_patch = false;
     for entry in archive.iter()? {
-        let entry = entry.map_err(|e| anyhow::anyhow!("the archive is damaged: {e:#}"))?;
+        let entry = entry.map_err(|e| e.context("can't read the archive's list of files"))?;
         if entry.is_directory() {
             continue;
         }

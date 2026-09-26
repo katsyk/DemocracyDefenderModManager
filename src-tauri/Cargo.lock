@@ -4146,6 +4146,7 @@ dependencies = [
  "bzip2",
  "cbc 0.2.1",
  "crc32fast",
+ "flate2",
  "getrandom 0.4.3",
  "js-sys",
  "lzma-rust2 0.21.0",

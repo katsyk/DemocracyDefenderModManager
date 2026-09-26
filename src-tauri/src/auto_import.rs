@@ -126,6 +126,14 @@ async fn run(app: AppHandle) {
             let Ok(size) = tokio::fs::metadata(&path).await.map(|m| m.len()) else {
                 continue;
             };
+            // Still being downloaded (an empty placeholder, or its `.part`
+            // is still there): not a candidate yet. Checked before it can
+            // count as "stable", so it is looked at again once the real
+            // file lands under this name.
+            if crate::commands::handoff::download_in_progress(&path).await {
+                pending.remove(&path);
+                continue;
+            }
 
             match pending.get(&path) {
                 // Same size as last tick: the download has finished.

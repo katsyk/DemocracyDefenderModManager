@@ -301,7 +301,17 @@ async fn duplicates_older_versions_and_broken_archives_are_flagged_and_do_not_st
     assert!(matches!(status("Capes-77-1-0-1700000000.zip"), ItemStatus::OlderVersion { .. }));
     assert_eq!(status("Capes-77-1-1-1710000000.zip"), ItemStatus::New);
     assert_eq!(status("Capes Red Variant-77-1-1-1710000001.zip"), ItemStatus::New);
-    assert!(matches!(status("truncated.zip"), ItemStatus::Unreadable { .. }));
+    assert_eq!(
+        status("truncated.zip"),
+        ItemStatus::Unreadable {
+            reason: "can't open the archive: the zip archive is incomplete or damaged: its table of contents (at the \
+                     end of the file) is missing, which usually means the download didn't finish (invalid Zip \
+                     archive: Could not find EOCD)\n\
+                     Hint: Download the mod again and add the new file. If that doesn't help, the file on the mod \
+                     page itself is probably broken: let the mod's author know."
+                .to_string()
+        }
+    );
     assert!(matches!(status("evil.zip"), ItemStatus::Unreadable { reason } if reason.contains("unsafe")));
     assert!(matches!(status("bad manifest.zip"), ItemStatus::Unreadable { reason } if reason.contains("JSON")));
     assert_eq!(status("author-a.zip"), ItemStatus::New);

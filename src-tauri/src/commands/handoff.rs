@@ -39,6 +39,31 @@ const HANDOFF_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 pub(crate) const IGNORED_SUFFIXES: [&str; 5] = [".crdownload", ".part", ".tmp", ".download", ".partial"];
 pub(crate) const ARCHIVE_SUFFIXES: [&str; 3] = [".zip", ".7z", ".rar"];
 
+/// Whether a browser is still writing `path`: it is empty (Firefox
+/// reserves the final name with an empty file as soon as a download
+/// starts, and writes into `<name>.part` next to it until it's done), or a
+/// "still downloading" file for it sits next to it (`<name>.part`,
+/// `<name>.crdownload`, ...). Such a file must never be picked up: DDMM
+/// would try to install an empty or half-written archive and fail.
+pub(crate) async fn download_in_progress(path: &Path) -> bool {
+    let empty = match tokio::fs::metadata(path).await {
+        Ok(m) => m.len() == 0,
+        Err(_) => return true,
+    };
+    if empty {
+        return true;
+    }
+    let Some(name) = path.file_name() else { return false };
+    for suffix in IGNORED_SUFFIXES {
+        let mut sibling = name.to_os_string();
+        sibling.push(suffix);
+        if tokio::fs::symlink_metadata(path.with_file_name(sibling)).await.is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
 /// The single `handoff` event the frontend listens for; `status` picks
 /// which of the optional fields are meaningful.
 #[derive(Debug, Clone, Serialize)]
@@ -495,6 +520,15 @@ async fn wait_until_stable(path: &Path, cancel: &AtomicBool) -> anyhow::Result<O
         }
         let size = meta.len();
 
+        // An empty placeholder, or a file whose `.part` is still being
+        // written: not finished, however long its size stays the same.
+        if download_in_progress(path).await {
+            stable_count = 0;
+            last_size = None;
+            tokio::time::sleep(POLL_INTERVAL).await;
+            continue;
+        }
+
         if Some(size) == last_size {
             stable_count += 1;
             if stable_count >= STABLE_POLLS_REQUIRED {
@@ -515,6 +549,58 @@ mod tests {
 
     async fn touch(path: &Path, contents: &[u8]) {
         tokio::fs::write(path, contents).await.unwrap();
+    }
+
+    /// Firefox reserves `mod.zip` with an empty file the moment a download
+    /// starts and writes into `mod.zip.part`; neither is finished.
+    #[tokio::test]
+    async fn empty_placeholders_and_files_with_a_part_are_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("koyuki launcher.zip");
+        touch(&path, b"").await;
+        touch(&dir.path().join("koyuki launcher.zip.part"), b"PK\x03\x04half").await;
+        assert!(download_in_progress(&path).await, "empty placeholder");
+
+        touch(&path, b"PK\x03\x04full").await;
+        assert!(download_in_progress(&path).await, "its .part is still there");
+
+        tokio::fs::remove_file(dir.path().join("koyuki launcher.zip.part")).await.unwrap();
+        assert!(!download_in_progress(&path).await);
+
+        let chrome = dir.path().join("yuuka hammer.rar");
+        touch(&chrome, b"Rar!\x1a\x07\x01\x00").await;
+        touch(&dir.path().join("yuuka hammer.rar.crdownload"), b"x").await;
+        assert!(download_in_progress(&chrome).await);
+    }
+
+    /// The handoff used to take the empty placeholder as "finished" after
+    /// two unchanged polls (0 bytes, 0 bytes) and fail to install it; a
+    /// download that takes longer than that must be waited for.
+    #[tokio::test]
+    async fn wait_until_stable_waits_out_a_firefox_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("koyuki launcher.zip");
+        let part = dir.path().join("koyuki launcher.zip.part");
+        touch(&path, b"").await;
+        touch(&part, b"PK\x03\x04").await;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let (path, cancel) = (path.clone(), cancel.clone());
+            tokio::spawn(async move { wait_until_stable(&path, &cancel).await })
+        };
+
+        // Long past the old "two unchanged polls".
+        tokio::time::sleep(POLL_INTERVAL * 4).await;
+        assert!(!waiter.is_finished(), "must not take the empty placeholder");
+
+        // Firefox finishes: the .part replaces the placeholder.
+        tokio::fs::write(&part, b"PK\x03\x04the whole archive").await.unwrap();
+        tokio::fs::rename(&part, &path).await.unwrap();
+
+        let found = tokio::time::timeout(POLL_INTERVAL * 6, waiter).await.unwrap().unwrap().unwrap();
+        assert_eq!(found.as_deref(), Some(path.as_path()));
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"PK\x03\x04the whole archive");
     }
 
     #[tokio::test]
