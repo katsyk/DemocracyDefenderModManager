@@ -512,6 +512,7 @@ export type ImportSource = {
 export type ImportItemStatus =
     | { Kind: "New" }
     | { Kind: "Installed"; Name: string }
+    | { Kind: "InstalledAddSource"; Name: string }
     | { Kind: "InstalledOtherVersion"; Name: string }
     | { Kind: "Duplicate"; Of: string }
     | { Kind: "OlderVersion"; Of: string }
@@ -561,6 +562,8 @@ export type ImportedMod = {
 
 export type ImportReport = {
     Imported: ImportedMod[];
+    /** Already in DDMM; only their Nexus Mods info was added. */
+    Linked: { Id: number; Name: string }[];
     Failed: { Id: number; Name: string; Reason: string }[];
     NotStarted: number;
     Cancelled: boolean;

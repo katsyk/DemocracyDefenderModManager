@@ -1,5 +1,5 @@
 //! Import tests. Fixtures synthesize the other managers' on-disk layouts as
-//! documented in `docs/development/importing-from-other-managers.md`.
+//! documented in `mod_import/FORMATS.md`.
 
 use super::*;
 use std::io::Write;
@@ -436,10 +436,11 @@ async fn archives_added_before_with_add_file_count_as_installed() {
 // Another manager's folders
 // ---------------------------------------------------------------------------
 
-/// Helldivers 2 Mod Manager (and older DDMM) storage: one folder per mod
+/// The older HD2 mod manager's (and older DDMM's) storage: one folder per mod
 /// with its manifest.json (a generated `LOCAL` one for mods that had none),
 /// and profiles.json with the load order, on/off state and chosen options.
-fn hd2mm_storage(root: &Path) -> PathBuf {
+fn older_manager_storage(root: &Path) -> PathBuf {
+    // Its default storage folder name, as created on disk.
     let storage = root.join("Helldivers2ModManager");
     let mods = storage.join("Mods");
     let v1 = mods.join("Fancy Capes");
@@ -509,7 +510,7 @@ fn hd2mm_storage(root: &Path) -> PathBuf {
 async fn imports_another_managers_storage_with_profile_order_state_and_options() {
     let root = tempfile::tempdir().unwrap();
     let base = root.path().join("ddmm");
-    let storage = hd2mm_storage(root.path());
+    let storage = older_manager_storage(root.path());
     let before = snapshot(&storage);
 
     let state = state_with_empty_library(&base).await;
@@ -785,12 +786,12 @@ async fn imports_an_arsenal_library_with_names_nexus_ids_order_and_options() {
     assert!(rescan.items.iter().all(|i| matches!(i.status, ItemStatus::Installed { .. })), "{:?}", rescan.items);
 }
 
-/// Helldivers 2 Mod Manager 1.x: `enabled.json` (not profiles.json) next to
+/// The older HD2 mod manager, 1.x: `enabled.json` (not profiles.json) next to
 /// `Mods\`, in load order.
 #[tokio::test]
 async fn reads_the_1x_enabled_list() {
     let root = tempfile::tempdir().unwrap();
-    let storage = hd2mm_storage(root.path());
+    let storage = older_manager_storage(root.path());
     std::fs::remove_file(storage.join("profiles.json")).unwrap();
     std::fs::write(
         storage.join("enabled.json"),
@@ -887,9 +888,134 @@ fn json_shapes_match_the_frontend_types() {
     let v = serde_json::to_value(&report).unwrap();
     assert_eq!(v["Imported"][0]["Config"]["For"], "Legacy");
     assert_eq!(v["Imported"][0]["Enabled"], true);
-    for key in ["Imported", "Failed", "NotStarted", "Cancelled"] {
+    for key in ["Imported", "Linked", "Failed", "NotStarted", "Cancelled"] {
         assert!(v.get(key).is_some(), "{key} missing from {v}");
     }
     let d = serde_json::to_value(DetectedSource { kind: SourceKind::ManagerMods, path: "/x".into(), count: 3 }).unwrap();
     assert_eq!(d, serde_json::json!({ "Kind": "ManagerMods", "Path": "/x", "Count": 3 }));
+}
+
+// ---------------------------------------------------------------------------
+// Linking mods that were added by hand before importing
+// ---------------------------------------------------------------------------
+
+/// Someone adds their archives with Add (no Nexus link recorded), then runs
+/// Import on the same folder: the mods are recognized, and the only thing
+/// that happens is that their Nexus info is added -- no files copied, no
+/// manifest, options or folder touched.
+#[tokio::test]
+async fn mods_added_by_hand_get_their_nexus_info_and_nothing_else() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("ddmm");
+    let src = root.path().join("dl");
+    std::fs::create_dir_all(&src).unwrap();
+    let plain = nexus_name("Plain Helmets", 321, "1.4", 1_712_000_321);
+    let already = nexus_name("Linked Capes", 654, "2.0", 1_712_000_654);
+    mod_zip(&src.join(&plain), "plain");
+    mod_zip(&src.join(&already), "linked");
+    mod_zip(&src.join("no nexus name.zip"), "anon");
+
+    let state = state_with_empty_library(&base).await;
+    let mut dirs = Vec::new();
+    {
+        let mut guard = state.mods.lock().await;
+        let mods = guard.as_mut().unwrap();
+        for f in [&plain, &already, &"no nexus name.zip".to_string()] {
+            let (m, _) = crate::commands::mods::install_from_archive(&state, mods, &src.join(f)).await.unwrap();
+            dirs.push(m.directory.clone());
+        }
+        // The second one already has a Nexus link (e.g. installed through
+        // the browser).
+        sources::write_origin_sidecar(&dirs[1], vec![Source { provider: "nexus".into(), id: Some("654".into()), url: None, version: Some("2.0".into()) }])
+            .await
+            .unwrap();
+        for m in mods.iter_mut() {
+            m.resolve_sources().await;
+        }
+    }
+    let plain_dir = dirs[0].clone();
+    let manifest_before = std::fs::read(plain_dir.join("manifest.json")).unwrap();
+    let patch_before = std::fs::read(plain_dir.join(PATCH)).unwrap();
+    let linked_sidecar_before = std::fs::read(dirs[1].join(ORIGIN_SIDECAR_FILE)).unwrap();
+    let guids_before: Vec<Uuid> = state.mods.lock().await.as_ref().unwrap().iter().map(|m| m.guid()).collect();
+
+    let scan = scan_folder(&src, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    let find = |f: &str| scan.items.iter().find(|i| i.path.file_name().unwrap() == f).unwrap().clone();
+    let p = find(&plain);
+    assert!(matches!(&p.status, ItemStatus::InstalledAddSource { name } if name.starts_with("Plain Helmets")), "{:?}", p.status);
+    assert!(p.status.selected_by_default() && !p.status.blocked());
+    assert!(matches!(find(&already).status, ItemStatus::Installed { .. }), "already linked: nothing to add");
+    assert!(matches!(find("no nexus name.zip").status, ItemStatus::Installed { .. }), "nothing to add without a Nexus id");
+    let v = serde_json::to_value(&p.status).unwrap();
+    assert_eq!(v["Kind"], "InstalledAddSource");
+
+    let report = run_import(&state, ids(&scan), &no_cancel(), |_| {}).await;
+    assert!(report.imported.is_empty(), "nothing is re-imported: {:?}", report.imported);
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    assert_eq!(report.linked.len(), 1);
+    assert!(report.linked[0].name.starts_with("Plain Helmets"));
+
+    // Same three mod folders, same GUIDs; files and manifest untouched.
+    assert_eq!(installed_dirs(&base).len(), 3);
+    let guids_after: Vec<Uuid> = state.mods.lock().await.as_ref().unwrap().iter().map(|m| m.guid()).collect();
+    assert_eq!(guids_before, guids_after);
+    assert_eq!(std::fs::read(plain_dir.join("manifest.json")).unwrap(), manifest_before);
+    assert_eq!(std::fs::read(plain_dir.join(PATCH)).unwrap(), patch_before);
+    assert_eq!(std::fs::read(dirs[1].join(ORIGIN_SIDECAR_FILE)).unwrap(), linked_sidecar_before);
+    assert!(!dirs[2].join(ORIGIN_SIDECAR_FILE).exists());
+
+    // Only the Nexus link was written, so update checks now cover it.
+    let sidecar = sources::load_origin_sidecar(&plain_dir).await.unwrap();
+    assert_eq!(sidecar.sources.len(), 1);
+    assert_eq!(sidecar.sources[0].id.as_deref(), Some("321"));
+    assert_eq!(sidecar.sources[0].version.as_deref(), Some("1.4"));
+    assert_eq!(sidecar.installed_files[0].file_name.as_deref(), Some(plain.as_str()));
+    assert_eq!(sidecar.installed_files[0].uploaded_at, Some(1712000321));
+    let mods = state.mods.lock().await.clone().unwrap();
+    let m = mods.iter().find(|m| m.directory == plain_dir).unwrap();
+    assert!(m.sources.iter().any(|s| s.page_url.as_deref() == Some("https://www.nexusmods.com/helldivers2/mods/321")));
+
+    // Scanning again: now it's plainly "already in DDMM".
+    let rescan = scan_folder(&src, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    assert!(rescan.items.iter().all(|i| matches!(i.status, ItemStatus::Installed { .. })), "{:?}", rescan.items);
+}
+
+/// A mod folder from another manager's list whose copy in DDMM (same GUID)
+/// has no Nexus link: the link is added, and the item's profile state is
+/// not handed back for the profile (order/on-off stay as the user set them).
+#[tokio::test]
+async fn linking_by_guid_keeps_the_profile_out_of_it() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("ddmm");
+    let local = root.path().join("Local");
+    let data = arsenal_data_folder(&local);
+    let state = state_with_empty_library(&base).await;
+    // The user added Arsenal's mod folder by hand with Add Folder first.
+    {
+        let mut guard = state.mods.lock().await;
+        let mods = guard.as_mut().unwrap();
+        let helmets = data.join("mods").join("Better Helmets");
+        crate::commands::mods::install_from_folder_as(&base, mods, &helmets, None).await.unwrap();
+    }
+    // Give it the same GUID Arsenal knows it by (as an earlier import
+    // would have): rewrite its generated manifest.
+    let dir = base.join("mods").join("Better Helmets");
+    let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+    manifest["Guid"] = serde_json::json!("0b8f3c1e-8a41-4b52-9d2c-3f1e2d4c5b6a");
+    std::fs::write(dir.join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let mut fresh = None;
+    let reloaded = crate::commands::mods::ensure_mods_loaded(&mut fresh, &base).await.unwrap().clone();
+    *state.mods.lock().await = Some(reloaded);
+    let manifest_before = std::fs::read(dir.join("manifest.json")).unwrap();
+
+    let scan = scan_folder(&data, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    let helmets = scan.items.iter().find(|i| i.name == "Better Helmets").unwrap();
+    assert!(matches!(helmets.status, ItemStatus::InstalledAddSource { .. }), "{:?}", helmets.status);
+    let report = run_import(&state, vec![helmets.clone()], &no_cancel(), |_| {}).await;
+    assert_eq!(report.linked.len(), 1);
+    assert!(report.imported.is_empty());
+    assert_eq!(std::fs::read(dir.join("manifest.json")).unwrap(), manifest_before);
+    let sidecar = sources::load_origin_sidecar(&dir).await.unwrap();
+    assert_eq!(sidecar.sources[0].id.as_deref(), Some("4242"));
+    assert_eq!(sidecar.installed_files[0].file_id.as_deref(), Some("17001"));
 }

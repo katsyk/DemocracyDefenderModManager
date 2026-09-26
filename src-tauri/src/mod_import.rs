@@ -6,7 +6,7 @@
 //! (the commands live in `commands::import`):
 //!
 //! 1. [`detect_sources`] looks for the data folders of the mod managers
-//!    people move here from (see `docs/development/importing-from-other-managers.md`
+//!    people move here from (see `mod_import/FORMATS.md`
 //!    for what each one stores where) and for the Downloads folder.
 //! 2. [`scan`] lists what's in a folder (or in a list of picked files):
 //!    every archive, and every folder that is a mod (has a `manifest.json`
@@ -99,7 +99,7 @@ pub struct DetectedSource {
 }
 
 /// Where to look, per OS folder. Code comments may name the tools; the UI
-/// never does. See `docs/development/importing-from-other-managers.md`.
+/// never does. See `mod_import/FORMATS.md`.
 #[derive(Debug, Clone, Default)]
 pub struct KnownDirs {
     /// `%APPDATA%` (Roaming) on Windows, `~/.config` on Linux.
@@ -137,15 +137,16 @@ pub fn candidate_sources(dirs: &KnownDirs) -> Vec<(SourceKind, PathBuf)> {
         out.push((SourceKind::ManagerMods, config.join("hd2arsenal")));
     }
     if let Some(local) = &dirs.local_data {
-        // Helldivers 2 Mod Manager (teutinsa; the project DDMM is derived
-        // from) keeps its storage -- one folder per mod, each with a
-        // manifest.json, plus profiles.json next to them -- in
-        // `%LOCALAPPDATA%\Helldivers2ModManager` by default.
+        // The older HD2 mod manager (1.x): its default storage folder -- one
+        // folder per mod, each with a manifest.json, plus enabled.json. The
+        // folder name is what it creates on disk, so it has to be matched
+        // literally.
         out.push((SourceKind::ManagerMods, local.join("Helldivers2ModManager").join("Mods")));
         out.push((SourceKind::ManagerMods, local.join("Helldivers2ModManager")));
     }
     if let Some(config) = &dirs.config {
-        // Its 2024 predecessor, in Roaming.
+        // The older HD2 mod manager's 2024 original, in Roaming (folder name
+        // as created on disk).
         out.push((SourceKind::ManagerMods, config.join("HD2ModManager").join("Mods")));
         // Vortex: staging folder (one unpacked folder per mod, named after
         // the archive) and its download folder (the original archives).
@@ -253,6 +254,10 @@ pub enum ItemStatus {
     New,
     /// Already in DDMM as `name`.
     Installed { name: String },
+    /// Already in DDMM as `name`, which has no Nexus Mods link yet while
+    /// this item knows its Nexus page: importing it only adds that link
+    /// (see [`ScanItem::link_to`]).
+    InstalledAddSource { name: String },
     /// Already in DDMM as `name`, but a different version of it.
     InstalledOtherVersion { name: String },
     /// The same archive/mod as another item in this list (`of` is its name).
@@ -268,7 +273,7 @@ pub enum ItemStatus {
 impl ItemStatus {
     /// Checked in the preview by default.
     pub fn selected_by_default(&self) -> bool {
-        matches!(self, ItemStatus::New)
+        matches!(self, ItemStatus::New | ItemStatus::InstalledAddSource { .. })
     }
 
     /// Can't be imported at all (the checkbox is disabled). Everything
@@ -334,6 +339,10 @@ pub struct ScanItem {
     /// The source manager's description of a mod that has no manifest.
     #[serde(skip)]
     pub description: Option<String>,
+    /// For [`ItemStatus::InstalledAddSource`]: the installed mod (by GUID)
+    /// that importing this item only adds Nexus info to.
+    #[serde(skip)]
+    pub link_to: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -585,6 +594,7 @@ fn inspect(id: usize, candidate: &Candidate) -> ScanItem {
         local_guid: false,
         manifest_override: None,
         description: None,
+        link_to: None,
     };
 
     let result = match candidate.kind {
@@ -694,10 +704,12 @@ struct InstalledNexus {
 pub struct InstalledIndex {
     guids: HashMap<Uuid, String>,
     nexus: Vec<InstalledNexus>,
-    fingerprints: Vec<(ArchiveFingerprint, String)>,
+    fingerprints: Vec<(ArchiveFingerprint, String, Uuid)>,
     /// Lower-cased archive file names DDMM installed from, and mod folder
     /// names (a plain Add File names the folder after the archive).
-    file_names: HashMap<String, String>,
+    file_names: HashMap<String, (String, Uuid)>,
+    /// Installed mods that already have a Nexus Mods source.
+    has_nexus: HashSet<Uuid>,
 }
 
 impl InstalledIndex {
@@ -705,22 +717,26 @@ impl InstalledIndex {
         let mut index = InstalledIndex::default();
         for m in mods {
             let name = m.name().to_string();
-            index.guids.insert(m.guid(), name.clone());
+            let guid = m.guid();
+            index.guids.insert(guid, name.clone());
+            if m.sources.iter().any(|s| s.provider.eq_ignore_ascii_case("nexus")) {
+                index.has_nexus.insert(guid);
+            }
             if let Some(dir) = m.directory.file_name() {
-                index.file_names.insert(dir.to_string_lossy().to_lowercase(), name.clone());
+                index.file_names.insert(dir.to_string_lossy().to_lowercase(), (name.clone(), guid));
             }
             let sidecar = sources::load_origin_sidecar(&m.directory).await;
             let files = sidecar.as_ref().map(|s| s.installed_files.clone()).unwrap_or_default();
             for f in &files {
                 if let Some(fname) = &f.file_name {
-                    index.file_names.insert(fname.to_lowercase(), name.clone());
+                    index.file_names.insert(fname.to_lowercase(), (name.clone(), guid));
                 }
             }
             if let Some(fp) = sidecar.as_ref().and_then(|s| s.imported_archive.clone()) {
                 if let Some(fname) = &fp.file_name {
-                    index.file_names.insert(fname.to_lowercase(), name.clone());
+                    index.file_names.insert(fname.to_lowercase(), (name.clone(), guid));
                 }
-                index.fingerprints.push((fp, name.clone()));
+                index.fingerprints.push((fp, name.clone(), guid));
             }
             let nexus_file = files.iter().find(|f| f.provider.eq_ignore_ascii_case("nexus"));
             let sidecar_versions: HashMap<String, Option<String>> = sidecar
@@ -750,7 +766,7 @@ impl InstalledIndex {
     }
 
     fn installed_sizes(&self) -> HashSet<u64> {
-        self.fingerprints.iter().map(|(f, _)| f.size).collect()
+        self.fingerprints.iter().map(|(f, ..)| f.size).collect()
     }
 }
 
@@ -795,8 +811,20 @@ pub fn resolve_statuses(items: &mut [ScanItem], installed: &InstalledIndex) {
         if item.status != ItemStatus::New {
             continue;
         }
-        if let Some(status) = installed_status(item, installed) {
+        if let Some((status, link_to)) = installed_status(item, installed) {
             item.status = status;
+            item.link_to = link_to;
+        }
+    }
+    // One link per installed mod: the first item wins, the rest are just
+    // "already in DDMM".
+    let mut linking: HashSet<Uuid> = HashSet::new();
+    for item in items.iter_mut() {
+        if let (ItemStatus::InstalledAddSource { name }, Some(target)) = (&item.status, item.link_to) {
+            if !linking.insert(target) {
+                item.status = ItemStatus::Installed { name: name.clone() };
+                item.link_to = None;
+            }
         }
     }
 
@@ -864,20 +892,33 @@ fn looks_like_a_copy(path: &Path) -> bool {
     re.is_match(&stem)
 }
 
-fn installed_status(item: &ScanItem, installed: &InstalledIndex) -> Option<ItemStatus> {
+/// The status of an item that is already in DDMM as `name` (`guid`): plain
+/// "installed", or -- when that mod has no Nexus link and this item knows
+/// its Nexus page -- "will add Nexus info", with the mod to link.
+fn already_installed(item: &ScanItem, installed: &InstalledIndex, name: &str, guid: Uuid) -> (ItemStatus, Option<Uuid>) {
+    if item.nexus.is_some() && !installed.has_nexus.contains(&guid) {
+        (ItemStatus::InstalledAddSource { name: name.to_string() }, Some(guid))
+    } else {
+        (ItemStatus::Installed { name: name.to_string() }, None)
+    }
+}
+
+fn installed_status(item: &ScanItem, installed: &InstalledIndex) -> Option<(ItemStatus, Option<Uuid>)> {
     // Same manifest GUID. A manager-generated (`LOCAL...`) GUID only counts
     // for a folder, which carries its manifest (and so its GUID) along.
     if let Some(guid) = item.guid {
         if !item.local_guid || item.kind == ItemKind::Folder {
             if let Some(name) = installed.guids.get(&guid) {
-                return Some(ItemStatus::Installed { name: name.clone() });
+                return Some(already_installed(item, installed, name, guid));
             }
         }
     }
     // The very same archive.
     if let Some(sha) = &item.sha256 {
-        if let Some((_, name)) = installed.fingerprints.iter().find(|(f, _)| f.size == item.file_size && &f.sha256 == sha) {
-            return Some(ItemStatus::Installed { name: name.clone() });
+        if let Some((_, name, guid)) =
+            installed.fingerprints.iter().find(|(f, ..)| f.size == item.file_size && &f.sha256 == sha)
+        {
+            return Some(already_installed(item, installed, name, *guid));
         }
     }
     // Installed from a file of the same name before (or, for a folder, a
@@ -888,8 +929,8 @@ fn installed_status(item: &ScanItem, installed: &InstalledIndex) -> Option<ItemS
         ItemKind::Archive => installed.file_names.get(&file_name).or_else(|| installed.file_names.get(&stem)),
         ItemKind::Folder => installed.file_names.get(&file_name),
     };
-    if let Some(name) = by_name {
-        return Some(ItemStatus::Installed { name: name.clone() });
+    if let Some((name, guid)) = by_name {
+        return Some(already_installed(item, installed, name, *guid));
     }
     // Same Nexus mod.
     if let Some(nexus) = &item.nexus {
@@ -902,14 +943,14 @@ fn installed_status(item: &ScanItem, installed: &InstalledIndex) -> Option<ItemS
                     || matches!((&i.version, &nexus.version), (Some(a), Some(b)) if versions_equal(a, b))
             });
             if let Some(i) = same_file {
-                return Some(ItemStatus::Installed { name: i.name.clone() });
+                return Some((ItemStatus::Installed { name: i.name.clone() }, None));
             }
             // A Nexus page can hold several different files (a main file
             // and optional variants): only call it "another version" when
             // the names match up too.
             let shape = crate::providers::file_shape(&item.name);
             if let Some(i) = same_mod.iter().find(|i| crate::providers::file_shape(&i.name) == shape) {
-                return Some(ItemStatus::InstalledOtherVersion { name: i.name.clone() });
+                return Some((ItemStatus::InstalledOtherVersion { name: i.name.clone() }, None));
             }
         }
     }
@@ -1079,6 +1120,9 @@ pub struct ImportProblem {
 #[serde(rename_all = "PascalCase")]
 pub struct ImportReport {
     pub imported: Vec<ImportedMod>,
+    /// Mods that were already in DDMM and only got Nexus info added (files,
+    /// options, order and on/off state untouched).
+    pub linked: Vec<ImportProblem>,
     pub failed: Vec<ImportProblem>,
     /// Chosen, but not started because the import was cancelled.
     pub not_started: usize,
@@ -1204,7 +1248,7 @@ pub async fn run_import(
     let mods_root = state.base_path.join(MODS_DIRECTORY);
     let _ = tokio::fs::create_dir_all(&mods_root).await;
     let total = items.len();
-    let bytes_total: u64 = items.iter().map(|i| i.size).sum();
+    let bytes_total: u64 = items.iter().filter(|i| i.link_to.is_none()).map(|i| i.size).sum();
     let mut bytes_done = 0u64;
     let mut report = ImportReport::default();
     let mut taken: HashSet<String> = HashSet::new();
@@ -1216,6 +1260,17 @@ pub async fn run_import(
             break;
         }
         progress(ImportProgress { done: index, total, bytes_done, bytes_total, current: Some(item.name.clone()) });
+
+        if let Some(target) = item.link_to {
+            match link_existing(state, item, target).await {
+                Ok(name) => report.linked.push(ImportProblem { id: item.id, name, reason: String::new() }),
+                Err(e) => {
+                    log::warn!("Adding Nexus info from {:?} failed: {e:#}", item.path);
+                    report.failed.push(ImportProblem { id: item.id, name: item.name.clone(), reason: format!("{e:#}") });
+                }
+            }
+            continue;
+        }
 
         match import_one(state, &mods_root, item, &mut taken).await {
             Ok((installed, warning)) => {
@@ -1250,7 +1305,7 @@ pub async fn run_import(
         bytes_done = bytes_done.saturating_add(item.size);
     }
     progress(ImportProgress {
-        done: report.imported.len() + report.failed.len(),
+        done: report.imported.len() + report.linked.len() + report.failed.len(),
         total,
         bytes_done,
         bytes_total,
@@ -1347,6 +1402,53 @@ fn fit_options(hint: &ProfileHint, sub_counts: &[usize]) -> (Vec<bool>, Vec<usiz
         .filter(|s| s.len() == n && s.iter().zip(sub_counts).all(|(&i, &count)| i < count.max(1)))
         .unwrap_or_else(|| vec![0; n]);
     (toggled, selected)
+}
+
+/// Add the item's Nexus Mods source and file to an installed mod that has
+/// none, by rewriting only its `.hd2mm-origin.json`: nothing is copied, and
+/// its files, manifest, options, load order and on/off state stay as they
+/// are. Returns the installed mod's name.
+async fn link_existing(state: &AppState, item: &ScanItem, target: Uuid) -> anyhow::Result<String> {
+    let nexus = item.nexus.as_ref().ok_or_else(|| anyhow::anyhow!("no Nexus Mods info to add"))?;
+    let mut guard = state.mods.lock().await;
+    let mods = guard.as_mut().ok_or_else(|| anyhow::anyhow!("mods not read"))?;
+    let installed = mods
+        .iter_mut()
+        .find(|m| m.guid() == target)
+        .ok_or_else(|| anyhow::anyhow!("the installed copy isn't in DDMM any more"))?;
+    let name = installed.name().to_string();
+    if installed.sources.iter().any(|s| s.provider.eq_ignore_ascii_case("nexus")) {
+        // Linked in the meantime (e.g. a browser update): leave it alone.
+        return Ok(name);
+    }
+    let mut sidecar = sources::load_origin_sidecar(&installed.directory).await.unwrap_or(OriginSidecar {
+        sources: Vec::new(),
+        installed_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+        installed_files: Vec::new(),
+        skipped_versions: Vec::new(),
+        imported_archive: None,
+    });
+    sidecar.sources.retain(|s| !s.provider.eq_ignore_ascii_case("nexus"));
+    sidecar.sources.push(Source {
+        provider: "nexus".into(),
+        id: Some(nexus.mod_id.clone()),
+        url: None,
+        version: nexus.version.clone(),
+    });
+    sidecar.installed_files.retain(|f| !f.provider.eq_ignore_ascii_case("nexus"));
+    if nexus.file_id.is_some() || nexus.file_name.is_some() || nexus.uploaded_at.is_some() {
+        sidecar.installed_files.push(InstalledFile {
+            provider: "nexus".into(),
+            file_id: nexus.file_id.clone(),
+            file_name: nexus.file_name.clone(),
+            label: None,
+            uploaded_at: nexus.uploaded_at,
+        });
+    }
+    sources::save_origin_sidecar(&installed.directory, &sidecar).await?;
+    installed.resolve_sources().await;
+    log::info!("Import: added Nexus Mods #{} to \"{name}\" (already in DDMM).", nexus.mod_id);
+    Ok(name)
 }
 
 async fn remove_imported(state: &AppState, installed: &Mod) {

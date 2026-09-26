@@ -54,6 +54,7 @@ Nexus Mods id and version (when known), and a status:
 |---|---|---|
 | **New** | Not in DDMM yet | Yes |
 | **Already in DDMM as "…"** | The same mod is installed (same ID, same archive, same file name, or same Nexus file) | No |
+| **Already in DDMM: will add Nexus info** | You already added this mod yourself (for example with Add), but DDMM doesn't know its Nexus page yet; the import knows it | Yes |
 | **Another version is in DDMM** | Same Nexus mod and file, different version | No |
 | **Same as "…"** | An identical copy of another item in the list, e.g. `Mod (1).zip` next to `Mod.zip` | Can't be ticked |
 | **Older download of "…"** | You downloaded the same Nexus file more than once; only the newest is ticked | No |
@@ -82,6 +83,15 @@ copied.
   the end lists each one with the reason. You never get a separate error popup for every mod.
 - **While an import runs**, other changes to DDMM's data wait, and moving the data folder is refused. If you
   try to close DDMM with the Import window open, it asks first.
+
+## Mods you already added by hand
+
+Added a pile of archives with **Add** before you found Import? Run Import on the same folder anyway. Mods that
+are already in DDMM aren't copied again. When DDMM has no Nexus Mods link for one of them and the import source
+has one (from the Nexus download's file name, or the other mod manager's records), it's listed as **Already in
+DDMM: will add Nexus info**, and it's ticked. Importing it only records the Nexus page, version and file, so
+[update checks](updating-mods.md) cover it. Its files, options, place in the load order and on/off state stay
+exactly as they are.
 
 ## Adding many files at once
 

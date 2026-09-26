@@ -1,8 +1,8 @@
 //! Other mod managers' own records (read-only): what they know about each
 //! mod beyond its files -- its name, Nexus id, on/off state, load order and
-//! chosen options. Formats and sources are in
-//! `docs/development/importing-from-other-managers.md`; every parser here is
-//! tolerant (unknown or missing fields are skipped, never an error), since
+//! chosen options. Formats and where they were documented from are in
+//! `mod_import/FORMATS.md` (file-format knowledge only; no other tool's
+//! code is used here). Every parser here is tolerant (unknown or missing fields are skipped, never an error), since
 //! none of these formats is a published contract.
 
 use std::{
@@ -250,7 +250,7 @@ pub fn arsenal_manifest(m: &ArsenalMod) -> Option<Manifest> {
 }
 
 // ---------------------------------------------------------------------------
-// Helldivers 2 Mod Manager (teutinsa) and its descendants.
+// The older HD2 mod manager (1.x / 2024 original / 2.0 rewrite).
 // ---------------------------------------------------------------------------
 
 /// Per-mod state keyed by manifest GUID, with the profile's name if known.

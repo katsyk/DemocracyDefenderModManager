@@ -160,7 +160,7 @@ pub async fn run_import(app: AppHandle, state: State<'_, AppState>, ids: Vec<usi
         return Ok(ImportReport::default());
     }
 
-    let needed: u64 = items.iter().map(|i| i.size).sum();
+    let needed: u64 = items.iter().filter(|i| i.link_to.is_none()).map(|i| i.size).sum();
     mod_import::check_free_space(needed, crate::data_move::available_space(&state.base_path.join(MODS_DIRECTORY)))
         .into_ta_result()?;
 
@@ -180,8 +180,9 @@ pub async fn run_import(app: AppHandle, state: State<'_, AppState>, ids: Vec<usi
     })
     .await;
     log::info!(
-        "Import finished: {} imported, {} failed{}",
+        "Import finished: {} imported, {} linked, {} failed{}",
         report.imported.len(),
+        report.linked.len(),
         report.failed.len(),
         if report.cancelled { ", cancelled" } else { "" }
     );

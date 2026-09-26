@@ -18,7 +18,7 @@ export type ImportStep = "source" | "scanning" | "preview" | "importing" | "done
 /** Statuses that are ticked by default / can't be ticked at all (mirrors
  * `ItemStatus::selected_by_default` / `blocked` on the Rust side). */
 export function selectedByDefault(item: ImportItem): boolean {
-    return item.Status.Kind === "New";
+    return item.Status.Kind === "New" || item.Status.Kind === "InstalledAddSource";
 }
 
 export function blocked(item: ImportItem): boolean {
@@ -55,8 +55,11 @@ export class ImportWizard {
         return this.scan?.Items.filter(i => this.selected.has(i.Id)) ?? [];
     }
 
+    /** Space needed: items that only get Nexus info added copy nothing. */
     get selectedBytes(): number {
-        return this.selectedItems.reduce((sum, i) => sum + i.Size, 0);
+        return this.selectedItems
+            .filter(i => i.Status.Kind !== "InstalledAddSource")
+            .reduce((sum, i) => sum + i.Size, 0);
     }
 
     async detect() {

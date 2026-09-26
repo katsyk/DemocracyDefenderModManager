@@ -45,6 +45,7 @@
         switch (s.Kind) {
             case "New": return t("popup.import.status.new");
             case "Installed": return t("popup.import.status.installed", { name: s.Name });
+            case "InstalledAddSource": return t("popup.import.status.installed_add_source", { name: s.Name });
             case "InstalledOtherVersion": return t("popup.import.status.installed_other_version", { name: s.Name });
             case "Duplicate": return t("popup.import.status.duplicate", { name: s.Of });
             case "OlderVersion": return t("popup.import.status.older_version", { name: s.Of });
@@ -56,6 +57,7 @@
     function statusClass(item: ImportItem): string {
         switch (item.Status.Kind) {
             case "New": return "text-green-400";
+            case "InstalledAddSource": return "text-sky-300";
             case "Unreadable": return "text-red-400";
             default: return "text-zinc-400";
         }
@@ -80,7 +82,7 @@
 
     /** New first, then what needs a look, then what's already here or
      * can't be imported; by name within each group. */
-    const STATUS_ORDER = ["New", "InstalledOtherVersion", "OlderVersion", "NotAMod", "Installed", "Duplicate", "Unreadable"];
+    const STATUS_ORDER = ["New", "InstalledAddSource", "InstalledOtherVersion", "OlderVersion", "NotAMod", "Installed", "Duplicate", "Unreadable"];
     let items = $derived(
         [...(w.scan?.Items ?? [])].sort((a, b) =>
             STATUS_ORDER.indexOf(a.Status.Kind) - STATUS_ORDER.indexOf(b.Status.Kind) || a.Name.localeCompare(b.Name, undefined, { numeric: true }))
@@ -92,8 +94,9 @@
     );
     let counts = $derived({
         new: items.filter(i => i.Status.Kind === "New").length,
-        installed: items.filter(i => i.Status.Kind === "Installed" || i.Status.Kind === "InstalledOtherVersion").length,
-        other: items.filter(i => !["New", "Installed", "InstalledOtherVersion"].includes(i.Status.Kind)).length,
+        installed: items.filter(i => ["Installed", "InstalledOtherVersion", "InstalledAddSource"].includes(i.Status.Kind)).length,
+        linkable: items.filter(i => i.Status.Kind === "InstalledAddSource").length,
+        other: items.filter(i => !["New", "Installed", "InstalledOtherVersion", "InstalledAddSource"].includes(i.Status.Kind)).length,
     });
     let selectedCount = $derived(w.selected.size);
     let tooBig = $derived(w.scan?.FreeBytes != null && w.selectedBytes + 256 * 1024 * 1024 > w.scan.FreeBytes);
@@ -161,6 +164,13 @@
                 <p class="text-sm" data-testid="import-summary">
                     {t("popup.import.summary", { total: items.length, new: counts.new, installed: counts.installed, other: counts.other })}
                 </p>
+                {#if counts.linkable > 0}
+                    <p class="text-xs text-sky-300" data-testid="import-linkable">
+                        {counts.linkable === 1
+                            ? t("popup.import.linkable_one")
+                            : t("popup.import.linkable", { count: counts.linkable })}
+                    </p>
+                {/if}
                 {#if w.scan.Truncated}
                     <p class="text-xs text-yellow-300">{t("popup.import.truncated")}</p>
                 {/if}
@@ -253,6 +263,11 @@
                 {w.report.Imported.length === 1
                     ? t("popup.import.done_imported_one")
                     : t("popup.import.done_imported", { count: w.report.Imported.length })}
+                {#if w.report.Linked.length > 0}
+                    {w.report.Linked.length === 1
+                        ? t("popup.import.done_linked_one")
+                        : t("popup.import.done_linked", { count: w.report.Linked.length })}
+                {/if}
                 {#if w.report.Failed.length > 0}
                     {w.report.Failed.length === 1
                         ? t("popup.import.done_failed_one")
