@@ -16,7 +16,7 @@ by step, what you were doing right before the problem happened.
 
 ## Helpful details to attach
 
-- Your DDMM version (shown in the app; matches the `2.0.0-rc.7`-style tag on the release you downloaded).
+- Your DDMM version (shown in the app; matches the `2.0.0-rc.8`-style tag on the release you downloaded).
 - Your OS (Windows/Linux, and distribution if Linux).
 - The [log file](logs.md) from the run where it happened — **Data Folder → Open Folder** in Settings, then
   `logs/`, gets you there.
