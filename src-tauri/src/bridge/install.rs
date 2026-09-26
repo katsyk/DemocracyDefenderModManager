@@ -164,6 +164,9 @@ pub async fn install_file_with(
             .map_err(|_| InstallError::new(ErrorCode::FileNotFound, "could not read file"))?;
         let what = match crate::archive::sniff(&header) {
             crate::archive::Sniffed::Archive(_) => None,
+            // Zero padding in front of a zip: only the start was checked,
+            // so let the install (the zip reader) decide.
+            crate::archive::Sniffed::Zeros => None,
             crate::archive::Sniffed::NotArchive(what) => Some(what),
             crate::archive::Sniffed::Empty => Some("an empty file (the download didn't finish)"),
             crate::archive::Sniffed::Unknown => Some("not a file DDMM recognizes"),

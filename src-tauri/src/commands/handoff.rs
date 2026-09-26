@@ -23,6 +23,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 use crate::{
+    install_error::{InstallError, InstallStep},
     commands::{
         mods::{install_from_archive, install_update_from_archive},
         settings::do_load_settings,
@@ -39,29 +40,54 @@ const HANDOFF_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 pub(crate) const IGNORED_SUFFIXES: [&str; 5] = [".crdownload", ".part", ".tmp", ".download", ".partial"];
 pub(crate) const ARCHIVE_SUFFIXES: [&str; 3] = [".zip", ".7z", ".rar"];
 
-/// Whether a browser is still writing `path`: it is empty (Firefox
-/// reserves the final name with an empty file as soon as a download
-/// starts, and writes into `<name>.part` next to it until it's done), or a
-/// "still downloading" file for it sits next to it (`<name>.part`,
-/// `<name>.crdownload`, ...). Such a file must never be picked up: DDMM
-/// would try to install an empty or half-written archive and fail.
+/// How long a `<name>.part` / `.crdownload` / ... next to a download may
+/// go unchanged and still count as "being written". Older than this it is
+/// a leftover (a paused, crashed or abandoned download) and is ignored.
+pub(crate) const PARTIAL_STALE_AFTER: Duration = Duration::from_secs(60);
+
+/// Whether a browser is still writing `path`: a "still downloading" file
+/// for it (`<name>.part`, `<name>.crdownload`, ...) sits next to it and
+/// was written to within [`PARTIAL_STALE_AFTER`]. Firefox reserves the
+/// final name with an empty file as soon as a download starts and writes
+/// into `<name>.part` until it's done, so the empty file alone means
+/// nothing; picking it up would try to install an empty archive.
+///
+/// A file with no active partial next to it is final, even if it is
+/// empty (a download that really is 0 bytes): the install then says so.
 pub(crate) async fn download_in_progress(path: &Path) -> bool {
-    let empty = match tokio::fs::metadata(path).await {
-        Ok(m) => m.len() == 0,
-        Err(_) => return true,
-    };
-    if empty {
-        return true;
-    }
-    let Some(name) = path.file_name() else { return false };
+    active_partial(path, PARTIAL_STALE_AFTER).await.is_some()
+}
+
+/// The actively written partial-download file next to `path`, if any.
+async fn active_partial(path: &Path, stale_after: Duration) -> Option<PathBuf> {
+    let name = path.file_name()?;
     for suffix in IGNORED_SUFFIXES {
         let mut sibling = name.to_os_string();
         sibling.push(suffix);
-        if tokio::fs::symlink_metadata(path.with_file_name(sibling)).await.is_ok() {
-            return true;
+        let sibling = path.with_file_name(sibling);
+        let Ok(meta) = tokio::fs::symlink_metadata(&sibling).await else { continue };
+        let fresh = match meta.modified().ok().map(|m| SystemTime::now().duration_since(m)) {
+            // Modified in the future (clock skew) counts as fresh.
+            Some(Ok(age)) => age <= stale_after,
+            Some(Err(_)) => true,
+            None => true,
+        };
+        if fresh {
+            return Some(sibling);
         }
     }
-    false
+    None
+}
+
+/// Limits for [`wait_until_stable`] (tests use short ones).
+#[derive(Debug, Clone, Copy)]
+struct WaitLimits {
+    deadline: SystemTime,
+    stale_after: Duration,
+}
+
+fn file_label(path: &Path) -> String {
+    crate::install_error::subject_of(path)
 }
 
 /// The single `handoff` event the frontend listens for; `status` picks
@@ -208,6 +234,7 @@ pub async fn start_handoff(
     tokio::spawn(run_handoff(
         app,
         downloads_dir,
+        crate::download::redact_url(&page_url),
         source,
         existing_guid,
         cancel,
@@ -256,11 +283,12 @@ pub async fn install_handoff_file(
 async fn run_handoff(
     app: AppHandle,
     downloads_dir: PathBuf,
+    subject: String,
     source: Source,
     existing_guid: Option<Uuid>,
     cancel: Arc<AtomicBool>,
 ) {
-    let outcome = wait_for_download(&app, &downloads_dir, &cancel).await;
+    let outcome = wait_for_download(&app, &downloads_dir, &subject, &cancel).await;
 
     match outcome {
         Ok(WaitOutcome::Found(path)) => {
@@ -314,15 +342,18 @@ async fn run_handoff(
                 message: None,
             },
         ),
-        Err(e) => emit(
-            &app,
-            HandoffEvent {
-                status: HandoffStatus::Error,
-                r#mod: None,
-                warning: None,
-                message: Some(e.to_string()),
-            },
-        ),
+        Err(e) => {
+            log::error!("{e}");
+            emit(
+                &app,
+                HandoffEvent {
+                    status: HandoffStatus::Error,
+                    r#mod: None,
+                    warning: None,
+                    message: Some(e.to_string()),
+                },
+            )
+        }
     }
 
     let state = app.state::<AppState>();
@@ -401,10 +432,13 @@ enum WaitOutcome {
 async fn wait_for_download(
     app: &AppHandle,
     downloads_dir: &Path,
+    subject: &str,
     cancel: &AtomicBool,
-) -> anyhow::Result<WaitOutcome> {
+) -> Result<WaitOutcome, InstallError> {
     let start = SystemTime::now();
-    let existing_before = snapshot_names(downloads_dir).await?;
+    let existing_before = snapshot_names(downloads_dir)
+        .await
+        .map_err(|e| downloads_folder_error(subject, downloads_dir, e))?;
     let deadline = start + HANDOFF_TIMEOUT;
 
     emit(
@@ -431,8 +465,12 @@ async fn wait_for_download(
             return Ok(WaitOutcome::Cancelled);
         }
 
-        if let Some(candidate) = find_new_archive(downloads_dir, &existing_before, start).await? {
-            match wait_until_stable(&candidate, cancel).await? {
+        let found = find_new_archive(downloads_dir, &existing_before, start)
+            .await
+            .map_err(|e| downloads_folder_error(subject, downloads_dir, e))?;
+        if let Some(candidate) = found {
+            let limits = WaitLimits { deadline, stale_after: PARTIAL_STALE_AFTER };
+            match wait_until_stable(&candidate, cancel, limits).await? {
                 Some(path) => return Ok(WaitOutcome::Found(path)),
                 None => return Ok(WaitOutcome::Cancelled),
             }
@@ -440,7 +478,7 @@ async fn wait_for_download(
     }
 }
 
-async fn snapshot_names(dir: &Path) -> anyhow::Result<HashSet<String>> {
+async fn snapshot_names(dir: &Path) -> std::io::Result<HashSet<String>> {
     let mut names = HashSet::new();
     let mut entries = tokio::fs::read_dir(dir).await?;
     while let Some(entry) = entries.next_entry().await? {
@@ -459,7 +497,7 @@ async fn find_new_archive(
     dir: &Path,
     existing_before: &HashSet<String>,
     start: SystemTime,
-) -> anyhow::Result<Option<PathBuf>> {
+) -> std::io::Result<Option<PathBuf>> {
     let mut entries = tokio::fs::read_dir(dir).await?;
     while let Some(entry) = entries.next_entry().await? {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
@@ -499,9 +537,13 @@ async fn find_new_archive(
 }
 
 /// Poll a candidate file's size until it hasn't changed for
-/// [`STABLE_POLLS_REQUIRED`] consecutive checks (i.e. the browser has
-/// finished writing it). Returns `Ok(None)` if cancelled mid-wait.
-async fn wait_until_stable(path: &Path, cancel: &AtomicBool) -> anyhow::Result<Option<PathBuf>> {
+/// [`STABLE_POLLS_REQUIRED`] consecutive checks and no partial-download
+/// file next to it is still being written (i.e. the browser has finished
+/// it). Returns `Ok(None)` if cancelled mid-wait, and an [`InstallError`]
+/// saying what was still going on if `limits.deadline` passes first, or if
+/// the file disappears or turns out to be a symlink.
+async fn wait_until_stable(path: &Path, cancel: &AtomicBool, limits: WaitLimits) -> Result<Option<PathBuf>, InstallError> {
+    let subject = file_label(path);
     let mut last_size: Option<u64> = None;
     let mut stable_count = 0u32;
 
@@ -510,26 +552,40 @@ async fn wait_until_stable(path: &Path, cancel: &AtomicBool) -> anyhow::Result<O
             return Ok(None);
         }
 
-        let meta = tokio::fs::symlink_metadata(path).await?;
+        let meta = match tokio::fs::symlink_metadata(path).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(vanished(&subject)),
+            Err(e) => {
+                return Err(InstallError::new(
+                    subject,
+                    InstallStep::Download,
+                    crate::archive::io_error(e, "checking the downloaded file failed"),
+                ))
+            }
+        };
         if meta.file_type().is_symlink() {
-            anyhow::bail!("refusing to install a symlink");
+            return Err(InstallError::new(
+                subject,
+                InstallStep::Download,
+                anyhow::anyhow!("the file in the Downloads folder is a symbolic link, and DDMM never installs through one"),
+            )
+            .with_hint("Download the mod again so the real file lands in the Downloads folder, or add the file it points to with Add."));
         }
         if !meta.is_file() {
-            // Disappeared or changed type mid-download; give up on this candidate.
-            return Ok(None);
+            return Err(vanished(&subject));
         }
         let size = meta.len();
+        let partial = active_partial(path, limits.stale_after).await;
 
-        // An empty placeholder, or a file whose `.part` is still being
-        // written: not finished, however long its size stays the same.
-        if download_in_progress(path).await {
-            stable_count = 0;
-            last_size = None;
-            tokio::time::sleep(POLL_INTERVAL).await;
-            continue;
+        if SystemTime::now() >= limits.deadline {
+            return Err(still_unfinished(&subject, size, partial.as_deref()));
         }
 
-        if Some(size) == last_size {
+        if partial.is_some() {
+            // Not finished, however long its size stays the same.
+            stable_count = 0;
+            last_size = None;
+        } else if Some(size) == last_size {
             stable_count += 1;
             if stable_count >= STABLE_POLLS_REQUIRED {
                 return Ok(Some(path.to_path_buf()));
@@ -541,6 +597,52 @@ async fn wait_until_stable(path: &Path, cancel: &AtomicBool) -> anyhow::Result<O
 
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+const HINT_CHOOSE_FILE: &str = "Once the browser has finished the download, use \"I already downloaded it -- choose \
+     file\", or add the file with Add.";
+
+fn vanished(subject: &str) -> InstallError {
+    InstallError::new(
+        subject,
+        InstallStep::Download,
+        anyhow::anyhow!(
+            "the file disappeared from the Downloads folder before it was finished (it was moved, renamed or \
+             deleted, or the browser cancelled the download)"
+        ),
+    )
+    .with_hint(HINT_CHOOSE_FILE)
+}
+
+/// The deadline passed while `subject` was still not a finished download.
+fn still_unfinished(subject: &str, size: u64, partial: Option<&Path>) -> InstallError {
+    let minutes = HANDOFF_TIMEOUT.as_secs() / 60;
+    let cause = match partial {
+        Some(partial) if size == 0 => anyhow::anyhow!(
+            "the download was still in progress after {minutes} minutes: the file is still empty and the browser \
+             is still writing \"{}\"",
+            file_label(partial)
+        ),
+        Some(partial) => anyhow::anyhow!(
+            "the download was still in progress after {minutes} minutes: the browser is still writing \"{}\"",
+            file_label(partial)
+        ),
+        None if size == 0 => anyhow::anyhow!("the file was still empty (0 bytes) after {minutes} minutes"),
+        None => anyhow::anyhow!(
+            "the file was still growing after {minutes} minutes ({size} bytes so far), so the download never finished"
+        ),
+    };
+    InstallError::new(subject, InstallStep::Download, cause).with_hint(HINT_CHOOSE_FILE)
+}
+
+/// A failure reading the Downloads folder itself.
+fn downloads_folder_error(subject: &str, dir: &Path, e: std::io::Error) -> InstallError {
+    InstallError::new(
+        subject,
+        InstallStep::Download,
+        crate::archive::io_error(e, &format!("reading the Downloads folder ({}) failed", dir.display())),
+    )
+    .with_hint("Check that the Downloads folder in Settings exists and DDMM can open it, then try again.")
 }
 
 #[cfg(test)]
@@ -567,10 +669,141 @@ mod tests {
         tokio::fs::remove_file(dir.path().join("koyuki launcher.zip.part")).await.unwrap();
         assert!(!download_in_progress(&path).await);
 
+        // Empty with nothing being written next to it: a finished 0-byte
+        // download, left for the install to report.
+        touch(&path, b"").await;
+        assert!(!download_in_progress(&path).await);
+
         let chrome = dir.path().join("yuuka hammer.rar");
         touch(&chrome, b"Rar!\x1a\x07\x01\x00").await;
         touch(&dir.path().join("yuuka hammer.rar.crdownload"), b"x").await;
         assert!(download_in_progress(&chrome).await);
+    }
+
+    fn long_limits() -> WaitLimits {
+        WaitLimits { deadline: SystemTime::now() + Duration::from_secs(600), stale_after: PARTIAL_STALE_AFTER }
+    }
+
+    fn short_limits(secs: u64) -> WaitLimits {
+        WaitLimits { deadline: SystemTime::now() + Duration::from_secs(secs), stale_after: Duration::from_secs(30) }
+    }
+
+    fn age(path: &Path, by: Duration) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(SystemTime::now() - by).unwrap();
+    }
+
+    /// A download that really is 0 bytes (Chrome, finished, nothing next to
+    /// it) is final: it is handed to the install, which says the file is
+    /// empty, instead of being waited on forever.
+    #[tokio::test]
+    async fn a_finished_empty_download_is_not_waited_on_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mod.zip");
+        touch(&path, b"").await;
+        let found = tokio::time::timeout(POLL_INTERVAL * 6, wait_until_stable(&path, &AtomicBool::new(false), short_limits(60)))
+            .await
+            .expect("must not hang")
+            .unwrap();
+        assert_eq!(found.as_deref(), Some(path.as_path()));
+    }
+
+    /// A stale `mod.zip.part` / `.crdownload` from an earlier download next
+    /// to a later, complete `mod.zip` doesn't block it.
+    #[tokio::test]
+    async fn a_stale_partial_next_to_a_complete_file_is_ignored() {
+        for suffix in [".part", ".crdownload"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("mod.zip");
+            let partial = dir.path().join(format!("mod.zip{suffix}"));
+            touch(&partial, b"old").await;
+            age(&partial, Duration::from_secs(120));
+            touch(&path, b"PK\x03\x04complete").await;
+            assert!(!download_in_progress(&path).await, "{suffix}");
+            let found = tokio::time::timeout(
+                POLL_INTERVAL * 6,
+                wait_until_stable(&path, &AtomicBool::new(false), short_limits(60)),
+            )
+            .await
+            .expect("must not hang")
+            .unwrap();
+            assert_eq!(found.as_deref(), Some(path.as_path()), "{suffix}");
+        }
+    }
+
+    /// A paused Firefox download: an empty placeholder next to a `.part`
+    /// that keeps being "fresh" (or a download that simply never ends)
+    /// stops at the deadline with a specific error, not a hang.
+    #[tokio::test]
+    async fn a_download_still_in_progress_stops_at_the_deadline_with_a_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("koyuki launcher.zip");
+        touch(&path, b"").await;
+        touch(&dir.path().join("koyuki launcher.zip.part"), b"PK\x03\x04half").await;
+        let err = tokio::time::timeout(
+            POLL_INTERVAL * 8,
+            wait_until_stable(&path, &AtomicBool::new(false), short_limits(2)),
+        )
+        .await
+        .expect("must stop at the deadline")
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Couldn't install \"koyuki launcher.zip\".\n\
+             Step: downloading it\n\
+             Cause: the download was still in progress after 15 minutes: the file is still empty and the browser \
+             is still writing \"koyuki launcher.zip.part\"\n\
+             Hint: Once the browser has finished the download, use \"I already downloaded it -- choose file\", or \
+             add the file with Add."
+        );
+    }
+
+    /// A paused download whose `.part` went stale: the placeholder is
+    /// taken as final (empty) and handed to the install, which reports it.
+    #[tokio::test]
+    async fn a_paused_download_with_a_stale_part_is_handed_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mod.zip");
+        let part = dir.path().join("mod.zip.part");
+        touch(&path, b"").await;
+        touch(&part, b"PK\x03\x04half").await;
+        age(&part, Duration::from_secs(120));
+        let found = tokio::time::timeout(POLL_INTERVAL * 6, wait_until_stable(&path, &AtomicBool::new(false), short_limits(60)))
+            .await
+            .expect("must not hang")
+            .unwrap();
+        assert_eq!(found.as_deref(), Some(path.as_path()));
+    }
+
+    #[tokio::test]
+    async fn a_file_that_vanishes_mid_wait_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = wait_until_stable(&dir.path().join("gone.zip"), &AtomicBool::new(false), short_limits(60))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.starts_with("Couldn't install \"gone.zip\".\nStep: downloading it\nCause: the file disappeared"), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_download_is_refused_in_the_same_format() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("real.zip"), b"PK\x03\x04").await;
+        let link = dir.path().join("link.zip");
+        tokio::fs::symlink(dir.path().join("real.zip"), &link).await.unwrap();
+        let msg = wait_until_stable(&link, &AtomicBool::new(false), short_limits(60)).await.unwrap_err().to_string();
+        assert!(msg.starts_with("Couldn't install \"link.zip\".\nStep: downloading it\nCause: the file in the Downloads folder is a symbolic link"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_downloads_folder_is_reported_in_the_same_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no such folder");
+        let e = snapshot_names(&missing).await.unwrap_err();
+        let msg = downloads_folder_error("https://example.com/mod", &missing, e).to_string();
+        assert!(msg.starts_with("Couldn't install \"https://example.com/mod\".\nStep: downloading it\nCause: reading the Downloads folder ("), "{msg}");
+        assert!(msg.ends_with("Hint: Check that the Downloads folder in Settings exists and DDMM can open it, then try again."), "{msg}");
     }
 
     /// The handoff used to take the empty placeholder as "finished" after
@@ -587,7 +820,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let waiter = {
             let (path, cancel) = (path.clone(), cancel.clone());
-            tokio::spawn(async move { wait_until_stable(&path, &cancel).await })
+            tokio::spawn(async move { wait_until_stable(&path, &cancel, long_limits()).await })
         };
 
         // Long past the old "two unchanged polls".
@@ -682,7 +915,7 @@ mod tests {
         touch(&path, b"data").await;
 
         let cancel = AtomicBool::new(true);
-        let result = wait_until_stable(&path, &cancel).await.unwrap();
+        let result = wait_until_stable(&path, &cancel, long_limits()).await.unwrap();
         assert!(result.is_none());
     }
 

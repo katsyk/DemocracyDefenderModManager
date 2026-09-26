@@ -182,8 +182,8 @@ async fn download_archive_into(
             anyhow::bail!("downloaded file is not a supported archive (zip/7z/rar): {host} sent an empty file")
         }
         // Possibly a zip with something in front of it; opening it will tell.
-        crate::archive::Sniffed::Unknown if filename.to_ascii_lowercase().ends_with(".zip") => {}
-        crate::archive::Sniffed::Unknown => {
+        crate::archive::Sniffed::Unknown | crate::archive::Sniffed::Zeros if filename.to_ascii_lowercase().ends_with(".zip") => {}
+        crate::archive::Sniffed::Unknown | crate::archive::Sniffed::Zeros => {
             anyhow::bail!("downloaded file is not a supported archive (zip/7z/rar)")
         }
     }

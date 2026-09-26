@@ -33,9 +33,10 @@ pub fn spawn(app: AppHandle) {
 }
 
 async fn run(app: AppHandle) {
-    // Files already reported (skipped on every later tick) and files seen
-    // but not yet confirmed stable (path -> last observed size).
-    let mut seen: HashSet<PathBuf> = HashSet::new();
+    // Files already evaluated (path -> size then; skipped on later ticks
+    // unless the size changes, e.g. a paused download that resumed) and
+    // files seen but not yet confirmed stable (path -> last observed size).
+    let mut seen: HashMap<PathBuf, u64> = HashMap::new();
     let mut pending: HashMap<PathBuf, u64> = HashMap::new();
     // `false` right after startup and right after resuming from a pause
     // (an active handoff) -- the next tick re-baselines instead of
@@ -107,7 +108,12 @@ async fn run(app: AppHandle) {
         };
 
         if !baseline_ready {
-            seen = candidates.into_iter().collect();
+            seen.clear();
+            for path in candidates {
+                if let Ok(meta) = tokio::fs::metadata(&path).await {
+                    seen.insert(path, meta.len());
+                }
+            }
             pending.clear();
             baseline_ready = true;
             continue;
@@ -117,42 +123,57 @@ async fn run(app: AppHandle) {
         // deleted, or already installed by something else).
         let current: HashSet<&PathBuf> = candidates.iter().collect();
         pending.retain(|p, _| current.contains(p));
+        seen.retain(|p, _| current.contains(p));
 
         for path in candidates {
-            if seen.contains(&path) {
-                continue;
-            }
-
             let Ok(size) = tokio::fs::metadata(&path).await.map(|m| m.len()) else {
                 continue;
             };
-            // Still being downloaded (an empty placeholder, or its `.part`
-            // is still there): not a candidate yet. Checked before it can
-            // count as "stable", so it is looked at again once the real
-            // file lands under this name.
-            if crate::commands::handoff::download_in_progress(&path).await {
-                pending.remove(&path);
-                continue;
-            }
+            // Still being downloaded: a `.part`/`.crdownload`/... next to
+            // it was written to recently (a stale leftover doesn't count).
+            let in_progress = crate::commands::handoff::download_in_progress(&path).await;
 
-            match pending.get(&path) {
-                // Same size as last tick: the download has finished.
-                Some(&last_size) if last_size == size => {
-                    pending.remove(&path);
-                    seen.insert(path.clone());
-
-                    if looks_like_hd2_mod_archive(path.clone()).await {
-                        let _ = app.emit(
-                            "auto-import://candidate",
-                            serde_json::json!({ "file": path.to_string_lossy() }),
-                        );
-                    }
-                }
-                // First sighting, or still growing: wait for the next tick.
-                _ => {
-                    pending.insert(path, size);
-                }
+            if tick(&path, size, in_progress, &mut seen, &mut pending)
+                && looks_like_hd2_mod_archive(path.clone()).await
+            {
+                let _ = app.emit(
+                    "auto-import://candidate",
+                    serde_json::json!({ "file": path.to_string_lossy() }),
+                );
             }
+        }
+    }
+}
+
+/// One poll's decision for one candidate file: `true` when it has just
+/// finished downloading and should be looked at now. A file is finished
+/// when nothing is still writing it and its size is the same as on the
+/// previous tick; it is then remembered with that size, and looked at again
+/// only if the size changes later (a paused download that resumed and
+/// finished under the same name).
+fn tick(
+    path: &Path,
+    size: u64,
+    in_progress: bool,
+    seen: &mut HashMap<PathBuf, u64>,
+    pending: &mut HashMap<PathBuf, u64>,
+) -> bool {
+    if seen.get(path) == Some(&size) {
+        return false;
+    }
+    if in_progress {
+        pending.remove(path);
+        return false;
+    }
+    match pending.get(path) {
+        Some(&last_size) if last_size == size => {
+            pending.remove(path);
+            seen.insert(path.to_path_buf(), size);
+            true
+        }
+        _ => {
+            pending.insert(path.to_path_buf(), size);
+            false
         }
     }
 }
@@ -230,6 +251,28 @@ async fn looks_like_hd2_mod_archive(path: PathBuf) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A paused (or slow) Firefox download: the empty placeholder is never
+    /// offered while its `.part` is being written; once it finishes, the
+    /// real file is, even though an earlier tick already looked at the name.
+    #[test]
+    fn tick_waits_for_downloads_and_rechecks_a_file_whose_size_changed() {
+        let (mut seen, mut pending) = (HashMap::new(), HashMap::new());
+        let path = Path::new("/dl/mod.zip");
+        for _ in 0..5 {
+            assert!(!tick(path, 0, true, &mut seen, &mut pending));
+        }
+        // The .part went stale (paused): the 0-byte file is final now.
+        assert!(!tick(path, 0, false, &mut seen, &mut pending));
+        assert!(tick(path, 0, false, &mut seen, &mut pending));
+        assert!(!tick(path, 0, false, &mut seen, &mut pending), "only once per size");
+        // Resumed and finished under the same name.
+        assert!(!tick(path, 0, true, &mut seen, &mut pending));
+        assert!(!tick(path, 4096, false, &mut seen, &mut pending));
+        assert!(tick(path, 4096, false, &mut seen, &mut pending));
+        assert!(!tick(path, 4096, false, &mut seen, &mut pending));
+    }
+
     use std::io::Write;
 
     fn make_zip(path: &Path, entries: &[(&str, &[u8])]) {

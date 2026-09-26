@@ -40,10 +40,13 @@ impl Format {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sniffed {
     Archive(Format),
-    /// No bytes at all, or only zero bytes: a download that hasn't been
-    /// written yet (browsers reserve the name with an empty file) or that
-    /// failed.
+    /// No bytes at all: a download that hasn't been written yet (browsers
+    /// reserve the name with an empty file) or that failed.
     Empty,
+    /// Every byte looked at is zero. Only the start of the file was seen,
+    /// so this alone says nothing about the rest: a zip may carry padding
+    /// in front (its reader works from the end of the file).
+    Zeros,
     /// Recognizably something else; the text says what, in plain words.
     NotArchive(&'static str),
     Unknown,
@@ -57,8 +60,11 @@ pub const SNIFF_LEN: usize = 512;
 /// what's inside (a RAR uploaded as `mod.zip`, or a login page saved as
 /// `mod.zip`, are both common).
 pub fn sniff(header: &[u8]) -> Sniffed {
-    if header.iter().all(|&b| b == 0) {
+    if header.is_empty() {
         return Sniffed::Empty;
+    }
+    if header.iter().all(|&b| b == 0) {
+        return Sniffed::Zeros;
     }
     // Local file header, empty archive, or a single-part "spanned" marker.
     if header.starts_with(b"PK\x03\x04") || header.starts_with(b"PK\x05\x06") || header.starts_with(b"PK\x07\x08") {
@@ -165,14 +171,33 @@ impl Archive {
             }
             Sniffed::Empty => {
                 return Err(ArchiveError::with_hint(
-                    if meta.len() == 0 {
-                        "the file is empty (0 bytes): the download didn't finish, or the browser hasn't written it yet".to_string()
-                    } else {
-                        format!(
-                            "the file contains only zero bytes ({} bytes): the download didn't finish or was damaged",
-                            meta.len()
-                        )
-                    },
+                    "the file is empty (0 bytes): the download didn't finish, or the browser hasn't written it yet",
+                    errors::HINT_REDOWNLOAD,
+                )
+                .into())
+            }
+            // The whole file was read, and every byte is zero.
+            Sniffed::Zeros if meta.len() <= header.len() as u64 => {
+                return Err(ArchiveError::with_hint(
+                    format!(
+                        "every byte of the file is zero (all {} bytes checked): the download didn't finish or was damaged",
+                        meta.len()
+                    ),
+                    errors::HINT_REDOWNLOAD,
+                )
+                .into())
+            }
+            // Only the start was checked: a zip may be padded in front, so
+            // the zip reader (which starts from the end) decides.
+            Sniffed::Zeros if matches!(by_extension, None | Some(Format::Zip)) => Format::Zip,
+            Sniffed::Zeros => {
+                let f = by_extension.map(Format::name).unwrap_or_default();
+                return Err(ArchiveError::with_hint(
+                    format!(
+                        "it's named .{f} but its first {} bytes are all zero where a {f} archive's signature should \
+                         be, so it is damaged or not a {f} archive",
+                        header.len()
+                    ),
                     errors::HINT_REDOWNLOAD,
                 )
                 .into())
@@ -891,7 +916,7 @@ mod tests {
         assert_eq!(sniff(b"Rar!\x1a\x07\x00"), Sniffed::Archive(Format::Rar));
         assert_eq!(sniff(b"Rar!\x1a\x07\x01\x00"), Sniffed::Archive(Format::Rar));
         assert_eq!(sniff(b""), Sniffed::Empty);
-        assert_eq!(sniff(&[0u8; 64]), Sniffed::Empty);
+        assert_eq!(sniff(&[0u8; 64]), Sniffed::Zeros);
         assert!(matches!(sniff(b"\xEF\xBB\xBF  <!DOCTYPE html><html>"), Sniffed::NotArchive(w) if w.contains("web page")));
         assert!(matches!(sniff(b"<html><head>"), Sniffed::NotArchive(w) if w.contains("web page")));
         assert!(matches!(sniff(b"MZ\x90\x00"), Sniffed::NotArchive(w) if w.contains("Windows program")));
@@ -1191,4 +1216,39 @@ mod tests {
         assert_eq!(hint, Some(errors::HINT_DISK_FULL));
     }
 
+
+    /// Only a file whose every byte was checked is called all-zero; a zip
+    /// with zero padding in front (longer than what `sniff` looks at)
+    /// still opens, since the zip reader works from the end of the file.
+    #[test]
+    fn zero_bytes_are_only_reported_when_the_whole_file_was_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let (msg, hint) = open_err(&write(tmp.path(), "small.zip", &[0u8; 300]));
+        assert_eq!(
+            msg,
+            "every byte of the file is zero (all 300 bytes checked): the download didn't finish or was damaged"
+        );
+        assert_eq!(hint, Some(errors::HINT_REDOWNLOAD));
+
+        let owned = plushie();
+        let mut padded = vec![0u8; 4096];
+        padded.extend(make_zip_bytes(&as_entries(&owned)));
+        let path = write(tmp.path(), "padded.zip", &padded);
+        let dest = fresh_dest(tmp.path(), "out");
+        Archive::open(&path).unwrap().extract_to(&dest).unwrap();
+        assert!(dest.join("manifest.json").is_file());
+
+        // Large and all zero: not claimed to be all zero (only the start
+        // was checked); the zip reader says what it found instead.
+        let (msg, _) = open_err(&write(tmp.path(), "zeros.zip", &vec![0u8; 100_000]));
+        assert!(msg.starts_with("the zip archive is incomplete or damaged"), "{msg}");
+
+        let (msg, _) = open_err(&write(tmp.path(), "zeros.7z", &vec![0u8; 100_000]));
+        assert_eq!(
+            msg,
+            "it's named .7z but its first 512 bytes are all zero where a 7z archive's signature should be, so it \
+             is damaged or not a 7z archive"
+        );
+    }
 }
