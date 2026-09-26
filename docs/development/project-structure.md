@@ -5,7 +5,7 @@ title: Project structure
 # Project structure
 
 ```text
-Helldivers2ModManager/       (repository root — the folder name is historical)
+DemocracyDefenderModManager/
 ├── src/                     SvelteKit frontend
 │   ├── routes/               pages: Mods (+page.svelte), Settings, Create, Help
 │   └── lib/

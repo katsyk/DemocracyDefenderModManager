@@ -9,7 +9,7 @@ title: For mod authors
 - [The Sources field](sources.md) — declaring where your mod can be found, per site, with examples
 - [Install button for your mod page](install-button.md) — a one-click `ddmm://install` link, no extension needed
 
-DDMM reads [Helldivers 2 Mod Manager](https://github.com/teutinsa/Helldivers2ModManager)'s original manifest
-formats unchanged, plus its own provider-neutral `Sources` field layered on top — a manifest written for the
-original manager works in DDMM without modification, and a `Sources`-aware manifest still works in managers that
-don't know about it.
+DDMM also reads the original HD2 mod manifest format (version-less `manifest.json`, described as **Legacy** in
+the [Manifest reference](manifest.md#legacy)) unchanged, plus its own provider-neutral `Sources` field layered on
+top — a manifest with no `Sources` field still works fine, and a `Sources`-aware manifest still works in managers
+that don't know about it.
