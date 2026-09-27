@@ -72,8 +72,14 @@ Every install goes through the same steps:
 3. If there's no `manifest.json`, DDMM generates a minimal one automatically: a random ID, the archive/folder name
    as the mod's name, an empty description — and, for this auto-generated manifest only, DDMM also scans the mod's
    files to fill in `Options` if needed; see [Archives without a manifest.json](#archives-without-a-manifestjson)
-   below.
-4. The mod is added to your Library, from where you can drag or insert it into a profile. If DDMM couldn't find
+   below. The name is cleaned up first: a Nexus Mods download such as `EAGLE-2-1065-V1-1-1752787902.zip` is named
+   **EAGLE-2** (the mod id, version and upload time are dropped), and a browser's duplicate-download counter such as
+   ` (1)` is removed. A name from a `manifest.json` is always used as it is.
+4. If the file (or folder) name is a Nexus Mods download name, DDMM also records the mod's Nexus page and version
+   from it, so **Check for updates** works for the mod. This is read from the name only; nothing is looked up
+   online. A mod installed from a link (Add from URL, the browser extension, one-click install) keeps the source of
+   that link instead.
+5. The mod is added to your Library, from where you can drag or insert it into a profile. If DDMM couldn't find
    any Helldivers 2 patch files anywhere in it, you'll see a non-fatal warning: "no Helldivers 2 patch files found
    in this archive" — the mod is still added, it just won't do anything when deployed.
 

@@ -473,20 +473,13 @@ pub fn parse_nexus_archive_name(file_name: &str) -> Option<NexusArchiveName> {
     static OLD: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static NEW: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let old = OLD.get_or_init(|| {
-        regex::Regex::new(
-            r"(?i)^(.+?)-(\d+)-([0-9a-z][0-9a-z-]*?)-(\d{9,11})(?: \(\d+\))?\.(?:zip|7z|rar)$",
-        )
-        .unwrap()
+        regex::Regex::new(r"(?i)^(.+)-(\d{9,11})(?: \(\d+\))?\.(?:zip|7z|rar)$").unwrap()
     });
-    if let Some(caps) = old.captures(file_name) {
-        let ts: i64 = caps.get(4)?.as_str().parse().ok()?;
-        return Some(NexusArchiveName {
-            mod_id: caps.get(2)?.as_str().to_string(),
-            version: caps.get(3)?.as_str().replace('-', "."),
-            uploaded_at: Some(ts),
-            upload_order: ts,
-            name: caps.get(1)?.as_str().to_string(),
-        });
+    if let Some(parsed) = old.captures(file_name).and_then(|caps| {
+        let ts: i64 = caps.get(2)?.as_str().parse().ok()?;
+        parse_old_nexus_body(caps.get(1)?.as_str(), ts)
+    }) {
+        return Some(parsed);
     }
     let new = NEW.get_or_init(|| {
         regex::Regex::new(
@@ -502,6 +495,41 @@ pub fn parse_nexus_archive_name(file_name: &str) -> Option<NexusArchiveName> {
         uploaded_at: None,
         upload_order: crate::providers::parse_iso_utc(&iso)?,
         name: caps.get(1)?.as_str().to_string(),
+    })
+}
+
+/// `<name>-<modId>-<version with dashes>` (the old scheme minus its
+/// upload time). Names and versions can both contain dashes and numbers
+/// (`EAGLE-2-1065-V1-1`: mod "EAGLE-2", id 1065, version V1.1), so every
+/// all-digit part is a candidate id. The longest one wins (leftmost on a
+/// tie): mod ids run to several digits, while numbers at the end of a
+/// mod's name ("-2") or the start of its version ("-1-0") are short.
+fn parse_old_nexus_body(body: &str, ts: i64) -> Option<NexusArchiveName> {
+    let parts: Vec<&str> = body.split('-').collect();
+    let is_version = |v: &str| {
+        v.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+            && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    let mut best: Option<usize> = None;
+    for i in 1..parts.len().saturating_sub(1) {
+        let id = parts[i];
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if parts[..i].join("-").is_empty() || !is_version(&parts[i + 1..].join("-")) {
+            continue;
+        }
+        if best.is_none_or(|b| id.len() > parts[b].len()) {
+            best = Some(i);
+        }
+    }
+    let i = best?;
+    Some(NexusArchiveName {
+        mod_id: parts[i].to_string(),
+        version: parts[i + 1..].join("."),
+        uploaded_at: Some(ts),
+        upload_order: ts,
+        name: parts[..i].join("-"),
     })
 }
 
@@ -738,6 +766,36 @@ mod tests {
         assert!(parse_nexus_archive_name("cool-mod.zip").is_none());
         assert!(parse_nexus_archive_name("Test Mod-4084-1-0.zip").is_none());
         assert!(parse_nexus_archive_name("x-1-1-1718000000.exe").is_none());
+    }
+
+    /// Issue #33: a name ending in a number and a version starting with a
+    /// letter (`EAGLE-2` / mod 1065 / `V1.1`).
+    #[test]
+    fn parses_nexus_names_with_numbers_in_the_name() {
+        let n = parse_nexus_archive_name("EAGLE-2-1065-V1-1-1752787902.zip").unwrap();
+        assert_eq!((n.name.as_str(), n.mod_id.as_str(), n.version.as_str()), ("EAGLE-2", "1065", "V1.1"));
+        assert_eq!(n.uploaded_at, Some(1752787902));
+
+        for file in [
+            "EAGLE-2-1065-V1-1-1752787902.7z",
+            "EAGLE-2-1065-V1-1-1752787902.RAR",
+            "EAGLE-2-1065-V1-1-1752787902.ZIP",
+            "EAGLE-2-1065-V1-1-1752787902 (1).zip",
+            "EAGLE-2-1065-V1-1-1752787902 (12).7z",
+        ] {
+            let n = parse_nexus_archive_name(file).unwrap_or_else(|| panic!("{file}"));
+            assert_eq!((n.name.as_str(), n.mod_id.as_str(), n.version.as_str()), ("EAGLE-2", "1065", "V1.1"), "{file}");
+        }
+
+        let n = parse_nexus_archive_name("B-01 Tactical-Mk 3-512-2-0-1-1718000000.zip").unwrap();
+        assert_eq!((n.name.as_str(), n.mod_id.as_str(), n.version.as_str()), ("B-01 Tactical-Mk 3", "512", "2.0.1"));
+        let n = parse_nexus_archive_name("300 Armor-4321-1-0-1718000000.zip").unwrap();
+        assert_eq!((n.name.as_str(), n.mod_id.as_str(), n.version.as_str()), ("300 Armor", "4321", "1.0"));
+
+        // Ordinary names are not Nexus downloads.
+        for file in ["My-Mod-2.zip", "Armor Pack 1.0.zip", "EAGLE-2.zip", "Mod-2-1065-V1-1.zip", "Mod-123456789.zip"] {
+            assert!(parse_nexus_archive_name(file).is_none(), "{file}");
+        }
     }
 
     #[test]
