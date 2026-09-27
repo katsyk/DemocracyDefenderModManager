@@ -251,24 +251,72 @@ pub fn parse_iso_utc(s: &str) -> Option<i64> {
     Some(days * 86_400 + hh * 3600 + mm * 60 + ss)
 }
 
-/// A comparable "shape" of a file name or label: lowercase, extension and
-/// digits/separators stripped, and GameBanana's random 5-hex upload suffix
-/// removed -- so `cool_mod_v1_ab12c.zip` and `cool_mod_v2_ff3bb.zip` match.
+/// A comparable "shape" of a file name or label -- what stays the same
+/// between versions of one file but differs between different files (say
+/// the variants on one mod page): lowercase, without its extension, a
+/// browser's ` (1)` duplicate counter or GameBanana's random 5-hex upload
+/// suffix, and without **version-shaped** parts: a number with a leading
+/// `v` (`v2`, `v1.2`) or a run of numbers joined by `.`, `-` or `_`
+/// (`1.2.0`, `1-2-0`, `2024-06-01`). Everything else counts, digits
+/// included, so `armor_2k` and `armor_4k`, `1080p` and `1440p`, or
+/// `Option 1` and `Option 2` are different files, while
+/// `cool_mod_v1_ab12c.zip` and `cool_mod_v2_ff3bb.zip` are the same one.
+/// (When in doubt, two names are different: DDMM then installs a second
+/// mod rather than replacing the wrong one.)
 pub fn file_shape(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-    let stem = ["zip", "7z", "rar"]
+    let lower = name.trim().to_ascii_lowercase();
+    let mut stem = ["zip", "7z", "rar"]
         .iter()
         .find_map(|ext| lower.strip_suffix(&format!(".{ext}")))
         .unwrap_or(&lower)
         .to_string();
+    static DUPLICATE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let dup = DUPLICATE.get_or_init(|| regex::Regex::new(r"\s*\(\d+\)$").unwrap());
+    stem = dup.replace(&stem, "").into_owned();
     static GB_SUFFIX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = GB_SUFFIX.get_or_init(|| regex::Regex::new(r"_[0-9a-f]{5}$").unwrap());
-    let stem = re.replace(&stem, "");
-    stem.chars()
-        .filter(|c| c.is_ascii_alphabetic())
-        .collect::<String>()
-        .trim_start_matches('v')
-        .to_string()
+    stem = re.replace(&stem, "").into_owned();
+
+    // Split into alphanumeric tokens, remembering the separator before each.
+    let mut tokens: Vec<(String, String)> = Vec::new(); // (separator before, token)
+    let mut sep = String::new();
+    let mut tok = String::new();
+    for c in stem.chars() {
+        if c.is_ascii_alphanumeric() {
+            tok.push(c);
+        } else {
+            if !tok.is_empty() {
+                tokens.push((std::mem::take(&mut sep), std::mem::take(&mut tok)));
+            }
+            sep.push(c);
+        }
+    }
+    if !tok.is_empty() {
+        tokens.push((sep, tok));
+    }
+
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    let v_number = |t: &str| t.strip_prefix('v').is_some_and(digits);
+    let joiner = |s: &str| matches!(s, "." | "-" | "_");
+    let mut shape = String::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = tokens[i].1.as_str();
+        if digits(t) || v_number(t) {
+            // The run of numbers this one starts, joined by single `.-_`.
+            let mut j = i + 1;
+            while j < tokens.len() && joiner(&tokens[j].0) && digits(&tokens[j].1) {
+                j += 1;
+            }
+            if j - i > 1 || v_number(t) {
+                i = j; // version-shaped: left out
+                continue;
+            }
+        }
+        shape.push_str(t);
+        i += 1;
+    }
+    shape
 }
 
 #[cfg(test)]
@@ -310,8 +358,23 @@ mod tests {
 
     #[test]
     fn file_shapes_ignore_versions_and_upload_suffixes() {
-        assert_eq!(file_shape("rabu_ss_sa-8_no_helm_8430d.zip"), file_shape("rabu_ss_sa-9_no_helm_ff3bb.zip"));
+        assert_eq!(file_shape("rabu_ss_sa-8_no_helm_8430d.zip"), file_shape("rabu_ss_sa-8_no_helm_ff3bb.zip"));
         assert_ne!(file_shape("rabu_ss_sa-8_no_helm_8430d.zip"), file_shape("rabu_ss_dp-00_1acbd.zip"));
         assert_eq!(file_shape("CoolMod-v1.2.zip"), file_shape("CoolMod-v1.3.zip"));
+        assert_eq!(file_shape("cool_mod_v1_ab12c.zip"), file_shape("cool_mod_v2_ff3bb.zip"));
+        assert_eq!(file_shape("coolmod_red_ab12c.zip"), file_shape("coolmod_red_v2_00aa1.zip"));
+        assert_eq!(file_shape("Test Mod-4084-1-0.zip"), file_shape("Test Mod-4084-1-1 (1).zip"));
+        assert_eq!(file_shape("Mod 1.0.zip"), file_shape("Mod 1.1.zip"));
+        assert_eq!(file_shape("Pack 2024-06-01.zip"), file_shape("Pack 2024-07-15.zip"));
+    }
+
+    /// Variants that differ only in a number are different files (a 2K
+    /// and a 4K texture pack must never replace each other).
+    #[test]
+    fn file_shapes_keep_numbers_that_name_a_variant() {
+        assert_ne!(file_shape("armor_2k_ab12c.zip"), file_shape("armor_4k_ff3bb.zip"));
+        assert_ne!(file_shape("hud 1080p.zip"), file_shape("hud 1440p.zip"));
+        assert_ne!(file_shape("Option 1.zip"), file_shape("Option 2.zip"));
+        assert_ne!(file_shape("rabu_ss_sa-8_no_helm_8430d.zip"), file_shape("rabu_ss_sa-9_no_helm_ff3bb.zip"));
     }
 }

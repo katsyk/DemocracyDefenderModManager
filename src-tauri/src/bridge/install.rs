@@ -105,19 +105,21 @@ fn mods_with_source<'a>(mods: &'a [Mod], source: &'a Source) -> impl Iterator<It
 /// version of `recorded` (the file an installed mod was installed from),
 /// rather than a different file offered on the same mod page.
 ///
-/// - Nexus Mods: both names are parsed (see `parse_nexus_archive_name`);
-///   same when they're from the same mod and carry the same file name.
-///   Versions and upload times differ between versions, so they don't
-///   count.
+/// - Nexus Mods: both names are parsed against the page's mod id
+///   `expected_id` (see `parse_nexus_archive_name_for`); same when they're
+///   from the same mod and carry the same file name. Versions and upload
+///   times differ between versions, so they don't count.
 /// - Everything else (and a Nexus name that doesn't parse): the names'
-///   `file_shape` (letters only, GameBanana's upload suffix removed), so
-///   `cool_mod_v1_ab12c.zip` and `cool_mod_v2_ff3bb.zip` are the same file
-///   but `cool_mod_red_ab12c.zip` and `cool_mod_blue_ff3bb.zip` are not.
-pub fn is_same_file(provider: &str, recorded: &str, incoming: &str) -> bool {
+///   `file_shape` (version-shaped parts and the site's upload suffix
+///   removed, everything else kept), so `cool_mod_v1_ab12c.zip` and
+///   `cool_mod_v2_ff3bb.zip` are the same file but `armor_2k_….zip` and
+///   `armor_4k_….zip` are not. When in doubt, they're different.
+pub fn is_same_file(provider: &str, expected_id: Option<&str>, recorded: &str, incoming: &str) -> bool {
     if provider.eq_ignore_ascii_case("nexus") {
-        if let (Some(a), Some(b)) =
-            (sources::parse_nexus_archive_name(recorded), sources::parse_nexus_archive_name(incoming))
-        {
+        if let (Some(a), Some(b)) = (
+            sources::parse_nexus_archive_name_for(recorded, expected_id),
+            sources::parse_nexus_archive_name_for(incoming, expected_id),
+        ) {
             return a.mod_id == b.mod_id && a.name.trim().eq_ignore_ascii_case(b.name.trim());
         }
     }
@@ -135,7 +137,13 @@ pub fn is_same_file(provider: &str, recorded: &str, incoming: &str) -> bool {
 ///   there is nothing to tell them apart by, and this is how updates of
 ///   such mods always worked;
 /// - otherwise none: it's another file of that page, installed alongside.
+///
+/// Never a mod whose page isn't the file's own: a file whose Nexus archive
+/// name says it's from another Nexus mod updates nothing here.
 async fn find_update_target(mods: &[Mod], source: &Source, incoming_name: &str) -> Option<uuid::Uuid> {
+    if sources::other_nexus_mod(source, incoming_name).is_some() {
+        return None;
+    }
     let candidates: Vec<&Mod> = mods_with_source(mods, source).collect();
     let mut unrecorded = Vec::new();
     for m in &candidates {
@@ -146,7 +154,9 @@ async fn find_update_target(mods: &[Mod], source: &Source, incoming_name: &str) 
                 .and_then(|f| f.file_name)
         });
         match recorded {
-            Some(name) if is_same_file(&source.provider, &name, incoming_name) => return Some(m.guid()),
+            Some(name) if is_same_file(&source.provider, source.id.as_deref(), &name, incoming_name) => {
+                return Some(m.guid())
+            }
             Some(_) => {}
             None => unrecorded.push(m.guid()),
         }
@@ -232,6 +242,16 @@ pub async fn install_file_with(
         Some(s) => find_update_target(mods, s, &incoming_name).await,
         None => None,
     };
+
+    // A file of another Nexus mod than the page's (a requirement linked
+    // from it, say): installed as a new mod, and recorded as the mod it
+    // really is -- the same attribution the Downloads-folder handoff uses.
+    if let Some(src) = source.as_mut() {
+        if let Some(other) = sources::other_nexus_mod(src, &incoming_name) {
+            src.id = Some(other);
+            src.version = None;
+        }
+    }
 
     // Remember which file this is (unless the caller already knows more),
     // so a later install from the same page can tell "a new version of
@@ -496,7 +516,7 @@ mod tests {
         assert_eq!(patch_bytes(&red_out.r#mod.directory), b"red 1");
 
         // A new upload of the red variant updates red, and only red.
-        let red2 = dir.path().join("coolmod_red_2_00aa1.zip");
+        let red2 = dir.path().join("coolmod_red_v2_00aa1.zip");
         make_zip(&red2, &[("0123456789abcdef.patch_0", b"red 2")]);
         let red2_out = install_file(&state, &mut mods, &red2, Some(GB), None, None).await.unwrap();
         assert!(red2_out.updated);
@@ -569,16 +589,72 @@ mod tests {
 
     #[test]
     fn same_file_rules() {
-        assert!(is_same_file("gamebanana", "cool_mod_v1_ab12c.zip", "cool_mod_v2_ff3bb.zip"));
-        assert!(!is_same_file("gamebanana", "cool_mod_red_ab12c.zip", "cool_mod_blue_ff3bb.zip"));
-        assert!(is_same_file("ayakamods", "Test Mod-4084-1-0.zip", "Test Mod-4084-1-1 (1).zip"));
-        assert!(is_same_file("nexus", "Better Stims-1234-1-0-1718000000.zip", "Better Stims-1234-1-1-1718100000.zip"));
-        assert!(!is_same_file("nexus", "Better Stims-1234-1-0-1718000000.zip", "Req-5678-1-0-1718000000.zip"));
-        assert!(!is_same_file(
+        let gb = |a, b| is_same_file("gamebanana", Some("1"), a, b);
+        assert!(gb("cool_mod_v1_ab12c.zip", "cool_mod_v2_ff3bb.zip"));
+        assert!(!gb("cool_mod_red_ab12c.zip", "cool_mod_blue_ff3bb.zip"));
+        assert!(gb("coolmod_red_ab12c.zip", "coolmod_red_v2_00aa1.zip"));
+        // Variants that differ only by a number are different files.
+        assert!(!gb("armor_2k_ab12c.zip", "armor_4k_ff3bb.zip"));
+        assert!(!gb("hud_1080p_ab12c.zip", "hud_1440p_ff3bb.zip"));
+        assert!(!gb("Option 1.zip", "Option 2.zip"));
+        assert!(is_same_file("ayakamods", Some("4084"), "Test Mod-4084-1-0.zip", "Test Mod-4084-1-1 (1).zip"));
+        let nx = |a, b| is_same_file("nexus", Some("1234"), a, b);
+        assert!(nx("Better Stims-1234-1-0-1718000000.zip", "Better Stims-1234-1-1-1718100000.zip"));
+        assert!(!nx("Better Stims-1234-1-0-1718000000.zip", "Req-5678-1-0-1718000000.zip"));
+        assert!(!nx("Better Stims-1234-1-0-1718000000.zip", "Better Stims Optional-1234-1-0-1718000000.zip"));
+        // A low mod id with a date-like version is still read as that mod.
+        assert!(is_same_file(
             "nexus",
-            "Better Stims-1234-1-0-1718000000.zip",
-            "Better Stims Optional-1234-1-0-1718000000.zip"
+            Some("456"),
+            "Cool Mod-456-2024-06-01-1718000000.zip",
+            "Cool Mod-456-2024-07-15-1720000000.zip"
         ));
+    }
+
+    /// 2K and 4K texture variants of one GameBanana page install side by
+    /// side; neither replaces the other.
+    #[tokio::test]
+    async fn variants_differing_only_by_a_number_install_side_by_side() {
+        const GB: &str = "https://gamebanana.com/mods/12345";
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("mods")).await.unwrap();
+        let state = AppState::new(dir.path().to_path_buf());
+        let mut mods = Vec::new();
+        let k2 = dir.path().join("armor_2k_ab12c.zip");
+        make_zip(&k2, &[("0123456789abcdef.patch_0", b"2k")]);
+        let k2_out = install_file(&state, &mut mods, &k2, Some(GB), None, None).await.unwrap();
+        let k4 = dir.path().join("armor_4k_ff3bb.zip");
+        make_zip(&k4, &[("0123456789abcdef.patch_0", b"4k")]);
+        let k4_out = install_file(&state, &mut mods, &k4, Some(GB), None, None).await.unwrap();
+        assert!(!k4_out.updated);
+        assert_eq!(mods.len(), 2);
+        assert_eq!(patch_bytes(&k2_out.r#mod.directory), b"2k");
+    }
+
+    /// The legacy "only mod from this page, no recorded file" fallback
+    /// never lets another Nexus mod's file replace it; that file installs
+    /// as a new mod, recorded as the mod it's really from.
+    #[tokio::test]
+    async fn another_nexus_mods_file_never_updates_a_mod_with_no_recorded_file() {
+        const NEXUS: &str = "https://www.nexusmods.com/helldivers2/mods/1234";
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("mods")).await.unwrap();
+        let state = AppState::new(dir.path().to_path_buf());
+        let mut mods = Vec::new();
+        let main = dir.path().join("Better Stims-1234-1-0-1718000000.zip");
+        make_zip(&main, &[("0123456789abcdef.patch_0", b"1234")]);
+        let main_out = install_file(&state, &mut mods, &main, Some(NEXUS), None, None).await.unwrap();
+        let mut sidecar = sources::load_origin_sidecar(&main_out.r#mod.directory).await.unwrap();
+        sidecar.installed_files.clear();
+        sources::save_origin_sidecar(&main_out.r#mod.directory, &sidecar).await.unwrap();
+
+        let req = dir.path().join("Req-5678-2-0-1718200000.zip");
+        make_zip(&req, &[("0123456789abcdef.patch_0", b"5678")]);
+        let out = install_file(&state, &mut mods, &req, Some(NEXUS), None, None).await.unwrap();
+        assert!(!out.updated);
+        assert_ne!(out.r#mod.guid(), main_out.r#mod.guid());
+        assert_eq!(out.source.as_ref().unwrap().id.as_deref(), Some("5678"));
+        assert_eq!(patch_bytes(&main_out.r#mod.directory), b"1234");
     }
 
     /// A zip with data in front of it (a self-extractor stub, or bytes an

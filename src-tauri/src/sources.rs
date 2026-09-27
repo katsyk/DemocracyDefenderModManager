@@ -472,6 +472,18 @@ pub struct NexusArchiveName {
 }
 
 pub fn parse_nexus_archive_name(file_name: &str) -> Option<NexusArchiveName> {
+    parse_nexus_archive_name_for(file_name, None)
+}
+
+/// [`parse_nexus_archive_name`] when the caller knows which Nexus mod the
+/// file should be from (`expected_id`, say the mod page it was downloaded
+/// for): in the old scheme, where the mod id can't always be told apart from
+/// numbers in the name or version (`Cool Mod-456-2024-06-01-...`: mod 456,
+/// version 2024.06.01, not mod 2024), a part in a valid mod-id position
+/// that equals `expected_id` is taken as the id. Without one (or when no
+/// such part matches), the longest candidate wins, as in
+/// [`parse_nexus_archive_name`].
+pub fn parse_nexus_archive_name_for(file_name: &str, expected_id: Option<&str>) -> Option<NexusArchiveName> {
     static OLD: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static NEW: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let old = OLD.get_or_init(|| {
@@ -479,7 +491,7 @@ pub fn parse_nexus_archive_name(file_name: &str) -> Option<NexusArchiveName> {
     });
     if let Some(parsed) = old.captures(file_name).and_then(|caps| {
         let ts: i64 = caps.get(2)?.as_str().parse().ok()?;
-        parse_old_nexus_body(caps.get(1)?.as_str(), ts)
+        parse_old_nexus_body(caps.get(1)?.as_str(), ts, expected_id)
     }) {
         return Some(parsed);
     }
@@ -506,13 +518,14 @@ pub fn parse_nexus_archive_name(file_name: &str) -> Option<NexusArchiveName> {
 /// all-digit part is a candidate id. The longest one wins (leftmost on a
 /// tie): mod ids run to several digits, while numbers at the end of a
 /// mod's name ("-2") or the start of its version ("-1-0") are short.
-fn parse_old_nexus_body(body: &str, ts: i64) -> Option<NexusArchiveName> {
+fn parse_old_nexus_body(body: &str, ts: i64, expected_id: Option<&str>) -> Option<NexusArchiveName> {
     let parts: Vec<&str> = body.split('-').collect();
     let is_version = |v: &str| {
         v.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
             && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
     };
     let mut best: Option<usize> = None;
+    let mut expected_at: Option<usize> = None;
     for i in 1..parts.len().saturating_sub(1) {
         let id = parts[i];
         if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
@@ -521,11 +534,14 @@ fn parse_old_nexus_body(body: &str, ts: i64) -> Option<NexusArchiveName> {
         if parts[..i].join("-").is_empty() || !is_version(&parts[i + 1..].join("-")) {
             continue;
         }
+        if expected_at.is_none() && expected_id == Some(id) {
+            expected_at = Some(i);
+        }
         if best.is_none_or(|b| id.len() > parts[b].len()) {
             best = Some(i);
         }
     }
-    let i = best?;
+    let i = expected_at.or(best)?;
     Some(NexusArchiveName {
         mod_id: parts[i].to_string(),
         version: parts[i + 1..].join("."),
@@ -533,6 +549,20 @@ fn parse_old_nexus_body(body: &str, ts: i64) -> Option<NexusArchiveName> {
         upload_order: ts,
         name: parts[..i].join("-"),
     })
+}
+
+/// Whether `file_name` is a download of a *different* Nexus Mods mod than
+/// `source` (a Nexus mod page): its archive name says which mod it's from.
+/// Returns that other mod's id. `None` when it's this mod's file (see
+/// [`parse_nexus_archive_name_for`]), when the name doesn't say, or when
+/// `source` isn't a Nexus mod with an id.
+pub fn other_nexus_mod(source: &Source, file_name: &str) -> Option<String> {
+    if !source.provider.eq_ignore_ascii_case("nexus") {
+        return None;
+    }
+    let expected = source.id.as_deref()?;
+    let parsed = parse_nexus_archive_name_for(file_name, Some(expected))?;
+    (parsed.mod_id != expected).then_some(parsed.mod_id)
 }
 
 /// The release tag in a GitHub release-asset download URL
@@ -798,6 +828,24 @@ mod tests {
         for file in ["My-Mod-2.zip", "Armor Pack 1.0.zip", "EAGLE-2.zip", "Mod-2-1065-V1-1.zip", "Mod-123456789.zip"] {
             assert!(parse_nexus_archive_name(file).is_none(), "{file}");
         }
+    }
+
+    /// A version made of dates (or other long numbers) mustn't be read as
+    /// the mod id when the caller knows which mod the file is from.
+    #[test]
+    fn parses_nexus_names_against_the_expected_mod_id() {
+        let name = "Cool Mod-456-2024-06-01-1718000000.zip";
+        let n = parse_nexus_archive_name_for(name, Some("456")).unwrap();
+        assert_eq!((n.name.as_str(), n.mod_id.as_str(), n.version.as_str()), ("Cool Mod", "456", "2024.06.01"));
+        // Without an expected id, the #40 rule (longest part) still applies.
+        assert_eq!(parse_nexus_archive_name(name).unwrap().mod_id, "2024");
+        // An expected id that isn't in the name changes nothing.
+        assert_eq!(parse_nexus_archive_name_for(name, Some("999")).unwrap().mod_id, "2024");
+
+        let page = |id: &str| Source { provider: "nexus".into(), id: Some(id.into()), url: None, version: None };
+        assert_eq!(other_nexus_mod(&page("456"), name), None);
+        assert_eq!(other_nexus_mod(&page("1234"), "Req-5678-1-0-1718000000.zip").as_deref(), Some("5678"));
+        assert_eq!(other_nexus_mod(&page("1234"), "plain.zip"), None);
     }
 
     #[test]

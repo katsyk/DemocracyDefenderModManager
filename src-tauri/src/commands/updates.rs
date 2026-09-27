@@ -836,7 +836,7 @@ pub async fn enrich_install_source(
 
     if provider == "nexus" {
         if let Some(name) = &file_name {
-            if let Some(parsed) = sources::parse_nexus_archive_name(name) {
+            if let Some(parsed) = sources::parse_nexus_archive_name_for(name, source.id.as_deref()) {
                 if source.id.as_deref().is_none_or(|id| id == parsed.mod_id) {
                     if source.version.is_none() {
                         source.version = Some(parsed.version.clone());
@@ -1094,7 +1094,7 @@ mod tests {
 
         let by_name = InstalledFile {
             provider: "gamebanana".into(),
-            file_name: Some("rabu_ss_sa-7_no_helm_00aa1.zip".into()),
+            file_name: Some("rabu_ss_sa-8_no_helm_00aa1.zip".into()),
             ..Default::default()
         };
         assert_eq!(preselect(&many, Some(&by_name)).as_deref(), Some("1"));
