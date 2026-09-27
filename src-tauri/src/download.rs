@@ -196,7 +196,11 @@ async fn download_archive_into(
 
 /// Turn a raw (possibly attacker-controlled) filename hint into a bare file
 /// name safe to join onto a directory: no path separators, no `..`/`.`
-/// traversal tricks, no control characters.
+/// traversal tricks, no leading dots (whose stem would be `.` or `..`, or
+/// hidden), no trailing dots or spaces, no control characters, no Windows
+/// reserved device names, and not overlong -- the same rules as a mod
+/// folder name ([`crate::mod_folder::safe_folder_name`]), keeping a
+/// recognizable archive extension where there is one.
 fn sanitize_filename(raw: &str) -> String {
     let decoded = percent_encoding::percent_decode_str(raw)
         .decode_utf8()
@@ -207,15 +211,20 @@ fn sanitize_filename(raw: &str) -> String {
         .rsplit(['/', '\\'])
         .find(|s| !s.is_empty())
         .unwrap_or("");
+    let base: String = base.chars().filter(|c| !c.is_control()).collect();
+    let base = base.as_str();
 
-    let cleaned: String = base.chars().filter(|c| !c.is_control()).collect();
-    let cleaned = cleaned.trim();
-
-    if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
-        return "download".to_string();
-    }
-
-    cleaned.to_string()
+    // Split off a known extension so cutting an overlong name or the
+    // reserved-name prefix keeps it; the stem is made safe on its own.
+    let lower = base.to_ascii_lowercase();
+    let (stem, ext) = match [".zip", ".7z", ".rar"].iter().find(|e| lower.ends_with(*e)) {
+        Some(e) => (&base[..base.len() - e.len()], &base[base.len() - e.len()..]),
+        None => (base, ""),
+    };
+    let safe_stem = crate::mod_folder::safe_folder_name(stem);
+    let fallback = safe_stem == crate::mod_folder::FALLBACK_NAME && stem != crate::mod_folder::FALLBACK_NAME;
+    let stem = if fallback { "download".to_string() } else { safe_stem };
+    format!("{stem}{ext}")
 }
 
 fn has_supported_archive_extension(filename: &str) -> bool {
@@ -277,6 +286,27 @@ mod tests {
     #[test]
     fn sanitize_filename_strips_control_characters() {
         assert_eq!(sanitize_filename("mod\n.zip"), "mod.zip");
+    }
+
+    #[test]
+    fn sanitize_filename_never_yields_a_dot_stem() {
+        for raw in ["..zip", "...zip", "....zip", ". .zip", "%2E%2E.zip", "%2E%2E%2Ezip", ".zip"] {
+            let name = sanitize_filename(raw);
+            let stem = std::path::Path::new(&name).file_stem().unwrap().to_str().unwrap().to_string();
+            assert!(!stem.starts_with('.') && !stem.is_empty(), "{raw:?} -> {name:?}");
+            assert_eq!(crate::mod_folder::safe_folder_name(&stem), stem, "{raw:?} -> {name:?}");
+        }
+        assert_eq!(sanitize_filename("..zip"), "download.zip");
+    }
+
+    #[test]
+    fn sanitize_filename_handles_reserved_and_long_names() {
+        assert_eq!(sanitize_filename("CON.zip"), "mod CON.zip");
+        assert_eq!(sanitize_filename("nul"), "mod nul");
+        assert_eq!(sanitize_filename(".hidden.7z"), "hidden.7z");
+        assert_eq!(sanitize_filename("name. .rar"), "name.rar");
+        let long = sanitize_filename(&format!("{}.zip", "x".repeat(400)));
+        assert!(long.ends_with(".zip") && long.chars().count() <= crate::mod_folder::MAX_NAME_CHARS + 4);
     }
 
     #[test]

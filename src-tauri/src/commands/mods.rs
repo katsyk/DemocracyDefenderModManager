@@ -2,6 +2,7 @@ use crate::{
     archive::Archive,
     download,
     install_error::{subject_of, InstallContext, InstallError, InstallStep},
+    mod_folder,
     models::{
         manifest::{legacy, Manifest, Source},
         Mod,
@@ -194,9 +195,19 @@ pub(crate) async fn ensure_mods_loaded<'a>(
         // read" until something called get_mods a second time.
         tokio::fs::create_dir_all(&mods_dir).await.into_ta_result()?;
     } else {
+        recover_leftover_folders(&mods_dir).await;
+
         let mut mods_dir = tokio::fs::read_dir(mods_dir).await.into_ta_result()?;
         while let Some(entry) = mods_dir.next_entry().await.into_ta_result()? {
             let mod_dir = entry.path();
+
+            // Folders starting with a dot are DDMM's own working folders
+            // (an update's staging copy or the old version set aside
+            // during one), never mods: loading one would list a mod twice.
+            if is_hidden_name(&entry.file_name()) {
+                log::debug!("Skipping working folder {:?}.", mod_dir);
+                continue;
+            }
 
             let manifest_file = mod_dir.join(MANIFEST_FILE);
             if !manifest_file.is_file() {
@@ -248,12 +259,16 @@ pub async fn delete_mod(state: State<'_, AppState>, guid: Uuid) -> TAResult<()> 
     log::info!("Deleting mod \"{}\"...", guid);
 
     if let Some(i) = mods.iter().position(|m| m.guid() == guid) {
+        let mods_root = state.base_path.join(MODS_DIRECTORY);
+        // Checked before the mod leaves the list, so a refused delete
+        // doesn't leave a mod that silently comes back on the next launch.
+        mod_folder::ensure_mod_folder(&mods_root, &mods[i].directory).into_ta_result()?;
         let r#mod = mods.remove(i);
         log::info!("Mod removed form registry.");
 
         log::info!("Deleting files...");
-        tokio::fs::remove_dir_all(r#mod.directory).await.into_ta_result()?;
-        
+        mod_folder::remove_mod_folder(&mods_root, &r#mod.directory).await.into_ta_result()?;
+
         log::info!("Mod deletion complete.");
         Ok(())
     } else {
@@ -284,7 +299,8 @@ pub async fn add_mod(state: State<'_, AppState>, archive_file: PathBuf) -> TARes
 /// item without ever calling back into another `#[tauri::command]` while
 /// holding the mutex.
 ///
-/// The mod's folder is named after the archive; a generated manifest (the
+/// The mod's folder is named after the archive (made safe and unique, see
+/// [`prepare_mod_dir`]); a generated manifest (the
 /// archive ships none) gets a readable name from the file name instead,
 /// without Nexus Mods' download suffix (see
 /// [`crate::mod_import::display_name_from_file`]), and a Nexus download's
@@ -350,10 +366,10 @@ async fn record_nexus_from_file_name(mods: &mut [Mod], r#mod: &mut Mod, file_nam
     }
 }
 
-/// [`install_from_archive`] into `mods/<name>` (also the generated
-/// manifest's name when the archive ships none) instead of a folder named
-/// after the archive -- used by the bulk import, which picks a readable,
-/// unique name itself.
+/// [`install_from_archive`] named `name` (the generated manifest's name
+/// when the archive ships none, and -- made safe and unique by
+/// [`prepare_mod_dir`] -- its folder's name) instead of after the archive
+/// -- used by the bulk import, which picks a readable, unique name itself.
 pub(crate) async fn install_from_archive_as(
     base_path: &Path,
     mods: &mut Vec<Mod>,
@@ -383,13 +399,11 @@ async fn install_archive_steps(
     log::debug!("Opening archive...");
     let archive = Archive::open(archive_file).install_step(subject, InstallStep::OpenArchive)?;
 
-    log::info!("Resolving mod directory...");
-    let mut mod_dir = base_path.join(MODS_DIRECTORY);
-    mod_dir.push(dir_name);
-
     log::info!("Preparing mod directory...");
+    let mods_root = base_path.join(MODS_DIRECTORY);
+    let (mod_dir, folder_name) = prepare_mod_dir(archive_file, &mods_root, dir_name, subject).await?;
+    let manifest_name = display_name(manifest_name, &folder_name);
     let manifest_file = mod_dir.join(MANIFEST_FILE);
-    prepare_mod_dir(archive_file, &mod_dir, &manifest_file, dir_name, subject).await?;
 
     // From here on `mod_dir` is ours (prepare_mod_dir just created it), so
     // a failure must remove it again: a half-written directory with a
@@ -424,8 +438,8 @@ async fn install_archive_steps(
     let (mut r#mod, warning) = match prepared {
         Ok(v) => v,
         Err(e) => {
-            if let Err(cleanup) = tokio::fs::remove_dir_all(&mod_dir).await {
-                log::error!("Failed to clean up {:?} after a failed install: {}", mod_dir, cleanup);
+            if let Err(cleanup) = mod_folder::remove_mod_folder(&mods_root, &mod_dir).await {
+                log::error!("Failed to clean up {:?} after a failed install: {:#}", mod_dir, cleanup);
             }
             return Err(e);
         }
@@ -503,44 +517,71 @@ pub async fn add_mods(state: State<'_, AppState>, archive_files: Vec<PathBuf>) -
     Ok(results)
 }
 
-/// Make `mod_dir` ready to install into from `source` (an archive file or a
-/// folder): an existing mod there is an error, a leftover folder without a
-/// manifest is cleared, and the folder is (re)created.
+/// Create a new, empty folder in `mods_root` to install `source` (an
+/// archive file or a folder) into, and return it with its name.
 ///
-/// Refuses first if `source` and `mod_dir` overlap -- clearing or copying
-/// into `mod_dir` would then delete the source or copy it into itself.
+/// The name is `wanted` made safe with [`mod_folder::safe_folder_name`]
+/// (so `.`, `..`, separators, reserved names and the like can never name
+/// anything but a single new folder), or -- when a file or folder of that
+/// name is already there -- `wanted (2)`, `wanted (3)`, ... An existing
+/// folder is never deleted or reused: it may be another mod, or something
+/// the user put there by hand.
+///
+/// Refuses first if `source` and the folder overlap -- copying into it
+/// would then copy the source into itself.
 async fn prepare_mod_dir(
     source: &Path,
-    mod_dir: &Path,
-    manifest_file: &Path,
-    name: &str,
+    mods_root: &Path,
+    wanted: &str,
     subject: &str,
-) -> Result<(), InstallError> {
+) -> Result<(PathBuf, String), InstallError> {
     let step = InstallStep::PrepareFolder;
-    if crate::fs_util::path_overlap(source, mod_dir).install_step(subject, step)?.is_some() {
-        return Err(InstallError::new(
-            subject,
-            step,
-            anyhow::anyhow!(
-                "it is inside (or is) the folder DDMM would install it into ({:?})",
-                mod_dir
-            ),
-        )
-        .with_hint("Move it somewhere outside DDMM's mod storage and add it from there."));
-    }
-    if tokio::fs::try_exists(mod_dir).await.install_step(subject, step)? {
-        if tokio::fs::try_exists(manifest_file).await.install_step(subject, step)? {
+    tokio::fs::create_dir_all(mods_root).await.install_step(subject, step)?;
+    let base = mod_folder::safe_folder_name(wanted);
+    for n in 1..=10_000usize {
+        let name = if n == 1 { base.clone() } else { mod_folder::numbered(&base, n) };
+        let mod_dir = mods_root.join(&name);
+        mod_folder::ensure_mod_folder(mods_root, &mod_dir).install_step(subject, step)?;
+        if crate::fs_util::path_overlap(source, &mod_dir).install_step(subject, step)?.is_some() {
             return Err(InstallError::new(
                 subject,
                 step,
-                anyhow::anyhow!("mod directory \"{}\" already exists: another mod is installed under that name", name),
+                anyhow::anyhow!(
+                    "it is inside (or is) the folder DDMM would install it into ({:?})",
+                    mod_dir
+                ),
             )
-            .with_hint("It is probably already in your mod list. Remove that mod first, or rename the file and add it again."));
-        } else {
-            tokio::fs::remove_dir_all(mod_dir).await.install_step(subject, step)?;
+            .with_hint("Move it somewhere outside DDMM's mod storage and add it from there."));
+        }
+        // `create_dir`, not `create_dir_all`: it fails if the folder is
+        // already there, so nothing that exists is ever taken over.
+        match tokio::fs::create_dir(&mod_dir).await {
+            Ok(()) => return Ok((mod_dir, name)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                log::info!("{:?} already exists; leaving it alone and trying the next free name.", mod_dir);
+            }
+            Err(e) => return Err(InstallError::new(subject, step, e)),
         }
     }
-    tokio::fs::create_dir_all(mod_dir).await.install_step(subject, step)
+    Err(InstallError::new(
+        subject,
+        step,
+        anyhow::anyhow!("no free folder name for \"{}\" in DDMM's mod storage", base),
+    ))
+}
+
+/// The name a mod without a manifest.json is listed under: the name it was
+/// added as, unless nothing readable is left of that (such as a file called
+/// `..zip`), in which case its folder's name.
+fn display_name(wanted: &str, folder_name: &str) -> String {
+    let trimmed = wanted.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if trimmed.is_empty() { folder_name.to_string() } else { wanted.trim().to_string() }
+}
+
+/// Whether a folder in the mod storage is one of DDMM's hidden working
+/// folders (its name starts with a dot) rather than a mod.
+fn is_hidden_name(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with('.')
 }
 
 /// Generate the same "no manifest present" local legacy manifest, whether
@@ -731,6 +772,13 @@ async fn install_folder_steps(
                 .map(|parent| matches!(path_overlap(parent, &mods_root), Ok(Some(PathOverlap::Same))))
                 .unwrap_or(false);
             if directly_in_storage && name_override.is_none() {
+                if name.starts_with('.') {
+                    return Err(refuse(anyhow::anyhow!(
+                        "folders in DDMM's mod storage whose names start with a dot are DDMM's own working \
+                         folders (for example a copy left behind by an interrupted update), not mods"
+                    ))
+                    .with_hint("Rename the folder so its name doesn't start with a dot, then add it again."));
+                }
                 let display_name = crate::mod_import::display_name_from_file(&name, false);
                 return adopt_folder_in_place(mods, &mods_root.join(&name), &display_name, subject).await;
             }
@@ -749,12 +797,10 @@ async fn install_folder_steps(
         .map(str::to_string)
         .unwrap_or_else(|| crate::mod_import::display_name_from_file(&name, false));
     let name = name_override.map(str::to_string).unwrap_or(name);
-    log::info!("Resolving mod directory...");
-    let mod_dir = mods_root.join(&name);
-
     log::info!("Preparing mod directory...");
+    let (mod_dir, folder_name) = prepare_mod_dir(folder, &mods_root, &name, subject).await?;
+    let manifest_name = display_name(&manifest_name, &folder_name);
     let manifest_file = mod_dir.join(MANIFEST_FILE);
-    prepare_mod_dir(folder, &mod_dir, &manifest_file, &name, subject).await?;
 
     // From here on `mod_dir` is a folder we just created (and, per the
     // checks above, not the source or anywhere near it), so a failure must
@@ -762,8 +808,8 @@ async fn install_folder_steps(
     let result = install_from_folder_inner(mods, folder, &manifest_name, &mod_dir, &manifest_file, subject).await;
 
     if result.is_err() {
-        if let Err(cleanup) = tokio::fs::remove_dir_all(&mod_dir).await {
-            log::error!("Failed to clean up {:?} after a failed install: {}", mod_dir, cleanup);
+        if let Err(cleanup) = mod_folder::remove_mod_folder(&mods_root, &mod_dir).await {
+            log::error!("Failed to clean up {:?} after a failed install: {:#}", mod_dir, cleanup);
         }
     }
 
@@ -1064,19 +1110,25 @@ async fn install_update_steps(
         .ok_or_else(|| anyhow::anyhow!("the mod to update (GUID {{{}}}) is no longer in the mod list", existing_guid))
         .install_step(subject, replace)?;
     let old_dir = old_mod.directory.clone();
+    let mods_root = state.base_path.join(MODS_DIRECTORY);
+    // The old folder is moved aside and replaced below: make sure it really
+    // is one mod's folder in the storage before anything is created.
+    mod_folder::ensure_mod_folder(&mods_root, &old_dir).install_step(subject, replace)?;
 
-    let staging_dir = state
-        .base_path
-        .join(MODS_DIRECTORY)
-        .join(format!(".update-{}", Uuid::new_v4()));
+    let staging_dir = mods_root.join(format!("{}{}", mod_folder::UPDATE_STAGING_PREFIX, Uuid::new_v4()));
     tokio::fs::create_dir_all(&staging_dir).await.install_step(subject, InstallStep::PrepareFolder)?;
+    let discard_staging = || async {
+        if let Err(e) = mod_folder::remove_mod_folder(&mods_root, &staging_dir).await {
+            log::error!("Couldn't remove the update's staging folder: {:#}", e);
+        }
+    };
 
     let staged = stage_update(&staging_dir, archive_path, subject).await;
 
     let (mut manifest, warning) = match staged {
         Ok(ok) => ok,
         Err(e) => {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            discard_staging().await;
             return Err(e);
         }
     };
@@ -1102,6 +1154,30 @@ async fn install_update_steps(
             Manifest::V2(m) => m.guid,
         };
         if new_guid != existing_guid {
+            // Keeping a new ID that another installed mod already has would
+            // leave two mods with one ID (and deleting one of them by ID
+            // could then hit the other's files): refuse before touching
+            // anything.
+            if let Some(other) = mods.iter().find(|m| m.guid() == new_guid) {
+                let err = InstallError::new(
+                    subject,
+                    replace,
+                    anyhow::anyhow!(
+                        "its manifest.json gives it the ID (GUID) {{{}}}, and \"{}\" in your mod list already has that ID",
+                        new_guid,
+                        other.name()
+                    ),
+                )
+                .with_hint(format!(
+                    "This file doesn't look like an update of \"{}\": it carries the ID of \"{}\", a different mod \
+                     in your list, so nothing was changed. Check that it's the right file; if it is, let the mod's \
+                     author know that it reuses another mod's ID.",
+                    old_mod.name(),
+                    other.name()
+                ));
+                discard_staging().await;
+                return Err(err);
+            }
             log::info!(
                 "Update for mod {{{}}} ships its own GUID {{{}}}; keeping the new one (profile entries referencing the old GUID will no longer match).",
                 existing_guid, new_guid
@@ -1114,34 +1190,54 @@ async fn install_update_steps(
     let manifest_data = match serde_json::to_vec_pretty(&manifest) {
         Ok(d) => d,
         Err(e) => {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            discard_staging().await;
             return Err(InstallError::new(subject, replace, e));
         }
     };
     if let Err(e) = tokio::fs::write(staging_dir.join(MANIFEST_FILE), manifest_data).await {
-        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        discard_staging().await;
         return Err(InstallError::new(subject, replace, e));
     }
 
     log::info!("Swapping in updated content for mod {{{}}}...", final_guid);
-    let backup_dir = state
-        .base_path
-        .join(MODS_DIRECTORY)
-        .join(format!(".update-backup-{}", Uuid::new_v4()));
+    let backup_dir = mods_root.join(format!("{}{}", mod_folder::UPDATE_BACKUP_PREFIX, Uuid::new_v4()));
+    // Note where the old version belongs before setting it aside, so that
+    // if DDMM is closed (or crashes) mid-swap, the next start can put it
+    // back instead of guessing.
+    let record = mod_folder::backup_record_path(&backup_dir);
+    let record_data = serde_json::json!({ "folder": old_dir.file_name().map(|n| n.to_string_lossy().into_owned()) });
+    if let Err(e) = tokio::fs::write(&record, record_data.to_string()).await {
+        discard_staging().await;
+        return Err(InstallError::new(subject, replace, e));
+    }
 
     if let Err(e) = crate::fs_util::move_path(&old_dir, &backup_dir).await {
-        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        discard_staging().await;
+        let _ = tokio::fs::remove_file(&record).await;
         return Err(InstallError::new(subject, replace, e));
     }
 
     if let Err(e) = crate::fs_util::move_path(&staging_dir, &old_dir).await {
         // Roll back: put the old content back where it was.
-        let _ = crate::fs_util::move_path(&backup_dir, &old_dir).await;
-        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        match crate::fs_util::move_path(&backup_dir, &old_dir).await {
+            Ok(()) => {
+                let _ = tokio::fs::remove_file(&record).await;
+            }
+            // The record stays, so the next start restores it.
+            Err(rollback) => log::error!("Couldn't put {:?} back after a failed update: {:#}", old_dir, rollback),
+        }
+        discard_staging().await;
         return Err(InstallError::new(subject, replace, e));
     }
 
-    let _ = tokio::fs::remove_dir_all(&backup_dir).await;
+    match mod_folder::remove_mod_folder(&mods_root, &backup_dir).await {
+        Ok(()) => {
+            let _ = tokio::fs::remove_file(&record).await;
+        }
+        // E.g. a file in it still open on Windows: the record stays, and
+        // the next start finishes the cleanup.
+        Err(e) => log::warn!("Couldn't remove the previous version of the updated mod yet: {:#}", e),
+    }
 
     let mut new_mod = Mod {
         manifest,
@@ -1159,6 +1255,174 @@ async fn install_update_steps(
 
     log::info!("Mod {{{}}} updated successfully.", new_mod.guid());
     Ok((new_mod, warning))
+}
+
+/// Put DDMM's mod storage back in order after an update that didn't finish
+/// (DDMM closed or crashed mid-swap, or a file still in use on Windows kept
+/// the old version from being deleted). Runs once, before the mods are
+/// first read. Never deletes a mod that isn't also installed elsewhere:
+///
+/// - `.update-backup-<id>` (the old version set aside during an update):
+///   put back into its folder when that folder is missing, deleted when
+///   the updated mod is in place, and otherwise restored under a free name;
+/// - `.update-<id>` (an update's staging copy, never the only copy of
+///   anything): deleted;
+/// - any other dot-folder with a manifest.json (a mod installed by an
+///   older version from a file whose name started with a dot): renamed to
+///   a visible name so it keeps showing up.
+///
+/// Problems are logged, never fatal: the mod list still loads.
+pub(crate) async fn recover_leftover_folders(mods_root: &Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(mods_root).await else { return };
+    let mut backups = Vec::new();
+    let mut staging = Vec::new();
+    let mut hidden_mods = Vec::new();
+    let mut records = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
+        if !name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let is_dir = tokio::fs::symlink_metadata(&path).await.map(|m| m.is_dir()).unwrap_or(false);
+        if let Some(rest) = name.strip_prefix(mod_folder::UPDATE_BACKUP_PREFIX) {
+            if is_dir && Uuid::parse_str(rest).is_ok() {
+                backups.push(path);
+            } else if !is_dir
+                && rest
+                    .strip_suffix(mod_folder::UPDATE_BACKUP_RECORD_SUFFIX)
+                    .is_some_and(|id| Uuid::parse_str(id).is_ok())
+            {
+                records.push(path);
+            }
+        } else if let Some(rest) = name.strip_prefix(mod_folder::UPDATE_STAGING_PREFIX) {
+            if is_dir && Uuid::parse_str(rest).is_ok() {
+                staging.push(path);
+            }
+        } else if is_dir && path.join(MANIFEST_FILE).is_file() {
+            hidden_mods.push((path, name));
+        }
+    }
+
+    for backup in backups {
+        if let Err(e) = recover_update_backup(mods_root, &backup).await {
+            log::error!("Couldn't recover {:?}, left as it is: {:#}", backup, e);
+        }
+    }
+    for dir in staging {
+        match mod_folder::remove_mod_folder(mods_root, &dir).await {
+            Ok(()) => log::info!("Removed {:?}, left over from an update that didn't finish.", dir),
+            Err(e) => log::warn!("Couldn't remove {:?}: {:#}", dir, e),
+        }
+    }
+    for record in records {
+        let backup = record.with_file_name(
+            record
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .trim_end_matches(mod_folder::UPDATE_BACKUP_RECORD_SUFFIX),
+        );
+        if tokio::fs::symlink_metadata(&backup).await.is_err() && mod_folder::ensure_mod_folder(mods_root, &record).is_ok() {
+            let _ = tokio::fs::remove_file(&record).await;
+        }
+    }
+    for (dir, name) in hidden_mods {
+        let target = mods_root.join(mod_folder::free_folder_name(mods_root, &name, &|_| false));
+        match crate::fs_util::move_path(&dir, &target).await {
+            Ok(()) => log::info!("Renamed the mod folder {:?} to {:?} so it stays visible.", dir, target),
+            Err(e) => log::error!("Couldn't rename the mod folder {:?}: {:#}", dir, e),
+        }
+    }
+}
+
+/// One `.update-backup-<id>` folder; see [`recover_leftover_folders`].
+async fn recover_update_backup(mods_root: &Path, backup: &Path) -> anyhow::Result<()> {
+    mod_folder::ensure_mod_folder(mods_root, backup)?;
+    let record = mod_folder::backup_record_path(backup);
+    let recorded: Option<String> = match tokio::fs::read(&record).await {
+        Ok(data) => serde_json::from_slice::<serde_json::Value>(&data)
+            .ok()
+            .and_then(|v| v.get("folder").and_then(|f| f.as_str()).map(str::to_string))
+            .filter(|n| !n.is_empty() && !n.starts_with('.') && mod_folder::ensure_mod_folder(mods_root, &mods_root.join(n)).is_ok()),
+        Err(_) => None,
+    };
+    let backup_manifest = read_manifest_quietly(&backup.join(MANIFEST_FILE)).await;
+
+    let restore_to = |name: &str| mods_root.join(mod_folder::free_folder_name(mods_root, name, &|_| false));
+    let done = |what: &str| log::info!("{what} {:?} (left over from an update that didn't finish).", backup);
+
+    let target = if let Some(folder) = recorded {
+        let original = mods_root.join(&folder);
+        if tokio::fs::symlink_metadata(&original).await.is_err() {
+            // Stopped between setting the old version aside and moving the
+            // new one in: the old version is the only copy. Put it back.
+            original
+        } else if original.join(MANIFEST_FILE).is_file() {
+            // The updated mod is in place: this is the old version.
+            mod_folder::remove_mod_folder(mods_root, backup).await?;
+            let _ = tokio::fs::remove_file(&record).await;
+            done("Removed the previous version");
+            return Ok(());
+        } else {
+            restore_to(&folder)
+        }
+    } else {
+        // Left by an older DDMM, which didn't record the folder.
+        let Some(manifest) = backup_manifest else {
+            log::warn!("Leaving {:?} alone: it has no manifest.json to tell which mod it is.", backup);
+            return Ok(());
+        };
+        if installed_guid_exists(mods_root, manifest_guid(&manifest)).await {
+            mod_folder::remove_mod_folder(mods_root, backup).await?;
+            done("Removed the previous version");
+            return Ok(());
+        }
+        restore_to(manifest_name(&manifest))
+    };
+
+    mod_folder::ensure_mod_folder(mods_root, &target)?;
+    crate::fs_util::move_path(backup, &target).await?;
+    let _ = tokio::fs::remove_file(&record).await;
+    log::info!("Restored {:?} to {:?} (left over from an update that didn't finish).", backup, target);
+    Ok(())
+}
+
+async fn read_manifest_quietly(file: &Path) -> Option<Manifest> {
+    let data = tokio::fs::read(file).await.ok()?;
+    Manifest::parse(&data, &file.to_string_lossy()).ok()
+}
+
+fn manifest_guid(manifest: &Manifest) -> Uuid {
+    match manifest {
+        Manifest::Legacy(m) => m.guid,
+        Manifest::V1(m) => m.guid,
+        Manifest::V2(m) => m.guid,
+    }
+}
+
+fn manifest_name(manifest: &Manifest) -> &str {
+    match manifest {
+        Manifest::Legacy(m) => &m.name,
+        Manifest::V1(m) => &m.name,
+        Manifest::V2(m) => &m.name,
+    }
+}
+
+/// Whether a visible mod folder in `mods_root` has a manifest with `guid`.
+async fn installed_guid_exists(mods_root: &Path, guid: Uuid) -> bool {
+    let Ok(mut entries) = tokio::fs::read_dir(mods_root).await else { return false };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if is_hidden_name(&entry.file_name()) {
+            continue;
+        }
+        if let Some(m) = read_manifest_quietly(&entry.path().join(MANIFEST_FILE)).await {
+            if manifest_guid(&m) == guid {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Extract `archive_path` into `staging_dir` and resolve its manifest
@@ -1966,5 +2230,315 @@ mod tests {
 
         assert!(msg.contains("inside"), "{msg}");
         assert!(zip.is_file(), "the picked archive must survive");
+    }
+
+    // --- mod folder names and deletes stay inside the mod storage ---
+
+    fn visible_and_hidden(mods_root: &Path) -> (Vec<String>, Vec<String>) {
+        let mut names: Vec<String> = std::fs::read_dir(mods_root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names.into_iter().partition(|n| !n.starts_with('.'))
+    }
+
+    /// Archive names whose stem is `.`, `..`, hidden, reserved on Windows,
+    /// or overlong used to become the mod folder's name as they were; a
+    /// stem of `.` or `..` then named the mod storage itself or the whole
+    /// data folder, which was cleared "to make room" and extracted into.
+    #[tokio::test]
+    async fn unsafe_archive_names_install_into_a_new_folder_inside_the_storage() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(base.path().join("settings.json"), b"{}").unwrap();
+        let (keep_guid, keep_dir) = make_existing_mod(base.path(), "Keep Me").await;
+        let state = fresh_library(base.path()).await;
+        let mods_root = std::fs::canonicalize(base.path().join(MODS_DIRECTORY)).unwrap();
+        let long = format!("{}.zip", "L".repeat(120));
+        let mut files = vec!["..zip", "...zip", "....zip", ". ..zip", ".hidden.zip", "trailing. .zip", long.as_str()];
+        // Windows won't even create these as files to add.
+        if cfg!(not(windows)) {
+            files.extend(["CON.zip", "lpt1.zip"]);
+        }
+
+        for file in files {
+            let archive = src.path().join(file);
+            make_zip(&archive, &[(&patch_file_name(), b"p")]);
+            let (m, _) = install(&state, &archive).await.unwrap_or_else(|e| panic!("{file:?}: {e}"));
+            let dir = std::fs::canonicalize(&m.directory).unwrap();
+            assert_eq!(dir.parent().unwrap(), mods_root, "{file:?} -> {:?}", m.directory);
+            let folder = dir.file_name().unwrap().to_str().unwrap();
+            assert_eq!(mod_folder::safe_folder_name(folder), folder, "{file:?}");
+            assert!(!folder.starts_with('.'), "{file:?} -> {folder:?}");
+            assert!(dir.join(patch_file_name()).is_file(), "{file:?}");
+            assert!(!m.name().trim_matches('.').trim().is_empty(), "{file:?} listed as {:?}", m.name());
+        }
+
+        assert!(keep_dir.join(patch_file_name()).is_file(), "an installed mod was touched");
+        assert!(base.path().join("settings.json").is_file(), "the data folder was touched");
+        assert!(!base.path().join(patch_file_name()).exists(), "extracted into the data folder");
+        let guard = state.mods.lock().await;
+        assert!(guard.as_ref().unwrap().iter().any(|m| m.guid() == keep_guid));
+        let (_, hidden) = visible_and_hidden(&mods_root);
+        assert!(hidden.is_empty(), "{hidden:?}");
+    }
+
+    /// The bulk import's own name goes through the same rules.
+    #[tokio::test]
+    async fn install_as_a_dot_name_stays_inside_the_storage() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let archive = src.path().join("x.zip");
+        make_zip(&archive, &[(&patch_file_name(), b"p")]);
+        let mut mods = Vec::new();
+        for name in ["..", ".", ""] {
+            let (m, _) = install_from_archive_as(base.path(), &mut mods, &archive, name).await.unwrap();
+            assert_eq!(m.directory.parent().unwrap(), base.path().join(MODS_DIRECTORY).as_path());
+            assert!(m.directory.join(patch_file_name()).is_file());
+        }
+        assert!(!base.path().join(patch_file_name()).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_folder_named_with_dots_is_copied_into_a_safe_folder() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let folder = src.path().join("...");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join(patch_file_name()), b"p").unwrap();
+        let state = fresh_library(base.path()).await;
+        let mut guard = state.mods.lock().await;
+        let (m, _) = install_from_folder(base.path(), guard.as_mut().unwrap(), &folder).await.unwrap();
+        assert_eq!(m.directory, base.path().join(MODS_DIRECTORY).join("mod"));
+        assert!(m.directory.join(patch_file_name()).is_file());
+    }
+
+    /// A folder already in the storage under the archive's name -- without
+    /// a manifest (put there by hand) or with one DDMM couldn't read -- used
+    /// to be deleted to make room. It's left alone; the mod gets "Name (2)".
+    #[tokio::test]
+    async fn an_existing_folder_of_the_same_name_is_never_deleted() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let mods_root = base.path().join(MODS_DIRECTORY);
+        std::fs::create_dir_all(mods_root.join("Foo")).unwrap();
+        std::fs::write(mods_root.join("Foo").join("notes.txt"), b"mine").unwrap();
+        std::fs::create_dir_all(mods_root.join("Foo (2)")).unwrap();
+        std::fs::write(mods_root.join("Foo (2)").join(MANIFEST_FILE), b"{ broken").unwrap();
+        let state = fresh_library(base.path()).await;
+
+        let archive = src.path().join("Foo.zip");
+        make_zip(&archive, &[(&patch_file_name(), b"p")]);
+        let (m, _) = install(&state, &archive).await.unwrap();
+
+        assert_eq!(m.directory, mods_root.join("Foo (3)"));
+        assert_eq!(m.name(), "Foo");
+        assert_eq!(std::fs::read(mods_root.join("Foo").join("notes.txt")).unwrap(), b"mine");
+        assert_eq!(std::fs::read(mods_root.join("Foo (2)").join(MANIFEST_FILE)).unwrap(), b"{ broken");
+    }
+
+    /// Same file name as an installed mod, but a different mod: installed
+    /// next to it instead of being refused for the folder name.
+    #[tokio::test]
+    async fn a_different_mod_with_the_same_file_name_gets_its_own_folder() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let first = src.path().join("a").join("Pack.zip");
+        let second = src.path().join("b").join("Pack.zip");
+        for (p, guid) in [(&first, KOYUKI_GUID), (&second, "9d1e5b7a-2c4f-4a8e-b6d0-7f3a1c5e9b2d")] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, zip_bytes(&as_entries(&plushie_mod(&v1_manifest(guid, "Pack"))))).unwrap();
+        }
+        let (a, _) = install(&state, &first).await.unwrap();
+        let (b, _) = install(&state, &second).await.unwrap();
+        assert_ne!(a.directory, b.directory);
+        assert!(a.directory.join(MANIFEST_FILE).is_file());
+        // The very same mod again is still refused by its ID.
+        let msg = message(install(&state, &first).await);
+        assert!(msg.contains("already has that ID"), "{msg}");
+    }
+
+    const GUID_A: &str = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+    const GUID_B: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+
+    async fn install_v1(state: &AppState, src: &Path, file: &str, guid: &str, name: &str) -> Mod {
+        let path = src.join(file);
+        std::fs::write(&path, zip_bytes(&as_entries(&plushie_mod(&v1_manifest(guid, name))))).unwrap();
+        install(state, &path).await.unwrap().0
+    }
+
+    /// Updating mod B with a file whose manifest carries mod A's ID used to
+    /// leave two mods with one ID.
+    #[tokio::test]
+    async fn an_update_carrying_another_installed_mods_id_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let a = install_v1(&state, src.path(), "A.zip", GUID_A, "Alpha").await;
+        let b = install_v1(&state, src.path(), "B.zip", GUID_B, "Beta").await;
+        let b_manifest = std::fs::read(b.directory.join(MANIFEST_FILE)).unwrap();
+
+        let update = src.path().join("Beta-2.zip");
+        std::fs::write(&update, zip_bytes(&as_entries(&plushie_mod(&v1_manifest(GUID_A, "Alpha"))))).unwrap();
+        let mut guard = state.mods.lock().await;
+        let mods = guard.as_mut().unwrap();
+        let msg = message(install_update_from_archive(&state, mods, &update, b.guid()).await);
+
+        assert!(msg.starts_with("Couldn't install \"Beta-2.zip\"."), "{msg}");
+        assert!(msg.contains("\nStep: replacing the installed version"), "{msg}");
+        assert!(msg.contains("\nCause: ") && msg.contains("\"Alpha\""), "{msg}");
+        assert!(msg.contains("\nHint: "), "{msg}");
+        assert_eq!(mods.len(), 2);
+        assert_eq!(mods.iter().filter(|m| m.guid() == a.guid()).count(), 1);
+        assert!(mods.iter().any(|m| m.guid() == b.guid() && m.directory == b.directory));
+        assert_eq!(std::fs::read(b.directory.join(MANIFEST_FILE)).unwrap(), b_manifest);
+        let (_, hidden) = visible_and_hidden(&base.path().join(MODS_DIRECTORY));
+        assert!(hidden.is_empty(), "{hidden:?}");
+    }
+
+    #[tokio::test]
+    async fn a_successful_update_leaves_no_working_folders_behind() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let b = install_v1(&state, src.path(), "B.zip", GUID_B, "Beta").await;
+        let update = src.path().join("Beta-2.zip");
+        std::fs::write(&update, zip_bytes(&as_entries(&plushie_mod(&v1_manifest(GUID_B, "Beta 2"))))).unwrap();
+        let mut guard = state.mods.lock().await;
+        let (m, _) = install_update_from_archive(&state, guard.as_mut().unwrap(), &update, b.guid()).await.unwrap();
+        assert_eq!(m.directory, b.directory);
+        let (visible, hidden) = visible_and_hidden(&base.path().join(MODS_DIRECTORY));
+        assert_eq!(visible, vec!["B".to_string()]);
+        assert!(hidden.is_empty(), "{hidden:?}");
+    }
+
+    fn write_v1_mod(dir: &Path, guid: &str, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(MANIFEST_FILE), v1_manifest(guid, name)).unwrap();
+        std::fs::write(dir.join(patch_file_name()), name.as_bytes()).unwrap();
+    }
+
+    fn write_record(backup: &Path, folder: &str) {
+        std::fs::write(mod_folder::backup_record_path(backup), serde_json::json!({ "folder": folder }).to_string()).unwrap();
+    }
+
+    async fn load(base: &Path) -> Vec<Mod> {
+        let mut state_mods = None;
+        ensure_mods_loaded(&mut state_mods, base).await.unwrap().clone()
+    }
+
+    /// An update's staging copy left behind (DDMM closed mid-update) used
+    /// to be loaded as a second copy of the mod.
+    #[tokio::test]
+    async fn leftover_update_staging_is_not_loaded_and_is_cleaned_up() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        write_v1_mod(&root.join("Beta"), GUID_B, "Beta");
+        let staging = root.join(format!(".update-{}", Uuid::new_v4()));
+        write_v1_mod(&staging, GUID_B, "Beta 2");
+
+        let mods = load(base.path()).await;
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].directory, root.join("Beta"));
+        assert!(!staging.exists());
+    }
+
+    /// Closed between setting the old version aside and moving the new one
+    /// in: the backup is the only copy, so it goes back where it was.
+    #[tokio::test]
+    async fn a_backup_whose_mod_folder_is_missing_is_restored() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        let backup = root.join(format!(".update-backup-{}", Uuid::new_v4()));
+        write_v1_mod(&backup, GUID_B, "Beta");
+        write_record(&backup, "Beta");
+        let staging = root.join(format!(".update-{}", Uuid::new_v4()));
+        write_v1_mod(&staging, GUID_B, "Beta 2");
+
+        let mods = load(base.path()).await;
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].directory, root.join("Beta"));
+        assert_eq!(std::fs::read(root.join("Beta").join(patch_file_name())).unwrap(), b"Beta");
+        let (visible, hidden) = visible_and_hidden(&root);
+        assert_eq!(visible, vec!["Beta".to_string()]);
+        assert!(hidden.is_empty(), "{hidden:?}");
+    }
+
+    /// The update finished but the old version couldn't be deleted (a file
+    /// in use on Windows): it's deleted now, and never listed.
+    #[tokio::test]
+    async fn a_backup_of_a_finished_update_is_removed() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        write_v1_mod(&root.join("Beta"), GUID_B, "Beta 2");
+        let backup = root.join(format!(".update-backup-{}", Uuid::new_v4()));
+        write_v1_mod(&backup, GUID_B, "Beta");
+        write_record(&backup, "Beta");
+
+        let mods = load(base.path()).await;
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].name(), "Beta 2");
+        let (visible, hidden) = visible_and_hidden(&root);
+        assert_eq!(visible, vec!["Beta".to_string()]);
+        assert!(hidden.is_empty(), "{hidden:?}");
+    }
+
+    /// Backups from before the folder was recorded: removed only when the
+    /// same mod (by ID) is installed, otherwise restored under a free name.
+    #[tokio::test]
+    async fn unrecorded_backups_are_removed_only_when_the_mod_is_installed() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        write_v1_mod(&root.join("Alpha"), GUID_A, "Alpha");
+        let stale = root.join(format!(".update-backup-{}", Uuid::new_v4()));
+        write_v1_mod(&stale, GUID_A, "Alpha old");
+        let orphan = root.join(format!(".update-backup-{}", Uuid::new_v4()));
+        write_v1_mod(&orphan, GUID_B, "Alpha");
+        let unknown = root.join(format!(".update-backup-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&unknown).unwrap();
+        std::fs::write(unknown.join("leftover.patch_0"), b"?").unwrap();
+
+        let mut mods = load(base.path()).await;
+        mods.sort_by_key(|m| m.directory.clone());
+        assert_eq!(mods.len(), 2);
+        assert_eq!(mods[0].directory, root.join("Alpha"));
+        assert_eq!(mods[0].guid().to_string(), GUID_A);
+        assert_eq!(mods[1].directory, root.join("Alpha (2)"));
+        assert_eq!(mods[1].guid().to_string(), GUID_B);
+        assert!(!stale.exists());
+        assert!(unknown.join("leftover.patch_0").is_file(), "an unidentifiable folder must be left alone");
+    }
+
+    /// Mods an older version installed from a file whose name started with
+    /// a dot stay in the list, under a visible name; other dot-folders
+    /// (without a manifest) are neither loaded nor touched.
+    #[tokio::test]
+    async fn dot_named_mods_from_older_versions_are_renamed_not_lost() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        write_v1_mod(&root.join(".Sneaky"), GUID_A, "Sneaky");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git").join("HEAD"), b"ref").unwrap();
+
+        let mods = load(base.path()).await;
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].directory, root.join("Sneaky"));
+        assert!(root.join(".git").join("HEAD").is_file());
+    }
+
+    #[tokio::test]
+    async fn a_dot_folder_in_the_storage_is_not_adopted_as_a_mod() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        let state = fresh_library(base.path()).await;
+        let staging = root.join(format!(".update-{}", Uuid::new_v4()));
+        write_v1_mod(&staging, GUID_B, "Beta");
+        let mut guard = state.mods.lock().await;
+        let msg = err_text(install_from_folder(base.path(), guard.as_mut().unwrap(), &staging).await);
+        assert!(msg.contains("working"), "{msg}");
+        assert!(staging.join(MANIFEST_FILE).is_file());
     }
 }
