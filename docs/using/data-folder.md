@@ -86,11 +86,14 @@ DDMM data (say, from before you moved it), you're offered to use that instead, a
 
 ## How DDMM remembers the folder
 
-The chosen folder is stored in a small file named `ddmm-data-location.json`, outside the data folder itself so
-it survives the move:
+The chosen folder is stored in a small file named `ddmm-data-location.json`. For an installed copy it's kept
+outside the default data folder, so it survives the move, and deleting the old default folder afterwards doesn't
+make DDMM forget where your data went:
 
-- **Installed** (Windows installer, `.deb`, `.rpm`, or an AppImage in a read-only location): in your per-user
-  config folder, `%APPDATA%\io.github.katsyk.ddmm\` on Windows and `~/.config/io.github.katsyk.ddmm/` on Linux.
+- **Installed** (Windows installer, `.deb`, `.rpm`, or an AppImage in a read-only location): in its own per-user
+  folder, `%LOCALAPPDATA%\io.github.katsyk.ddmm.location\` on Windows and `~/.config/io.github.katsyk.ddmm/` on
+  Linux. (Earlier versions kept it in `%APPDATA%\io.github.katsyk.ddmm\` on Windows, which is also the default
+  data folder; DDMM moves it to the new place by itself the next time it starts.)
 - **Portable**: next to `ddmm.exe` (or the `.AppImage`), so the portable folder describes itself.
 
 When DDMM starts it picks its data folder in this order, first match wins:
@@ -98,7 +101,7 @@ When DDMM starts it picks its data folder in this order, first match wins:
 1. `ddmm-data-location.json` next to the executable;
 2. the executable's own folder, if it's a [portable copy](../getting-started/download.md#data-location) and
    writable;
-3. `ddmm-data-location.json` in the per-user config folder;
+3. `ddmm-data-location.json` in the per-user folder above;
 4. the per-user app data folder.
 
 So a location you chose always wins over the default, and a portable copy never picks up an installed copy's
@@ -107,7 +110,7 @@ choice. The browser extension's helper uses the same rules, so it finds DDMM aft
 !!! note "Portable copies in a read-only folder"
     A portable copy only uses its own folder for data while that folder is writable (otherwise it behaves like an
     installed copy). Moving the data works either way: when the program's folder is read-only, the location is
-    stored in the per-user config folder instead. Once `ddmm-data-location.json` sits next to the executable, the
+    stored in the per-user folder instead. Once `ddmm-data-location.json` sits next to the executable, the
     program's folder no longer needs to be writable at all.
 
 ### Moving a whole portable folder
@@ -115,20 +118,24 @@ choice. The browser extension's helper uses the same rules, so it finds DDMM aft
 If you move or rename the portable folder (the one with `ddmm.exe` and `ddmm-data-location.json` in it):
 
 - **Data somewhere else** (for example `D:\DDMM Data`): nothing changes. The location file still points there.
-- **Data in a folder inside the portable folder** (for example `...\DDMM\Data`): the location is stored
-  *relative* to the portable folder, so it keeps working after the move.
+- **Data in a folder inside the portable folder** (for example `...\DDMM\Mod Data`, after you moved the data there
+  from another drive): the location is stored *relative* to the portable folder, so it keeps working after the
+  move. You can't get there straight from the portable folder itself, though: while the data is *in* the portable
+  folder, DDMM refuses to move it into one of that folder's own subfolders (see
+  [what DDMM refuses](#what-ddmm-refuses)).
 - **Data in the portable folder itself** (you never chose another folder): there's no location file, and the
   data moves with the folder as always.
 
 ## If the folder is missing at startup
 
-If DDMM starts and the chosen folder isn't there, for example because the USB drive it's on is unplugged or a
-drive letter changed, DDMM does **not** create a new empty folder (which would look like all your mods were gone).
+If DDMM starts and the chosen folder isn't there, for example because the USB drive it's on is unplugged, a
+drive letter changed, or the folder was deleted, DDMM does **not** create a new empty folder (which would look like all your mods were gone).
 Instead it shows **Data Folder Not Found**, with the missing path and these options:
 
 - **Retry**: connect the drive, then click this. DDMM restarts normally if the folder is back.
 - **Locate Folder...**: pick where the data is now (for example the same folder under a new drive letter). DDMM
-  only accepts a folder that holds DDMM data, or one with a `DDMM Data` folder in it.
+  only accepts a folder that holds DDMM data, or one with a `DDMM Data` folder in it, and never one holding the
+  unfinished copy of an interrupted move.
 - **Use the Default Location**: forget the chosen folder and restart with the default location, which may be
   empty. The missing folder isn't touched, so you can switch back to it later with **Change...** and
   **Use the Existing Data**.

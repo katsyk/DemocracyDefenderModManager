@@ -115,12 +115,88 @@ pub struct PointerFile {
 
 pub const POINTER_VERSION: u32 = 1;
 
-/// Where an installed (non-portable) DDMM keeps its pointer file: the OS
-/// per-user config directory plus [`APP_IDENTIFIER`] (`%APPDATA%` on
-/// Windows, `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME` or
-/// `~/.config` on Linux).
+/// The folder an installed DDMM keeps its pointer file in when the OS
+/// config folder is also where the data lives (see
+/// [`installed_pointer_dir`]). Its own folder, next to (never inside) the
+/// default data folder.
+pub const POINTER_DIR_NAME: &str = "io.github.katsyk.ddmm.location";
+
+/// Where an installed (non-portable) DDMM keeps its pointer file: always
+/// outside the default data folder, so deleting that folder after moving
+/// the data elsewhere can't lose the record of where the data went.
+///
+/// - Linux: `$XDG_CONFIG_HOME/<identifier>` (or `~/.config/...`), as it
+///   always was; the data is in `~/.local/share`.
+/// - Windows: `%LOCALAPPDATA%\io.github.katsyk.ddmm.location` (the data is
+///   in Roaming `%APPDATA%`).
+/// - macOS: `~/Library/Application Support/io.github.katsyk.ddmm.location`,
+///   next to the data folder.
+///
+/// Earlier versions used `<config dir>/<identifier>`, which on Windows and
+/// macOS *is* the default data folder; [`legacy_pointer_dir`] and
+/// [`migrate_legacy_pointer`] take care of that.
 pub fn installed_pointer_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join(APP_IDENTIFIER))
+    pointer_dir_for(dirs::config_dir(), dirs::config_local_dir(), dirs::data_dir())
+}
+
+/// [`installed_pointer_dir`] from the OS folders (a function of them, for
+/// tests).
+pub fn pointer_dir_for(config: Option<PathBuf>, config_local: Option<PathBuf>, data: Option<PathBuf>) -> Option<PathBuf> {
+    let app_data = data.map(|d| d.join(APP_IDENTIFIER));
+    if let Some(dir) = config.map(|c| c.join(APP_IDENTIFIER)) {
+        if app_data.as_ref() != Some(&dir) {
+            return Some(dir);
+        }
+    }
+    config_local.map(|c| c.join(POINTER_DIR_NAME))
+}
+
+/// Where earlier versions kept an installed copy's pointer file, when that
+/// isn't [`installed_pointer_dir`] (Windows and macOS).
+pub fn legacy_pointer_dir() -> Option<PathBuf> {
+    let old = dirs::config_dir()?.join(APP_IDENTIFIER);
+    (Some(&old) != installed_pointer_dir().as_ref()).then_some(old)
+}
+
+/// Move a pointer file from where an earlier version kept it (`legacy_dir`,
+/// inside the default data folder on Windows and macOS) to `new_dir`, once.
+/// A pointer already in `new_dir` wins; the old one is then only removed.
+/// Returns the pointer file to use this session: the new one, or -- if it
+/// couldn't be written -- the old one, so a failed migration never loses
+/// the user's choice.
+pub fn migrate_legacy_pointer(legacy_dir: &Path, new_dir: &Path) -> PathBuf {
+    let old = legacy_dir.join(POINTER_FILENAME);
+    let new = new_dir.join(POINTER_FILENAME);
+    if old == new || !old.is_file() {
+        return new;
+    }
+    if new.is_file() {
+        let _ = std::fs::remove_file(&old);
+        return new;
+    }
+    let migrated = match read_pointer(&old) {
+        // Resolved against its old folder and stored absolute (a relative
+        // path would now be relative to the wrong folder).
+        Ok(Some(target)) => write_pointer_raw(&new, &PointerFile { version: POINTER_VERSION, path: target }),
+        Ok(None) => return new,
+        // Unreadable: carried over as it is, so the recovery screen still
+        // says so instead of DDMM quietly starting empty.
+        Err(_) => std::fs::read(&old)
+            .map_err(anyhow::Error::from)
+            .and_then(|data| write_bytes_durably(&new, &data)),
+    };
+    match migrated {
+        Ok(()) => {
+            if let Err(e) = std::fs::remove_file(&old) {
+                eprintln!("warning: couldn't remove the old {}: {e}", old.display());
+            }
+            new
+        }
+        Err(e) => {
+            eprintln!("warning: couldn't move {} to {}: {e:#}; using it where it is", old.display(), new.display());
+            old
+        }
+    }
 }
 
 /// Why the chosen data folder can't be used this session. DDMM then starts
@@ -170,26 +246,62 @@ pub fn read_pointer(pointer_file: &Path) -> Result<Option<PathBuf>, String> {
 
 /// Write a pointer file atomically (temp file, then rename over the old
 /// one), creating its folder if needed. A `target` inside the pointer's own
-/// folder is stored relative to it (see [`PointerFile`]).
+/// folder is stored relative to it (see [`PointerFile`]). The file (and, on
+/// Unix, its folder) is synced to disk before this returns: a move deletes
+/// the old data right after, and a crash in between must not leave DDMM
+/// pointing nowhere.
 pub fn write_pointer(pointer_file: &Path, target: &Path) -> anyhow::Result<()> {
+    let dir = pointer_file.parent().unwrap_or(Path::new("."));
+    let _ = std::fs::create_dir_all(dir);
+    let stored = relative_if_inside(target, dir).unwrap_or_else(|| target.to_path_buf());
+    write_pointer_raw(pointer_file, &PointerFile { version: POINTER_VERSION, path: stored })
+}
+
+fn write_pointer_raw(pointer_file: &Path, contents: &PointerFile) -> anyhow::Result<()> {
+    write_bytes_durably(pointer_file, &serde_json::to_vec_pretty(contents)?)
+}
+
+fn write_bytes_durably(pointer_file: &Path, data: &[u8]) -> anyhow::Result<()> {
     use anyhow::Context;
+    use std::io::Write;
     let dir = pointer_file.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("couldn't create {}", dir.display()))?;
-    let stored = relative_if_inside(target, dir).unwrap_or_else(|| target.to_path_buf());
-    let data = serde_json::to_vec_pretty(&PointerFile { version: POINTER_VERSION, path: stored })?;
     let tmp = pointer_file.with_extension("json.tmp");
-    std::fs::write(&tmp, data).with_context(|| format!("couldn't write {}", tmp.display()))?;
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("couldn't write {}", tmp.display()));
+    }
     if let Err(e) = std::fs::rename(&tmp, pointer_file) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("couldn't write {}", pointer_file.display()));
     }
+    sync_dir(dir);
     Ok(())
+}
+
+/// Make a rename or removal in `dir` durable, where the OS allows syncing a
+/// folder (Unix). On Windows, NTFS journals the rename itself.
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 /// Remove a pointer file ("Reset to default"). Already gone is fine.
 pub fn remove_pointer(pointer_file: &Path) -> anyhow::Result<()> {
     match std::fs::remove_file(pointer_file) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            sync_dir(pointer_file.parent().unwrap_or(Path::new(".")));
+            Ok(())
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(anyhow::anyhow!("couldn't remove {}: {e}", pointer_file.display())),
     }
@@ -292,6 +404,11 @@ pub fn decide_data_dir_for_this_machine() -> DataDirDecision {
         exe_dir.clone()
     });
     let pointer_dir = installed_pointer_dir().unwrap_or_else(|| app_data_dir.clone());
+    let pointer_file = match legacy_pointer_dir() {
+        Some(legacy) => migrate_legacy_pointer(&legacy, &pointer_dir),
+        None => pointer_dir.join(POINTER_FILENAME),
+    };
+    let pointer_dir = pointer_file.parent().map(Path::to_path_buf).unwrap_or(pointer_dir);
     decide_data_dir(&exe_dir, &app_data_dir, &pointer_dir)
 }
 
@@ -631,6 +748,89 @@ mod tests {
         // Plugged back in: fine again.
         std::fs::create_dir_all(&usb).unwrap();
         assert_eq!(decide_data_dir(&d.exe, &d.app_data, &d.config).problem, None);
+    }
+
+    /// On Windows and macOS the OS config folder is the data folder's
+    /// parent too; the pointer must never land inside the data folder.
+    #[test]
+    fn the_installed_pointer_is_never_inside_the_default_data_folder() {
+        let roaming = PathBuf::from("C:/Users/u/AppData/Roaming");
+        let local = PathBuf::from("C:/Users/u/AppData/Local");
+        // Windows / macOS shape: config == data.
+        let dir = pointer_dir_for(Some(roaming.clone()), Some(local.clone()), Some(roaming.clone())).unwrap();
+        assert_eq!(dir, local.join(POINTER_DIR_NAME));
+        let support = PathBuf::from("/Users/u/Library/Application Support");
+        let dir = pointer_dir_for(Some(support.clone()), Some(support.clone()), Some(support.clone())).unwrap();
+        assert_eq!(dir, support.join(POINTER_DIR_NAME));
+        assert!(!dir.starts_with(support.join(APP_IDENTIFIER)));
+        // Linux: unchanged.
+        let dir = pointer_dir_for(
+            Some(PathBuf::from("/home/u/.config")),
+            Some(PathBuf::from("/home/u/.config")),
+            Some(PathBuf::from("/home/u/.local/share")),
+        )
+        .unwrap();
+        assert_eq!(dir, PathBuf::from("/home/u/.config").join(APP_IDENTIFIER));
+    }
+
+    /// The user moved the data, then deleted the old default folder (where
+    /// earlier versions kept the pointer): after migration the pointer
+    /// survives and a missing target shows the recovery screen.
+    #[test]
+    fn a_pointer_from_inside_the_old_data_folder_is_migrated_out() {
+        let d = dirs();
+        let new_dir = d._root.path().join("local").join(POINTER_DIR_NAME);
+        // Earlier version: pointer inside the default data folder.
+        write_pointer(&d.app_data.join(POINTER_FILENAME), &d.custom).unwrap();
+        let file = migrate_legacy_pointer(&d.app_data, &new_dir);
+        assert_eq!(file, new_dir.join(POINTER_FILENAME));
+        assert!(!d.app_data.join(POINTER_FILENAME).exists(), "the old one is gone");
+        assert_eq!(read_pointer(&file).unwrap(), Some(d.custom.clone()));
+
+        // Delete the whole old default folder: nothing is lost.
+        std::fs::remove_dir_all(&d.app_data).unwrap();
+        let decision = decide_data_dir(&d.exe, &d.app_data, &new_dir);
+        assert_eq!(decision.path, d.custom);
+        assert!(decision.pointed && decision.problem.is_none());
+
+        // And if the data itself goes missing, it's the recovery screen,
+        // not a silent empty start.
+        std::fs::remove_dir_all(&d.custom).unwrap();
+        let decision = decide_data_dir(&d.exe, &d.app_data, &new_dir);
+        assert_eq!(decision.problem, Some(DataDirProblem::Missing));
+        assert!(!d.app_data.exists(), "the default folder isn't recreated by deciding");
+
+        // Running migration again (no old file) changes nothing.
+        assert_eq!(migrate_legacy_pointer(&d.app_data, &new_dir), new_dir.join(POINTER_FILENAME));
+        assert!(new_dir.join(POINTER_FILENAME).is_file());
+    }
+
+    #[test]
+    fn migration_keeps_an_existing_new_pointer_and_carries_a_broken_one() {
+        let d = dirs();
+        let new_dir = d._root.path().join("local").join(POINTER_DIR_NAME);
+        let other = d._root.path().join("other");
+        write_pointer(&new_dir.join(POINTER_FILENAME), &d.custom).unwrap();
+        write_pointer(&d.app_data.join(POINTER_FILENAME), &other).unwrap();
+        migrate_legacy_pointer(&d.app_data, &new_dir);
+        assert_eq!(read_pointer(&new_dir.join(POINTER_FILENAME)).unwrap(), Some(d.custom.clone()));
+        assert!(!d.app_data.join(POINTER_FILENAME).exists());
+
+        // A broken old pointer still ends in the recovery screen.
+        let new_dir2 = d._root.path().join("local2");
+        std::fs::write(d.app_data.join(POINTER_FILENAME), b"not json").unwrap();
+        migrate_legacy_pointer(&d.app_data, &new_dir2);
+        let decision = decide_data_dir(&d.exe, &d.app_data, &new_dir2);
+        assert!(matches!(decision.problem, Some(DataDirProblem::BadPointer(_))));
+
+        // A relative path (data inside the old folder) is stored resolved.
+        let new_dir3 = d._root.path().join("local3");
+        let inside = d.app_data.join("Moved");
+        std::fs::create_dir_all(&inside).unwrap();
+        write_pointer(&d.app_data.join(POINTER_FILENAME), &inside).unwrap();
+        migrate_legacy_pointer(&d.app_data, &new_dir3);
+        let got = read_pointer(&new_dir3.join(POINTER_FILENAME)).unwrap().unwrap();
+        assert_eq!(std::fs::canonicalize(got).unwrap(), std::fs::canonicalize(&inside).unwrap());
     }
 
     #[test]
