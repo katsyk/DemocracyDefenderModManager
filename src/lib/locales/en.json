@@ -224,6 +224,10 @@
                 "import_found": "Found {count} mods in {path}",
                 "import_found_one": "Found 1 mod in {path}"
             },
+            "missing_entry": {
+                "title": "Mod not found",
+                "message": "This mod isn't in your library right now (its folder was removed, or its manifest.json can't be read). It keeps its place here and is skipped when deploying; remove it if it's gone for good."
+            },
             "load_order": {
                 "hint": "Load order: when two mods change the same game file, the one lower in the list wins.",
                 "lowest": "Lowest priority (loaded first)",

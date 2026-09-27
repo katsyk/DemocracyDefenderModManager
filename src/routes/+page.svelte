@@ -104,15 +104,19 @@
     let importSources = $state<ImportSource[]>([]);
 
     let currentProfile = $derived<Profile | undefined>(profiles[activeProfile]);
-    let profileMods = $derived<Mod[]>(profileConfigs.map(config => mods.find(m => m.guid === config.Guid)).filter((m): m is Mod => m !== undefined));
-    let profileEntries = $derived<[Config, Mod][]>(
+    /** The profile's entries as shown: each config, its mod (`undefined`
+     * when that mod isn't in the library -- deleted, or its manifest.json
+     * can't be read -- which keeps its place in the load order), and its
+     * index in `profileConfigs` (which the list's own index isn't while
+     * searching). */
+    let profileEntries = $derived<[Config, Mod | undefined, number][]>(
         profileConfigs
-            .map((config, i) => [config, profileMods[i]] as [Config, Mod])
+            .map((config, i) => [config, mods.find(m => m.guid === config.Guid), i] as [Config, Mod | undefined, number])
             .filter(([_, mod]) =>
                 searchText.length === 0 ||
-                [mod.name, mod.description].some(field =>
+                (mod !== undefined && [mod.name, mod.description].some(field =>
                     field.toLowerCase().includes(searchText.toLowerCase())
-                )
+                ))
             )
     );
     let enableRemoveProfile = $derived<boolean>(profiles.length > 1);
@@ -300,15 +304,14 @@
             loadProfiles()
         ]);
 
-        loadedConfig.Profiles.forEach(profile => {
-            switch (profile.Version) {
-                case "V1":
-                    profile.Configs = profile.Configs.filter(config => {
-                        return loadedMods.some(mod => mod.guid === config.Guid);
-                    });
-                    break;
-            }
-        });
+        // Entries whose mod isn't in the library (deleted by hand, or its
+        // manifest.json can't be read right now) are kept, shown as
+        // missing, so a mod that comes back gets its old place in the load
+        // order. Deploy skips them.
+        const missing = loadedConfig.Profiles
+            .flatMap(p => p.Configs)
+            .filter(c => !loadedMods.some(mod => mod.guid === c.Guid)).length;
+        if (missing > 0) log.warn(`${missing} profile entr(ies) refer to mods that couldn't be loaded; keeping them.`);
 
         mods = loadedMods;
         profiles = loadedConfig.Profiles;
@@ -964,8 +967,10 @@
     }
 
     async function onEditConfig(i: number) {
-        if (i < 0 || i >= profileEntries.length) return;
-        const [config, mod] = profileEntries[i];
+        if (i < 0 || i >= profileConfigs.length) return;
+        const config = profileConfigs[i];
+        const mod = mods.find(m => m.guid === config.Guid);
+        if (!mod) return;
         const newConfig = await showPopup(new ModConfigPopup(mod, config));
         if (!newConfig) return;
         profileConfigs[i] = newConfig;
@@ -1529,12 +1534,43 @@
                     isLocked={!allowReorder}
                     gap={4}
                 >
-                    {#each profileEntries as [config, mod], i (config.Guid)}
+                    {#each profileEntries as [config, mod, ci], i (config.Guid)}
                         {@const iconPath = iconPaths.get(config.Guid)}
                         <SortableList.Item
                             id={config.Guid}
                             index={i}
                         >
+                            {#if !mod}
+                            <div class="p-2 text-zinc-400 bg-zinc-800/60 border border-dashed border-zinc-600 rounded flex flex-row gap-1 items-center" data-testid="missing-mod-entry">
+                                <span
+                                    class="shrink-0 text-zinc-500 {allowReorder ? 'cursor-grab' : 'opacity-40'}"
+                                    title={t("pages.mods.load_order.drag_handle")}
+                                    aria-label={t("pages.mods.load_order.drag_handle")}
+                                >
+                                    <GripVertical width="16" height="16" />
+                                </span>
+                                <div class="flex-1 flex flex-col gap-0.5 min-w-0">
+                                    <span class="text-lg truncate">{t("pages.mods.missing_entry.title")}</span>
+                                    <span class="text-xs truncate">{t("pages.mods.missing_entry.message")}</span>
+                                    <span class="text-xs text-zinc-500 truncate">{config.Guid}</span>
+                                </div>
+                                <PopupMenuButton insertTarget="main">
+                                    <button onclick={() => onRemove(ci)}>
+                                        <Eraser />
+                                        <span>Remove</span>
+                                    </button>
+                                    <hr>
+                                    <button disabled={ci === 0} onclick={() => onMoveUp(ci)}>
+                                        <CaretUp />
+                                        <span>Move Up</span>
+                                    </button>
+                                    <button disabled={ci === profileConfigs.length - 1} onclick={() => onMoveDown(ci)}>
+                                        <CaretDown />
+                                        <span>Move Down</span>
+                                    </button>
+                                </PopupMenuButton>
+                            </div>
+                            {:else}
                             <div class="p-2 text-zinc-300 bg-zinc-800 rounded flex flex-row gap-1 items-center">
                                 <span
                                     class="shrink-0 text-zinc-500 {allowReorder ? 'cursor-grab' : 'opacity-40'}"
@@ -1588,41 +1624,41 @@
                                     <button
                                         class="hd2mm-button-nop p-2"
                                         class:invisible={!Array.isArray(mod.Manifest.Options)}
-                                        onclick={() => onEditConfig(i)}
+                                        onclick={() => onEditConfig(ci)}
                                     >
                                         <PencilSquare class="block mx-auto" />
                                     </button>
                                 {/if}
                                 <PopupMenuButton insertTarget="main">
-                                    <button onclick={() => onRemove(i)}>
+                                    <button onclick={() => onRemove(ci)}>
                                         <Eraser />
                                         <span>Remove</span>
                                     </button>
                                     <hr>
                                     <button
-                                        disabled={i === 0}
-                                        onclick={() => onMoveUp(i)}
+                                        disabled={ci === 0}
+                                        onclick={() => onMoveUp(ci)}
                                     >
                                         <CaretUp />
                                         <span>Move Up</span>
                                     </button>
                                     <button
-                                        disabled={i === profileEntries.length - 1}
-                                        onclick={() => onMoveDown(i)}
+                                        disabled={ci === profileConfigs.length - 1}
+                                        onclick={() => onMoveDown(ci)}
                                     >
                                         <CaretDown />
                                         <span>Move Down</span>
                                     </button>
                                     <button
-                                        disabled={i === 0}
-                                        onclick={() => onToTop(i)}
+                                        disabled={ci === 0}
+                                        onclick={() => onToTop(ci)}
                                     >
                                         <ArrowBarUp />
                                         <span>To Top</span>
                                     </button>
                                     <button
-                                        disabled={i === profileEntries.length - 1}
-                                        onclick={() => onToBottom(i)}
+                                        disabled={ci === profileConfigs.length - 1}
+                                        onclick={() => onToBottom(ci)}
                                     >
                                         <ArrowBarDown />
                                         <span>To Bottom</span>
@@ -1669,6 +1705,7 @@
                                     {/if}
                                 </PopupMenuButton>
                             </div>
+                            {/if}
                         </SortableList.Item>
                     {/each}
                 </SortableList.Root>
