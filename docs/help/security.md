@@ -10,9 +10,10 @@ DDMM never asks for, stores, or transmits a username or password for any mod sit
 logged in to download hand the actual download off to your own browser, where your own session (and your own
 login) does the work — see [Mod sites](../using/mod-sites.md). Update checks read public page/API information.
 
-The single exception is optional: so DDMM can check Nexus mods for updates, you can **sign in to Nexus Mods**
-(you log in and approve DDMM on the Nexus Mods website; DDMM gets a sign-in token, never your password) or add
-your own **personal Nexus Mods API key**. Neither is ever required, and:
+The single exception is optional: so DDMM can check Nexus mods for updates, you can add your own **personal Nexus
+Mods API key**, or, once it's available (it shows as *Coming soon* until then), **sign in to Nexus Mods** (you log in
+and approve DDMM on the Nexus Mods website; DDMM gets a sign-in token, never your password). Neither is ever
+required, and:
 
 - the sign-in uses OAuth 2.0 with PKCE: DDMM opens your browser, and Nexus hands the approval back to a listener
   on `127.0.0.1:28647` that only this computer can reach, that checks the reply belongs to this sign-in attempt,

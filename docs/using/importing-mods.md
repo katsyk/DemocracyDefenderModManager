@@ -25,7 +25,7 @@ When the mod list is empty, it offers the same **Import Mods** button and names 
 
 A Nexus Mods download keeps the mod's Nexus id and version in its file name, and other mod managers record
 them too. Either way, DDMM keeps that information, so [update checks](updating-mods.md) work for imported mods
-right away. Nexus Mods checks still need the optional sign-in or API key.
+right away. Nexus Mods checks still need the optional API key (or, once available, sign-in).
 
 ## 1. Pick where to import from
 
@@ -56,13 +56,16 @@ Nexus Mods id and version (when known), and a status:
 | **Already in DDMM as "…"** | The same mod is installed (same ID, same archive, same file name, or same Nexus file) | No |
 | **Already in DDMM: will add Nexus info** | You already added this mod yourself (for example with Add), but DDMM doesn't know its Nexus page yet; the import knows it | Yes |
 | **Another version is in DDMM** | Same Nexus mod and file, different version | No |
-| **Same as "…"** | An identical copy of another item in the list, e.g. `Mod (1).zip` next to `Mod.zip` | Can't be ticked |
-| **Older download of "…"** | You downloaded the same Nexus file more than once; only the newest is ticked | No |
+| **Same as "…"** | An identical copy of another item in the list (the very same files), e.g. `Mod (1).zip` next to `Mod.zip` | Can't be ticked |
+| **Older version of "…"** | Another version of a mod that's also in the list: the same mod ID with different files, or the same Nexus file downloaded more than once. Only the newest is ticked: the one Nexus uploaded last, else the higher version number, else the newer file | No |
 | **No Helldivers 2 mod files inside** | An archive with no Helldivers 2 patch files or `manifest.json` (a Downloads folder holds other things too) | No |
 | **Can't read: …** | A damaged archive, one with unsafe paths, or a broken `manifest.json` | Can't be ticked |
 
 Several files from the same Nexus mod page (a main file and optional variants) are separate mods, and each one
 is ticked.
+
+If the folder you pick is a single mod itself (it has its own `manifest.json`, with its options in subfolders),
+the list shows just that one mod.
 
 To change the selection, use **Select All**, **Select None** and **Only New**, or type in the filter box. Below
 the list you see how much space the selection needs once unpacked, and how much is free on the drive with
@@ -98,6 +101,10 @@ exactly as they are.
 Picking 10 or more files with **Add**, or dropping 10 or more at once, uses the same list. You can check what
 you're adding (duplicates, mods you already have) before anything is installed, and you get one summary. For
 fewer files, Add installs them straight away as before.
+
+If you stop that scan (or it fails), DDMM says so and offers **Scan Again**, **Choose a Folder Instead** or
+**Close**. Files dropped while the Import window (or any other DDMM window) is open are ignored, with a short
+note: finish or close it first, then drop them again.
 
 ## What's carried over
 

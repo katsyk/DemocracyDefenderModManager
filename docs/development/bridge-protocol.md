@@ -9,8 +9,9 @@ If you change the protocol, change this page in the same pull request and bump `
 - **One click from any mod site.** AyakaMods, Nexus Mods, ModWorkshop, GameBanana, GitHub and any other site are
   equal. No site is special-cased in a way that makes another site second-class.
 - **The browser downloads, DDMM installs.** Login-gated downloads work because the *browser* fetches the file with the
-  user's own session. No credentials, cookies or API keys for any site cross the bridge. (The only credential DDMM
-  itself can hold is the user's optional Nexus Mods API key for update checks, which stays inside the app.)
+  user's own session. No credentials, cookies or API keys for any site cross the bridge. (The only credentials DDMM
+  itself can hold are the user's optional Nexus Mods API key and, where signing in is available, Nexus Mods sign-in
+  tokens, both only for update checks and both staying inside the app.)
 - **Web pages can't drive DDMM.** Only the extension (via native messaging) can hand DDMM a file. `ddmm://` links, which
   any page can trigger, always require explicit confirmation in DDMM.
 
@@ -142,8 +143,11 @@ The extension sends this after a download **has completed** in the browser.
   origin sidecar.
 - `afterInstall`: `null` means "use the app setting". Otherwise one of `"library"`, `"profile"` or `"deploy"`.
 
-If a mod from the same source (provider + id) is already installed, the app performs an **in-place update** (keeping the
-GUID and profile config, like "Update from …") instead of failing with a duplicate. Because an update replaces an
+If a mod from the same source (provider + id) is already installed, the app performs an **in-place update** (like
+"Update from …") instead of failing with a duplicate. The mod keeps its GUID, and so its profile entries (enabled state,
+options, position), only when the new archive has no `manifest.json` of its own. If the new archive ships a manifest with
+its own `Guid`, that GUID replaces the old one and profile entries that point at the old GUID no longer match (they are
+not migrated; the Mods page shows them as missing). Because an update replaces an
 installed mod's files, the app only does it when the id came from a recognized mod-page `pageUrl`. A source derived
 from `downloadUrl` host detection never has an id and always installs as a new mod.
 
