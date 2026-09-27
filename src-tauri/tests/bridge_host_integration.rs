@@ -164,7 +164,9 @@ fn spawn_fake_app_server(expected_token: &str) -> (u16, std::sync::mpsc::Receive
 }
 
 fn write_bridge_json(dir: &Path, port: u16, token: &str) {
-    let content = serde_json::json!({ "port": port, "token": token, "pid": 999999u32, "protocol": 1 });
+    // A live pid (this test process): the host skips a bridge.json whose
+    // process is gone.
+    let content = serde_json::json!({ "port": port, "token": token, "pid": std::process::id(), "protocol": 1 });
     std::fs::write(dir.join("bridge.json"), content.to_string()).unwrap();
 }
 
@@ -491,6 +493,128 @@ fn replies_are_routed_by_id_while_an_install_is_still_waiting() {
     assert_eq!(replies[1]["id"], "3");
     assert_eq!(replies[1]["type"], "status");
 
+    drop(stdin);
+    let _ = child.wait_timeout_or_kill();
+}
+
+/// A `bridge.json` left behind by a DDMM that crashed (its pid is gone) is
+/// ignored, even if something now listens on its port: no connection is
+/// attempted, and a passive request gets APP_NOT_RUNNING right away.
+#[test]
+fn a_stale_bridge_json_with_a_dead_pid_is_ignored() {
+    let (dir, exe) = portable_copy_of_binary();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    // A pid that can't be running.
+    let content = serde_json::json!({ "port": port, "token": "d".repeat(64), "pid": u32::MAX - 1, "protocol": 1 });
+    std::fs::write(dir.path().join("bridge.json"), content.to_string()).unwrap();
+
+    let mut child = spawn_host(&exe, &[]);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    write_frame(&mut stdin, br#"{"id":"1","type":"status"}"#);
+    let reply = read_frame_json(&mut stdout);
+    assert_eq!(reply["error"]["code"], "APP_NOT_RUNNING", "{reply}");
+    assert!(listener.accept().is_err(), "the host must not connect to a dead DDMM's port");
+
+    drop(stdin);
+    let _ = child.wait_timeout_or_kill();
+}
+
+/// Something that accepts on DDMM's port but never answers the handshake
+/// can't hang the host: the request fails within the handshake timeout.
+#[test]
+fn a_silent_listener_times_out_the_handshake() {
+    let (dir, exe) = portable_copy_of_binary();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    write_bridge_json(dir.path(), port, &"e".repeat(64));
+    let _hold = std::thread::spawn(move || {
+        let conns: Vec<_> = listener.incoming().take(2).collect();
+        std::thread::sleep(Duration::from_secs(15));
+        drop(conns);
+    });
+
+    let mut child = spawn_host(&exe, &[]);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let started = std::time::Instant::now();
+    write_frame(&mut stdin, br#"{"id":"1","type":"status"}"#);
+    let reply = read_frame_json(&mut stdout);
+    assert_eq!(reply["error"]["code"], "APP_NOT_RUNNING", "{reply}");
+    assert!(started.elapsed() < Duration::from_secs(14), "took {:?}", started.elapsed());
+
+    drop(stdin);
+    let _ = child.wait_timeout_or_kill();
+}
+
+/// A fake "app" that authenticates, reads everything, and never replies.
+fn spawn_unresponsive_app_server(token: &str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token = token.to_string();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let handshake: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(handshake["hello"], token);
+        stream.write_all(b"{\"ok\":true}\n").unwrap();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+        }
+    });
+    port
+}
+
+/// A request DDMM never answers gets an error once the host's per-request
+/// timeout passes, and its place (and id) is free again.
+#[test]
+fn an_unanswered_request_times_out_and_frees_its_place() {
+    let (dir, exe) = portable_copy_of_binary();
+    let token = "f".repeat(64);
+    let port = spawn_unresponsive_app_server(&token);
+    write_bridge_json(dir.path(), port, &token);
+
+    let mut child = spawn_host(&exe, &[("DDMM_BRIDGE_REQUEST_TIMEOUT_MS", "300")]);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    for _ in 0..2 {
+        // The same id twice: the first one's place was freed.
+        write_frame(&mut stdin, br#"{"id":"1","type":"status"}"#);
+        let reply = read_frame_json(&mut stdout);
+        assert_eq!(reply["id"], "1");
+        assert_eq!(reply["error"]["code"], "INTERNAL", "{reply}");
+    }
+    drop(stdin);
+    let _ = child.wait_timeout_or_kill();
+}
+
+/// However many requests the browser sends, the host keeps a bounded number
+/// in progress; the rest are answered BUSY at once.
+#[test]
+fn requests_in_progress_are_bounded() {
+    let (dir, exe) = portable_copy_of_binary();
+    let token = "9".repeat(64);
+    let port = spawn_unresponsive_app_server(&token);
+    write_bridge_json(dir.path(), port, &token);
+
+    let mut child = spawn_host(&exe, &[]);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    for i in 0..70 {
+        write_frame(&mut stdin, format!(r#"{{"id":"{i}","type":"status"}}"#).as_bytes());
+    }
+    for _ in 0..6 {
+        let reply = read_frame_json(&mut stdout);
+        assert_eq!(reply["error"]["code"], "BUSY", "{reply}");
+    }
     drop(stdin);
     let _ = child.wait_timeout_or_kill();
 }

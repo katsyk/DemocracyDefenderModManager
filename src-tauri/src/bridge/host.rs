@@ -23,7 +23,7 @@ use tokio::{
 use super::{
     allowlist::FIREFOX_EXTENSION_ID,
     protocol::{read_bounded_line, BoundedLine, ErrorCode, ErrorReply, MAX_MESSAGE_BYTES},
-    state::{read_bridge_file, tokens_match},
+    state::{process_is_alive, read_bridge_file, tokens_match},
 };
 
 /// Which browser shape argv matched, carrying the exact `origin` string the
@@ -79,12 +79,27 @@ fn spawn_detached(exe: &Path) -> io::Result<()> {
 /// `None` for anything short of a fully successful handshake (missing
 /// file, connection refused, wrong token, ...) -- every failure mode here
 /// is treated identically: "not reachable right now".
+///
+/// A `bridge.json` whose `pid` is no longer running is stale (DDMM
+/// crashed), and the whole connect + handshake must finish within
+/// [`CONNECT_TIMEOUT`]: a port some other program now holds, which accepts
+/// but never answers, must not hang a request forever.
 async fn try_connect(base_path: &Path) -> Option<TcpStream> {
     let info = read_bridge_file(base_path).await.ok()?;
-    let mut stream = TcpStream::connect(("127.0.0.1", info.port)).await.ok()?;
+    if info.pid != 0 && !process_is_alive(info.pid) {
+        return None;
+    }
+    tokio::time::timeout(CONNECT_TIMEOUT, connect_and_handshake(info.port, &info.token)).await.ok()?
+}
+
+/// How long connecting to DDMM and its token handshake may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn connect_and_handshake(port: u16, token: &str) -> Option<TcpStream> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.ok()?;
 
     stream
-        .write_all(format!("{{\"hello\":\"{}\"}}\n", info.token).as_bytes())
+        .write_all(format!("{{\"hello\":\"{token}\"}}\n").as_bytes())
         .await
         .ok()?;
 
@@ -96,7 +111,7 @@ async fn try_connect(base_path: &Path) -> Option<TcpStream> {
 
     // Belt and braces: the app already closes the connection on a bad
     // token, but double check the ack is unambiguous rather than assuming.
-    if ok && tokens_match(&info.token, &info.token) {
+    if ok && tokens_match(token, token) {
         Some(stream)
     } else {
         None
@@ -312,6 +327,23 @@ impl AppLink {
     }
 }
 
+/// How long the host waits for DDMM's reply to one request before giving
+/// up on it (and freeing its place): a little longer than the extension
+/// itself waits (see bridge-protocol.md, "Client-side timeouts"), so the
+/// extension normally times out first.
+/// `DDMM_BRIDGE_REQUEST_TIMEOUT_MS` overrides it for every request type, so
+/// the integration test doesn't wait half a minute.
+fn request_timeout(request_type: &str) -> Duration {
+    if let Some(ms) = std::env::var("DDMM_BRIDGE_REQUEST_TIMEOUT_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        return Duration::from_millis(ms);
+    }
+    match request_type {
+        "install" => Duration::from_secs(5 * 60 + 30),
+        "open" => Duration::from_secs(90),
+        _ => Duration::from_secs(30),
+    }
+}
+
 /// Shared by every request the relay is handling.
 struct Relay {
     resolve_base: fn() -> PathBuf,
@@ -387,9 +419,13 @@ impl Relay {
                 link.close();
                 return self.error(&id, ErrorCode::AppNotRunning, "lost connection to DDMM");
             }
-            match rx.await {
-                Ok(reply) => self.reply(reply),
-                Err(_) => self.error(&id, ErrorCode::AppNotRunning, "lost connection to DDMM"),
+            match tokio::time::timeout(request_timeout(&request_type), rx).await {
+                Ok(Ok(reply)) => self.reply(reply),
+                Ok(Err(_)) => self.error(&id, ErrorCode::AppNotRunning, "lost connection to DDMM"),
+                Err(_) => {
+                    link.unregister(&id);
+                    self.error(&id, ErrorCode::Internal, "DDMM didn't answer in time");
+                }
             }
             return;
         }
@@ -442,6 +478,10 @@ pub async fn run(origin: HostOrigin, resolve_base: fn() -> PathBuf) {
         out,
     });
 
+    // Bounds every request task, including ones still connecting or
+    // starting DDMM (which haven't registered with a connection yet).
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+
     loop {
         let data = match read_frame(&mut stdin, MAX_MESSAGE_BYTES).await {
             Ok(Frame::Eof) | Err(_) => break,
@@ -467,7 +507,15 @@ pub async fn run(origin: HostOrigin, resolve_base: fn() -> PathBuf) {
         let Ok(line) = serde_json::to_string(&value) else { continue };
         let id = extract_id(&data);
         let request_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
-        tokio::spawn(relay.clone().handle(id, request_type, line));
+        let Ok(permit) = in_flight.clone().try_acquire_owned() else {
+            relay.error(&id, ErrorCode::Busy, "too many requests at once, try again shortly");
+            continue;
+        };
+        let relay = relay.clone();
+        tokio::spawn(async move {
+            relay.handle(id, request_type, line).await;
+            drop(permit);
+        });
     }
 }
 

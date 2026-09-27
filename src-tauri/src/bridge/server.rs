@@ -12,7 +12,6 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::oneshot,
 };
 
 use crate::{
@@ -107,6 +106,11 @@ async fn handle_connection(app: AppHandle, stream: TcpStream, expected_token: St
 /// gets near it: it sends a handful of requests at a time.)
 const MAX_IN_FLIGHT_PER_CONNECTION: usize = 32;
 
+/// The unauthenticated handshake (`{"hello":"<64 hex chars>"}`) must fit in
+/// this many bytes and arrive within [`HANDSHAKE_TIMEOUT`].
+const MAX_HANDSHAKE_BYTES: usize = 256;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// One authenticated connection from the host relay: the token handshake,
 /// then full duplex. Every request is handled on its own task, and its
 /// reply is written as soon as it's ready, echoing the request's `id` (the
@@ -121,11 +125,15 @@ where
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    let handshake_line = match read_bounded_line(&mut reader, MAX_LINE_BYTES).await? {
-        None => return Ok(()),
-        Some(BoundedLine::Line(line)) => line,
-        Some(BoundedLine::TooLong) => String::new(),
-    };
+    // Nothing is trusted before the token: the handshake line is small and
+    // must come promptly, or the connection is dropped.
+    let handshake_line =
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_bounded_line(&mut reader, MAX_HANDSHAKE_BYTES)).await {
+            Err(_) | Ok(Ok(None)) => return Ok(()),
+            Ok(Err(e)) => return Err(e.into()),
+            Ok(Ok(Some(BoundedLine::Line(line)))) => line,
+            Ok(Ok(Some(BoundedLine::TooLong))) => String::new(),
+        };
     let handshake: serde_json::Value = serde_json::from_str(handshake_line.trim()).unwrap_or_default();
     let supplied = handshake.get("hello").and_then(|v| v.as_str()).unwrap_or("");
     if !tokens_match(&expected_token, supplied) {
@@ -364,16 +372,13 @@ async fn handle_query(app: &AppHandle, raw: serde_json::Value, id: String) -> St
 async fn handle_install_queued(app: &AppHandle, raw: serde_json::Value, id: String) -> String {
     let state = app.state::<AppState>();
 
-    let depth = state.bridge_queue_depth.fetch_add(1, Ordering::SeqCst) + 1;
-    if depth > MAX_QUEUE_DEPTH {
-        state.bridge_queue_depth.fetch_sub(1, Ordering::SeqCst);
+    let Some(_queued) = QueueSlot::take(&state.bridge_queue_depth, MAX_QUEUE_DEPTH) else {
         return ErrorReply::new(id, ErrorCode::Busy, "too many installs queued, try again shortly").to_line();
-    }
+    };
     let _recent = RecentFileGuard::new(&state, &raw);
 
     let _permit = state.bridge_install_lock.lock().await;
     let Ok(_data_op) = state.data_op() else {
-        state.bridge_queue_depth.fetch_sub(1, Ordering::SeqCst);
         return ErrorReply::new(
             id,
             ErrorCode::Busy,
@@ -381,9 +386,26 @@ async fn handle_install_queued(app: &AppHandle, raw: serde_json::Value, id: Stri
         )
         .to_line();
     };
-    let result = handle_install(app, raw, id.clone()).await;
-    state.bridge_queue_depth.fetch_sub(1, Ordering::SeqCst);
-    result
+    handle_install(app, raw, id.clone()).await
+}
+
+/// One place in the install queue (`bridge_queue_depth`), given back when
+/// dropped -- however the install ends, a panic included, so a failed
+/// install can never leave the queue looking permanently fuller.
+struct QueueSlot<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> QueueSlot<'a> {
+    /// A place in the queue, or `None` when `max` are already taken.
+    fn take(depth: &'a std::sync::atomic::AtomicUsize, max: usize) -> Option<Self> {
+        let slot = QueueSlot(depth);
+        (depth.fetch_add(1, Ordering::SeqCst) < max).then_some(slot)
+    }
+}
+
+impl Drop for QueueSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Keeps auto-import from offering `file` while the extension's install of
@@ -435,7 +457,7 @@ async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String) -> 
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        match request_consent(app, &id, site.as_deref(), &file_name).await {
+        match request_consent(app, site.as_deref(), &file_name).await {
             ConsentDecision::Deny => {
                 return ErrorReply::new(id, ErrorCode::Declined, "You chose not to install this mod.").to_line();
             }
@@ -501,7 +523,7 @@ async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String) -> 
         .unwrap_or_else(|| "deploy".to_string());
 
     let completion = if wait_for_frontend(app).await {
-        request_install_completion(app, &id, &outcome, &after_install).await
+        request_install_completion(app, &outcome, &after_install).await
     } else {
         log::warn!("Frontend never became ready; skipping the afterInstall step for a bridge install");
         InstallCompletion {
@@ -581,12 +603,18 @@ async fn allow_site(app: &AppHandle, site: &str) {
 /// Ask the frontend to show the per-site consent prompt and bring the
 /// window to the front, then wait for the user's answer. Times out to
 /// `Deny` -- a closed/ignored prompt must never fall through to installing.
-async fn request_consent(app: &AppHandle, request_id: &str, site: Option<&str>, file_name: &str) -> ConsentDecision {
-    let (tx, rx) = oneshot::channel();
-    {
+///
+/// The round trip is keyed by a fresh server-generated key, not by the
+/// extension's request `id` (which restarts at "1" whenever the browser
+/// restarts the extension), so a late answer to an old prompt can never
+/// resolve a newer install's.
+async fn request_consent(app: &AppHandle, site: Option<&str>, file_name: &str) -> ConsentDecision {
+    let (request_id, rx) = {
         let state = app.state::<AppState>();
-        state.bridge_pending.lock().await.consent.insert(request_id.to_string(), tx);
-    }
+        let mut pending = state.bridge_pending.lock().await;
+        pending.wait_for_consent()
+    };
+    let request_id = request_id.as_str();
 
     focus_main_window(app);
 
@@ -610,20 +638,16 @@ async fn request_consent(app: &AppHandle, request_id: &str, site: Option<&str>, 
 /// what actually happened.
 async fn request_install_completion(
     app: &AppHandle,
-    request_id: &str,
     outcome: &install::InstallOutcome,
     after_install: &str,
 ) -> InstallCompletion {
-    let (tx, rx) = oneshot::channel();
-    {
+    // Keyed by a fresh key, for the same reason as `request_consent`.
+    let (request_id, rx) = {
         let state = app.state::<AppState>();
-        state
-            .bridge_pending
-            .lock()
-            .await
-            .install_completion
-            .insert(request_id.to_string(), tx);
-    }
+        let mut pending = state.bridge_pending.lock().await;
+        pending.wait_for_completion()
+    };
+    let request_id = request_id.as_str();
 
     let payload = serde_json::json!({
         "requestId": request_id,
@@ -739,6 +763,53 @@ mod tests {
         write.write_all(b"{\"id\":\"after\"}\n").await.unwrap();
         assert!(read_line(&mut read).await.contains("message too large"));
         assert_eq!(read_line(&mut read).await, r#"{"id":"after"}"#);
+    }
+
+    #[test]
+    fn a_queue_slot_is_given_back_even_when_the_install_panics() {
+        let depth = std::sync::atomic::AtomicUsize::new(0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _slot = QueueSlot::take(&depth, 2).unwrap();
+            assert_eq!(depth.load(Ordering::SeqCst), 1);
+            panic!("install blew up");
+        }));
+        assert!(result.is_err());
+        assert_eq!(depth.load(Ordering::SeqCst), 0);
+
+        let a = QueueSlot::take(&depth, 2).unwrap();
+        let _b = QueueSlot::take(&depth, 2).unwrap();
+        assert!(QueueSlot::take(&depth, 2).is_none(), "full");
+        assert_eq!(depth.load(Ordering::SeqCst), 2, "a refused slot isn't counted");
+        drop(a);
+        assert!(QueueSlot::take(&depth, 2).is_some());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_or_silent_handshake_is_dropped() {
+        for mode in ["oversized", "silent"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_connection(stream, "secret".into(), |_| async { String::from("{}") }).await
+            });
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            if mode == "oversized" {
+                let mut line = format!("{{\"hello\":\"secret\",\"pad\":\"{}\"}}", "x".repeat(MAX_HANDSHAKE_BYTES));
+                line.push('\n');
+                stream.write_all(line.as_bytes()).await.unwrap();
+            }
+            // Refused (or timed out) without ever authenticating.
+            let started = tokio::time::Instant::now();
+            tokio::time::timeout(HANDSHAKE_TIMEOUT + Duration::from_secs(2), server).await.unwrap().unwrap().unwrap();
+            if mode == "silent" {
+                assert!(started.elapsed() >= HANDSHAKE_TIMEOUT - Duration::from_millis(100));
+            }
+            let mut buf = String::new();
+            let mut reader = BufReader::new(stream);
+            let _ = tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut buf).await;
+            assert!(!buf.contains("\"ok\":true"), "{mode}: {buf}");
+        }
     }
 
     #[test]

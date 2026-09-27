@@ -63,7 +63,9 @@ one connection concurrently too. So a request that waits on the user (an `instal
 2 minutes, or waiting up to 60 s for DDMM's window to be ready) never delays the `hello`/`query`/`status` the extension
 sends meanwhile, which have a 10 s timeout. Replies can therefore arrive in a different order than their requests,
 and requests sent without waiting for an earlier reply may reach the app in any order. At most 64 requests may be
-in progress through one host (32 per app connection); beyond that a request gets `BUSY` at once.
+in progress through one host (32 per app connection); beyond that a request gets `BUSY` at once. The host gives up on
+a request DDMM hasn't answered after a little longer than the extension's own timeout for it (5½ min for `install`,
+90 s for `open`, 30 s otherwise) and replies `INTERNAL`, so an unanswered request never holds its place forever.
 
 ### Reaching the running app
 
@@ -79,7 +81,10 @@ Windows) and deleted on clean exit. The token is regenerated on every start.
 
 The host resolves the data folder with the **same logic as the app** (a `ddmm-data-location.json` pointer, the
 portable marker, app-data; see [Data folder](../using/data-folder.md#how-ddmm-remembers-the-folder)), reads
-`bridge.json`, connects, and sends `{"hello": "<token>"}` followed by a newline. It resolves the folder again for every
+`bridge.json`, connects, and sends `{"hello": "<token>"}` followed by a newline. A `bridge.json` whose `pid` is no
+longer running is stale (DDMM crashed) and is ignored without connecting. Connecting plus the handshake must finish
+within 5 s. On the app side the handshake line must be at most 256 bytes and arrive within 5 s, or the connection is
+dropped; nothing else is read from a connection before its token checks out. It resolves the folder again for every
 (re)connect, so a host the browser kept alive finds the app after the user moves the data folder (the app restarts
 after a move and writes a fresh `bridge.json` in the new folder). The host never creates the data folder. The app replies `{"ok": true}` and closes the connection
 on a wrong token. After that, both sides exchange **newline-delimited JSON** (one object per line).
@@ -171,13 +176,18 @@ its optional files), so sharing a source isn't enough: the app records which fil
 (`InstalledFiles` in its origin sidecar) and updates a mod only with **the same file**:
 
 - Nexus Mods: the archive names (both of Nexus's naming schemes) have the same mod id and the same file name; the
-  version and upload time may differ.
-- Other sites: the names have the same "shape" (letters only, extension and GameBanana's upload suffix removed), so
+  version and upload time may differ. The names are read against the page's mod id, so a version made of long
+  numbers (`Cool Mod-456-2024-06-01-….zip`) isn't mistaken for another mod's id.
+- Other sites: the names have the same "shape": the extension, a browser's ` (1)`, GameBanana's upload suffix and
+  version-shaped parts (`v2`, `1.2.0`, `1-2-0`, a date) are removed, and everything else counts, numbers included. So
   `cool_mod_v2_ff3bb.zip` updates the mod installed from `cool_mod_v1_ab12c.zip`, but `cool_mod_red_….zip` never
-  replaces the mod installed from `cool_mod_blue_….zip`.
+  replaces `cool_mod_blue_….zip`, nor `armor_4k_….zip` replaces `armor_2k_….zip` (or `1440p` `1080p`, or `Option 2`
+  `Option 1`). When in doubt, the file installs as a new mod.
 
 Any other file from that page installs as a new mod. The one exception is a mod installed before DDMM recorded its
-file: when it's the only mod from that page, it's updated in place as before (there's nothing to tell files apart by).
+file: when it's the only mod from that page, it's updated in place as before (there's nothing to tell files apart by),
+unless the file's Nexus archive name says it's from a different Nexus mod. Such a file (a requirement linked from
+the page, say) is never an update of the page's mod: it installs as a new mod, recorded as the mod it really is.
 
 For a GitHub release asset, the version recorded is the release tag named in `downloadUrl`
 (`https://github.com/<owner>/<repo>/releases/download/<tag>/<file>`), the same rule Add URL uses, not whatever the
@@ -314,6 +324,9 @@ the restart fails with links, it's retried once without them.
 - App-side origin allowlist (the extension IDs above).
 - Per-site "Always allow" consent for extension installs; an install with no `http(s)` URL is always confirmed.
   `ddmm://` always confirms.
+- Consent prompts and afterInstall reports are matched to their install by a fresh key the app generates for each,
+  never by the extension's request `id` (which restarts when the browser restarts the extension), so a late answer
+  can't resolve a different install.
 - Content-script buttons act only on trusted clicks (`event.isTrusted`), so a page can't script-click them.
 - Every install still goes through archive validation (paths, symlinks, magic bytes, size cap).
 - No credentials, cookies or tokens for any mod site ever cross the bridge.

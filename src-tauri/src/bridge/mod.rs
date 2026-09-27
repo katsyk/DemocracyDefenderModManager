@@ -64,6 +64,33 @@ pub struct BridgePending {
     pub install_completion: HashMap<String, oneshot::Sender<InstallCompletion>>,
 }
 
+impl BridgePending {
+    /// A fresh key for one consent/completion round trip. Never the
+    /// extension's request `id`: that restarts at "1" whenever the browser
+    /// restarts the extension, so a late answer meant for an older install
+    /// could otherwise resolve a newer one.
+    fn new_key() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    /// Start waiting for a consent answer: the key the frontend answers
+    /// with, and where the answer arrives.
+    pub fn wait_for_consent(&mut self) -> (String, oneshot::Receiver<ConsentDecision>) {
+        let (tx, rx) = oneshot::channel();
+        let key = Self::new_key();
+        self.consent.insert(key.clone(), tx);
+        (key, rx)
+    }
+
+    /// Start waiting for the frontend's afterInstall report.
+    pub fn wait_for_completion(&mut self) -> (String, oneshot::Receiver<InstallCompletion>) {
+        let (tx, rx) = oneshot::channel();
+        let key = Self::new_key();
+        self.install_completion.insert(key.clone(), tx);
+        (key, rx)
+    }
+}
+
 /// Downloads the browser extension has asked DDMM to install: while such an
 /// install is running, and for [`RecentBridgeFiles::KEEP_AFTER`] after it
 /// finished, auto-import (which watches the same Downloads folder) doesn't
@@ -119,6 +146,28 @@ impl RecentBridgeFiles {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A late answer to an older prompt (the frontend answering with the
+    /// old key) can't resolve a newer install's prompt.
+    #[tokio::test]
+    async fn round_trips_use_fresh_keys_so_late_answers_cant_cross() {
+        let mut pending = BridgePending::default();
+        let (old_key, old_rx) = pending.wait_for_consent();
+        drop(old_rx); // that install timed out and moved on
+        pending.consent.remove(&old_key);
+        let (new_key, new_rx) = pending.wait_for_consent();
+        assert_ne!(old_key, new_key);
+
+        // The stale answer arrives now: it finds nothing to resolve.
+        assert!(pending.consent.remove(&old_key).is_none());
+        let tx = pending.consent.remove(&new_key).unwrap();
+        tx.send(ConsentDecision::JustOnce).unwrap();
+        assert_eq!(new_rx.await.unwrap(), ConsentDecision::JustOnce);
+
+        let (a, _) = pending.wait_for_completion();
+        let (b, _) = pending.wait_for_completion();
+        assert_ne!(a, b);
+    }
 
     #[test]
     fn recent_bridge_files_cover_running_and_just_finished_installs() {
