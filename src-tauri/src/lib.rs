@@ -125,6 +125,7 @@ impl AppState {
             reason: String::new(),
             default_path: base_path.clone(),
             pointer_file: base_path.join(data_dir::POINTER_FILENAME),
+            mirror_pointer_file: None,
             pointed: false,
             problem: None,
         };
@@ -184,10 +185,10 @@ impl AppState {
 }
 
 /// Compute the base data directory the same way the desktop app does,
-/// without touching Tauri at all -- used both by `run()` before the
-/// builder is constructed and by host mode, which never constructs one.
+/// without touching Tauri at all, for host mode (which never constructs
+/// it). Read-only: the host never copies or writes a pointer file.
 fn resolve_base_path() -> PathBuf {
-    data_dir::decide_data_dir_for_this_machine().path
+    data_dir::decide_data_dir_for_this_machine_read_only().path
 }
 
 /// Run as the browser's native-messaging host: relay only, no window, no

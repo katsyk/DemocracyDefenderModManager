@@ -134,9 +134,9 @@ fn commit_location(state_dir: &data_dir::DataDirDecision, target: &Path, is_rese
                     .with_context(|| format!("couldn't create {}", marker.display()))?;
             }
         }
-        data_dir::remove_pointer(&state_dir.pointer_file)
+        data_dir::clear_pointer(state_dir)
     } else {
-        data_dir::write_pointer(&state_dir.pointer_file, target).map_err(|e| {
+        data_dir::commit_pointer(state_dir, target).map_err(|e| {
             if state_dir.kind == BaseDirKind::Portable {
                 e.context(format!(
                     "DDMM keeps the data folder location next to its program file, in {}",
@@ -310,7 +310,7 @@ fn located_folder(picked: &Path) -> anyhow::Result<PathBuf> {
 #[tauri::command]
 pub async fn locate_data_folder(app: AppHandle, state: State<'_, AppState>, folder: String) -> TAResult<()> {
     let chosen = located_folder(&PathBuf::from(folder.trim())).into_ta_result()?;
-    data_dir::write_pointer(&state.data_dir.pointer_file, &chosen).into_ta_result()?;
+    data_dir::commit_pointer(&state.data_dir, &chosen).into_ta_result()?;
     log::info!("Data folder located at {chosen:?}; restarting.");
     restart_soon(app);
     Ok(())
@@ -330,7 +330,7 @@ pub async fn reset_data_folder_location(app: AppHandle, state: State<'_, AppStat
             }
         }
     }
-    data_dir::remove_pointer(&d.pointer_file).into_ta_result()?;
+    data_dir::clear_pointer(d).into_ta_result()?;
     log::info!("Data folder location reset to the default ({:?}); restarting.", d.default_path);
     restart_soon(app);
     Ok(())
@@ -348,6 +348,7 @@ mod tests {
             kind,
             reason: String::new(),
             pointer_file: default_path.join(data_dir::POINTER_FILENAME),
+            mirror_pointer_file: None,
             default_path,
             pointed: false,
             problem: None,
