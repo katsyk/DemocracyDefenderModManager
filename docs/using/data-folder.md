@@ -91,9 +91,13 @@ outside the default data folder, so it survives the move, and deleting the old d
 make DDMM forget where your data went:
 
 - **Installed** (Windows installer, `.deb`, `.rpm`, or an AppImage in a read-only location): in its own per-user
-  folder, `%LOCALAPPDATA%\io.github.katsyk.ddmm.location\` on Windows and `~/.config/io.github.katsyk.ddmm/` on
-  Linux. (Earlier versions kept it in `%APPDATA%\io.github.katsyk.ddmm\` on Windows, which is also the default
-  data folder; DDMM moves it to the new place by itself the next time it starts.)
+  folder, `%APPDATA%\io.github.katsyk.ddmm.location\` on Windows (next to the default data folder, not inside it)
+  and `~/.config/io.github.katsyk.ddmm/` on Linux.
+  Earlier versions kept it in `%APPDATA%\io.github.katsyk.ddmm\` on Windows, which is also the default data folder.
+  DDMM copies that file to the new place the first time it starts, and **keeps the old one**, updating it along with
+  the new one whenever you change the data folder (as long as that old folder still exists). That way an earlier
+  version of DDMM still finds your data if you ever go back to it. If the two files ever disagree, DDMM uses the one
+  whose folder exists (or, if both do, the one written last) and says so in its log; it never deletes either.
 - **Portable**: next to `ddmm.exe` (or the `.AppImage`), so the portable folder describes itself.
 
 When DDMM starts it picks its data folder in this order, first match wins:

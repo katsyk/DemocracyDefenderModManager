@@ -72,6 +72,18 @@ delete this mod?"), DDMM deletes the mod's files from `mods/` and removes it fro
 it. This is different from a profile's **Remove**, which only takes the mod out of the current profile and leaves
 it installed in your Library.
 
+## Mods that can't be found
+
+If a mod in a profile isn't in your Library when DDMM starts (its folder was removed by hand, or its
+`manifest.json` is damaged), the profile keeps its entry, shown as **Mod not found**, in the same place in the load
+order. Fix or re-add the mod and it's back where it was; **Remove** takes the entry out for good.
+
+- **Deploy** skips missing mods and says how many it skipped. If *every* mod in the profile is missing, it refuses
+  and leaves the game's mods as they are.
+- If a mod comes back changed (different options, or another manifest version), the options you had chosen may no
+  longer fit. DDMM then resets that mod's options to the defaults, keeps it on or off as it was, and tells you
+  which mods it reset.
+
 ## Saving
 
 Profiles (and their mod order, enabled state, and options) are saved automatically whenever you navigate away

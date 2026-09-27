@@ -96,13 +96,18 @@
                 },
                 "notification": {
                     "empty_deploy_error": {
-                        "message": "Can not deploy empty profile!"
+                        "message": "Can not deploy empty profile!",
+                        "all_missing": "Nothing to deploy: none of the {count} mod(s) in this profile are in your library right now (shown as \"Mod not found\"). The game's mods were left as they are."
+                    },
+                    "options_reset": {
+                        "message": "These mods changed since their options were chosen, so their options were reset to the defaults: {names}. Check them before deploying."
                     },
                     "purge_success": {
                         "message": "Purge successful."
                     },
                     "deploy_success": {
-                        "message": "Deployment successful."
+                        "message": "Deployment successful.",
+                        "missing_skipped": "Deployed, but {count} missing mod(s) were skipped (shown as \"Mod not found\" in the profile)."
                     },
                     "game_path_detected": {
                         "message": "Found Helldivers 2 at {path}"

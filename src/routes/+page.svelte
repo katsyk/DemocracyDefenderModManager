@@ -11,6 +11,7 @@
     import { useLocalization } from "$lib/state/localization.svelte";
     import { Mod } from "$lib/models/mod";
     import type {Config, Profile, ProfilesConfig} from "$lib/models/profile";
+    import { defaultConfigFor, deployableEntries, fitConfig } from "$lib/utils/profileEntries";
     import {
         addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles,
         loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath,
@@ -312,6 +313,11 @@
             .flatMap(p => p.Configs)
             .filter(c => !loadedMods.some(mod => mod.guid === c.Guid)).length;
         if (missing > 0) log.warn(`${missing} profile entr(ies) refer to mods that couldn't be loaded; keeping them.`);
+        const resetOptions = fitProfilesToMods(loadedConfig.Profiles, loadedMods);
+        if (resetOptions.length > 0) {
+            log.warn(`Options reset to defaults (they no longer fit the mod): ${resetOptions.join(", ")}`);
+            showPopup(new NotificationPopup("warning", t("pages.mods.popup.notification.options_reset.message", { names: resetOptions.join(", ") })));
+        }
 
         mods = loadedMods;
         profiles = loadedConfig.Profiles;
@@ -382,34 +388,24 @@
     }
 
     function makeConfigForMod(mod: Mod): Config {
-        if (!("Version" in mod.Manifest)) {
-            return {
-                For: "Legacy",
-                Guid: mod.Manifest.Guid,
-                Enabled: true,
-                Selected: 0
-            };
-        } else if (mod.Manifest.Version === 1) {
-            const len = mod.Manifest.Options?.length ?? 0;
-            return {
-                For: "V1",
-                Guid: mod.Manifest.Guid,
-                Enabled: true,
-                Toggled: new Array(len).fill(true),
-                Selected: new Array(len).fill(0)
-            };
-        } else if (mod.Manifest.Version === 2) {
-            const len = mod.Manifest.Options?.length ?? 0;
-            return {
-                For: "V2",
-                Guid: mod.Manifest.Guid,
-                Enabled: true,
-                Toggled: new Array(len).fill(true),
-                Selected: new Array(len).fill(0)
-            };
-        } else {
-            throw "Unknown manifest version!";
+        return defaultConfigFor(mod.Manifest);
+    }
+
+    /** Reset the option choices of entries that no longer fit their mod
+     * (it came back after being missing, or changed underneath), keeping
+     * on/off and position; returns the names of the mods that were reset. */
+    function fitProfilesToMods(allProfiles: Profile[], loaded: Mod[]): string[] {
+        const reset: string[] = [];
+        for (const profile of allProfiles) {
+            profile.Configs = profile.Configs.map(config => {
+                const mod = loaded.find(m => m.guid === config.Guid);
+                if (!mod) return config;
+                const fitted = fitConfig(config, mod.Manifest);
+                if (fitted.reset && !reset.includes(mod.name)) reset.push(mod.name);
+                return fitted.config;
+            });
         }
+        return reset;
     }
 
     async function doDeleteMod(guid: string) {
@@ -1409,8 +1405,22 @@
     async function onDeploy() {
         if (!currentProfile) return;
         
-        if (currentProfile.Configs.length === 0) {
-            showPopup(new NotificationPopup("error", t("pages.mods.popup.notification.empty_deploy_error.message")));
+        // A mod that came back (re-added, repaired) may not fit its old
+        // option choices any more.
+        const resetOptions = fitProfilesToMods([currentProfile], mods);
+        if (resetOptions.length > 0) {
+            profileConfigs = currentProfile.Configs;
+            log.warn(`Options reset to defaults before deploying: ${resetOptions.join(", ")}`);
+            showToast("warning", t("pages.mods.popup.notification.options_reset.message", { names: resetOptions.join(", ") }));
+        }
+
+        // Entries whose mod isn't in the library are skipped by deploy; a
+        // profile of only those would just remove every mod from the game.
+        const { loaded, missing } = deployableEntries(currentProfile.Configs, mods.map(m => m.guid));
+        if (loaded.length === 0) {
+            showPopup(new NotificationPopup("error", missing > 0
+                ? t("pages.mods.popup.notification.empty_deploy_error.all_missing", { count: missing })
+                : t("pages.mods.popup.notification.empty_deploy_error.message")));
             return;
         }
 
@@ -1420,7 +1430,9 @@
 
         try {
             await deploy(currentProfile.Configs);
-            showPopup(new NotificationPopup("info", t("pages.mods.popup.notification.deploy_success.message")));
+            showPopup(missing > 0
+                ? new NotificationPopup("warning", t("pages.mods.popup.notification.deploy_success.missing_skipped", { count: missing }))
+                : new NotificationPopup("info", t("pages.mods.popup.notification.deploy_success.message")));
         } catch(ex: unknown) {
             showPopup(new ErrorPopup(t("pages.mods.popup.error.deploy.message"), errorMessage(ex)));
         } finally {
