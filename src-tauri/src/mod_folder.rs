@@ -122,18 +122,43 @@ pub fn ensure_mod_folder(mods_root: &Path, target: &Path) -> anyhow::Result<()> 
     let rest = target.strip_prefix(mods_root).map_err(|_| refuse())?;
     let mut components = rest.components();
     match (components.next(), components.next()) {
-        (Some(Component::Normal(name)), None) if !name.is_empty() => {}
+        (Some(Component::Normal(name)), None) if !name.is_empty() => {
+            // Windows drops trailing dots and spaces from names, so a
+            // delete of `Foo.` would remove `Foo`.
+            if cfg!(windows) && has_windows_alias_ending(&name.to_string_lossy()) {
+                return Err(refuse());
+            }
+        }
         _ => return Err(refuse()),
     }
     let parent = target.parent().ok_or_else(refuse)?;
-    let canonical_parent =
-        std::fs::canonicalize(parent).with_context(|| format!("couldn't resolve {:?}", parent))?;
-    let canonical_root =
-        std::fs::canonicalize(mods_root).with_context(|| format!("couldn't resolve {:?}", mods_root))?;
-    if canonical_parent != canonical_root {
-        return Err(refuse());
+    match (std::fs::canonicalize(parent), std::fs::canonicalize(mods_root)) {
+        (Ok(canonical_parent), Ok(canonical_root)) => {
+            if canonical_parent != canonical_root {
+                return Err(refuse());
+            }
+        }
+        // Some drives (certain network shares, RAM disks) can't be
+        // canonicalized: the lexical check above -- `mods_root` plus one
+        // plain name -- still holds, so rely on it rather than refusing
+        // every delete there.
+        (parent_result, root_result) => {
+            log::warn!(
+                "Couldn't resolve {:?} / {:?} ({:?} / {:?}); relying on the name check alone.",
+                parent,
+                mods_root,
+                parent_result.err(),
+                root_result.err()
+            );
+        }
     }
     Ok(())
+}
+
+/// Whether `name` ends in a dot or a space, which Windows silently strips
+/// (so it names a different folder there).
+pub fn has_windows_alias_ending(name: &str) -> bool {
+    name.ends_with('.') || name.ends_with(' ')
 }
 
 /// `remove_dir_all(target)`, but only after [`ensure_mod_folder`] agrees
@@ -256,6 +281,43 @@ mod tests {
         ] {
             assert!(ensure_mod_folder(&root, &bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn names_windows_would_alias_are_detected() {
+        for name in ["Foo.", "Foo ", "Foo. ", "..."] {
+            assert!(has_windows_alias_ending(name), "{name:?}");
+        }
+        for name in ["Foo", "Foo.bar", ".Foo"] {
+            assert!(!has_windows_alias_ending(name), "{name:?}");
+        }
+        // Nothing DDMM names itself ends that way.
+        for name in ["Foo.", "Foo ", "a. . ."] {
+            assert!(!has_windows_alias_ending(&safe_folder_name(name)), "{name:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_trailing_dot_name_never_deletes_its_alias_on_windows() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("mods");
+        std::fs::create_dir_all(root.join("Foo")).unwrap();
+        assert!(remove_mod_folder(&root, &root.join("Foo.")).await.is_err());
+        assert!(remove_mod_folder(&root, &root.join("Foo ")).await.is_err());
+        assert!(root.join("Foo").is_dir());
+    }
+
+    /// When the storage can't be canonicalized (here: it doesn't exist),
+    /// the one-name check alone decides instead of refusing everything.
+    #[test]
+    fn an_unresolvable_storage_falls_back_to_the_name_check() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("not-there");
+        assert!(ensure_mod_folder(&root, &root.join("Foo")).is_ok());
+        assert!(ensure_mod_folder(&root, &root.join("..")).is_err());
+        assert!(ensure_mod_folder(&root, &root).is_err());
+        assert!(ensure_mod_folder(&root, &root.join("a").join("b")).is_err());
     }
 
     #[cfg(unix)]
