@@ -958,7 +958,10 @@ fn looks_like_a_copy(path: &Path) -> bool {
 /// know one counts as older on it); an original before a renamed copy when
 /// nothing else tells them apart.
 fn newer_first(a: &ScanItem, b: &ScanItem) -> std::cmp::Ordering {
-    fn key(i: &ScanItem) -> (i64, Option<Vec<u64>>, Option<std::time::SystemTime>, std::cmp::Reverse<(bool, usize, usize)>) {
+    /// Upload order, version, file date, then "the original" (not a
+    /// renamed copy, shorter path, listed first) -- larger is newer.
+    type Key = (i64, Option<Vec<u64>>, Option<std::time::SystemTime>, std::cmp::Reverse<(bool, usize, usize)>);
+    fn key(i: &ScanItem) -> Key {
         let upload = i.nexus.as_ref().map(|n| n.upload_order).unwrap_or(0);
         let version = i.nexus.as_ref().and_then(|n| n.version.as_deref()).and_then(crate::providers::numeric_version);
         let modified = std::fs::metadata(&i.path).and_then(|m| m.modified()).ok();
