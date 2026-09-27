@@ -1170,38 +1170,15 @@ pub fn check_free_space(needed: u64, free: Option<u64>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A folder name that's valid on every OS DDMM runs on, derived from `name`.
+/// A folder name that's valid on every OS DDMM runs on, derived from `name`
+/// (see [`crate::mod_folder::safe_folder_name`]).
 pub fn safe_dir_name(name: &str) -> String {
-    let mut out: String = name
-        .chars()
-        .map(|c| if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || c.is_control() { '_' } else { c })
-        .collect();
-    while out.ends_with('.') || out.ends_with(' ') {
-        out.pop();
-    }
-    let out = out.trim_start().to_string();
-    let upper = out.to_ascii_uppercase();
-    let stem = upper.split('.').next().unwrap_or("");
-    let reserved = matches!(stem, "CON" | "PRN" | "AUX" | "NUL")
-        || ((stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4 && stem.as_bytes()[3].is_ascii_digit());
-    let mut out = if out.is_empty() || reserved { format!("mod {out}").trim().to_string() } else { out };
-    // Keep paths comfortably short on Windows.
-    if out.chars().count() > 80 {
-        out = out.chars().take(80).collect::<String>().trim_end().to_string();
-    }
-    out
+    crate::mod_folder::safe_folder_name(name)
 }
 
 /// `mods/<name>`, or `mods/<name> (2)`, ... -- the first that's free.
 fn unique_dir_name(mods_root: &Path, name: &str, taken: &HashSet<String>) -> String {
-    let base = safe_dir_name(name);
-    let free = |candidate: &str| {
-        !taken.contains(&candidate.to_lowercase()) && std::fs::symlink_metadata(mods_root.join(candidate)).is_err()
-    };
-    if free(&base) {
-        return base;
-    }
-    (2..).map(|n| format!("{base} ({n})")).find(|c| free(c)).unwrap()
+    crate::mod_folder::free_folder_name(mods_root, name, &|candidate| taken.contains(&candidate.to_lowercase()))
 }
 
 /// The sidecar sources/files to record for an imported mod.
@@ -1482,8 +1459,9 @@ async fn remove_imported(state: &AppState, installed: &Mod) {
     if let Some(mods) = guard.as_mut() {
         mods.retain(|m| m.guid() != installed.guid() || m.directory != installed.directory);
     }
-    if let Err(e) = tokio::fs::remove_dir_all(&installed.directory).await {
-        log::error!("Couldn't remove the cancelled import {:?}: {e}", installed.directory);
+    let mods_root = state.base_path.join(MODS_DIRECTORY);
+    if let Err(e) = crate::mod_folder::remove_mod_folder(&mods_root, &installed.directory).await {
+        log::error!("Couldn't remove the cancelled import {:?}: {e:#}", installed.directory);
     }
 }
 
