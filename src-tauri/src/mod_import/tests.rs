@@ -137,6 +137,29 @@ fn nexus_download_names_give_mod_id_version_and_clean_name() {
     assert_eq!(display_name_from_file("MOD.ZIP", true), "MOD");
 }
 
+/// Issue #33: "EAGLE-2-1065-V1-1-1752787902" showed up in the mod list.
+#[test]
+fn display_names_clean_nexus_downloads_and_leave_other_names_alone() {
+    assert_eq!(display_name_from_file("EAGLE-2-1065-V1-1-1752787902.zip", true), "EAGLE-2");
+    assert_eq!(display_name_from_file("EAGLE-2-1065-V1-1-1752787902 (1).zip", true), "EAGLE-2");
+    assert_eq!(display_name_from_file("EAGLE-2-1065-V1-1-1752787902.7Z", true), "EAGLE-2");
+    assert_eq!(display_name_from_file("EAGLE-2-1065-V1-1-1752787902.rar", true), "EAGLE-2");
+    assert_eq!(display_name_from_file("EAGLE-2-1065-V1-1-1752787902", false), "EAGLE-2");
+    let n = nexus_ref_from_name("EAGLE-2-1065-V1-1-1752787902.zip", true).unwrap();
+    assert_eq!((n.mod_id.as_str(), n.version.as_deref()), ("1065", Some("V1.1")));
+
+    assert_eq!(display_name_from_file("My-Mod-2.zip", true), "My-Mod-2");
+    assert_eq!(display_name_from_file("Armor Pack 1.0.zip", true), "Armor Pack 1.0");
+    assert_eq!(display_name_from_file("Armor Pack 1.0.7z", true), "Armor Pack 1.0");
+    assert_eq!(display_name_from_file("Armor Pack 1.0.RAR", true), "Armor Pack 1.0");
+    assert_eq!(display_name_from_file("My-Mod-2 (1).zip", true), "My-Mod-2");
+    assert_eq!(display_name_from_file("Armor Pack 1.0 (2)", false), "Armor Pack 1.0");
+    assert_eq!(display_name_from_file("Pack (Blue).zip", true), "Pack (Blue)");
+    assert_eq!(display_name_from_file("(1).zip", true), "(1)");
+    assert!(nexus_ref_from_name("My-Mod-2.zip", true).is_none());
+    assert!(nexus_ref_from_name("Armor Pack 1.0.zip", true).is_none());
+}
+
 #[test]
 fn safe_dir_names_work_on_every_os() {
     assert_eq!(safe_dir_name("A: B / C?"), "A_ B _ C_");
@@ -933,6 +956,11 @@ async fn mods_added_by_hand_get_their_nexus_info_and_nothing_else() {
         for f in [&plain, &already, &"no nexus name.zip".to_string()] {
             let (m, _) = crate::commands::mods::install_from_archive(&state, mods, &src.join(f)).await.unwrap();
             dirs.push(m.directory.clone());
+        }
+        // Add now records the Nexus link from the file name itself; these
+        // stand for mods added before it did.
+        for dir in &dirs {
+            let _ = std::fs::remove_file(dir.join(ORIGIN_SIDECAR_FILE));
         }
         // The second one already has a Nexus link (e.g. installed through
         // the browser).

@@ -283,16 +283,71 @@ pub async fn add_mod(state: State<'_, AppState>, archive_file: PathBuf) -> TARes
 /// single install, and from callers (like `add_paths`) that lock once per
 /// item without ever calling back into another `#[tauri::command]` while
 /// holding the mutex.
+///
+/// The mod's folder is named after the archive; a generated manifest (the
+/// archive ships none) gets a readable name from the file name instead,
+/// without Nexus Mods' download suffix (see
+/// [`crate::mod_import::display_name_from_file`]), and a Nexus download's
+/// page and version are recorded (see [`record_nexus_from_file_name`]).
 pub(crate) async fn install_from_archive(state: &AppState, mods: &mut Vec<Mod>, archive_file: &Path) -> TAResult<(Mod, Option<String>)> {
     log::debug!("Obtaining name...");
-    let name = archive_file
+    let dir_name = archive_file
         .file_stem()
         .ok_or(anyhow::anyhow!("archive path has no file name"))?
         .to_str()
         .map(str::to_string)
         .ok_or(anyhow::anyhow!("file name conversion failed"))?;
+    let file_name = archive_file.file_name().and_then(|n| n.to_str()).unwrap_or(&dir_name).to_string();
+    let display_name = crate::mod_import::display_name_from_file(&file_name, true);
 
-    install_from_archive_as(&state.base_path, mods, archive_file, &name).await
+    log::info!("Adding mod from {:?}...", archive_file);
+    let subject = subject_of(archive_file);
+    let (mut r#mod, warning) =
+        install_archive_steps(&state.base_path, mods, archive_file, &dir_name, &display_name, &subject)
+            .await
+            .map_err(report)?;
+    record_nexus_from_file_name(mods, &mut r#mod, &file_name, true).await;
+    Ok((r#mod, warning))
+}
+
+/// A mod just installed from a file Nexus Mods named (`Name-1234-1-0-...`)
+/// gets that Nexus page, version and file recorded in its origin sidecar,
+/// the same way import records them, so "Check for updates" works for it.
+/// Read off the file name only: no Nexus API call.
+///
+/// Skipped when the mod already has an origin sidecar, or when its own
+/// manifest names a different Nexus page. Callers that know where the file
+/// came from (Add from URL, browser installs) write their origin afterwards,
+/// which replaces this one: a download URL's attribution always wins.
+async fn record_nexus_from_file_name(mods: &mut [Mod], r#mod: &mut Mod, file_name: &str, is_archive: bool) {
+    let Some(nexus) = crate::mod_import::nexus_ref_from_name(file_name, is_archive) else { return };
+    let other_page = r#mod.sources.iter().any(|s| {
+        s.provider.eq_ignore_ascii_case("nexus")
+            && s.origin == sources::SourceOrigin::Manifest
+            && sources::resolved_source_id(s).is_some_and(|id| id != nexus.mod_id)
+    });
+    if other_page || sources::load_origin_sidecar(&r#mod.directory).await.is_some() {
+        return;
+    }
+    let mut sidecar = sources::OriginSidecar {
+        sources: Vec::new(),
+        installed_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+        installed_files: Vec::new(),
+        skipped_versions: Vec::new(),
+        imported_archive: None,
+    };
+    crate::mod_import::add_nexus_to_sidecar(&mut sidecar, &nexus, r#mod);
+    if sidecar.sources.is_empty() && sidecar.installed_files.is_empty() {
+        return;
+    }
+    if let Err(e) = sources::save_origin_sidecar(&r#mod.directory, &sidecar).await {
+        log::error!("Failed to record the Nexus Mods source: {}", e);
+        return;
+    }
+    r#mod.resolve_sources().await;
+    if let Some(existing) = mods.iter_mut().find(|m| m.guid() == r#mod.guid()) {
+        *existing = r#mod.clone();
+    }
 }
 
 /// [`install_from_archive`] into `mods/<name>` (also the generated
@@ -307,7 +362,7 @@ pub(crate) async fn install_from_archive_as(
 ) -> TAResult<(Mod, Option<String>)> {
     log::info!("Adding mod from {:?}...", archive_file);
     let subject = subject_of(archive_file);
-    install_archive_steps(base_path, mods, archive_file, name, &subject).await.map_err(report)
+    install_archive_steps(base_path, mods, archive_file, name, name, &subject).await.map_err(report)
 }
 
 /// Log a failed install (the whole message: which mod, which step, why)
@@ -321,20 +376,20 @@ async fn install_archive_steps(
     base_path: &Path,
     mods: &mut Vec<Mod>,
     archive_file: &Path,
-    name: &str,
+    dir_name: &str,
+    manifest_name: &str,
     subject: &str,
 ) -> Result<(Mod, Option<String>), InstallError> {
     log::debug!("Opening archive...");
     let archive = Archive::open(archive_file).install_step(subject, InstallStep::OpenArchive)?;
-    let name = name.to_string();
 
     log::info!("Resolving mod directory...");
     let mut mod_dir = base_path.join(MODS_DIRECTORY);
-    mod_dir.push(&name);
+    mod_dir.push(dir_name);
 
     log::info!("Preparing mod directory...");
     let manifest_file = mod_dir.join(MANIFEST_FILE);
-    prepare_mod_dir(archive_file, &mod_dir, &manifest_file, &name, subject).await?;
+    prepare_mod_dir(archive_file, &mod_dir, &manifest_file, dir_name, subject).await?;
 
     // From here on `mod_dir` is ours (prepare_mod_dir just created it), so
     // a failure must remove it again: a half-written directory with a
@@ -343,7 +398,7 @@ async fn install_archive_steps(
     // already exists" (e.g. after an archive was rejected as unsafe).
     let prepared: Result<(Mod, Option<String>), InstallError> = async {
         log::info!("Resolving manifest...");
-        let (archive, manifest) = resolve_manifest(archive, name.clone(), manifest_file.clone())
+        let (archive, manifest) = resolve_manifest(archive, manifest_name.to_string(), manifest_file.clone())
             .await
             .map_err(|e| manifest_failure(subject, e))?;
 
@@ -604,7 +659,14 @@ async fn normalize_manifest_file_name(mod_dir: &Path) -> anyhow::Result<()> {
 /// Mirrors [`install_from_archive`]'s locking contract: takes the
 /// already-locked mods vector, never locks anything itself.
 async fn install_from_folder(base_path: &Path, mods: &mut Vec<Mod>, folder: &Path) -> TAResult<(Mod, Option<String>)> {
-    install_from_folder_as(base_path, mods, folder, None).await
+    let (mut r#mod, warning) = install_from_folder_as(base_path, mods, folder, None).await?;
+    let folder_name = crate::fs_util::resolve_path(folder)
+        .ok()
+        .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string));
+    if let Some(folder_name) = folder_name {
+        record_nexus_from_file_name(mods, &mut r#mod, &folder_name, false).await;
+    }
+    Ok((r#mod, warning))
 }
 
 /// [`install_from_folder`], optionally into `mods/<name>` instead of a
@@ -669,7 +731,8 @@ async fn install_folder_steps(
                 .map(|parent| matches!(path_overlap(parent, &mods_root), Ok(Some(PathOverlap::Same))))
                 .unwrap_or(false);
             if directly_in_storage && name_override.is_none() {
-                return adopt_folder_in_place(mods, &mods_root.join(&name), &name, subject).await;
+                let display_name = crate::mod_import::display_name_from_file(&name, false);
+                return adopt_folder_in_place(mods, &mods_root.join(&name), &display_name, subject).await;
             }
             return Err(refuse(anyhow::anyhow!(
                 "{} is inside a mod folder in DDMM's mod storage ({}). Pick that mod's own \
@@ -680,6 +743,11 @@ async fn install_folder_steps(
         }
     }
 
+    // The folder keeps the source folder's name; a generated manifest gets
+    // a readable one (no Nexus download suffix).
+    let manifest_name = name_override
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::mod_import::display_name_from_file(&name, false));
     let name = name_override.map(str::to_string).unwrap_or(name);
     log::info!("Resolving mod directory...");
     let mod_dir = mods_root.join(&name);
@@ -691,7 +759,7 @@ async fn install_folder_steps(
     // From here on `mod_dir` is a folder we just created (and, per the
     // checks above, not the source or anywhere near it), so a failure must
     // remove it again rather than leave a half-copied mod behind.
-    let result = install_from_folder_inner(mods, folder, &name, &mod_dir, &manifest_file, subject).await;
+    let result = install_from_folder_inner(mods, folder, &manifest_name, &mod_dir, &manifest_file, subject).await;
 
     if result.is_err() {
         if let Err(cleanup) = tokio::fs::remove_dir_all(&mod_dir).await {
@@ -1104,9 +1172,9 @@ async fn stage_update(
     let archive = Archive::open(archive_path).install_step(subject, InstallStep::OpenArchive)?;
     let manifest_file = staging_dir.join(MANIFEST_FILE);
     let name = archive_path
-        .file_stem()
+        .file_name()
         .and_then(|n| n.to_str())
-        .map(str::to_string)
+        .map(|n| crate::mod_import::display_name_from_file(n, true))
         .unwrap_or_else(|| "update".to_string());
 
     let (archive, mut manifest) = resolve_manifest(archive, name, manifest_file)
@@ -1156,8 +1224,84 @@ mod tests {
         let mut guard = state.mods.lock().await;
         let mods = ensure_mods_loaded(&mut guard, base.path()).await.unwrap();
         let (m, _) = install_from_archive(&state, mods, &archive).await.unwrap();
-        assert_eq!(m.name(), "PawnCompanion 1377 1.35 2026-06-24T03-45Z G8alq8bQH");
+        assert_eq!(m.name(), "PawnCompanion");
         assert_eq!(m.directory.file_name().unwrap(), "PawnCompanion 1377 1.35 2026-06-24T03-45Z G8alq8bQH");
+    }
+
+    fn nexus_source(m: &Mod) -> Option<(String, Option<String>)> {
+        m.sources
+            .iter()
+            .find(|s| s.provider.eq_ignore_ascii_case("nexus"))
+            .map(|s| (sources::resolved_source_id(s).unwrap_or_default(), s.version.clone()))
+    }
+
+    /// Issue #33: a Nexus download without a manifest showed up as
+    /// "EAGLE-2-1065-V1-1-1752787902". It gets the mod's name, and the
+    /// Nexus page and version from the file name (for update checks); the
+    /// folder keeps the file's name.
+    #[tokio::test]
+    async fn nexus_download_without_manifest_gets_clean_name_and_nexus_source() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let archive = src.path().join("EAGLE-2-1065-V1-1-1752787902.zip");
+        make_zip(&archive, &[(&patch_file_name(), b"x")]);
+        let state = AppState::new(base.path().to_path_buf());
+        let mut guard = state.mods.lock().await;
+        let mods = ensure_mods_loaded(&mut guard, base.path()).await.unwrap();
+        let (m, _) = install_from_archive(&state, mods, &archive).await.unwrap();
+        assert_eq!(m.name(), "EAGLE-2");
+        assert_eq!(m.directory.file_name().unwrap(), "EAGLE-2-1065-V1-1-1752787902");
+        assert_eq!(nexus_source(&m), Some(("1065".to_string(), Some("V1.1".to_string()))));
+        let sidecar = sources::load_origin_sidecar(&m.directory).await.unwrap();
+        assert_eq!(sidecar.installed_files.len(), 1);
+        assert_eq!(sidecar.installed_files[0].file_name.as_deref(), Some("EAGLE-2-1065-V1-1-1752787902.zip"));
+        assert_eq!(sidecar.installed_files[0].uploaded_at, Some(1752787902));
+        // The mod list holds the same, recorded mod.
+        assert_eq!(nexus_source(mods.iter().find(|x| x.guid() == m.guid()).unwrap()), nexus_source(&m));
+    }
+
+    /// A manifest's name always wins over the file name.
+    #[tokio::test]
+    async fn manifest_name_wins_over_nexus_file_name() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let archive = src.path().join("EAGLE-2-1065-V1-1-1752787902.zip");
+        std::fs::write(&archive, zip_bytes(&as_entries(&plushie_mod(&v1_manifest(KOYUKI_GUID, "koyuki launcher"))))).unwrap();
+        let (m, _) = install(&state, &archive).await.unwrap();
+        assert_eq!(m.name(), "koyuki launcher");
+        assert_eq!(nexus_source(&m).map(|(id, _)| id).as_deref(), Some("1065"));
+    }
+
+    /// Plain names are left as they are, and get no Nexus source.
+    #[tokio::test]
+    async fn ordinary_archive_names_are_not_mangled() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        for (file, name) in [("My-Mod-2.zip", "My-Mod-2"), ("Armor Pack 1.0.zip", "Armor Pack 1.0")] {
+            let archive = src.path().join(file);
+            make_zip(&archive, &[(&patch_file_name(), b"x")]);
+            let (m, _) = install(&state, &archive).await.unwrap();
+            assert_eq!(m.name(), name);
+            assert_eq!(nexus_source(&m), None);
+            assert!(sources::load_origin_sidecar(&m.directory).await.is_none());
+        }
+    }
+
+    /// Add Folder on an unpacked Nexus download names it the same way.
+    #[tokio::test]
+    async fn nexus_named_folder_gets_clean_name_and_nexus_source() {
+        let base = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let src = elsewhere.path().join("EAGLE-2-1065-V1-1-1752787902");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join(patch_file_name()), b"p").unwrap();
+        let mut mods = Vec::new();
+        let (m, _) = install_from_folder(base.path(), &mut mods, &src).await.unwrap();
+        assert_eq!(m.name(), "EAGLE-2");
+        assert_eq!(m.directory.file_name().unwrap(), "EAGLE-2-1065-V1-1-1752787902");
+        assert_eq!(nexus_source(&m), Some(("1065".to_string(), Some("V1.1".to_string()))));
     }
 
     // --- issue #33: the reported mods' layouts, and saying why an install failed ---
@@ -1225,7 +1369,7 @@ mod tests {
         )
         .unwrap();
         let (m, warning) = install(&state, &path).await.unwrap();
-        assert_eq!(m.name(), "EAGLE-2 - GERMAN-1065-V1-1-1752788163");
+        assert_eq!(m.name(), "EAGLE-2 - GERMAN");
         assert_eq!(warning, None);
         assert!(m.directory.join("9ba626afa44a3aa3.patch_0.stream").is_file());
     }

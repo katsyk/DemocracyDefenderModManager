@@ -532,9 +532,11 @@ pub fn nexus_ref_from_name(file_name: &str, is_archive: bool) -> Option<NexusRef
     })
 }
 
-/// A readable mod name from an archive/folder name: the extension and a
-/// Nexus download suffix (`-1234-1-0-1712345678`, ` 1234 1.0 2026-...Z slug`,
-/// ` (1)`) removed.
+/// A readable mod name from an archive/folder name: the extension, a
+/// Nexus download suffix (`-1234-1-0-1712345678`, ` 1234 1.0 2026-...Z slug`)
+/// and a browser's duplicate counter (` (1)`) removed. Every install path
+/// (Add, drag and drop, Add Folder, Add from URL, browser installs, import)
+/// names a mod that ships no manifest this way.
 pub fn display_name_from_file(file_name: &str, is_archive: bool) -> String {
     let as_archive = if is_archive { file_name.to_string() } else { format!("{file_name}.zip") };
     if let Some(parsed) = sources::parse_nexus_archive_name(&as_archive) {
@@ -551,8 +553,22 @@ pub fn display_name_from_file(file_name: &str, is_archive: bool) -> String {
     } else {
         file_name.to_string()
     };
-    let cleaned = stem.trim().to_string();
+    let cleaned = strip_duplicate_suffix(stem.trim()).trim().to_string();
     if cleaned.is_empty() { file_name.to_string() } else { cleaned }
+}
+
+/// `name` without a browser's duplicate-download counter (`Mod (1)`,
+/// `Mod (12)`).
+fn strip_duplicate_suffix(name: &str) -> &str {
+    if let Some(rest) = name.strip_suffix(')') {
+        if let Some(i) = rest.rfind(" (") {
+            let counter = &rest[i + 2..];
+            if i > 0 && (1..=3).contains(&counter.len()) && counter.bytes().all(|b| b.is_ascii_digit()) {
+                return &name[..i];
+            }
+        }
+    }
+    name
 }
 
 /// Nexus id declared by a manifest (legacy `NexusData` or a `Sources`
@@ -1200,41 +1216,47 @@ fn sidecar_for(item: &ScanItem, installed: &Mod, fingerprint: Option<ArchiveFing
     sidecar.installed_at =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     if let Some(nexus) = &item.nexus {
-        // Record it as an install source unless the mod's own manifest
-        // already names the same Nexus page (it would show twice); the
-        // exact file is recorded either way.
-        let declared = installed.sources.iter().any(|s| {
-            s.provider.eq_ignore_ascii_case("nexus")
-                && s.origin == sources::SourceOrigin::Manifest
-                && sources::resolved_source_id(s).as_deref() == Some(nexus.mod_id.as_str())
-        });
-        let have = sidecar
-            .sources
-            .iter()
-            .any(|s| s.provider.eq_ignore_ascii_case("nexus") && s.id.as_deref() == Some(nexus.mod_id.as_str()));
-        if !have && !declared {
-            sidecar.sources.push(Source {
-                provider: "nexus".into(),
-                id: Some(nexus.mod_id.clone()),
-                url: None,
-                version: nexus.version.clone(),
-            });
-        }
-        let has_file = sidecar.installed_files.iter().any(|f| f.provider.eq_ignore_ascii_case("nexus"));
-        if !has_file && (nexus.file_id.is_some() || nexus.file_name.is_some() || nexus.uploaded_at.is_some()) {
-            sidecar.installed_files.push(InstalledFile {
-                provider: "nexus".into(),
-                file_id: nexus.file_id.clone(),
-                file_name: nexus.file_name.clone(),
-                label: None,
-                uploaded_at: nexus.uploaded_at,
-            });
-        }
+        add_nexus_to_sidecar(&mut sidecar, nexus, installed);
     }
     if fingerprint.is_some() {
         sidecar.imported_archive = fingerprint;
     }
     sidecar
+}
+
+/// Record a Nexus Mods page and file (read off a download's file name) in
+/// `sidecar`, the way import does, so update checks work for the mod.
+pub(crate) fn add_nexus_to_sidecar(sidecar: &mut OriginSidecar, nexus: &NexusRef, installed: &Mod) {
+    // Record it as an install source unless the mod's own manifest
+    // already names the same Nexus page (it would show twice); the
+    // exact file is recorded either way.
+    let declared = installed.sources.iter().any(|s| {
+        s.provider.eq_ignore_ascii_case("nexus")
+            && s.origin == sources::SourceOrigin::Manifest
+            && sources::resolved_source_id(s).as_deref() == Some(nexus.mod_id.as_str())
+    });
+    let have = sidecar
+        .sources
+        .iter()
+        .any(|s| s.provider.eq_ignore_ascii_case("nexus") && s.id.as_deref() == Some(nexus.mod_id.as_str()));
+    if !have && !declared {
+        sidecar.sources.push(Source {
+            provider: "nexus".into(),
+            id: Some(nexus.mod_id.clone()),
+            url: None,
+            version: nexus.version.clone(),
+        });
+    }
+    let has_file = sidecar.installed_files.iter().any(|f| f.provider.eq_ignore_ascii_case("nexus"));
+    if !has_file && (nexus.file_id.is_some() || nexus.file_name.is_some() || nexus.uploaded_at.is_some()) {
+        sidecar.installed_files.push(InstalledFile {
+            provider: "nexus".into(),
+            file_id: nexus.file_id.clone(),
+            file_name: nexus.file_name.clone(),
+            label: None,
+            uploaded_at: nexus.uploaded_at,
+        });
+    }
 }
 
 /// Import `items` (already chosen by the user) into DDMM, one at a time.
