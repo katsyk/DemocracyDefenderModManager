@@ -103,8 +103,10 @@ pub struct AppState {
     /// Cancel flag of the running import scan or import, if any
     /// (`commands::import` only; one at a time).
     import_cancel: std::sync::Mutex<Option<Arc<AtomicBool>>>,
-    /// The latest import scan, which `run_import` imports from by item id.
-    import_scan: Mutex<Option<mod_import::ScanResult>>,
+    /// The latest import scan, which `run_import` imports from by item id,
+    /// with the token its wizard got for it (see
+    /// `commands::import::run_import`).
+    import_scan: Mutex<Option<(u64, mod_import::ScanResult)>>,
     /// `ddmm://install` links waiting for the Mods page's confirmation
     /// (`deep_link` only).
     deep_links: std::sync::Mutex<deep_link::DeepLinkQueue>,
@@ -123,6 +125,7 @@ impl AppState {
             reason: String::new(),
             default_path: base_path.clone(),
             pointer_file: base_path.join(data_dir::POINTER_FILENAME),
+            mirror_pointer_file: None,
             pointed: false,
             problem: None,
         };
@@ -182,10 +185,10 @@ impl AppState {
 }
 
 /// Compute the base data directory the same way the desktop app does,
-/// without touching Tauri at all -- used both by `run()` before the
-/// builder is constructed and by host mode, which never constructs one.
+/// without touching Tauri at all, for host mode (which never constructs
+/// it). Read-only: the host never copies or writes a pointer file.
 fn resolve_base_path() -> PathBuf {
-    data_dir::decide_data_dir_for_this_machine().path
+    data_dir::decide_data_dir_for_this_machine_read_only().path
 }
 
 /// Run as the browser's native-messaging host: relay only, no window, no

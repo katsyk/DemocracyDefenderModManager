@@ -756,7 +756,10 @@ impl InstalledIndex {
                 if let Some(fname) = &fp.file_name {
                     index.file_names.insert(fname.to_lowercase(), (name.clone(), guid));
                 }
-                index.fingerprints.push((fp, name.clone(), guid));
+                // A folder import records only its folder's name.
+                if !fp.sha256.is_empty() {
+                    index.fingerprints.push((fp, name.clone(), guid));
+                }
             }
             let nexus_file = files.iter().find(|f| f.provider.eq_ignore_ascii_case("nexus"));
             let sidecar_versions: HashMap<String, Option<String>> = sidecar
@@ -848,15 +851,13 @@ pub fn resolve_statuses(items: &mut [ScanItem], installed: &InstalledIndex) {
         }
     }
 
-    // Within this list: identical archives, same manifest GUID, same
-    // Nexus file downloaded more than once.
-    // Originals before copies: `Mod.zip` before `Mod (1).zip`, then the
-    // shorter path.
+    // Within this list: identical copies first -- the same archive bytes,
+    // whatever the files are called. Originals before copies: `Mod.zip`
+    // before `Mod (1).zip`, then the shorter path.
     let mut order: Vec<usize> = (0..items.len()).collect();
     order.sort_by_key(|&i| (looks_like_a_copy(&items[i].path), items[i].path.as_os_str().len(), i));
     let mut by_hash: HashMap<(u64, String), String> = HashMap::new();
-    let mut by_guid: HashMap<Uuid, String> = HashMap::new();
-    for i in order {
+    for &i in &order {
         let item = &mut items[i];
         if !matches!(item.status, ItemStatus::New | ItemStatus::InstalledOtherVersion { .. }) {
             continue;
@@ -869,12 +870,52 @@ pub fn resolve_statuses(items: &mut [ScanItem], installed: &InstalledIndex) {
             }
             by_hash.insert(key, item.name.clone());
         }
+    }
+
+    // Then the same mod (manifest GUID) more than once. That alone doesn't
+    // make a copy -- v1.0 and v1.1 of a mod share their GUID -- so only the
+    // same GUID *and* the same content is a duplicate; anything else is an
+    // older version of the newest one (see [`newer_first`]).
+    let mut by_guid: HashMap<Uuid, Vec<usize>> = HashMap::new();
+    for &i in &order {
+        let item = &items[i];
+        if !matches!(item.status, ItemStatus::New | ItemStatus::InstalledOtherVersion { .. }) {
+            continue;
+        }
         if let Some(guid) = item.guid.filter(|_| !item.local_guid || item.kind == ItemKind::Folder) {
-            if let Some(of) = by_guid.get(&guid) {
-                item.status = ItemStatus::Duplicate { of: of.clone() };
-                continue;
+            by_guid.entry(guid).or_default().push(i);
+        }
+    }
+    for group in by_guid.into_values().filter(|g| g.len() > 1) {
+        // Content fingerprints, only where two items could be identical.
+        for &i in &group {
+            let same_size = group.iter().any(|&j| {
+                j != i && items[j].kind == items[i].kind && items[j].file_size == items[i].file_size
+            });
+            if same_size && items[i].sha256.is_none() {
+                items[i].sha256 = match items[i].kind {
+                    ItemKind::Archive => sha256_file(&items[i].path).ok(),
+                    ItemKind::Folder => tree_hash(&items[i].path).ok(),
+                };
             }
-            by_guid.insert(guid, item.name.clone());
+        }
+        let mut sorted = group.clone();
+        sorted.sort_by(|&a, &b| newer_first(&items[a], &items[b]));
+        let newest = sorted[0];
+        let newest_name = items[newest].name.clone();
+        let mut kept: Vec<usize> = vec![newest];
+        for &i in &sorted[1..] {
+            let copy_of = kept.iter().copied().find(|&k| {
+                items[k].kind == items[i].kind
+                    && items[k].file_size == items[i].file_size
+                    && items[k].sha256.is_some()
+                    && items[k].sha256 == items[i].sha256
+            });
+            items[i].status = match copy_of {
+                Some(k) => ItemStatus::Duplicate { of: items[k].name.clone() },
+                None => ItemStatus::OlderVersion { of: newest_name.clone() },
+            };
+            kept.push(i);
         }
     }
 
@@ -910,6 +951,55 @@ fn looks_like_a_copy(path: &Path) -> bool {
     let re = RE.get_or_init(|| regex::Regex::new(r"(?i)(?: \(\d+\)| - copy(?: \(\d+\))?)$").unwrap());
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     re.is_match(&stem)
+}
+
+/// Newest first, for items that are the same mod: by Nexus upload time,
+/// then by version number, then by the file's date (an item that doesn't
+/// know one counts as older on it); an original before a renamed copy when
+/// nothing else tells them apart.
+fn newer_first(a: &ScanItem, b: &ScanItem) -> std::cmp::Ordering {
+    /// Upload order, version, file date, then "the original" (not a
+    /// renamed copy, shorter path, listed first) -- larger is newer.
+    type Key = (i64, Option<Vec<u64>>, Option<std::time::SystemTime>, std::cmp::Reverse<(bool, usize, usize)>);
+    fn key(i: &ScanItem) -> Key {
+        let upload = i.nexus.as_ref().map(|n| n.upload_order).unwrap_or(0);
+        let version = i.nexus.as_ref().and_then(|n| n.version.as_deref()).and_then(crate::providers::numeric_version);
+        let modified = std::fs::metadata(&i.path).and_then(|m| m.modified()).ok();
+        (upload, version, modified, std::cmp::Reverse((looks_like_a_copy(&i.path), i.path.as_os_str().len(), i.id)))
+    }
+    key(b).cmp(&key(a))
+}
+
+/// SHA-256 over a folder's files (relative paths and contents, in name
+/// order, not following symlinks), to tell an identical copy of a mod
+/// folder from a different version of it. DDMM's own origin record is left
+/// out: it says where a copy came from, not what it is.
+fn tree_hash(dir: &Path) -> std::io::Result<String> {
+    let mut files = Vec::new();
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((d, depth)) = stack.pop() {
+        for entry in std::fs::read_dir(&d)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            if ft.is_file() {
+                if depth == 0 && entry.file_name() == ORIGIN_SIDECAR_FILE {
+                    continue;
+                }
+                files.push(entry.path());
+            } else if ft.is_dir() && depth < crate::utils::MAX_COPY_DEPTH {
+                stack.push((entry.path(), depth + 1));
+            }
+        }
+    }
+    files.sort();
+    let mut hasher = Sha256::new();
+    for file in files {
+        let rel = file.strip_prefix(dir).unwrap_or(&file).to_string_lossy().replace('\\', "/");
+        hasher.update((rel.len() as u64).to_le_bytes());
+        hasher.update(rel.as_bytes());
+        hasher.update(sha256_file(&file)?.as_bytes());
+    }
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// The status of an item that is already in DDMM as `name` (`guid`): plain
@@ -1018,7 +1108,13 @@ pub fn scan_folder(
         }
         ScanResult { root: None, items, profile_name: data.profile_name, truncated: false }
     } else {
-        let (candidates, truncated) = collect_candidates(root, cancel);
+        // The folder picked is a mod itself (its own manifest.json): it's
+        // one item, not a list of its option subfolders.
+        let (candidates, truncated) = if has_manifest_sync(root) {
+            (vec![Candidate { kind: ItemKind::Folder, path: root.to_path_buf() }], false)
+        } else {
+            collect_candidates(root, cancel)
+        };
         let mut items = inspect_all(&candidates, cancel, &mut progress);
         let mut profile_name = None;
         if let Some((name, hints)) = layouts::load_guid_hints(root) {
@@ -1486,7 +1582,14 @@ async fn import_one(
             file_name: item.path.file_name().map(|n| n.to_string_lossy().into_owned()),
         })
     } else {
-        None
+        // A folder isn't hashed; its name is enough to know it again when
+        // its copy here got another name (a clash, or a name that isn't
+        // valid on every OS).
+        Some(ArchiveFingerprint {
+            size: item.file_size,
+            sha256: String::new(),
+            file_name: item.path.file_name().map(|n| n.to_string_lossy().into_owned()),
+        })
     };
 
     let dir_name = unique_dir_name(mods_root, &item.name, taken);

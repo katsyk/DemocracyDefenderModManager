@@ -96,13 +96,18 @@
                 },
                 "notification": {
                     "empty_deploy_error": {
-                        "message": "Can not deploy empty profile!"
+                        "message": "Can not deploy empty profile!",
+                        "all_missing": "Nothing to deploy: none of the {count} mod(s) in this profile are in your library right now (shown as \"Mod not found\"). The game's mods were left as they are."
+                    },
+                    "options_reset": {
+                        "message": "These mods changed since their options were chosen, so their options were reset to the defaults: {names}. Check them before deploying."
                     },
                     "purge_success": {
                         "message": "Purge successful."
                     },
                     "deploy_success": {
-                        "message": "Deployment successful."
+                        "message": "Deployment successful.",
+                        "missing_skipped": "Deployed, but {count} missing mod(s) were skipped (shown as \"Mod not found\" in the profile)."
                     },
                     "game_path_detected": {
                         "message": "Found Helldivers 2 at {path}"
@@ -224,6 +229,10 @@
                 "import_found": "Found {count} mods in {path}",
                 "import_found_one": "Found 1 mod in {path}"
             },
+            "missing_entry": {
+                "title": "Mod not found",
+                "message": "This mod isn't in your library right now (its folder was removed, or its manifest.json can't be read). It keeps its place here and is skipped when deploying; remove it if it's gone for good."
+            },
             "load_order": {
                 "hint": "Load order: when two mods change the same game file, the one lower in the list wins.",
                 "lowest": "Lowest priority (loaded first)",
@@ -240,7 +249,7 @@
             },
             "skip_version": "Skip version {version}",
             "unskip_version": "Stop skipping {version}",
-            "needs_nexus_key": "Optional: sign in to Nexus Mods or add a key to check for updates"
+            "needs_nexus_key": "Optional: add a Nexus Mods API key in Settings to check for updates"
         },
         "settings": {
             "popup": {
@@ -383,6 +392,7 @@
                 "nexus": {
                     "title": "Nexus Mods (optional)",
                     "description": "Optional. Only used to check your Nexus Mods mods for updates. Sign in, or enter a personal API key, or do neither: everything else in DDMM works the same.",
+                    "description_key_only": "Optional. Only used to check your Nexus Mods mods for updates. Enter a personal API key, or leave it empty: everything else in DDMM works the same. Signing in to Nexus Mods instead is coming soon.",
                     "where_to_get": "On Nexus Mods, open your account's API Keys page (Get a key), copy the Personal API Key at the bottom, and paste it here. DDMM checks it with Nexus before saving. Remove it here any time.",
                     "placeholder": "Paste your personal Nexus Mods API key",
                     "save_button": {
@@ -400,7 +410,7 @@
                     "remove_button": {
                         "text": "Remove key"
                     },
-                    "privacy": "Nexus is only contacted when you click Check for Updates, Sign in, Sign out, or Save & verify, never by automatic checks. Your sign-in and key are only sent to Nexus Mods (users.nexusmods.com and api.nexusmods.com) over HTTPS, and aren't written to settings.json or logs.",
+                    "privacy": "Nexus is only contacted when you click Check for Updates, Save & verify, or (once available) Sign in or Sign out, never by automatic checks. Your key and any sign-in are only sent to Nexus Mods (users.nexusmods.com and api.nexusmods.com) over HTTPS, and aren't written to settings.json or logs.",
                     "sign_in": {
                         "button": {
                             "text": "Sign in to Nexus Mods",
@@ -524,7 +534,7 @@
             "state": {
                 "update_available": "Update available",
                 "skipped": "Skipping {version}",
-                "needs_api_key": "Optional: sign in or add a key to check",
+                "needs_api_key": "Optional: add a Nexus Mods key in Settings to check",
                 "error": "Couldn't check: {message}",
                 "unknown": "Unknown",
                 "unknown_tip": "DDMM doesn't know which version is installed (or the site didn't say), so it won't guess.",
@@ -651,6 +661,9 @@
             "cancel_button": "Cancel",
             "scanning": "Looking for mods...",
             "scanning_progress": "Reading {done} of {total}...",
+            "scan_stopped": "The scan was stopped before it finished, so nothing was imported.",
+            "retry_button": "Scan Again",
+            "choose_source_button": "Choose a Folder Instead",
             "nothing_found": "No mods found there. Pick the folder that holds the mod folders or the downloaded archives.",
             "summary": "{total} found: {new} new, {installed} already in DDMM, {other} skipped.",
             "truncated": "That folder holds a lot; only the first 5000 items are listed. Pick a more specific folder to see the rest.",
@@ -666,7 +679,7 @@
                 "installed_add_source": "Already in DDMM (\"{name}\"): will add Nexus info",
                 "installed_other_version": "Another version is in DDMM (\"{name}\")",
                 "duplicate": "Same as \"{name}\"",
-                "older_version": "Older download of \"{name}\"",
+                "older_version": "Older version of \"{name}\"",
                 "not_a_mod": "No Helldivers 2 mod files inside",
                 "unreadable": "Can't read: {reason}"
             },
@@ -719,6 +732,7 @@
             "redeployed": "Redeployed with the updated mods.",
             "game_running": "Mods updated, but Helldivers 2 is running: deploy after closing it to use the new versions."
         },
+        "drop_while_busy": "Finish or close the open window first, then drop the files again.",
         "import": {
             "added_to_profile": "Imported mods were added to \"{profile}\". Deploy to use them.",
             "profile_save_failed": "The mods were imported, but the profile couldn't be saved: {error}"

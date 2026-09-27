@@ -115,12 +115,125 @@ pub struct PointerFile {
 
 pub const POINTER_VERSION: u32 = 1;
 
-/// Where an installed (non-portable) DDMM keeps its pointer file: the OS
-/// per-user config directory plus [`APP_IDENTIFIER`] (`%APPDATA%` on
-/// Windows, `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME` or
-/// `~/.config` on Linux).
+/// The folder an installed DDMM keeps its pointer file in when the OS
+/// config folder is also where the data lives (see
+/// [`installed_pointer_dir`]). Its own folder, next to (never inside) the
+/// default data folder.
+pub const POINTER_DIR_NAME: &str = "io.github.katsyk.ddmm.location";
+
+/// Where an installed (non-portable) DDMM keeps its pointer file: always
+/// outside the default data folder, so deleting that folder after moving
+/// the data elsewhere can't lose the record of where the data went.
+///
+/// - Linux: `$XDG_CONFIG_HOME/<identifier>` (or `~/.config/...`), as it
+///   always was; the data is in `~/.local/share`.
+/// - Windows: `%APPDATA%\io.github.katsyk.ddmm.location`, next to the
+///   (Roaming) default data folder, so it roams with it.
+/// - macOS: `~/Library/Application Support/io.github.katsyk.ddmm.location`,
+///   next to the data folder.
+///
+/// Earlier versions used `<config dir>/<identifier>`, which on Windows and
+/// macOS *is* the default data folder. That old file ([`legacy_pointer_dir`])
+/// is kept up to date as a mirror (see [`commit_pointer`]), so going back to
+/// an earlier version still finds the data.
 pub fn installed_pointer_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join(APP_IDENTIFIER))
+    pointer_dir_for(dirs::config_dir(), dirs::data_dir())
+}
+
+/// [`installed_pointer_dir`] from the OS config and data folders (a
+/// function of them, for tests).
+pub fn pointer_dir_for(config: Option<PathBuf>, data: Option<PathBuf>) -> Option<PathBuf> {
+    let config = config?;
+    let old = config.join(APP_IDENTIFIER);
+    if data.map(|d| d.join(APP_IDENTIFIER)).as_ref() != Some(&old) {
+        return Some(old);
+    }
+    Some(config.join(POINTER_DIR_NAME))
+}
+
+/// Where earlier versions kept an installed copy's pointer file, when that
+/// isn't [`installed_pointer_dir`] (Windows and macOS).
+pub fn legacy_pointer_dir() -> Option<PathBuf> {
+    legacy_pointer_dir_for(dirs::config_dir(), dirs::data_dir())
+}
+
+fn legacy_pointer_dir_for(config: Option<PathBuf>, data: Option<PathBuf>) -> Option<PathBuf> {
+    let old = config.clone()?.join(APP_IDENTIFIER);
+    (Some(&old) != pointer_dir_for(config, data).as_ref()).then_some(old)
+}
+
+/// Whether deciding the data folder may copy an old pointer file to its new
+/// place ([`PointerAccess::Migrate`], the app) or must only read
+/// ([`PointerAccess::ReadOnly`], the browser's native-messaging host, which
+/// runs alongside the app and must never write where it keeps its data).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerAccess {
+    Migrate,
+    ReadOnly,
+}
+
+/// Copy the old pointer to `new` if `new` doesn't exist yet. The old file
+/// is never changed or removed. An unreadable old pointer is copied as it
+/// is, so the recovery screen still says so.
+fn copy_pointer_if_missing(old: &Path, new: &Path) -> anyhow::Result<()> {
+    if new.is_file() {
+        return Ok(());
+    }
+    match read_pointer(old) {
+        // Resolved against its old folder and stored absolute (a relative
+        // path would now be relative to the wrong folder).
+        Ok(Some(target)) => write_pointer_raw(new, &PointerFile { version: POINTER_VERSION, path: target }),
+        Ok(None) => Ok(()),
+        Err(_) => write_bytes_durably(new, &std::fs::read(old)?),
+    }
+}
+
+/// Which installed pointer file to read: `new` (authoritative) or the
+/// earlier versions' `old` one, plus a note for the log when they disagree.
+///
+/// - Only `old` exists: with [`PointerAccess::Migrate`] it's copied to
+///   `new` first. If that fails (or another process is doing the same at
+///   the same moment), whatever `new` holds afterwards is used, else `old`.
+/// - Both exist and disagree: the one whose folder exists wins; if both
+///   exist, the more recently written file. Neither is ever deleted.
+fn installed_pointer_to_read(new: &Path, old: Option<&Path>, access: PointerAccess) -> (PathBuf, Option<String>) {
+    let Some(old) = old.filter(|o| *o != new && o.is_file()) else { return (new.to_path_buf(), None) };
+    if !new.is_file() {
+        if access == PointerAccess::Migrate {
+            if let Err(e) = copy_pointer_if_missing(old, new) {
+                eprintln!("warning: couldn't copy {} to {}: {e:#}", old.display(), new.display());
+            }
+            if new.is_file() {
+                return (new.to_path_buf(), None);
+            }
+        }
+        return (old.to_path_buf(), None);
+    }
+    let (from_new, from_old) = (read_pointer(new), read_pointer(old));
+    if let (Ok(a), Ok(b)) = (&from_new, &from_old) {
+        if a == b {
+            return (new.to_path_buf(), None);
+        }
+    }
+    let rank = |r: &Result<Option<PathBuf>, String>| match r {
+        Ok(Some(p)) if p.is_dir() => 2,
+        Ok(Some(_)) => 1,
+        _ => 0,
+    };
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let (rank_new, rank_old) = (rank(&from_new), rank(&from_old));
+    let pick_old = rank_old > rank_new || (rank_new == 2 && rank_old == 2 && modified(old) > modified(new));
+    let chosen = if pick_old { old } else { new };
+    let note = format!(
+        "{} ({:?}) and {} ({:?}) disagree; using {}",
+        new.display(),
+        from_new,
+        old.display(),
+        from_old,
+        chosen.display()
+    );
+    eprintln!("warning: {note}");
+    (chosen.to_path_buf(), Some(note))
 }
 
 /// Why the chosen data folder can't be used this session. DDMM then starts
@@ -147,6 +260,10 @@ pub struct DataDirDecision {
     pub default_path: PathBuf,
     /// Where this mode's pointer file is (or would be written).
     pub pointer_file: PathBuf,
+    /// An earlier versions' copy of the pointer (installed copies on
+    /// Windows and macOS) that every change is mirrored to, best effort,
+    /// so going back to such a version still finds the data.
+    pub mirror_pointer_file: Option<PathBuf>,
     /// `path` came from a pointer file.
     pub pointed: bool,
     pub problem: Option<DataDirProblem>,
@@ -170,29 +287,103 @@ pub fn read_pointer(pointer_file: &Path) -> Result<Option<PathBuf>, String> {
 
 /// Write a pointer file atomically (temp file, then rename over the old
 /// one), creating its folder if needed. A `target` inside the pointer's own
-/// folder is stored relative to it (see [`PointerFile`]).
+/// folder is stored relative to it (see [`PointerFile`]). The file (and, on
+/// Unix, its folder) is synced to disk before this returns: a move deletes
+/// the old data right after, and a crash in between must not leave DDMM
+/// pointing nowhere.
 pub fn write_pointer(pointer_file: &Path, target: &Path) -> anyhow::Result<()> {
-    use anyhow::Context;
     let dir = pointer_file.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir).with_context(|| format!("couldn't create {}", dir.display()))?;
+    let _ = std::fs::create_dir_all(dir);
     let stored = relative_if_inside(target, dir).unwrap_or_else(|| target.to_path_buf());
-    let data = serde_json::to_vec_pretty(&PointerFile { version: POINTER_VERSION, path: stored })?;
-    let tmp = pointer_file.with_extension("json.tmp");
-    std::fs::write(&tmp, data).with_context(|| format!("couldn't write {}", tmp.display()))?;
+    write_pointer_raw(pointer_file, &PointerFile { version: POINTER_VERSION, path: stored })
+}
+
+fn write_pointer_raw(pointer_file: &Path, contents: &PointerFile) -> anyhow::Result<()> {
+    write_bytes_durably(pointer_file, &serde_json::to_vec_pretty(contents)?)
+}
+
+fn write_bytes_durably(pointer_file: &Path, data: &[u8]) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::io::Write;
+    static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = pointer_file.parent().unwrap_or(Path::new("."));
+    let existed = dir.is_dir();
+    std::fs::create_dir_all(dir).with_context(|| format!("couldn't create {}", dir.display()))?;
+    if !existed {
+        // The new folder's own entry must be durable too.
+        sync_dir(dir.parent().unwrap_or(Path::new(".")));
+    }
+    // Unique per process and call: the app and the browser helper (or two
+    // app launches) may write at the same moment.
+    let tmp = dir.join(format!(
+        ".{}.{}.{}.tmp",
+        pointer_file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("couldn't write {}", tmp.display()));
+    }
     if let Err(e) = std::fs::rename(&tmp, pointer_file) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("couldn't write {}", pointer_file.display()));
     }
+    sync_dir(dir);
     Ok(())
+}
+
+/// Make a rename or removal in `dir` durable, where the OS allows syncing a
+/// folder (Unix). On Windows, NTFS journals the rename itself.
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 /// Remove a pointer file ("Reset to default"). Already gone is fine.
 pub fn remove_pointer(pointer_file: &Path) -> anyhow::Result<()> {
     match std::fs::remove_file(pointer_file) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            sync_dir(pointer_file.parent().unwrap_or(Path::new(".")));
+            Ok(())
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(anyhow::anyhow!("couldn't remove {}: {e}", pointer_file.display())),
     }
+}
+
+/// Record `target` as the chosen data folder in `decision`'s pointer file,
+/// and mirror it (best effort) to the earlier versions' copy when that
+/// one's folder exists (see [`DataDirDecision::mirror_pointer_file`]).
+pub fn commit_pointer(decision: &DataDirDecision, target: &Path) -> anyhow::Result<()> {
+    write_pointer(&decision.pointer_file, target)?;
+    if let Some(mirror) = decision.mirror_pointer_file.as_deref().filter(|m| m.parent().is_some_and(Path::is_dir)) {
+        if let Err(e) = write_pointer(mirror, target) {
+            log::warn!("Couldn't update the older copy of the data-folder location ({mirror:?}): {e:#}");
+        }
+    }
+    Ok(())
+}
+
+/// Forget the chosen data folder: remove `decision`'s pointer file and
+/// (best effort) its mirror.
+pub fn clear_pointer(decision: &DataDirDecision) -> anyhow::Result<()> {
+    remove_pointer(&decision.pointer_file)?;
+    if let Some(mirror) = &decision.mirror_pointer_file {
+        if let Err(e) = remove_pointer(mirror) {
+            log::warn!("Couldn't remove the older copy of the data-folder location: {e:#}");
+        }
+    }
+    Ok(())
 }
 
 fn relative_if_inside(target: &Path, dir: &Path) -> Option<PathBuf> {
@@ -220,20 +411,44 @@ fn relative_if_inside(target: &Path, dir: &Path) -> Option<PathBuf> {
 /// that is missing, or a pointer that can't be read, is reported as a
 /// [`DataDirProblem`], never replaced with a new empty folder.
 pub fn decide_data_dir(exe_dir: &Path, app_data_dir: &Path, installed_pointer_dir: &Path) -> DataDirDecision {
+    decide_data_dir_with(exe_dir, app_data_dir, installed_pointer_dir, None, PointerAccess::Migrate)
+}
+
+/// [`decide_data_dir`], also knowing where earlier versions kept the
+/// installed pointer (`legacy_pointer_dir`, see [`installed_pointer_to_read`]).
+/// That's only looked at -- and only copied with [`PointerAccess::Migrate`]
+/// -- when the decision gets as far as the installed pointer: a portable
+/// copy never touches it.
+pub fn decide_data_dir_with(
+    exe_dir: &Path,
+    app_data_dir: &Path,
+    installed_pointer_dir: &Path,
+    legacy_pointer_dir: Option<&Path>,
+    access: PointerAccess,
+) -> DataDirDecision {
     let portable_pointer = exe_dir.join(POINTER_FILENAME);
     let installed_pointer = installed_pointer_dir.join(POINTER_FILENAME);
+    let legacy_pointer = legacy_pointer_dir.map(|d| d.join(POINTER_FILENAME)).filter(|p| *p != installed_pointer);
 
-    let pointed = |pointer_file: PathBuf, kind: BaseDirKind, default_path: &Path| -> Option<DataDirDecision> {
-        match read_pointer(&pointer_file) {
+    let pointed = |read_from: &Path,
+                   pointer_file: PathBuf,
+                   mirror: Option<PathBuf>,
+                   kind: BaseDirKind,
+                   default_path: &Path,
+                   note: Option<String>|
+     -> Option<DataDirDecision> {
+        let note = note.map(|n| format!("; {n}")).unwrap_or_default();
+        match read_pointer(read_from) {
             Ok(None) => None,
             Ok(Some(path)) => {
                 let problem = (!path.is_dir()).then_some(DataDirProblem::Missing);
                 Some(DataDirDecision {
                     path,
                     kind,
-                    reason: format!("chosen in Settings ({})", pointer_file.display()),
+                    reason: format!("chosen in Settings ({}){note}", read_from.display()),
                     default_path: default_path.to_path_buf(),
                     pointer_file,
+                    mirror_pointer_file: mirror,
                     pointed: true,
                     problem,
                 })
@@ -241,16 +456,17 @@ pub fn decide_data_dir(exe_dir: &Path, app_data_dir: &Path, installed_pointer_di
             Err(message) => Some(DataDirDecision {
                 path: default_path.to_path_buf(),
                 kind,
-                reason: "unreadable data-location file".to_string(),
+                reason: format!("unreadable data-location file{note}"),
                 default_path: default_path.to_path_buf(),
                 pointer_file,
+                mirror_pointer_file: mirror,
                 pointed: true,
                 problem: Some(DataDirProblem::BadPointer(message)),
             }),
         }
     };
 
-    if let Some(d) = pointed(portable_pointer.clone(), BaseDirKind::Portable, exe_dir) {
+    if let Some(d) = pointed(&portable_pointer, portable_pointer.clone(), None, BaseDirKind::Portable, exe_dir, None) {
         return d;
     }
 
@@ -262,12 +478,16 @@ pub fn decide_data_dir(exe_dir: &Path, app_data_dir: &Path, installed_pointer_di
             reason: base.reason.to_string(),
             default_path: exe_dir.to_path_buf(),
             pointer_file: portable_pointer,
+            mirror_pointer_file: None,
             pointed: false,
             problem: None,
         };
     }
 
-    if let Some(d) = pointed(installed_pointer.clone(), BaseDirKind::AppData, app_data_dir) {
+    let (read_from, note) = installed_pointer_to_read(&installed_pointer, legacy_pointer.as_deref(), access);
+    if let Some(d) =
+        pointed(&read_from, installed_pointer.clone(), legacy_pointer.clone(), BaseDirKind::AppData, app_data_dir, note)
+    {
         return d;
     }
 
@@ -277,22 +497,34 @@ pub fn decide_data_dir(exe_dir: &Path, app_data_dir: &Path, installed_pointer_di
         reason: base.reason.to_string(),
         default_path: app_data_dir.to_path_buf(),
         pointer_file: installed_pointer,
+        mirror_pointer_file: legacy_pointer,
         pointed: false,
         problem: None,
     }
 }
 
 /// [`decide_data_dir`] for this machine (the real executable, app data and
-/// config folders). Used by the app at startup and by the browser's native
-/// messaging host, so both always agree on where `bridge.json` is.
+/// config folders), as the app does it at startup: an earlier version's
+/// pointer is copied to its new place if needed.
 pub fn decide_data_dir_for_this_machine() -> DataDirDecision {
+    decide_for_this_machine(PointerAccess::Migrate)
+}
+
+/// The same decision for the browser's native-messaging host, so both
+/// always agree on where `bridge.json` is -- but strictly read-only: the
+/// host reads the new pointer, else the old one, and never writes.
+pub fn decide_data_dir_for_this_machine_read_only() -> DataDirDecision {
+    decide_for_this_machine(PointerAccess::ReadOnly)
+}
+
+fn decide_for_this_machine(access: PointerAccess) -> DataDirDecision {
     let exe_dir = resolve_exe_dir();
     let app_data_dir = platform_app_data_dir().unwrap_or_else(|e| {
         eprintln!("warning: {e}; falling back to the executable directory for app data");
         exe_dir.clone()
     });
     let pointer_dir = installed_pointer_dir().unwrap_or_else(|| app_data_dir.clone());
-    decide_data_dir(&exe_dir, &app_data_dir, &pointer_dir)
+    decide_data_dir_with(&exe_dir, &app_data_dir, &pointer_dir, legacy_pointer_dir().as_deref(), access)
 }
 
 /// The directory containing the running executable.
@@ -631,6 +863,203 @@ mod tests {
         // Plugged back in: fine again.
         std::fs::create_dir_all(&usb).unwrap();
         assert_eq!(decide_data_dir(&d.exe, &d.app_data, &d.config).problem, None);
+    }
+
+    /// On Windows and macOS the OS config folder is the data folder's
+    /// parent too; the pointer must never land inside the data folder.
+    #[test]
+    fn the_installed_pointer_is_never_inside_the_default_data_folder() {
+        // Windows (Roaming for both) / macOS shape: config == data.
+        let roaming = PathBuf::from("C:/Users/u/AppData/Roaming");
+        let dir = pointer_dir_for(Some(roaming.clone()), Some(roaming.clone())).unwrap();
+        assert_eq!(dir, roaming.join(POINTER_DIR_NAME), "a Roaming sibling of the data folder");
+        assert!(!dir.starts_with(roaming.join(APP_IDENTIFIER)));
+        assert_eq!(legacy_pointer_dir_for(Some(roaming.clone()), Some(roaming.clone())), Some(roaming.join(APP_IDENTIFIER)));
+        // Linux: unchanged, and no older location to look at.
+        let (config, data) = (PathBuf::from("/home/u/.config"), PathBuf::from("/home/u/.local/share"));
+        assert_eq!(pointer_dir_for(Some(config.clone()), Some(data.clone())), Some(config.join(APP_IDENTIFIER)));
+        assert_eq!(legacy_pointer_dir_for(Some(config), Some(data)), None);
+    }
+
+    /// The Windows layout: the old pointer sits inside the default data
+    /// folder, the new one in a sibling folder.
+    struct Layout {
+        d: Dirs,
+        new_dir: PathBuf,
+        old_dir: PathBuf,
+    }
+
+    fn layout() -> Layout {
+        let d = dirs();
+        let new_dir = d._root.path().join(POINTER_DIR_NAME);
+        let old_dir = d.app_data.clone();
+        Layout { d, new_dir, old_dir }
+    }
+
+    impl Layout {
+        fn decide(&self, access: PointerAccess) -> DataDirDecision {
+            decide_data_dir_with(&self.d.exe, &self.d.app_data, &self.new_dir, Some(&self.old_dir), access)
+        }
+        fn new_file(&self) -> PathBuf {
+            self.new_dir.join(POINTER_FILENAME)
+        }
+        fn old_file(&self) -> PathBuf {
+            self.old_dir.join(POINTER_FILENAME)
+        }
+    }
+
+    /// Migration copies, never moves: the old pointer stays for a
+    /// downgrade, and later changes are mirrored to it.
+    #[test]
+    fn migration_copies_the_old_pointer_and_changes_are_mirrored_to_it() {
+        let l = layout();
+        write_pointer(&l.old_file(), &l.d.custom).unwrap();
+        let decision = l.decide(PointerAccess::Migrate);
+        assert_eq!(decision.path, l.d.custom);
+        assert!(decision.pointed && decision.problem.is_none());
+        assert_eq!(decision.pointer_file, l.new_file());
+        assert_eq!(decision.mirror_pointer_file, Some(l.old_file()));
+        assert_eq!(read_pointer(&l.new_file()).unwrap(), Some(l.d.custom.clone()));
+        assert_eq!(read_pointer(&l.old_file()).unwrap(), Some(l.d.custom.clone()), "the old one is kept");
+
+        // A later move updates both, so an earlier version (reading only
+        // the old file) follows along.
+        let other = l.d._root.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        commit_pointer(&decision, &other).unwrap();
+        assert_eq!(read_pointer(&l.new_file()).unwrap(), Some(other.clone()));
+        assert_eq!(read_pointer(&l.old_file()).unwrap(), Some(other.clone()));
+        assert_eq!(l.decide(PointerAccess::Migrate).path, other);
+
+        // Reset clears both, so a stale old copy can't be copied back in.
+        clear_pointer(&l.decide(PointerAccess::Migrate)).unwrap();
+        assert!(!l.new_file().exists() && !l.old_file().exists());
+        let decision = l.decide(PointerAccess::Migrate);
+        assert!(!decision.pointed);
+        assert_eq!(decision.path, l.d.app_data);
+
+        // Deleting the whole old default folder after a move loses
+        // nothing, and a missing target is the recovery screen.
+        commit_pointer(&decision, &other).unwrap();
+        std::fs::remove_dir_all(&l.old_dir).unwrap();
+        assert_eq!(l.decide(PointerAccess::Migrate).path, other);
+        // No mirror when its folder is gone (nothing is recreated there).
+        commit_pointer(&l.decide(PointerAccess::Migrate), &l.d.custom).unwrap();
+        assert!(!l.old_dir.exists());
+        std::fs::remove_dir_all(&l.d.custom).unwrap();
+        assert_eq!(l.decide(PointerAccess::Migrate).problem, Some(DataDirProblem::Missing));
+    }
+
+    /// The browser helper only reads: new pointer, else the old one.
+    #[test]
+    fn read_only_access_never_writes() {
+        let l = layout();
+        write_pointer(&l.old_file(), &l.d.custom).unwrap();
+        let decision = l.decide(PointerAccess::ReadOnly);
+        assert_eq!(decision.path, l.d.custom);
+        assert!(!l.new_dir.exists(), "read-only must not create the new pointer");
+        assert!(l.old_file().is_file());
+    }
+
+    /// Two processes (two launches, or the app and the browser helper)
+    /// deciding at the same moment must both find the data.
+    #[test]
+    fn concurrent_migrations_all_find_the_data() {
+        for _ in 0..40 {
+            let l = std::sync::Arc::new(layout());
+            write_pointer(&l.old_file(), &l.d.custom).unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let (l, barrier) = (l.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let access = if i % 2 == 0 { PointerAccess::Migrate } else { PointerAccess::ReadOnly };
+                        l.decide(access).path
+                    })
+                })
+                .collect();
+            for h in handles {
+                assert_eq!(h.join().unwrap(), l.d.custom);
+            }
+            assert_eq!(read_pointer(&l.new_file()).unwrap(), Some(l.d.custom.clone()));
+            let leftovers: Vec<_> = std::fs::read_dir(&l.new_dir).unwrap().flatten().map(|e| e.file_name()).collect();
+            assert_eq!(leftovers.len(), 1, "no temp files left behind: {leftovers:?}");
+        }
+    }
+
+    /// Both pointers exist and disagree: the one whose folder exists wins,
+    /// then the newer file; neither is deleted.
+    #[test]
+    fn disagreeing_pointers_prefer_the_one_that_works() {
+        let l = layout();
+        let gone = l.d._root.path().join("gone");
+        write_pointer(&l.new_file(), &gone).unwrap();
+        write_pointer(&l.old_file(), &l.d.custom).unwrap();
+        let decision = l.decide(PointerAccess::Migrate);
+        assert_eq!(decision.path, l.d.custom);
+        assert!(decision.problem.is_none());
+        assert!(decision.reason.contains("disagree"), "{}", decision.reason);
+        assert!(l.new_file().is_file() && l.old_file().is_file());
+
+        // Both folders exist: the more recently written pointer wins.
+        let other = l.d._root.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        write_pointer(&l.new_file(), &other).unwrap();
+        let set = |p: &Path, secs| {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap()
+        };
+        set(&l.new_file(), 1_000_000);
+        set(&l.old_file(), 2_000_000);
+        assert_eq!(l.decide(PointerAccess::Migrate).path, l.d.custom);
+        set(&l.new_file(), 3_000_000);
+        assert_eq!(l.decide(PointerAccess::Migrate).path, other);
+        assert!(l.new_file().is_file() && l.old_file().is_file());
+
+        // An unreadable old copy doesn't beat a good new one.
+        std::fs::write(l.old_file(), b"not json").unwrap();
+        assert_eq!(l.decide(PointerAccess::Migrate).path, other);
+    }
+
+    /// A portable copy never reads, copies or changes the installed
+    /// pointers.
+    #[test]
+    fn a_portable_copy_leaves_the_installed_pointers_alone() {
+        let l = layout();
+        std::fs::write(l.d.exe.join(PORTABLE_MARKER_FILENAME), b"").unwrap();
+        write_pointer(&l.old_file(), &l.d.custom).unwrap();
+        let before = std::fs::read(l.old_file()).unwrap();
+        let decision = l.decide(PointerAccess::Migrate);
+        assert_eq!(decision.kind, BaseDirKind::Portable);
+        assert_eq!(decision.path, l.d.exe);
+        assert!(decision.mirror_pointer_file.is_none());
+        assert!(!l.new_dir.exists(), "no migration for a portable copy");
+        assert_eq!(std::fs::read(l.old_file()).unwrap(), before);
+    }
+
+    #[test]
+    fn a_broken_old_pointer_is_carried_over_to_the_recovery_screen() {
+        let l = layout();
+        std::fs::write(l.old_file(), b"not json").unwrap();
+        let decision = l.decide(PointerAccess::Migrate);
+        assert!(matches!(decision.problem, Some(DataDirProblem::BadPointer(_))));
+        assert_eq!(std::fs::read(l.new_file()).unwrap(), b"not json");
+        assert!(l.old_file().is_file());
+
+        // A relative path (data inside the old folder) is stored resolved.
+        let l = layout();
+        let inside = l.old_dir.join("Moved");
+        std::fs::create_dir_all(&inside).unwrap();
+        write_pointer(&l.old_file(), &inside).unwrap();
+        l.decide(PointerAccess::Migrate);
+        let got = read_pointer(&l.new_file()).unwrap().unwrap();
+        assert!(got.is_absolute());
+        assert_eq!(std::fs::canonicalize(got).unwrap(), std::fs::canonicalize(&inside).unwrap());
     }
 
     #[test]

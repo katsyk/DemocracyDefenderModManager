@@ -80,6 +80,9 @@ jobs:
       - name: i18n check
         run: pnpm run scan:i18n
 
+      - name: Frontend unit tests
+        run: pnpm run test:unit
+
       - name: Frontend build
         run: pnpm run build
 

@@ -11,6 +11,7 @@
     import { useLocalization } from "$lib/state/localization.svelte";
     import { Mod } from "$lib/models/mod";
     import type {Config, Profile, ProfilesConfig} from "$lib/models/profile";
+    import { defaultConfigFor, deployableEntries, fitConfig } from "$lib/utils/profileEntries";
     import {
         addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles,
         loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath,
@@ -50,7 +51,8 @@
     import { FALLBACK_MOD_IMAGE, useFallbackImage } from "$lib/utils/modImages";
 
     const { t } = useLocalization();
-    const { show: showPopup } = usePopup();
+    const popups = usePopup();
+    const { show: showPopup } = popups;
     const { show: showToast } = useToast();
     const appWindow = getCurrentWindow();
 
@@ -93,23 +95,29 @@
     /** Set when this page is left; queued `ddmm://` links then stay queued
      * until it's shown again. */
     let unmounted = false;
-    /** True while the "Import mods" popup is open (an import may be
+    /** How many "Import mods" popups are open (normally 0 or 1). */
+    let importWindows = $state(0);
+    /** True while an "Import mods" popup is open (an import may be
      * running in it); closing then asks first, like during a deploy. */
-    let importing = $state<boolean>(false);
+    let importing = $derived(importWindows > 0);
     /** Other mod managers' folders (or Downloads) with mods in them, shown
      * on the empty mod list as a way in. */
     let importSources = $state<ImportSource[]>([]);
 
     let currentProfile = $derived<Profile | undefined>(profiles[activeProfile]);
-    let profileMods = $derived<Mod[]>(profileConfigs.map(config => mods.find(m => m.guid === config.Guid)).filter((m): m is Mod => m !== undefined));
-    let profileEntries = $derived<[Config, Mod][]>(
+    /** The profile's entries as shown: each config, its mod (`undefined`
+     * when that mod isn't in the library -- deleted, or its manifest.json
+     * can't be read -- which keeps its place in the load order), and its
+     * index in `profileConfigs` (which the list's own index isn't while
+     * searching). */
+    let profileEntries = $derived<[Config, Mod | undefined, number][]>(
         profileConfigs
-            .map((config, i) => [config, profileMods[i]] as [Config, Mod])
+            .map((config, i) => [config, mods.find(m => m.guid === config.Guid), i] as [Config, Mod | undefined, number])
             .filter(([_, mod]) =>
                 searchText.length === 0 ||
-                [mod.name, mod.description].some(field =>
+                (mod !== undefined && [mod.name, mod.description].some(field =>
                     field.toLowerCase().includes(searchText.toLowerCase())
-                )
+                ))
             )
     );
     let enableRemoveProfile = $derived<boolean>(profiles.length > 1);
@@ -183,6 +191,14 @@
                     break;
                 case "drop":
                     isDragging = false;
+                    // A window is open (an import wizard, a question, ...):
+                    // a second import or add started under it would get in
+                    // its way, so the drop waits for the user to finish.
+                    if (popups.isShown) {
+                        log.info(`Ignored a drop of ${e.payload.paths.length} file(s): a window is open.`);
+                        showToast("warning", t("toast.drop_while_busy"));
+                        break;
+                    }
                     if (e.payload.paths.length >= BULK_ADD_THRESHOLD) {
                         await onImport(e.payload.paths);
                     } else {
@@ -289,15 +305,19 @@
             loadProfiles()
         ]);
 
-        loadedConfig.Profiles.forEach(profile => {
-            switch (profile.Version) {
-                case "V1":
-                    profile.Configs = profile.Configs.filter(config => {
-                        return loadedMods.some(mod => mod.guid === config.Guid);
-                    });
-                    break;
-            }
-        });
+        // Entries whose mod isn't in the library (deleted by hand, or its
+        // manifest.json can't be read right now) are kept, shown as
+        // missing, so a mod that comes back gets its old place in the load
+        // order. Deploy skips them.
+        const missing = loadedConfig.Profiles
+            .flatMap(p => p.Configs)
+            .filter(c => !loadedMods.some(mod => mod.guid === c.Guid)).length;
+        if (missing > 0) log.warn(`${missing} profile entr(ies) refer to mods that couldn't be loaded; keeping them.`);
+        const resetOptions = fitProfilesToMods(loadedConfig.Profiles, loadedMods);
+        if (resetOptions.length > 0) {
+            log.warn(`Options reset to defaults (they no longer fit the mod): ${resetOptions.join(", ")}`);
+            showPopup(new NotificationPopup("warning", t("pages.mods.popup.notification.options_reset.message", { names: resetOptions.join(", ") })));
+        }
 
         mods = loadedMods;
         profiles = loadedConfig.Profiles;
@@ -368,34 +388,24 @@
     }
 
     function makeConfigForMod(mod: Mod): Config {
-        if (!("Version" in mod.Manifest)) {
-            return {
-                For: "Legacy",
-                Guid: mod.Manifest.Guid,
-                Enabled: true,
-                Selected: 0
-            };
-        } else if (mod.Manifest.Version === 1) {
-            const len = mod.Manifest.Options?.length ?? 0;
-            return {
-                For: "V1",
-                Guid: mod.Manifest.Guid,
-                Enabled: true,
-                Toggled: new Array(len).fill(true),
-                Selected: new Array(len).fill(0)
-            };
-        } else if (mod.Manifest.Version === 2) {
-            const len = mod.Manifest.Options?.length ?? 0;
-            return {
-                For: "V2",
-                Guid: mod.Manifest.Guid,
-                Enabled: true,
-                Toggled: new Array(len).fill(true),
-                Selected: new Array(len).fill(0)
-            };
-        } else {
-            throw "Unknown manifest version!";
+        return defaultConfigFor(mod.Manifest);
+    }
+
+    /** Reset the option choices of entries that no longer fit their mod
+     * (it came back after being missing, or changed underneath), keeping
+     * on/off and position; returns the names of the mods that were reset. */
+    function fitProfilesToMods(allProfiles: Profile[], loaded: Mod[]): string[] {
+        const reset: string[] = [];
+        for (const profile of allProfiles) {
+            profile.Configs = profile.Configs.map(config => {
+                const mod = loaded.find(m => m.guid === config.Guid);
+                if (!mod) return config;
+                const fitted = fitConfig(config, mod.Manifest);
+                if (fitted.reset && !reset.includes(mod.name)) reset.push(mod.name);
+                return fitted.config;
+            });
         }
+        return reset;
     }
 
     async function doDeleteMod(guid: string) {
@@ -953,8 +963,10 @@
     }
 
     async function onEditConfig(i: number) {
-        if (i < 0 || i >= profileEntries.length) return;
-        const [config, mod] = profileEntries[i];
+        if (i < 0 || i >= profileConfigs.length) return;
+        const config = profileConfigs[i];
+        const mod = mods.find(m => m.guid === config.Guid);
+        if (!mod) return;
         const newConfig = await showPopup(new ModConfigPopup(mod, config));
         if (!newConfig) return;
         profileConfigs[i] = newConfig;
@@ -1276,12 +1288,12 @@
      * archives, or `paths`; then add what was imported to the active
      * profile (keeping the source's order, on/off state and options). */
     async function onImport(paths?: string[]) {
-        importing = true;
+        importWindows++;
         let result;
         try {
             result = await showPopup(new ImportPopup(currentProfile?.Name, paths));
         } finally {
-            importing = false;
+            importWindows--;
         }
         mods = await getMods();
         importSources = [];
@@ -1393,8 +1405,22 @@
     async function onDeploy() {
         if (!currentProfile) return;
         
-        if (currentProfile.Configs.length === 0) {
-            showPopup(new NotificationPopup("error", t("pages.mods.popup.notification.empty_deploy_error.message")));
+        // A mod that came back (re-added, repaired) may not fit its old
+        // option choices any more.
+        const resetOptions = fitProfilesToMods([currentProfile], mods);
+        if (resetOptions.length > 0) {
+            profileConfigs = currentProfile.Configs;
+            log.warn(`Options reset to defaults before deploying: ${resetOptions.join(", ")}`);
+            showToast("warning", t("pages.mods.popup.notification.options_reset.message", { names: resetOptions.join(", ") }));
+        }
+
+        // Entries whose mod isn't in the library are skipped by deploy; a
+        // profile of only those would just remove every mod from the game.
+        const { loaded, missing } = deployableEntries(currentProfile.Configs, mods.map(m => m.guid));
+        if (loaded.length === 0) {
+            showPopup(new NotificationPopup("error", missing > 0
+                ? t("pages.mods.popup.notification.empty_deploy_error.all_missing", { count: missing })
+                : t("pages.mods.popup.notification.empty_deploy_error.message")));
             return;
         }
 
@@ -1404,7 +1430,9 @@
 
         try {
             await deploy(currentProfile.Configs);
-            showPopup(new NotificationPopup("info", t("pages.mods.popup.notification.deploy_success.message")));
+            showPopup(missing > 0
+                ? new NotificationPopup("warning", t("pages.mods.popup.notification.deploy_success.missing_skipped", { count: missing }))
+                : new NotificationPopup("info", t("pages.mods.popup.notification.deploy_success.message")));
         } catch(ex: unknown) {
             showPopup(new ErrorPopup(t("pages.mods.popup.error.deploy.message"), errorMessage(ex)));
         } finally {
@@ -1518,12 +1546,43 @@
                     isLocked={!allowReorder}
                     gap={4}
                 >
-                    {#each profileEntries as [config, mod], i (config.Guid)}
+                    {#each profileEntries as [config, mod, ci], i (config.Guid)}
                         {@const iconPath = iconPaths.get(config.Guid)}
                         <SortableList.Item
                             id={config.Guid}
                             index={i}
                         >
+                            {#if !mod}
+                            <div class="p-2 text-zinc-400 bg-zinc-800/60 border border-dashed border-zinc-600 rounded flex flex-row gap-1 items-center" data-testid="missing-mod-entry">
+                                <span
+                                    class="shrink-0 text-zinc-500 {allowReorder ? 'cursor-grab' : 'opacity-40'}"
+                                    title={t("pages.mods.load_order.drag_handle")}
+                                    aria-label={t("pages.mods.load_order.drag_handle")}
+                                >
+                                    <GripVertical width="16" height="16" />
+                                </span>
+                                <div class="flex-1 flex flex-col gap-0.5 min-w-0">
+                                    <span class="text-lg truncate">{t("pages.mods.missing_entry.title")}</span>
+                                    <span class="text-xs truncate">{t("pages.mods.missing_entry.message")}</span>
+                                    <span class="text-xs text-zinc-500 truncate">{config.Guid}</span>
+                                </div>
+                                <PopupMenuButton insertTarget="main">
+                                    <button onclick={() => onRemove(ci)}>
+                                        <Eraser />
+                                        <span>Remove</span>
+                                    </button>
+                                    <hr>
+                                    <button disabled={ci === 0} onclick={() => onMoveUp(ci)}>
+                                        <CaretUp />
+                                        <span>Move Up</span>
+                                    </button>
+                                    <button disabled={ci === profileConfigs.length - 1} onclick={() => onMoveDown(ci)}>
+                                        <CaretDown />
+                                        <span>Move Down</span>
+                                    </button>
+                                </PopupMenuButton>
+                            </div>
+                            {:else}
                             <div class="p-2 text-zinc-300 bg-zinc-800 rounded flex flex-row gap-1 items-center">
                                 <span
                                     class="shrink-0 text-zinc-500 {allowReorder ? 'cursor-grab' : 'opacity-40'}"
@@ -1577,41 +1636,41 @@
                                     <button
                                         class="hd2mm-button-nop p-2"
                                         class:invisible={!Array.isArray(mod.Manifest.Options)}
-                                        onclick={() => onEditConfig(i)}
+                                        onclick={() => onEditConfig(ci)}
                                     >
                                         <PencilSquare class="block mx-auto" />
                                     </button>
                                 {/if}
                                 <PopupMenuButton insertTarget="main">
-                                    <button onclick={() => onRemove(i)}>
+                                    <button onclick={() => onRemove(ci)}>
                                         <Eraser />
                                         <span>Remove</span>
                                     </button>
                                     <hr>
                                     <button
-                                        disabled={i === 0}
-                                        onclick={() => onMoveUp(i)}
+                                        disabled={ci === 0}
+                                        onclick={() => onMoveUp(ci)}
                                     >
                                         <CaretUp />
                                         <span>Move Up</span>
                                     </button>
                                     <button
-                                        disabled={i === profileEntries.length - 1}
-                                        onclick={() => onMoveDown(i)}
+                                        disabled={ci === profileConfigs.length - 1}
+                                        onclick={() => onMoveDown(ci)}
                                     >
                                         <CaretDown />
                                         <span>Move Down</span>
                                     </button>
                                     <button
-                                        disabled={i === 0}
-                                        onclick={() => onToTop(i)}
+                                        disabled={ci === 0}
+                                        onclick={() => onToTop(ci)}
                                     >
                                         <ArrowBarUp />
                                         <span>To Top</span>
                                     </button>
                                     <button
-                                        disabled={i === profileEntries.length - 1}
-                                        onclick={() => onToBottom(i)}
+                                        disabled={ci === profileConfigs.length - 1}
+                                        onclick={() => onToBottom(ci)}
                                     >
                                         <ArrowBarDown />
                                         <span>To Bottom</span>
@@ -1658,6 +1717,7 @@
                                     {/if}
                                 </PopupMenuButton>
                             </div>
+                            {/if}
                         </SortableList.Item>
                     {/each}
                 </SortableList.Root>

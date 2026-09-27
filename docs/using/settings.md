@@ -65,16 +65,16 @@ here. See [Updating mods](updating-mods.md).
 - **then every N hours while DDMM is open** — off by default, and only available with the option above. Accepts
   1 to 168 hours.
 - **Nexus Mods (optional)** — optional, and only used for Nexus update checks. Either:
-    - **Sign in to Nexus Mods**: opens Nexus Mods in your browser, where you approve DDMM; Settings then shows
-      *Signed in to Nexus Mods as &lt;account&gt;*. **Sign out** removes the sign-in (and asks Nexus to revoke it).
-      Shown as *Coming soon* in versions that can't sign in yet.
+    - **Sign in to Nexus Mods** (coming soon; greyed out with *Coming soon* until this version can sign in): opens
+      Nexus Mods in your browser, where you approve DDMM; Settings then shows *Signed in to Nexus Mods as
+      &lt;account&gt;*. **Sign out** removes the sign-in (and asks Nexus to revoke it).
     - **Or enter a personal API key manually** (collapsible): paste your personal key (Nexus Mods account → API
       Keys → Personal API Key; **Get a key** opens that page) and click **Save & verify**: DDMM checks it with
       Nexus and shows the account name. **Remove key** deletes it.
 
     If both are set, the sign-in is used. Both are stored in your system keychain (or, on Linux without one, an
     owner-only file in the data folder, which Settings points out), never in `settings.json`. See
-    [Nexus Mods: optional sign-in or API key](updating-mods.md#nexus-mods-and-the-optional-api-key).
+    [Nexus Mods: optional API key](updating-mods.md#nexus-mods-and-the-optional-api-key).
 
 ## After a Browser Install
 

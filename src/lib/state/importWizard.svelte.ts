@@ -13,7 +13,9 @@ import {
     type ImportSource,
 } from "$lib/utils/commands";
 
-export type ImportStep = "source" | "scanning" | "preview" | "importing" | "done";
+/** `stopped`: a scan of picked files was cancelled or failed (there is no
+ * source list to go back to). */
+export type ImportStep = "source" | "scanning" | "stopped" | "preview" | "importing" | "done";
 
 /** Statuses that are ticked by default / can't be ticked at all (mirrors
  * `ItemStatus::selected_by_default` / `blocked` on the Rust side). */
@@ -94,7 +96,7 @@ export class ImportWizard {
         try {
             const scan = await run();
             if (scan.Cancelled) {
-                this.step = "source";
+                this.step = this.fromPicked ? "stopped" : "source";
                 return;
             }
             this.scan = scan;
@@ -102,10 +104,20 @@ export class ImportWizard {
             this.step = "preview";
         } catch (ex: unknown) {
             this.error = errorText(ex);
-            this.step = "source";
+            this.step = this.fromPicked ? "stopped" : "source";
         } finally {
             unlisten();
         }
+    }
+
+    /** From a stopped scan of picked files to the usual start: other mod
+     * managers' folders, or a folder of your choice. */
+    async chooseSourceInstead() {
+        this.error = null;
+        this.fromPicked = false;
+        this.scan = null;
+        this.step = "source";
+        if (this.sources === null) await this.detect();
     }
 
     toggle(item: ImportItem, on: boolean) {
@@ -130,7 +142,8 @@ export class ImportWizard {
 
     async start() {
         const ids = [...this.selected];
-        if (ids.length === 0) return;
+        if (ids.length === 0 || !this.scan) return;
+        const token = this.scan.ScanToken;
         this.error = null;
         this.cancelling = false;
         this.progress = null;
@@ -139,7 +152,7 @@ export class ImportWizard {
             this.progress = e.payload;
         });
         try {
-            this.report = await runImport(ids);
+            this.report = await runImport(token, ids);
             this.step = "done";
         } catch (ex: unknown) {
             // Refused before anything was imported (not enough space, a

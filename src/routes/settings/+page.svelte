@@ -607,7 +607,7 @@
                 <p class="text-zinc-500 text-xs max-w-lg">{t("pages.settings.updates.auto_check.description")}</p>
 
                 <h3 id="nexus-api-key" class="text-zinc-300 text-base mt-2">{t("pages.settings.updates.nexus.title")}</h3>
-                <p class="text-zinc-400 text-sm max-w-lg">{t("pages.settings.updates.nexus.description")}</p>
+                <p class="text-zinc-400 text-sm max-w-lg">{signIn.Available ? t("pages.settings.updates.nexus.description") : t("pages.settings.updates.nexus.description_key_only")}</p>
                 <div id="nexus-sign-in" class="flex flex-col gap-1 max-w-lg">
                     {#if signIn.SignedIn}
                         <p class="text-sm text-green-400">

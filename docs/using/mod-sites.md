@@ -66,8 +66,9 @@ future update checks — see [Updating mods](updating-mods.md#how-ddmm-knows-a-m
 Nexus Mods gates its downloads behind a login too, so a Nexus Mods mod-page link always uses the browser handoff.
 A direct Nexus **file** link (not the mod page) can still install immediately, if you have one.
 
-Update checks for Nexus Mods need you to sign in to Nexus Mods or add your own personal API key in Settings.
-Both are **optional**; without either, Nexus mods show "Optional: sign in or add a key to check" and everything
+Update checks for Nexus Mods need your own personal Nexus Mods API key in Settings (signing in to Nexus Mods
+instead is coming soon). It's **optional**; without it, Nexus mods show "Optional: add a Nexus Mods key in Settings
+to check" and everything
 else works the same.
 DDMM never downloads from Nexus through the API: updating a Nexus mod always goes through your browser. See
 [Updating mods](updating-mods.md#nexus-mods-and-the-optional-api-key).

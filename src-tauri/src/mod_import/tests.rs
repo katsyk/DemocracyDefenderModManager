@@ -24,6 +24,11 @@ fn mod_zip(path: &Path, seed: &str) {
     make_zip(path, &[(PATCH, seed.as_bytes())]);
 }
 
+fn set_mtime(path: &Path, secs: u64) {
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)).unwrap();
+}
+
 fn nexus_name(name: &str, id: u32, version: &str, ts: u64) -> String {
     format!("{name}-{id}-{}-{ts}.zip", version.replace('.', "-"))
 }
@@ -314,6 +319,8 @@ async fn duplicates_older_versions_and_broken_archives_are_flagged_and_do_not_st
     let manifest = br#"{"Version":1,"Guid":"11111111-2222-3333-4444-555555555555","Name":"Author Mod","Description":"","IconPath":null,"Options":null}"#;
     make_zip(&src.join("author-a.zip"), &[("manifest.json", manifest), (PATCH, b"a")]);
     make_zip(&src.join("author-b.zip"), &[("manifest.json", manifest), (PATCH, b"b")]);
+    set_mtime(&src.join("author-a.zip"), 2_000_000);
+    set_mtime(&src.join("author-b.zip"), 1_000_000);
 
     let state = state_with_empty_library(&base).await;
     let scan = scan_folder(&src, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
@@ -337,8 +344,11 @@ async fn duplicates_older_versions_and_broken_archives_are_flagged_and_do_not_st
     );
     assert!(matches!(status("evil.zip"), ItemStatus::Unreadable { reason } if reason.contains("unsafe")));
     assert!(matches!(status("bad manifest.zip"), ItemStatus::Unreadable { reason } if reason.contains("JSON")));
+    // Same GUID, different content: not a copy, so one of them is the
+    // older version (by file date here -- they carry no version) and can
+    // still be ticked.
     assert_eq!(status("author-a.zip"), ItemStatus::New);
-    assert!(matches!(status("author-b.zip"), ItemStatus::Duplicate { .. }));
+    assert!(matches!(status("author-b.zip"), ItemStatus::OlderVersion { .. }));
     assert!(status("truncated.zip").blocked());
     assert!(!ItemStatus::OlderVersion { of: String::new() }.blocked());
 
@@ -360,7 +370,14 @@ async fn duplicates_older_versions_and_broken_archives_are_flagged_and_do_not_st
     std::fs::write(&damaged, bytes).unwrap();
 
     let scan = scan_folder(&src, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
-    let chosen: Vec<ScanItem> = scan.items.iter().filter(|i| !i.status.blocked() && i.status != ItemStatus::NotAMod).cloned().collect();
+    // (Not the older "Author Mod": two versions of one GUID can't both be
+    // installed, and install says so on its own.)
+    let chosen: Vec<ScanItem> = scan
+        .items
+        .iter()
+        .filter(|i| !i.status.blocked() && i.status != ItemStatus::NotAMod && !i.path.ends_with("author-b.zip"))
+        .cloned()
+        .collect();
     let report = run_import(&state, chosen, &no_cancel(), |_| {}).await;
     let names: Vec<&str> = report.imported.iter().map(|m| m.name.as_str()).collect();
     assert!(names.contains(&"Cool Armor"));
@@ -1056,4 +1073,144 @@ async fn linking_by_guid_keeps_the_profile_out_of_it() {
     let sidecar = sources::load_origin_sidecar(&dir).await.unwrap();
     assert_eq!(sidecar.sources[0].id.as_deref(), Some("4242"));
     assert_eq!(sidecar.installed_files[0].file_id.as_deref(), Some("17001"));
+}
+
+fn author_manifest(guid: &str, name: &str) -> Vec<u8> {
+    format!(r#"{{"Version":1,"Guid":"{guid}","Name":"{name}","Description":"","IconPath":null,"Options":null}}"#).into_bytes()
+}
+
+/// Two versions of a mod share their manifest GUID; only an identical
+/// copy is a duplicate. The newest is kept by upload time, then version,
+/// then file date -- never by how the file is named.
+#[tokio::test]
+async fn same_guid_is_a_duplicate_only_when_the_content_is_identical() {
+    let root = tempfile::tempdir().unwrap();
+    let src = root.path().join("downloads");
+    std::fs::create_dir_all(&src).unwrap();
+    let guid = "aaaaaaaa-1111-2222-3333-444444444444";
+    let m = author_manifest(guid, "Helmets");
+
+    // v1.1 has the shorter, "original-looking" name, v1.0 the longer one:
+    // the path shape must not decide which is newer.
+    let v10 = nexus_name("Helmets", 55, "1.0", 1_700_000_000);
+    let v11 = nexus_name("H", 55, "1.1", 1_710_000_000);
+    make_zip(&src.join(&v10), &[("manifest.json", &m), (PATCH, b"one-oh")]);
+    make_zip(&src.join(&v11), &[("manifest.json", &m), (PATCH, b"one-one")]);
+    // Byte-for-byte copy of v1.0 under another name.
+    std::fs::copy(src.join(&v10), src.join("Helmets (1).zip")).unwrap();
+
+    let scan = scan_folder(&src, &InstalledIndex::default(), &no_cancel(), |_| {}).unwrap();
+    let status = |file: &str| scan.items.iter().find(|i| i.path.file_name().unwrap() == file).unwrap().status.clone();
+    assert_eq!(status(&v11), ItemStatus::New);
+    assert_eq!(status(&v10), ItemStatus::OlderVersion { of: "Helmets".into() });
+    assert!(!status(&v10).blocked(), "an older version can still be ticked");
+    assert!(matches!(status("Helmets (1).zip"), ItemStatus::Duplicate { .. }), "{:?}", status("Helmets (1).zip"));
+    assert!(status("Helmets (1).zip").blocked());
+
+    // Without upload times: the version decides, then the file date.
+    let plain = root.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    make_zip(&plain.join("b.zip"), &[("manifest.json", &m), (PATCH, b"b")]);
+    make_zip(&plain.join("a.zip"), &[("manifest.json", &m), (PATCH, b"a-longer")]);
+    set_mtime(&plain.join("a.zip"), 1_000_000);
+    set_mtime(&plain.join("b.zip"), 3_000_000);
+    let scan = scan_folder(&plain, &InstalledIndex::default(), &no_cancel(), |_| {}).unwrap();
+    let status = |file: &str| scan.items.iter().find(|i| i.path.file_name().unwrap() == file).unwrap().status.clone();
+    assert_eq!(status("b.zip"), ItemStatus::New, "the newer file wins");
+    assert!(matches!(status("a.zip"), ItemStatus::OlderVersion { .. }));
+}
+
+#[test]
+fn same_guid_mod_folders_are_duplicates_only_when_identical() {
+    let root = tempfile::tempdir().unwrap();
+    let guid = "bbbbbbbb-1111-2222-3333-444444444444";
+    for (name, patch) in [("one", "same"), ("two", "same"), ("three", "changed!")] {
+        let dir = root.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), author_manifest(guid, "Shared")).unwrap();
+        std::fs::write(dir.join(PATCH), patch).unwrap();
+    }
+    // "three" is the newest by date.
+    for (name, t) in [("one", 1_000_000), ("two", 1_000_000), ("three", 5_000_000)] {
+        let dir = root.path().join(name);
+        std::fs::File::open(&dir).and_then(|f| f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(t))).ok();
+    }
+    let scan = scan_folder(root.path(), &InstalledIndex::default(), &no_cancel(), |_| {}).unwrap();
+    let kinds: Vec<(String, ItemStatus)> = scan
+        .items
+        .iter()
+        .map(|i| (i.path.file_name().unwrap().to_string_lossy().into_owned(), i.status.clone()))
+        .collect();
+    let dupes = kinds.iter().filter(|(_, s)| matches!(s, ItemStatus::Duplicate { .. })).count();
+    let older = kinds.iter().filter(|(_, s)| matches!(s, ItemStatus::OlderVersion { .. })).count();
+    let new = kinds.iter().filter(|(_, s)| *s == ItemStatus::New).count();
+    // "one" and "two" are the same folder: one of them is a duplicate. The
+    // different one is a version, not a copy.
+    assert_eq!((new, older, dupes), (1, 1, 1), "{kinds:?}");
+}
+
+/// Picking one mod's own folder (manifest plus option subfolders full of
+/// patch files) imports that mod, not each option as a mod of its own.
+#[test]
+fn picking_a_mods_own_folder_lists_just_that_mod() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("Fancy Capes");
+    for option in ["Red", "Blue", "Green/Dark"] {
+        std::fs::create_dir_all(dir.join(option)).unwrap();
+        std::fs::write(dir.join(option).join(PATCH), option.as_bytes()).unwrap();
+    }
+    std::fs::write(dir.join("manifest.json"), author_manifest("cccccccc-1111-2222-3333-444444444444", "Fancy Capes")).unwrap();
+    let scan = scan_folder(&dir, &InstalledIndex::default(), &no_cancel(), |_| {}).unwrap();
+    assert_eq!(scan.items.len(), 1, "{:?}", scan.items.iter().map(|i| &i.path).collect::<Vec<_>>());
+    assert_eq!(scan.items[0].path, dir);
+    assert_eq!(scan.items[0].kind, ItemKind::Folder);
+    assert_eq!(scan.items[0].name, "Fancy Capes");
+    assert_eq!(scan.items[0].status, ItemStatus::New);
+}
+
+/// The 2024 enabled.json is a map whose key order is the load order; it
+/// must come out in file order, not sorted by GUID.
+#[test]
+fn the_2024_enabled_map_keeps_its_load_order() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = root.path().join("HD2ModManager");
+    let mods = storage.join("Mods");
+    let guids = ["ffffffff-0000-0000-0000-000000000001", "11111111-0000-0000-0000-000000000002", "88888888-0000-0000-0000-000000000003"];
+    for (i, g) in guids.iter().enumerate() {
+        let dir = mods.join(format!("m{i}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(PATCH), g.as_bytes()).unwrap();
+        std::fs::write(dir.join("manifest.json"), author_manifest(g, &format!("m{i}"))).unwrap();
+    }
+    std::fs::write(storage.join("enabled.json"), format!(r#"{{"{}": 0, "{}": 0, "{}": 0}}"#, guids[0], guids[1], guids[2])).unwrap();
+    let scan = scan_folder(&mods, &InstalledIndex::default(), &no_cancel(), |_| {}).unwrap();
+    for (i, g) in guids.iter().enumerate() {
+        let item = scan.items.iter().find(|it| it.guid == Some(Uuid::parse_str(g).unwrap())).unwrap();
+        assert_eq!(item.profile.as_ref().unwrap().order, i, "{g}");
+    }
+}
+
+/// A folder whose copy in DDMM got another name (too long, a clash) is
+/// still recognized on the next import.
+#[tokio::test]
+async fn a_folder_renamed_on_import_is_known_again() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("ddmm");
+    let src = root.path().join("mods");
+    let long = format!("Extremely Detailed {} Armor Pack", "Super ".repeat(15));
+    for name in [long.as_str(), "Plain"] {
+        std::fs::create_dir_all(src.join(name)).unwrap();
+        std::fs::write(src.join(name).join(PATCH), name.as_bytes()).unwrap();
+    }
+    let state = state_with_empty_library(&base).await;
+    let scan = scan_folder(&src, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    assert_eq!(scan.items.iter().filter(|i| i.status == ItemStatus::New).count(), 2);
+    let report = run_import(&state, ids(&scan), &no_cancel(), |_| {}).await;
+    assert_eq!(report.imported.len(), 2, "{:?}", report.failed);
+    assert!(!installed_dirs(&base).contains(&long), "the long name was shortened");
+
+    let again = scan_folder(&src, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    for item in &again.items {
+        assert!(matches!(item.status, ItemStatus::Installed { .. }), "{:?}: {:?}", item.path, item.status);
+    }
 }

@@ -134,9 +134,9 @@ fn commit_location(state_dir: &data_dir::DataDirDecision, target: &Path, is_rese
                     .with_context(|| format!("couldn't create {}", marker.display()))?;
             }
         }
-        data_dir::remove_pointer(&state_dir.pointer_file)
+        data_dir::clear_pointer(state_dir)
     } else {
-        data_dir::write_pointer(&state_dir.pointer_file, target).map_err(|e| {
+        data_dir::commit_pointer(state_dir, target).map_err(|e| {
             if state_dir.kind == BaseDirKind::Portable {
                 e.context(format!(
                     "DDMM keeps the data folder location next to its program file, in {}",
@@ -282,33 +282,35 @@ pub async fn retry_data_folder(app: AppHandle) -> TAResult<()> {
     }
 }
 
+/// The data folder the recovery screen's Locate means by `picked`: the
+/// folder itself, or the `DDMM Data` folder inside it. The folder actually
+/// used must hold complete DDMM data -- not an unfinished move.
+fn located_folder(picked: &Path) -> anyhow::Result<PathBuf> {
+    if !picked.is_dir() {
+        anyhow::bail!("{} doesn't exist or isn't a folder.", picked.display());
+    }
+    let sub = picked.join(data_move::SUBFOLDER_NAME);
+    let chosen = [picked.to_path_buf(), sub]
+        .into_iter()
+        .find(|dir| data_move::is_ddmm_data_dir(dir) || dir.join(data_move::INCOMPLETE_MARKER).exists())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} doesn't look like a DDMM data folder (no settings.json or profiles.json from DDMM in it).",
+                picked.display()
+            )
+        })?;
+    if chosen.join(data_move::INCOMPLETE_MARKER).exists() {
+        anyhow::bail!("{} holds an unfinished data folder move, not complete DDMM data.", chosen.display());
+    }
+    Ok(chosen)
+}
+
 /// Recovery screen: point DDMM at the folder its data is in now (e.g. the
 /// drive letter changed), then restart.
 #[tauri::command]
 pub async fn locate_data_folder(app: AppHandle, state: State<'_, AppState>, folder: String) -> TAResult<()> {
-    let folder = PathBuf::from(folder.trim());
-    if !folder.is_dir() {
-        return anyhow::anyhow!("{} doesn't exist or isn't a folder.", folder.display()).into_ta_result();
-    }
-    if folder.join(data_move::INCOMPLETE_MARKER).exists() {
-        return anyhow::anyhow!(
-            "{} holds an unfinished data folder move, not complete DDMM data.",
-            folder.display()
-        )
-        .into_ta_result();
-    }
-    let chosen = if data_move::is_ddmm_data_dir(&folder) {
-        folder
-    } else if data_move::is_ddmm_data_dir(&folder.join(data_move::SUBFOLDER_NAME)) {
-        folder.join(data_move::SUBFOLDER_NAME)
-    } else {
-        return anyhow::anyhow!(
-            "{} doesn't look like a DDMM data folder (no settings.json or profiles.json from DDMM in it).",
-            folder.display()
-        )
-        .into_ta_result();
-    };
-    data_dir::write_pointer(&state.data_dir.pointer_file, &chosen).into_ta_result()?;
+    let chosen = located_folder(&PathBuf::from(folder.trim())).into_ta_result()?;
+    data_dir::commit_pointer(&state.data_dir, &chosen).into_ta_result()?;
     log::info!("Data folder located at {chosen:?}; restarting.");
     restart_soon(app);
     Ok(())
@@ -328,7 +330,7 @@ pub async fn reset_data_folder_location(app: AppHandle, state: State<'_, AppStat
             }
         }
     }
-    data_dir::remove_pointer(&d.pointer_file).into_ta_result()?;
+    data_dir::clear_pointer(d).into_ta_result()?;
     log::info!("Data folder location reset to the default ({:?}); restarting.", d.default_path);
     restart_soon(app);
     Ok(())
@@ -346,6 +348,7 @@ mod tests {
             kind,
             reason: String::new(),
             pointer_file: default_path.join(data_dir::POINTER_FILENAME),
+            mirror_pointer_file: None,
             default_path,
             pointed: false,
             problem: None,
@@ -393,6 +396,40 @@ mod tests {
         assert!(state.data_ops_paused());
         state.freeze_data_ops(Some(guard));
         assert!(format!("{:#}", state.data_op().unwrap_err()).contains("being moved"));
+    }
+
+    #[test]
+    fn locate_checks_the_folder_it_actually_uses_for_an_unfinished_move() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = br#"{"Version":"V1","GamePath":"","SkipList":[]}"#;
+
+        // The picked folder is the data folder.
+        let direct = root.path().join("direct");
+        std::fs::create_dir(&direct).unwrap();
+        std::fs::write(direct.join("settings.json"), settings).unwrap();
+        assert_eq!(located_folder(&direct).unwrap(), direct);
+
+        // Its "DDMM Data" subfolder is, complete.
+        let parent = root.path().join("usb");
+        let sub = parent.join(data_move::SUBFOLDER_NAME);
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("settings.json"), settings).unwrap();
+        assert_eq!(located_folder(&parent).unwrap(), sub);
+
+        // ...but half-copied: refused, although the picked folder itself
+        // has no marker.
+        std::fs::write(sub.join(data_move::INCOMPLETE_MARKER), b"").unwrap();
+        let err = located_folder(&parent).unwrap_err();
+        assert!(format!("{err}").contains("unfinished"), "{err}");
+
+        // A half-copied subfolder without DDMM files yet is refused too.
+        std::fs::remove_file(sub.join("settings.json")).unwrap();
+        assert!(format!("{}", located_folder(&parent).unwrap_err()).contains("unfinished"));
+
+        // The picked folder's own marker.
+        std::fs::write(direct.join(data_move::INCOMPLETE_MARKER), b"").unwrap();
+        assert!(located_folder(&direct).is_err());
+        assert!(located_folder(&root.path().join("nope")).is_err());
     }
 
     #[test]

@@ -64,7 +64,9 @@ pub struct OriginSidecar {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped_versions: Vec<SkippedVersion>,
     /// The archive a mod was imported from (bulk import only), so importing
-    /// the same file again is recognized as "already in DDMM". Dropped
+    /// the same file again is recognized as "already in DDMM". For a mod
+    /// imported from a folder, just that folder's name (empty `sha256`).
+    /// Dropped
     /// when the mod is updated, since the sidecar is rewritten then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imported_archive: Option<ArchiveFingerprint>,

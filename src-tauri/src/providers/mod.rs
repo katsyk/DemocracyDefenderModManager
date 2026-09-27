@@ -174,6 +174,17 @@ fn numeric_parts(v: &str) -> Option<Vec<u64>> {
     v.split('.').map(|p| p.parse::<u64>().ok()).collect()
 }
 
+/// A version as numbers (`v1.10` -> `[1, 10]`, trailing zeros dropped so
+/// `1.0` equals `1`), for ordering; `None` unless it's plain dotted numbers,
+/// as most mod versions can't be ordered.
+pub fn numeric_version(v: &str) -> Option<Vec<u64>> {
+    let mut parts = numeric_parts(&normalize_version(v))?;
+    while parts.len() > 1 && parts.last() == Some(&0) {
+        parts.pop();
+    }
+    Some(parts)
+}
+
 pub fn compare_versions(installed: &str, latest: &str) -> VersionRelation {
     let a = normalize_version(installed);
     let b = normalize_version(latest);
