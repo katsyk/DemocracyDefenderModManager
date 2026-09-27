@@ -299,8 +299,11 @@ pub fn load_guid_hints(root: &Path) -> Option<GuidHints> {
                             );
                         }
                     }
-                    Value::Object(map) => {
-                        for (order, (guid, index)) in map.iter().enumerate() {
+                    Value::Object(_) => {
+                        // Its load order is the order of the keys, which
+                        // `Value`'s map doesn't keep (it sorts them).
+                        let Ok(OrderedObject(entries)) = serde_json::from_slice::<OrderedObject>(&data) else { continue };
+                        for (order, (guid, index)) in entries.iter().enumerate() {
                             let Ok(guid) = Uuid::parse_str(guid) else { continue };
                             let selected = index.as_u64().map(|n| vec![n as usize]);
                             hints.insert(guid, ProfileHint { enabled: true, order, toggled: None, selected });
@@ -313,6 +316,29 @@ pub fn load_guid_hints(root: &Path) -> Option<GuidHints> {
         }
     }
     None
+}
+
+/// A JSON object's entries in file order.
+struct OrderedObject(Vec<(String, Value)>);
+
+impl<'de> serde::Deserialize<'de> for OrderedObject {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = OrderedObject;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<OrderedObject, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = map.next_entry::<String, Value>()? {
+                    entries.push(entry);
+                }
+                Ok(OrderedObject(entries))
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
 }
 
 fn hint_from_config(c: &Config, order: usize) -> ProfileHint {

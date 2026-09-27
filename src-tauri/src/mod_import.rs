@@ -756,7 +756,10 @@ impl InstalledIndex {
                 if let Some(fname) = &fp.file_name {
                     index.file_names.insert(fname.to_lowercase(), (name.clone(), guid));
                 }
-                index.fingerprints.push((fp, name.clone(), guid));
+                // A folder import records only its folder's name.
+                if !fp.sha256.is_empty() {
+                    index.fingerprints.push((fp, name.clone(), guid));
+                }
             }
             let nexus_file = files.iter().find(|f| f.provider.eq_ignore_ascii_case("nexus"));
             let sidecar_versions: HashMap<String, Option<String>> = sidecar
@@ -1102,7 +1105,13 @@ pub fn scan_folder(
         }
         ScanResult { root: None, items, profile_name: data.profile_name, truncated: false }
     } else {
-        let (candidates, truncated) = collect_candidates(root, cancel);
+        // The folder picked is a mod itself (its own manifest.json): it's
+        // one item, not a list of its option subfolders.
+        let (candidates, truncated) = if has_manifest_sync(root) {
+            (vec![Candidate { kind: ItemKind::Folder, path: root.to_path_buf() }], false)
+        } else {
+            collect_candidates(root, cancel)
+        };
         let mut items = inspect_all(&candidates, cancel, &mut progress);
         let mut profile_name = None;
         if let Some((name, hints)) = layouts::load_guid_hints(root) {
@@ -1570,7 +1579,14 @@ async fn import_one(
             file_name: item.path.file_name().map(|n| n.to_string_lossy().into_owned()),
         })
     } else {
-        None
+        // A folder isn't hashed; its name is enough to know it again when
+        // its copy here got another name (a clash, or a name that isn't
+        // valid on every OS).
+        Some(ArchiveFingerprint {
+            size: item.file_size,
+            sha256: String::new(),
+            file_name: item.path.file_name().map(|n| n.to_string_lossy().into_owned()),
+        })
     };
 
     let dir_name = unique_dir_name(mods_root, &item.name, taken);

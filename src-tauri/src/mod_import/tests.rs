@@ -1148,3 +1148,69 @@ fn same_guid_mod_folders_are_duplicates_only_when_identical() {
     // different one is a version, not a copy.
     assert_eq!((new, older, dupes), (1, 1, 1), "{kinds:?}");
 }
+
+/// Picking one mod's own folder (manifest plus option subfolders full of
+/// patch files) imports that mod, not each option as a mod of its own.
+#[test]
+fn picking_a_mods_own_folder_lists_just_that_mod() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("Fancy Capes");
+    for option in ["Red", "Blue", "Green/Dark"] {
+        std::fs::create_dir_all(dir.join(option)).unwrap();
+        std::fs::write(dir.join(option).join(PATCH), option.as_bytes()).unwrap();
+    }
+    std::fs::write(dir.join("manifest.json"), author_manifest("cccccccc-1111-2222-3333-444444444444", "Fancy Capes")).unwrap();
+    let scan = scan_folder(&dir, &InstalledIndex::default(), &no_cancel(), |_| {}).unwrap();
+    assert_eq!(scan.items.len(), 1, "{:?}", scan.items.iter().map(|i| &i.path).collect::<Vec<_>>());
+    assert_eq!(scan.items[0].path, dir);
+    assert_eq!(scan.items[0].kind, ItemKind::Folder);
+    assert_eq!(scan.items[0].name, "Fancy Capes");
+    assert_eq!(scan.items[0].status, ItemStatus::New);
+}
+
+/// The 2024 enabled.json is a map whose key order is the load order; it
+/// must come out in file order, not sorted by GUID.
+#[test]
+fn the_2024_enabled_map_keeps_its_load_order() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = root.path().join("HD2ModManager");
+    let mods = storage.join("Mods");
+    let guids = ["ffffffff-0000-0000-0000-000000000001", "11111111-0000-0000-0000-000000000002", "88888888-0000-0000-0000-000000000003"];
+    for (i, g) in guids.iter().enumerate() {
+        let dir = mods.join(format!("m{i}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(PATCH), g.as_bytes()).unwrap();
+        std::fs::write(dir.join("manifest.json"), author_manifest(g, &format!("m{i}"))).unwrap();
+    }
+    std::fs::write(storage.join("enabled.json"), format!(r#"{{"{}": 0, "{}": 0, "{}": 0}}"#, guids[0], guids[1], guids[2])).unwrap();
+    let scan = scan_folder(&mods, &InstalledIndex::default(), &no_cancel(), |_| {}).unwrap();
+    for (i, g) in guids.iter().enumerate() {
+        let item = scan.items.iter().find(|it| it.guid == Some(Uuid::parse_str(g).unwrap())).unwrap();
+        assert_eq!(item.profile.as_ref().unwrap().order, i, "{g}");
+    }
+}
+
+/// A folder whose copy in DDMM got another name (too long, a clash) is
+/// still recognized on the next import.
+#[tokio::test]
+async fn a_folder_renamed_on_import_is_known_again() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("ddmm");
+    let src = root.path().join("mods");
+    let long = format!("Extremely Detailed {} Armor Pack", "Super ".repeat(15));
+    for name in [long.as_str(), "Plain"] {
+        std::fs::create_dir_all(src.join(name)).unwrap();
+        std::fs::write(src.join(name).join(PATCH), name.as_bytes()).unwrap();
+    }
+    let state = state_with_empty_library(&base).await;
+    let scan = scan_folder(&src, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    assert_eq!(scan.items.iter().filter(|i| i.status == ItemStatus::New).count(), 2);
+    let report = run_import(&state, ids(&scan), &no_cancel(), |_| {}).await;
+    assert_eq!(report.imported.len(), 2, "{:?}", report.failed);
+    assert!(!installed_dirs(&base).contains(&long), "the long name was shortened");
+
+    let again = scan_folder(&src, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    for item in &again.items {
+        assert!(matches!(item.status, ItemStatus::Installed { .. }), "{:?}: {:?}", item.path, item.status);
+    }
+}
