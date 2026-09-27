@@ -64,7 +64,8 @@ These sites only give files to logged-in people, so the download happens in your
   installed in place as soon as it lands, and DDMM's window notices by itself.
 - **Without the extension** (or if you choose *Use Downloads-folder watch instead*), DDMM opens the page and
   watches your Downloads folder, the same [browser handoff](mod-sites.md#how-the-browser-handoff-works) used
-  for adding mods.
+  for adding mods. If a file of a *different* Nexus Mods mod lands there first (say, a requirement you downloaded
+  from the same page), DDMM leaves it alone, tells you, and keeps waiting for the update's own file.
 
 ### Update all
 
@@ -75,7 +76,8 @@ open the page, skip to the next, or stop.
 ### Skip this version
 
 Don't want a particular update? Use **Skip** (in the results) or **Skip version X** (in the mod's menu). DDMM stops
-showing that version; a later version shows up normally. **Stop skipping** in the same places undoes it. The
+showing that version (also if the site later writes it with or without a leading `v`); a later version shows up
+normally. **Stop skipping** in the same places undoes it. The
 skip is stored with the mod (in its `.hd2mm-origin.json`) and is cleared when the mod is updated.
 
 ### After updating: redeploy

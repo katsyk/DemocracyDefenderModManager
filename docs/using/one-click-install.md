@@ -103,8 +103,12 @@ link, or add the file manually in DDMM.
    with **Always Allow**, **Just This Once**, and **Deny**. Choosing **Always Allow** skips this prompt for that
    site from then on — revocable any time in
    [Settings → Sites Allowed to Install Through the Extension](settings.md#sites-allowed-to-install-through-the-extension).
-5. DDMM installs the mod exactly like [Add URL](adding-mods.md#add-url) would — if a mod from the same site is
-   already installed, it's updated in place instead of duplicated.
+   A download the extension can't tie to any website is always asked about, naming the file, with no
+   **Always Allow**.
+5. DDMM installs the mod exactly like [Add URL](adding-mods.md#add-url) would — if you already have this same file
+   of the mod installed (an older version of it), it's updated in place instead of duplicated. Another file from the
+   same mod page (a GameBanana variant, a Nexus Mods optional file) is installed alongside, never over the one you
+   have.
 6. Depending on [Settings → After a Browser Install](settings.md#after-a-browser-install), DDMM then adds the mod
    to your library only, adds it to your active profile, or adds it and deploys immediately.
 7. A small notification in the corner of the window reports what happened — installed, added to a profile,
@@ -132,7 +136,7 @@ A separate, **opt-in, off by default** option: turn on
 folder the whole time it's running (not just during a [browser handoff](mod-sites.md#how-the-browser-handoff-works))
 for anything that looks like a Helldivers 2 mod archive — useful for sites the extension doesn't have a button on
 yet. It never installs anything without you clicking **Install** (or **Install & Deploy**) on the notification
-first.
+first, and it doesn't offer files the browser extension has already handed to DDMM.
 
 ## Browser integration
 

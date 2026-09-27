@@ -248,6 +248,14 @@ fn status_for(installed: Option<&str>, latest: Option<&str>) -> UpdateState {
     }
 }
 
+/// Whether two version strings name the same version, the way update
+/// checks compare them (`v1.2` and `1.2` do; so do `1-2` and `1.2`) -- used
+/// for "Skip this version", which must not come back because a site
+/// started (or stopped) writing a leading `v`.
+fn same_version(a: &str, b: &str) -> bool {
+    compare_versions(a, b) == VersionRelation::Same
+}
+
 fn entry(t: &Target, status: UpdateState, latest: Option<String>) -> UpdateStatusEntry {
     UpdateStatusEntry {
         guid: t.guid,
@@ -459,16 +467,29 @@ async fn check_nexus(base_path: &Path, targets: &[&Target], make_client: &NexusC
     let mut cache = nexus::load_cache(base_path).await;
     let mut pacer = Pacer::default();
 
-    // What we know about each target: its id, installed file, and when that
-    // file was last checked (a cache entry for a different installed file
-    // doesn't count).
-    let info: Vec<Option<(u64, nexus::Installed, String, Option<i64>)>> = targets
+    // What we know about each target: its id, installed file, the cache
+    // entry for exactly that installed file, and when it was last checked.
+    // Keyed by mod id *and* installed file: several files of one Nexus page
+    // installed as separate mods (a main file and an optional one) each
+    // keep their own entry instead of overwriting each other's, which would
+    // cost a files request per mod on every check.
+    type TargetInfo = (u64, nexus::Installed, String, Option<i64>);
+    let info: Vec<Option<TargetInfo>> = targets
         .iter()
         .map(|t| {
             let mod_id = t.id.parse::<u64>().ok()?;
             let installed = nexus_installed(t);
-            let key = installed.cache_key();
-            let last = cache.nexus.get(&t.id).filter(|c| c.installed_key == key).map(|c| c.checked_at);
+            let installed_key = installed.cache_key();
+            let key = nexus::cache_entry_key(&t.id, &installed_key);
+            // An entry from before the cache was keyed per file (keyed by
+            // mod id alone) still counts, but only for the very file it
+            // was made for; it moves to the new key below.
+            if !cache.nexus.contains_key(&key) {
+                if let Some(old) = cache.nexus.get(&t.id).filter(|c| c.installed_key == installed_key).cloned() {
+                    cache.nexus.insert(key.clone(), old);
+                }
+            }
+            let last = cache.nexus.get(&key).filter(|c| c.installed_key == installed_key).map(|c| c.checked_at);
             Some((mod_id, installed, key, last))
         })
         .collect();
@@ -493,12 +514,10 @@ async fn check_nexus(base_path: &Path, targets: &[&Target], make_client: &NexusC
                     let last = last.unwrap_or(0);
                     if nexus::changed_since(&list, *mod_id, last) {
                         need_files.insert(*mod_id);
-                    } else if let Some(c) = cache.nexus.get_mut(&mod_id.to_string()) {
+                    } else if let Some(c) = cache.nexus.get_mut(key) {
                         // Nothing new since the last check: that result
                         // still holds, as of now.
-                        if &c.installed_key == key {
-                            c.checked_at = now;
-                        }
+                        c.checked_at = now;
                     }
                 }
             }
@@ -536,7 +555,7 @@ async fn check_nexus(base_path: &Path, targets: &[&Target], make_client: &NexusC
                     continue;
                 }
             }
-            match cache.nexus.get(&t.id).filter(|c| &c.installed_key == key) {
+            match cache.nexus.get(key) {
                 Some(cached) => results.push(nexus_entry(t, &cached.decision)),
                 None => results.push(entry(t, UpdateState::Unknown, None)),
             }
@@ -556,8 +575,12 @@ async fn check_nexus(base_path: &Path, targets: &[&Target], make_client: &NexusC
             Ok(files) => {
                 let decision = nexus::decide(installed, files);
                 cache.nexus.insert(
-                    t.id.clone(),
-                    nexus::CachedDecision { checked_at: now, installed_key: key.clone(), decision: decision.clone() },
+                    key.clone(),
+                    nexus::CachedDecision {
+                        checked_at: now,
+                        installed_key: installed.cache_key(),
+                        decision: decision.clone(),
+                    },
                 );
                 results.push(nexus_entry(t, &decision));
             }
@@ -572,6 +595,11 @@ async fn check_nexus(base_path: &Path, targets: &[&Target], make_client: &NexusC
         nexus_oauth::handle_rejected_sign_in(base_path).await;
     }
 
+    // Keep only entries for what's installed now: this drops legacy
+    // (mod-id-only) keys once migrated, and entries for files that have
+    // since been updated or removed, so the cache can't grow forever.
+    let current: std::collections::HashSet<&String> = info.iter().flatten().map(|(_, _, key, _)| key).collect();
+    cache.nexus.retain(|k, _| current.contains(k));
     nexus::save_cache(base_path, &cache).await;
     log::info!(
         "Nexus update check: {} mod(s): {} checked recently (skipped), {} individually, {} via updated list ({}); {} files request(s); quota left: hourly {:?}, daily {:?}",
@@ -659,7 +687,7 @@ async fn run_check_with(
         }
         if e.status == UpdateState::UpdateAvailable {
             if let (Some(skipped), Some(latest)) = (&t.skipped_version, &e.latest_version) {
-                if skipped == latest {
+                if same_version(skipped, latest) {
                     e.status = UpdateState::Skipped;
                 }
             }
@@ -724,7 +752,7 @@ pub async fn skip_update_version(
     if let Some(report) = state.last_update_report.lock().await.as_mut() {
         for e in report.results.iter_mut().filter(|e| e.guid == guid && e.provider.eq_ignore_ascii_case(&provider)) {
             match (&version, &e.status) {
-                (Some(v), UpdateState::UpdateAvailable) if e.latest_version.as_deref() == Some(v.as_str()) => {
+                (Some(v), UpdateState::UpdateAvailable) if e.latest_version.as_deref().is_some_and(|l| same_version(v, l)) => {
                     e.status = UpdateState::Skipped
                 }
                 (None, UpdateState::Skipped) => e.status = UpdateState::UpdateAvailable,
@@ -785,13 +813,26 @@ pub async fn known_update_available(state: &AppState, guid: Uuid, provider: &str
 /// Best-effort "what version is this?" for a freshly installed mod, so its
 /// first update check has something to compare against. Nexus archives
 /// carry their version and upload time in their own file name (no API
-/// call); the keyless sites are asked for their current version. Never
-/// fails an install.
-pub async fn enrich_install_source(source: &Source, archive_path: Option<&Path>) -> (Source, Vec<InstalledFile>) {
+/// call); a GitHub release-asset `download_url` names its release tag (the
+/// same rule Add URL uses); otherwise the keyless sites are asked for their
+/// current version. Never fails an install.
+pub async fn enrich_install_source(
+    source: &Source,
+    archive_path: Option<&Path>,
+    download_url: Option<&str>,
+) -> (Source, Vec<InstalledFile>) {
     let mut source = source.clone();
     let mut files = Vec::new();
     let provider = source.provider.to_ascii_lowercase();
     let file_name = archive_path.and_then(|p| p.file_name()).and_then(|n| n.to_str()).map(str::to_string);
+
+    // The release the user actually downloaded from, not whatever is the
+    // latest release now (which may be a different, newer tag).
+    if provider == "github" {
+        if let Some(tag) = download_url.and_then(sources::github_tag_from_download_url) {
+            source.version = Some(tag);
+        }
+    }
 
     if provider == "nexus" {
         if let Some(name) = &file_name {
@@ -1017,6 +1058,14 @@ mod tests {
         assert_eq!(status_for(Some("1.0"), Some("  ")), UpdateState::Unknown);
     }
 
+    #[test]
+    fn skipped_versions_match_ignoring_a_leading_v() {
+        assert!(same_version("v1.2", "1.2"));
+        assert!(same_version("1.2", "V1.2"));
+        assert!(same_version("1-2", "1.2"));
+        assert!(!same_version("1.2", "1.3"));
+    }
+
     fn file(id: &str, name: &str, label: Option<&str>) -> UpdateFile {
         UpdateFile {
             id: id.into(),
@@ -1123,14 +1172,30 @@ mod tests {
     #[tokio::test]
     async fn nexus_archive_names_record_version_and_upload_time_offline() {
         let source = Source { provider: "nexus".into(), id: Some("1234".into()), url: None, version: None };
-        let (s, files) = enrich_install_source(&source, Some(Path::new("/dl/Better Stims-1234-1-1-1718100000.zip"))).await;
+        let (s, files) = enrich_install_source(&source, Some(Path::new("/dl/Better Stims-1234-1-1-1718100000.zip")), None).await;
         assert_eq!(s.version.as_deref(), Some("1.1"));
         assert_eq!(files[0].uploaded_at, Some(1718100000));
 
         // A file from a *different* Nexus mod never stamps this one.
-        let (s, files) = enrich_install_source(&source, Some(Path::new("/dl/Other-99-2-0-1718100000.zip"))).await;
+        let (s, files) = enrich_install_source(&source, Some(Path::new("/dl/Other-99-2-0-1718100000.zip")), None).await;
         assert_eq!(s.version, None);
         assert!(files.is_empty());
+    }
+
+    /// An extension install of an older GitHub release records *that*
+    /// release's tag (from the download URL), never the latest one -- and
+    /// asks GitHub nothing to find it.
+    #[tokio::test]
+    async fn github_bridge_installs_record_the_downloaded_release_tag() {
+        let source = Source { provider: "github".into(), id: Some("owner/repo".into()), url: None, version: None };
+        let (s, files) = enrich_install_source(
+            &source,
+            Some(Path::new("/dl/cool-mod.zip")),
+            Some("https://github.com/owner/repo/releases/download/v1.2.0/cool-mod.zip"),
+        )
+        .await;
+        assert_eq!(s.version.as_deref(), Some("v1.2.0"));
+        assert_eq!(files[0].file_name.as_deref(), Some("cool-mod.zip"));
     }
 
     /// A mock Nexus API recording every request path. `updated.json`
@@ -1375,6 +1440,100 @@ mod tests {
         seen.lock().unwrap().clear();
         run_check_with(&state, CheckTrigger::Manual, &factory).await.unwrap();
         assert!(seen.lock().unwrap().iter().any(|p| p.contains("updated.json?period=1m")));
+    }
+
+    /// Install another mod from Nexus page `mod_id`, recording which file
+    /// of that page it is.
+    async fn add_nexus_file_mod(base: &Path, dir_name: &str, mod_id: &str, file_name: &str) -> Uuid {
+        let mod_dir = base.join("mods").join(dir_name);
+        tokio::fs::create_dir_all(&mod_dir).await.unwrap();
+        let guid = Uuid::new_v4();
+        tokio::fs::write(
+            mod_dir.join("manifest.json"),
+            format!(r#"{{"Guid":"{guid}","Name":"{dir_name}","Description":"","IconPath":null,"Options":null}}"#),
+        )
+        .await
+        .unwrap();
+        sources::write_origin_sidecar_with_files(
+            &mod_dir,
+            vec![Source { provider: "nexus".into(), id: Some(mod_id.into()), url: None, version: Some("1.0".into()) }],
+            vec![InstalledFile { provider: "nexus".into(), file_name: Some(file_name.into()), ..Default::default() }],
+        )
+        .await
+        .unwrap();
+        guid
+    }
+
+    /// A main file and an optional file of one Nexus page, installed as two
+    /// mods: each keeps its own cache entry, so checking again right away
+    /// asks Nexus nothing (they used to overwrite each other's entry and
+    /// cost a files request every check).
+    #[tokio::test]
+    async fn two_files_of_one_nexus_page_keep_separate_cache_entries() {
+        let (_dir, state, _guid) = nexus_only_state().await; // mod 1234
+        add_nexus_file_mod(&state.base_path, "optional", "1234", "Better Stims Optional-1234-1-0-1718000001.zip").await;
+        let (base, seen) = mock_nexus("[]".into()).await;
+        let factory = move |key| NexusClient::with_base(key, &base);
+
+        run_check_with(&state, CheckTrigger::Manual, &factory).await.unwrap();
+        assert_eq!(files_requests(&seen).len(), 1, "one request covers both files of the page");
+        let cache = nexus::load_cache(&state.base_path).await;
+        assert_eq!(cache.nexus.len(), 2, "{:?}", cache.nexus.keys().collect::<Vec<_>>());
+
+        seen.lock().unwrap().clear();
+        let report = run_check_with(&state, CheckTrigger::Manual, &factory).await.unwrap();
+        assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock().unwrap());
+        assert!(report.nexus_checked_recently);
+    }
+
+    /// A cache written before entries were keyed per file (by mod id alone)
+    /// is still used for the file it was made for, then rewritten under the
+    /// new key.
+    #[tokio::test]
+    async fn legacy_nexus_cache_entries_are_migrated() {
+        let (_dir, state, guid) = nexus_only_state().await; // mod 1234
+        let installed = nexus::Installed { version: Some("1.0".into()), uploaded_at: Some(1718000000), ..Default::default() };
+        let decision = nexus::Decision {
+            state: nexus::DecisionState::Update,
+            installed_version: Some("1.0".into()),
+            latest_version: Some("9.9".into()),
+            latest_file_name: None,
+        };
+        let mut legacy = nexus::Cache::default();
+        legacy.nexus.insert(
+            "1234".into(),
+            nexus::CachedDecision { checked_at: now_unix(), installed_key: installed.cache_key(), decision },
+        );
+        // An entry for some other, no longer installed file: dropped.
+        legacy.nexus.insert(
+            "9999".into(),
+            nexus::CachedDecision { checked_at: now_unix(), installed_key: String::new(), decision: legacy.nexus["1234"].decision.clone() },
+        );
+        nexus::save_cache(&state.base_path, &legacy).await;
+
+        let (base, seen) = mock_nexus("[]".into()).await;
+        let factory = move |key| NexusClient::with_base(key, &base);
+        let report = run_check_with(&state, CheckTrigger::Manual, &factory).await.unwrap();
+        assert!(seen.lock().unwrap().is_empty(), "the migrated entry is still fresh: {:?}", seen.lock().unwrap());
+        let e = report.results.iter().find(|e| e.guid == guid).unwrap();
+        assert_eq!(e.latest_version.as_deref(), Some("9.9"));
+
+        let cache = nexus::load_cache(&state.base_path).await;
+        let keys: Vec<_> = cache.nexus.keys().cloned().collect();
+        assert_eq!(keys, vec![nexus::cache_entry_key("1234", &installed.cache_key())]);
+    }
+
+    #[tokio::test]
+    async fn a_skipped_version_stays_skipped_when_the_site_adds_a_v() {
+        let (_dir, state, guid) = nexus_only_state().await; // latest on the mock: 1.2
+        sources::set_skipped_version(&state.base_path.join("mods").join("nexus-mod"), "nexus", Some("v1.2"))
+            .await
+            .unwrap();
+        let (base, _seen) = mock_nexus("[]".into()).await;
+        let factory = move |key| NexusClient::with_base(key, &base);
+        let report = run_check_with(&state, CheckTrigger::Manual, &factory).await.unwrap();
+        let e = report.results.iter().find(|e| e.guid == guid).unwrap();
+        assert_eq!(e.status, UpdateState::Skipped, "{e:?}");
     }
 
     #[test]

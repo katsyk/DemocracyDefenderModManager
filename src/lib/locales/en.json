@@ -489,6 +489,7 @@
             "message": "Download the mod in the browser tab that just opened for {site}. DDMM installs it automatically as soon as it lands in {downloadsPath}.",
             "error_message": "Installing the mod from {site} didn't work:",
             "timed_out_message": "Gave up waiting for the download after 15 minutes.",
+            "ignored_other_mod": "{file} is a file of another Nexus Mods mod (ID {modId}), not this one, so DDMM left it alone and is still waiting for this mod's file. To install it as a separate mod, add it with Add.",
             "status": {
                 "waiting": "Waiting for the download...",
                 "installing": "Installing..."
@@ -503,6 +504,7 @@
         "bridge_consent": {
             "title": "Allow Browser Install?",
             "question": "Allow the DDMM browser extension to install mods from {site}?",
+            "question_no_site": "The DDMM browser extension wants to install {file}, but didn't say which website it came from. Install it?",
             "always_allow_button": {
                 "text": "Always Allow"
             },

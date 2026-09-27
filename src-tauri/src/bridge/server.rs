@@ -10,7 +10,7 @@ use std::{
 
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     sync::oneshot,
 };
@@ -95,13 +95,37 @@ async fn accept_loop(app: AppHandle, listener: TcpListener, token: String) {
 }
 
 async fn handle_connection(app: AppHandle, stream: TcpStream, expected_token: String) -> anyhow::Result<()> {
+    serve_connection(stream, expected_token, move |line| {
+        let app = app.clone();
+        async move { dispatch(&app, &line).await }
+    })
+    .await
+}
+
+/// How many requests from one connection may be in progress at once;
+/// beyond that a request is answered `BUSY` at once. (The extension never
+/// gets near it: it sends a handful of requests at a time.)
+const MAX_IN_FLIGHT_PER_CONNECTION: usize = 32;
+
+/// One authenticated connection from the host relay: the token handshake,
+/// then full duplex. Every request is handled on its own task, and its
+/// reply is written as soon as it's ready, echoing the request's `id` (the
+/// host routes replies by `id`). So a `hello`/`query`/`status` is answered
+/// right away even while an install waits minutes for the user's consent;
+/// installs themselves still run one at a time (`handle_install_queued`).
+async fn serve_connection<H, F>(stream: TcpStream, expected_token: String, handle: H) -> anyhow::Result<()>
+where
+    H: Fn(String) -> F,
+    F: std::future::Future<Output = String> + Send + 'static,
+{
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    let mut handshake_line = String::new();
-    if reader.read_line(&mut handshake_line).await? == 0 {
-        return Ok(());
-    }
+    let handshake_line = match read_bounded_line(&mut reader, MAX_LINE_BYTES).await? {
+        None => return Ok(()),
+        Some(BoundedLine::Line(line)) => line,
+        Some(BoundedLine::TooLong) => String::new(),
+    };
     let handshake: serde_json::Value = serde_json::from_str(handshake_line.trim()).unwrap_or_default();
     let supplied = handshake.get("hello").and_then(|v| v.as_str()).unwrap_or("");
     if !tokens_match(&expected_token, supplied) {
@@ -110,22 +134,57 @@ async fn handle_connection(app: AppHandle, stream: TcpStream, expected_token: St
     }
     write_half_write(&mut write_half, "{\"ok\":true}").await?;
 
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if reader.read_line(&mut line).await? == 0 {
-            break;
+    // Replies are written by one task, in whatever order they're ready.
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let writer = tokio::spawn(async move {
+        while let Some(reply) = reply_rx.recv().await {
+            if write_half_write(&mut write_half, &reply).await.is_err() {
+                break;
+            }
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+    });
+
+    let in_flight = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_PER_CONNECTION));
+    let result = loop {
+        let line = match read_bounded_line(&mut reader, MAX_LINE_BYTES).await {
+            Ok(None) => break Ok(()),
+            Err(e) => break Err(e.into()),
+            Ok(Some(BoundedLine::TooLong)) => {
+                let _ = reply_tx.send(ErrorReply::new("", ErrorCode::BadRequest, "message too large").to_line());
+                continue;
+            }
+            Ok(Some(BoundedLine::Line(line))) => line,
+        };
+        if line.trim().is_empty() {
             continue;
         }
+        let Ok(permit) = in_flight.clone().try_acquire_owned() else {
+            let id = request_id(&line);
+            let _ = reply_tx.send(ErrorReply::new(id, ErrorCode::Busy, "too many requests at once, try again shortly").to_line());
+            continue;
+        };
+        let reply = handle(line.trim().to_string());
+        let reply_tx = reply_tx.clone();
+        tokio::spawn(async move {
+            let _ = reply_tx.send(reply.await);
+            drop(permit);
+        });
+    };
 
-        let reply = dispatch(&app, trimmed).await;
-        write_half_write(&mut write_half, &reply).await?;
-    }
+    // Requests already started still finish (an install isn't abandoned
+    // halfway because the browser went away); the writer ends once they
+    // have all replied.
+    drop(reply_tx);
+    let _ = writer.await;
+    result
+}
 
-    Ok(())
+/// The `id` of a request line, or `""` when it has none.
+fn request_id(line: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .unwrap_or_default()
 }
 
 async fn write_half_write(w: &mut (impl tokio::io::AsyncWrite + Unpin), line: &str) -> anyhow::Result<()> {
@@ -310,6 +369,7 @@ async fn handle_install_queued(app: &AppHandle, raw: serde_json::Value, id: Stri
         state.bridge_queue_depth.fetch_sub(1, Ordering::SeqCst);
         return ErrorReply::new(id, ErrorCode::Busy, "too many installs queued, try again shortly").to_line();
     }
+    let _recent = RecentFileGuard::new(&state, &raw);
 
     let _permit = state.bridge_install_lock.lock().await;
     let Ok(_data_op) = state.data_op() else {
@@ -326,37 +386,66 @@ async fn handle_install_queued(app: &AppHandle, raw: serde_json::Value, id: Stri
     result
 }
 
+/// Keeps auto-import from offering `file` while the extension's install of
+/// it runs, and for a while after (see `RecentBridgeFiles`).
+struct RecentFileGuard<'a> {
+    state: &'a AppState,
+    file: Option<std::path::PathBuf>,
+}
+
+impl<'a> RecentFileGuard<'a> {
+    fn new(state: &'a AppState, raw: &serde_json::Value) -> Self {
+        let file = raw.get("file").and_then(|f| f.as_str()).map(std::path::PathBuf::from);
+        if let Some(file) = &file {
+            state.bridge_recent_files.begin(file);
+        }
+        Self { state, file }
+    }
+}
+
+impl Drop for RecentFileGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            self.state.bridge_recent_files.finish(file);
+        }
+    }
+}
+
 async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String) -> String {
     let req: InstallRequest = match serde_json::from_value(raw) {
         Ok(r) => r,
         Err(e) => return ErrorReply::new(id, ErrorCode::BadRequest, e.to_string()).to_line(),
     };
 
-    let site = req
-        .page_url
-        .as_deref()
-        .and_then(registrable_domain_of_url)
-        .or_else(|| req.download_url.as_deref().and_then(registrable_domain_of_url));
-
-    if let Some(site) = &site {
-        if !is_site_allowed(app, site).await {
-            if !wait_for_frontend(app).await {
-                return ErrorReply::new(
-                    id,
-                    ErrorCode::Internal,
-                    "DDMM couldn't show the permission prompt. Open DDMM's Mods page and try again.",
-                )
-                .to_line();
+    let site = consent_site(req.page_url.as_deref(), req.download_url.as_deref());
+    let site_allowed = match &site {
+        Some(site) => is_site_allowed(app, site).await,
+        None => false,
+    };
+    if needs_consent(site.as_deref(), site_allowed) {
+        if !wait_for_frontend(app).await {
+            return ErrorReply::new(
+                id,
+                ErrorCode::Internal,
+                "DDMM couldn't show the permission prompt. Open DDMM's Mods page and try again.",
+            )
+            .to_line();
+        }
+        let file_name = std::path::Path::new(&req.file)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match request_consent(app, &id, site.as_deref(), &file_name).await {
+            ConsentDecision::Deny => {
+                return ErrorReply::new(id, ErrorCode::Declined, "You chose not to install this mod.").to_line();
             }
-            match request_consent(app, &id, site).await {
-                ConsentDecision::Deny => {
-                    return ErrorReply::new(id, ErrorCode::Declined, "You chose not to install this mod.").to_line();
-                }
-                ConsentDecision::AlwaysAllow => {
+            ConsentDecision::AlwaysAllow => {
+                // With no site there's nothing to remember: this once only.
+                if let Some(site) = &site {
                     allow_site(app, site).await;
                 }
-                ConsentDecision::JustOnce => {}
             }
+            ConsentDecision::JustOnce => {}
         }
     }
 
@@ -371,10 +460,11 @@ async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String) -> 
     if let Some(source) = install::resolve_source(req.page_url.as_deref(), req.download_url.as_deref(), page_version.as_deref())
         .filter(|s| s.id.is_some())
     {
-        let (enriched, files) = crate::commands::updates::enrich_install_source(&source, Some(&file)).await;
-        if page_version.is_none() {
-            page_version = enriched.version;
-        }
+        let (enriched, files) =
+            crate::commands::updates::enrich_install_source(&source, Some(&file), req.download_url.as_deref()).await;
+        // Starts from the page's version; enrichment only fills it in, or
+        // replaces it with the tag a GitHub release-asset link names.
+        page_version = enriched.version;
         installed_files = files;
     }
 
@@ -453,6 +543,23 @@ async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String) -> 
     serde_json::to_string(&reply).unwrap()
 }
 
+/// The site (registrable domain) an extension install is asked about and
+/// can be "Always allow"ed for: from `pageUrl`, else `downloadUrl`, and only
+/// from an `http(s)` URL.
+fn consent_site(page_url: Option<&str>, download_url: Option<&str>) -> Option<String> {
+    page_url
+        .and_then(registrable_domain_of_url)
+        .or_else(|| download_url.and_then(registrable_domain_of_url))
+}
+
+/// Every extension install needs the user's consent: "Always allow" for its
+/// site, or an answer to the prompt now. An install with no web URL at all
+/// has no site that could have been allowed, so it is always asked about
+/// (and the prompt offers no "Always allow" for it).
+fn needs_consent(site: Option<&str>, site_allowed: bool) -> bool {
+    site.is_none() || !site_allowed
+}
+
 async fn is_site_allowed(app: &AppHandle, site: &str) -> bool {
     let state = app.state::<AppState>();
     do_load_settings(&state.base_path)
@@ -474,7 +581,7 @@ async fn allow_site(app: &AppHandle, site: &str) {
 /// Ask the frontend to show the per-site consent prompt and bring the
 /// window to the front, then wait for the user's answer. Times out to
 /// `Deny` -- a closed/ignored prompt must never fall through to installing.
-async fn request_consent(app: &AppHandle, request_id: &str, site: &str) -> ConsentDecision {
+async fn request_consent(app: &AppHandle, request_id: &str, site: Option<&str>, file_name: &str) -> ConsentDecision {
     let (tx, rx) = oneshot::channel();
     {
         let state = app.state::<AppState>();
@@ -485,7 +592,7 @@ async fn request_consent(app: &AppHandle, request_id: &str, site: &str) -> Conse
 
     let _ = app.emit(
         "bridge://consent-request",
-        serde_json::json!({ "requestId": request_id, "site": site }),
+        serde_json::json!({ "requestId": request_id, "site": site, "fileName": file_name }),
     );
 
     match tokio::time::timeout(CONSENT_TIMEOUT, rx).await {
@@ -553,6 +660,106 @@ pub fn focus_main_window(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Connect to a `serve_connection` running `handle`, past the handshake.
+    async fn serve_for_test<H, F>(handle: H) -> (BufReader<tokio::net::tcp::OwnedReadHalf>, tokio::net::tcp::OwnedWriteHalf)
+    where
+        H: Fn(String) -> F + Send + 'static,
+        F: std::future::Future<Output = String> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = serve_connection(stream, "secret".into(), handle).await;
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut read = BufReader::new(read);
+        write.write_all(b"{\"hello\":\"secret\"}\n").await.unwrap();
+        assert_eq!(read_line(&mut read).await, r#"{"ok":true}"#);
+        (read, write)
+    }
+
+    async fn read_line(r: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> String {
+        match tokio::time::timeout(Duration::from_secs(5), read_bounded_line(r, MAX_LINE_BYTES)).await {
+            Ok(Ok(Some(BoundedLine::Line(l)))) => l,
+            other => panic!("expected a line, got {other:?}"),
+        }
+    }
+
+    /// While an install waits (for the consent prompt, the frontend, the
+    /// install queue), `hello`/`query`/`status` on the same connection are
+    /// answered at once, and the install's reply still arrives later.
+    #[tokio::test]
+    async fn requests_are_answered_while_an_install_waits() {
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let gate = release.clone();
+        let (mut read, mut write) = serve_for_test(move |line| {
+            let gate = gate.clone();
+            async move {
+                let id = request_id(&line);
+                if line.contains("\"install\"") {
+                    gate.notified().await;
+                }
+                format!(r#"{{"id":"{id}","ok":true}}"#)
+            }
+        })
+        .await;
+
+        write.write_all(b"{\"id\":\"1\",\"type\":\"install\"}\n").await.unwrap();
+        write.write_all(b"{\"id\":\"2\",\"type\":\"hello\"}\n").await.unwrap();
+        write.write_all(b"{\"id\":\"3\",\"type\":\"status\"}\n").await.unwrap();
+        let mut early = vec![read_line(&mut read).await, read_line(&mut read).await];
+        early.sort();
+        assert_eq!(early, vec![r#"{"id":"2","ok":true}"#, r#"{"id":"3","ok":true}"#]);
+
+        release.notify_one();
+        assert_eq!(read_line(&mut read).await, r#"{"id":"1","ok":true}"#);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_token_is_refused_and_overlong_lines_are_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = serve_connection(stream, "secret".into(), |_| async { String::from("{}") }).await;
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut read = BufReader::new(read);
+        write.write_all(b"{\"hello\":\"wrong\"}\n").await.unwrap();
+        assert_eq!(read_line(&mut read).await, r#"{"ok":false}"#);
+
+        let (mut read, mut write) = serve_for_test(|line| async move { format!(r#"{{"id":"{}"}}"#, request_id(&line)) }).await;
+        let mut big = vec![b'x'; MAX_LINE_BYTES + 10];
+        big.push(b'\n');
+        write.write_all(&big).await.unwrap();
+        write.write_all(b"{\"id\":\"after\"}\n").await.unwrap();
+        assert!(read_line(&mut read).await.contains("message too large"));
+        assert_eq!(read_line(&mut read).await, r#"{"id":"after"}"#);
+    }
+
+    #[test]
+    fn installs_without_a_web_url_always_need_consent() {
+        for (page, download) in [
+            (None, None),
+            (Some("file:///home/me/Downloads/mod.zip"), None),
+            (None, Some("ftp://files.example.com/mod.zip")),
+            (Some("not a url"), Some("blob:https://example.com/1234")),
+        ] {
+            let site = consent_site(page, download);
+            assert_eq!(site, None, "{page:?} {download:?}");
+            // Even if something claimed to allow it, there is nothing to
+            // have allowed.
+            assert!(needs_consent(site.as_deref(), true));
+        }
+        let site = consent_site(Some("https://www.ayakamods.com/mods/x.4084/"), None);
+        assert_eq!(site.as_deref(), Some("ayakamods.com"));
+        assert!(needs_consent(site.as_deref(), false));
+        assert!(!needs_consent(site.as_deref(), true));
+    }
 
     #[tokio::test]
     async fn wait_until_ready_returns_at_once_when_already_ready() {

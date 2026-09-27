@@ -20,10 +20,13 @@
         Mod?: { Manifest: Manifest, Directory: string, Sources?: ResolvedSource[] };
         Warning?: string;
         Message?: string;
+        /** A download left alone because it's another Nexus mod's file. */
+        Ignored?: { FileName: string; ModId: string };
     };
 
     let status = $state<Status>("Waiting");
     let errorMessage = $state<string | undefined>();
+    let ignored = $state<{ FileName: string; ModId: string } | undefined>();
     let unlisten: UnlistenFn | undefined;
     let closed = false;
 
@@ -40,6 +43,9 @@
                 status = payload.Status;
 
                 switch (payload.Status) {
+                    case "Waiting":
+                        if (payload.Ignored) ignored = payload.Ignored;
+                        break;
                     case "Done":
                         if (payload.Mod) {
                             closeOnce({ status: "Done", mod: rawModToMod(payload.Mod), warning: payload.Warning });
@@ -123,6 +129,11 @@
         <p class="min-w-60 max-w-80 text-sm">
             {t("popup.handoff.message", { site: popup.siteName, downloadsPath: popup.downloadsPath })}
         </p>
+        {#if ignored}
+            <p class="min-w-60 max-w-80 text-sm text-yellow-300">
+                {t("popup.handoff.ignored_other_mod", { file: ignored.FileName, modId: ignored.ModId })}
+            </p>
+        {/if}
         <div class="flex flex-row gap-1 items-center self-center">
             <div class="w-4 h-4 rounded-full border-2 border-transparent border-b-yellow-300 animate-spin"></div>
             <span class="text-sm text-zinc-400">

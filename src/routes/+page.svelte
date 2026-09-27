@@ -214,7 +214,7 @@
         // Browser bridge: the backend pushes these when a browser install
         // needs a consent decision or has finished (see bridge::server on
         // the Rust side). See docs/development/bridge-protocol.md.
-        const unlistenBridgeConsent = listen<{ requestId: string; site: string }>(
+        const unlistenBridgeConsent = listen<{ requestId: string; site: string | null; fileName?: string }>(
             "bridge://consent-request",
             (e) => onBridgeConsentRequest(e.payload),
         );
@@ -647,8 +647,10 @@
     /** `bridge://consent-request` -- the first time a site tries to
      * install through the browser extension, ask the user, per
      * docs/development/bridge-protocol.md. */
-    async function onBridgeConsentRequest(payload: { requestId: string; site: string }) {
-        const decision: BridgeConsentDecision = await showPopup(new BridgeConsentPopup(payload.site));
+    async function onBridgeConsentRequest(payload: { requestId: string; site: string | null; fileName?: string }) {
+        const decision: BridgeConsentDecision = await showPopup(
+            new BridgeConsentPopup(payload.site, payload.fileName ?? ""),
+        );
         await resolveBridgeConsent(payload.requestId, decision);
     }
 

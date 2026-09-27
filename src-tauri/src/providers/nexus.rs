@@ -488,6 +488,13 @@ pub struct CachedDecision {
     pub decision: Decision,
 }
 
+/// The update-cache key for one installed file of Nexus mod `mod_id`
+/// (`installed_key` is [`Installed::cache_key`]). Older caches keyed
+/// entries by the bare mod id; `commands::updates` migrates those.
+pub fn cache_entry_key(mod_id: &str, installed_key: &str) -> String {
+    format!("{mod_id}#{installed_key}")
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Cache {

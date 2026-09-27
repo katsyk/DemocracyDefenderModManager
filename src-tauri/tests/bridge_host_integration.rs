@@ -410,6 +410,91 @@ fn reconnects_after_the_app_restarts_instead_of_failing() {
     let _ = child.wait_timeout_or_kill();
 }
 
+/// A fake "app" that answers requests out of order, like the real one
+/// does while an install waits for the user: it holds back the reply to
+/// `install` until it has answered everything sent after it.
+fn spawn_slow_install_app_server(token: &str) -> (u16, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token = token.to_string();
+    let handle = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let handshake: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(handshake["hello"], token);
+        stream.write_all(b"{\"ok\":true}\n").unwrap();
+
+        let mut held_install: Option<serde_json::Value> = None;
+        let mut answered_after_install = 0;
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            let req: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            if req["type"] == "install" {
+                held_install = Some(req);
+                continue;
+            }
+            let reply = serde_json::json!({ "id": req["id"], "ok": true, "type": req["type"] });
+            stream.write_all(format!("{reply}\n").as_bytes()).unwrap();
+            if held_install.is_some() {
+                answered_after_install += 1;
+                if answered_after_install == 2 {
+                    let install = held_install.take().unwrap();
+                    let reply = serde_json::json!({ "id": install["id"], "ok": true, "type": "installed" });
+                    stream.write_all(format!("{reply}\n").as_bytes()).unwrap();
+                }
+            }
+        }
+    });
+    (port, handle)
+}
+
+#[test]
+fn replies_are_routed_by_id_while_an_install_is_still_waiting() {
+    let (dir, exe) = portable_copy_of_binary();
+    let token = "c".repeat(64);
+    let (port, _server) = spawn_slow_install_app_server(&token);
+    write_bridge_json(dir.path(), port, &token);
+
+    let mut child = spawn_host(&exe, &[]);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    write_frame(&mut stdin, br#"{"id":"1","type":"install","file":"/tmp/x.zip"}"#);
+    // Requests are relayed concurrently, so their order at the app isn't
+    // fixed; give the install a head start so the fake app sees it first.
+    std::thread::sleep(Duration::from_millis(300));
+    // The install's reply is still outstanding: these must not queue
+    // behind it (the extension gives them 10 seconds).
+    write_frame(&mut stdin, br#"{"id":"2","type":"hello"}"#);
+    let reply = read_frame_json(&mut stdout);
+    assert_eq!(reply["id"], "2", "{reply}");
+    assert_eq!(reply["type"], "hello");
+
+    // A request reusing the id of one still in progress is refused.
+    write_frame(&mut stdin, br#"{"id":"1","type":"status"}"#);
+    let reply = read_frame_json(&mut stdout);
+    assert_eq!(reply["id"], "1");
+    assert_eq!(reply["error"]["code"], "BAD_REQUEST", "{reply}");
+
+    write_frame(&mut stdin, br#"{"id":"3","type":"status"}"#);
+    let mut replies = [read_frame_json(&mut stdout), read_frame_json(&mut stdout)];
+    replies.sort_by_key(|r| r["id"].as_str().unwrap().to_string());
+    assert_eq!(replies[0]["id"], "1");
+    assert_eq!(replies[0]["type"], "installed");
+    assert_eq!(replies[1]["id"], "3");
+    assert_eq!(replies[1]["type"], "status");
+
+    drop(stdin);
+    let _ = child.wait_timeout_or_kill();
+}
+
 /// Small helper so the tests above don't hang forever if something went
 /// wrong: give the child a moment to exit on its own (stdin closed), then
 /// kill it.

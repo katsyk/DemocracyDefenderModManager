@@ -15,6 +15,64 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// browser->host at 64 MB; we hold everything to 1 MB regardless.
 pub const MAX_MESSAGE_BYTES: u32 = 1024 * 1024;
 
+/// Longest line either side of the loopback connection accepts: one
+/// browser message (≤ [`MAX_MESSAGE_BYTES`]) plus the `origin` the host adds.
+pub const MAX_LINE_BYTES: usize = MAX_MESSAGE_BYTES as usize + 4096;
+
+/// One line read by [`read_bounded_line`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum BoundedLine {
+    /// The line, without its newline.
+    Line(String),
+    /// Longer than allowed; it was read past (up to its newline) and
+    /// dropped, so the stream stays in sync.
+    TooLong,
+}
+
+/// Read one newline-terminated line of at most `max` bytes, without ever
+/// buffering more than that: a longer line is skipped and reported as
+/// [`BoundedLine::TooLong`]. `None` at end of stream.
+pub async fn read_bounded_line(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+    max: usize,
+) -> std::io::Result<Option<BoundedLine>> {
+    use tokio::io::AsyncBufReadExt;
+    let mut buf = Vec::new();
+    let mut too_long = false;
+    let mut read_any = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if !read_any {
+                return Ok(None);
+            }
+            break;
+        }
+        read_any = true;
+        let (chunk, used, done) = match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => (&available[..pos], pos + 1, true),
+            None => (available, available.len(), false),
+        };
+        if !too_long {
+            if buf.len() + chunk.len() > max {
+                too_long = true;
+                buf = Vec::new();
+            } else {
+                buf.extend_from_slice(chunk);
+            }
+        }
+        reader.consume(used);
+        if done {
+            break;
+        }
+    }
+    Ok(Some(if too_long {
+        BoundedLine::TooLong
+    } else {
+        BoundedLine::Line(String::from_utf8_lossy(&buf).into_owned())
+    }))
+}
+
 /// How many installs may be queued (serialized, one at a time) before a new
 /// request is rejected with `BUSY` instead of waiting.
 pub const MAX_QUEUE_DEPTH: usize = 20;
@@ -215,6 +273,17 @@ pub struct StatusReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_lines_skip_overlong_ones_and_stay_in_sync() {
+        let data = format!("short\n{}\nnext\nlast", "x".repeat(100));
+        let mut reader = tokio::io::BufReader::with_capacity(8, data.as_bytes());
+        assert_eq!(read_bounded_line(&mut reader, 10).await.unwrap(), Some(BoundedLine::Line("short".into())));
+        assert_eq!(read_bounded_line(&mut reader, 10).await.unwrap(), Some(BoundedLine::TooLong));
+        assert_eq!(read_bounded_line(&mut reader, 10).await.unwrap(), Some(BoundedLine::Line("next".into())));
+        assert_eq!(read_bounded_line(&mut reader, 10).await.unwrap(), Some(BoundedLine::Line("last".into())));
+        assert_eq!(read_bounded_line(&mut reader, 10).await.unwrap(), None);
+    }
 
     #[test]
     fn error_code_serializes_screaming_snake_case() {

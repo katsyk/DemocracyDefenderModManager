@@ -65,9 +65,12 @@ pub fn registrable_domain(host: &str) -> String {
 }
 
 /// `registrable_domain`, applied to a URL string instead of a bare host.
-/// `None` if the URL doesn't parse or has no host (e.g. isn't `http(s)`).
+/// `None` unless it is an `http(s)` URL with a host.
 pub fn registrable_domain_of_url(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
     let host = parsed.host_str()?;
     Some(registrable_domain(host))
 }
@@ -121,6 +124,13 @@ mod tests {
             registrable_domain_of_url("https://www.ayakamods.com/mods/hd2-auto-reload.4084/"),
             Some("ayakamods.com".to_string())
         );
+    }
+
+    #[test]
+    fn registrable_domain_of_url_is_only_for_web_urls() {
+        assert_eq!(registrable_domain_of_url("ftp://ayakamods.com/x.zip"), None);
+        assert_eq!(registrable_domain_of_url("file:///home/me/x.zip"), None);
+        assert_eq!(registrable_domain_of_url("http://example.com/x.zip").as_deref(), Some("example.com"));
     }
 
     #[test]
