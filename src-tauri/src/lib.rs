@@ -103,8 +103,10 @@ pub struct AppState {
     /// Cancel flag of the running import scan or import, if any
     /// (`commands::import` only; one at a time).
     import_cancel: std::sync::Mutex<Option<Arc<AtomicBool>>>,
-    /// The latest import scan, which `run_import` imports from by item id.
-    import_scan: Mutex<Option<mod_import::ScanResult>>,
+    /// The latest import scan, which `run_import` imports from by item id,
+    /// with the token its wizard got for it (see
+    /// `commands::import::run_import`).
+    import_scan: Mutex<Option<(u64, mod_import::ScanResult)>>,
     /// `ddmm://install` links waiting for the Mods page's confirmation
     /// (`deep_link` only).
     deep_links: std::sync::Mutex<deep_link::DeepLinkQueue>,

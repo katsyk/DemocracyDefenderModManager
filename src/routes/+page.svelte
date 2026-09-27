@@ -50,7 +50,8 @@
     import { FALLBACK_MOD_IMAGE, useFallbackImage } from "$lib/utils/modImages";
 
     const { t } = useLocalization();
-    const { show: showPopup } = usePopup();
+    const popups = usePopup();
+    const { show: showPopup } = popups;
     const { show: showToast } = useToast();
     const appWindow = getCurrentWindow();
 
@@ -93,9 +94,11 @@
     /** Set when this page is left; queued `ddmm://` links then stay queued
      * until it's shown again. */
     let unmounted = false;
-    /** True while the "Import mods" popup is open (an import may be
+    /** How many "Import mods" popups are open (normally 0 or 1). */
+    let importWindows = $state(0);
+    /** True while an "Import mods" popup is open (an import may be
      * running in it); closing then asks first, like during a deploy. */
-    let importing = $state<boolean>(false);
+    let importing = $derived(importWindows > 0);
     /** Other mod managers' folders (or Downloads) with mods in them, shown
      * on the empty mod list as a way in. */
     let importSources = $state<ImportSource[]>([]);
@@ -183,6 +186,14 @@
                     break;
                 case "drop":
                     isDragging = false;
+                    // A window is open (an import wizard, a question, ...):
+                    // a second import or add started under it would get in
+                    // its way, so the drop waits for the user to finish.
+                    if (popups.isShown) {
+                        log.info(`Ignored a drop of ${e.payload.paths.length} file(s): a window is open.`);
+                        showToast("warning", t("toast.drop_while_busy"));
+                        break;
+                    }
                     if (e.payload.paths.length >= BULK_ADD_THRESHOLD) {
                         await onImport(e.payload.paths);
                     } else {
@@ -1276,12 +1287,12 @@
      * archives, or `paths`; then add what was imported to the active
      * profile (keeping the source's order, on/off state and options). */
     async function onImport(paths?: string[]) {
-        importing = true;
+        importWindows++;
         let result;
         try {
             result = await showPopup(new ImportPopup(currentProfile?.Name, paths));
         } finally {
-            importing = false;
+            importWindows--;
         }
         mods = await getMods();
         importSources = [];

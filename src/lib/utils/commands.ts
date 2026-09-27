@@ -548,6 +548,8 @@ export type ImportScan = {
     Truncated: boolean;
     FreeBytes: number | null;
     Cancelled: boolean;
+    /** Names this scan; `runImport` takes it back (see `run_import`). */
+    ScanToken: number;
 };
 
 export type ImportProgress = {
@@ -592,9 +594,9 @@ export async function scanImportPaths(paths: string[]): Promise<ImportScan> {
     return await invoke<ImportScan>("scan_import_paths", { paths });
 }
 
-export async function runImport(ids: number[]): Promise<ImportReport> {
+export async function runImport(scanToken: number, ids: number[]): Promise<ImportReport> {
     log.info(`Importing ${ids.length} mod(s).`);
-    return await invoke<ImportReport>("run_import", { ids });
+    return await invoke<ImportReport>("run_import", { scanToken, ids });
 }
 
 export async function cancelImport(): Promise<void> {

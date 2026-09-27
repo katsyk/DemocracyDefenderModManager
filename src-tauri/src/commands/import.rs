@@ -82,6 +82,16 @@ pub struct ScanSummary {
     /// Free space on the drive with DDMM's data folder, if known.
     pub free_bytes: Option<u64>,
     pub cancelled: bool,
+    /// Which scan this is. [`run_import`] takes it back, so a wizard can
+    /// only import from its own scan: item ids are per scan, and a newer
+    /// scan replaces the stored one.
+    pub scan_token: u64,
+}
+
+/// A new, never-repeating [`ScanSummary::scan_token`].
+fn next_scan_token() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 async fn finish_scan(
@@ -115,9 +125,10 @@ async fn finish_scan(
         scan.items.len(),
         if cancelled { " (cancelled)" } else { "" }
     );
-    *state.import_scan.lock().await = Some(scan.clone());
+    let scan_token = next_scan_token();
+    *state.import_scan.lock().await = Some((scan_token, scan.clone()));
     let free_bytes = crate::data_move::available_space(&state.base_path.join(MODS_DIRECTORY));
-    Ok(ScanSummary { scan, free_bytes, cancelled })
+    Ok(ScanSummary { scan, free_bytes, cancelled, scan_token })
 }
 
 /// Scan a folder -- another manager's mods, or a folder of archives -- for
@@ -141,21 +152,37 @@ pub async fn scan_import_paths(app: AppHandle, state: State<'_, AppState>, paths
         .await
 }
 
-/// Import the items (by id) of the last scan. Refused while the data
-/// folder is being moved; checks free space first; one at a time, with
-/// progress events and cancel; never stops for one failing mod.
+/// The chosen items (by id) of the scan `scan_token` names, or why they
+/// can't be had: nothing scanned, or a newer scan replaced that one (its
+/// ids would pick other mods).
+async fn chosen_items(state: &AppState, scan_token: u64, ids: &[usize]) -> anyhow::Result<Vec<mod_import::ScanItem>> {
+    let scan = state.import_scan.lock().await;
+    let Some((token, scan)) = scan.as_ref() else {
+        anyhow::bail!("Nothing was scanned yet, or this list was already imported. Scan the folder again.");
+    };
+    if *token != scan_token {
+        anyhow::bail!(
+            "This list is out of date: another scan was started since. Go back and scan again to import from it."
+        );
+    }
+    Ok(scan.items.iter().filter(|i| ids.contains(&i.id) && !i.status.blocked()).cloned().collect())
+}
+
+/// Import the items (by id) of the scan `scan_token` names. Refused while
+/// the data folder is being moved, or when that scan isn't the last one;
+/// checks free space first; one at a time, with progress events and
+/// cancel; never stops for one failing mod.
 #[tauri::command]
-pub async fn run_import(app: AppHandle, state: State<'_, AppState>, ids: Vec<usize>) -> TAResult<ImportReport> {
+pub async fn run_import(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    scan_token: u64,
+    ids: Vec<usize>,
+) -> TAResult<ImportReport> {
     let _data_op = state.data_op().into_ta_result()?;
     let (cancel, _slot) = begin(&state).into_ta_result()?;
 
-    let items: Vec<_> = {
-        let scan = state.import_scan.lock().await;
-        let Some(scan) = scan.as_ref() else {
-            return anyhow::anyhow!("Nothing was scanned yet; scan a folder first.").into_ta_result();
-        };
-        scan.items.iter().filter(|i| ids.contains(&i.id) && !i.status.blocked()).cloned().collect()
-    };
+    let items = chosen_items(&state, scan_token, &ids).await.into_ta_result()?;
     if items.is_empty() {
         return Ok(ImportReport::default());
     }
@@ -186,7 +213,13 @@ pub async fn run_import(app: AppHandle, state: State<'_, AppState>, ids: Vec<usi
         report.failed.len(),
         if report.cancelled { ", cancelled" } else { "" }
     );
-    *state.import_scan.lock().await = None;
+    {
+        // Only this wizard's scan is used up; a newer one stays.
+        let mut stored = state.import_scan.lock().await;
+        if stored.as_ref().is_some_and(|(token, _)| *token == scan_token) {
+            *stored = None;
+        }
+    }
     Ok(report)
 }
 
@@ -201,4 +234,56 @@ pub async fn cancel_import(state: State<'_, AppState>) -> TAResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mod_import::{ItemKind, ItemStatus, ScanItem};
+
+    fn item(id: usize, name: &str) -> ScanItem {
+        ScanItem {
+            id,
+            kind: ItemKind::Archive,
+            path: PathBuf::from(format!("{name}.zip")),
+            name: name.into(),
+            size: 1,
+            file_size: 1,
+            guid: None,
+            nexus: None,
+            status: ItemStatus::New,
+            profile: None,
+            carried_sidecar: None,
+            sha256: None,
+            local_guid: false,
+            manifest_override: None,
+            description: None,
+            link_to: None,
+        }
+    }
+
+    fn scan(items: Vec<ScanItem>) -> ScanResult {
+        ScanResult { root: None, items, profile_name: None, truncated: false }
+    }
+
+    /// Two wizards (a second one opened by a drop): the first must not
+    /// import the second scan's items, which have the same ids.
+    #[tokio::test]
+    async fn an_import_only_takes_items_from_its_own_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf());
+        let first = next_scan_token();
+        *state.import_scan.lock().await = Some((first, scan(vec![item(0, "A0"), item(1, "A1")])));
+        let second = next_scan_token();
+        assert_ne!(first, second);
+        *state.import_scan.lock().await = Some((second, scan(vec![item(0, "B0"), item(1, "B1")])));
+
+        let err = chosen_items(&state, first, &[0, 1]).await.unwrap_err();
+        assert!(format!("{err}").contains("out of date"), "{err}");
+        let items = chosen_items(&state, second, &[1]).await.unwrap();
+        assert_eq!(items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), vec!["B1"]);
+
+        *state.import_scan.lock().await = None;
+        assert!(chosen_items(&state, second, &[1]).await.is_err());
+    }
 }

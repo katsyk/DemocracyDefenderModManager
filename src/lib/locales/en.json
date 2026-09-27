@@ -651,6 +651,9 @@
             "cancel_button": "Cancel",
             "scanning": "Looking for mods...",
             "scanning_progress": "Reading {done} of {total}...",
+            "scan_stopped": "The scan was stopped before it finished, so nothing was imported.",
+            "retry_button": "Scan Again",
+            "choose_source_button": "Choose a Folder Instead",
             "nothing_found": "No mods found there. Pick the folder that holds the mod folders or the downloaded archives.",
             "summary": "{total} found: {new} new, {installed} already in DDMM, {other} skipped.",
             "truncated": "That folder holds a lot; only the first 5000 items are listed. Pick a more specific folder to see the rest.",
@@ -719,6 +722,7 @@
             "redeployed": "Redeployed with the updated mods.",
             "game_running": "Mods updated, but Helldivers 2 is running: deploy after closing it to use the new versions."
         },
+        "drop_while_busy": "Finish or close the open window first, then drop the files again.",
         "import": {
             "added_to_profile": "Imported mods were added to \"{profile}\". Deploy to use them.",
             "profile_save_failed": "The mods were imported, but the profile couldn't be saved: {error}"

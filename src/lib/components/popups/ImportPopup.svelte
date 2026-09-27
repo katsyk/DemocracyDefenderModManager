@@ -154,6 +154,19 @@
                 <div class="h-full bg-yellow-300 transition-all" class:animate-pulse={w.scanTotal === 0} style="width: {w.scanTotal === 0 ? 100 : scanPercent}%"></div>
             </div>
             <button class="hd2mm-button self-end" disabled={w.cancelling} onclick={() => w.cancel()}>{t("popup.import.cancel_button")}</button>
+        {:else if w.step === "stopped"}
+            {#if !w.error}
+                <p class="text-sm" data-testid="import-scan-stopped">{t("popup.import.scan_stopped")}</p>
+            {/if}
+            <div class="flex flex-row flex-wrap gap-2 justify-between">
+                <button class="hd2mm-button" onclick={() => popup.close(null)}>{t("popup.import.close_button")}</button>
+                <div class="flex flex-row gap-2">
+                    <button class="hd2mm-button" onclick={() => w.chooseSourceInstead()}>{t("popup.import.choose_source_button")}</button>
+                    {#if popup.paths && popup.paths.length > 0}
+                        <button class="hd2mm-success-button" onclick={() => w.scanPaths(popup.paths!)} data-testid="import-retry">{t("popup.import.retry_button")}</button>
+                    {/if}
+                </div>
+            </div>
         {:else if w.step === "preview" && w.scan}
             {#if w.scan.Root}
                 <p class="text-xs text-zinc-400 break-all">{w.scan.Root}</p>
@@ -227,7 +240,7 @@
                 <p class="text-xs text-zinc-500">{t("popup.import.read_only_note")}</p>
             {/if}
             <div class="flex flex-row gap-2 justify-between">
-                {#if popup.paths}
+                {#if w.fromPicked}
                     <button class="hd2mm-button" onclick={() => popup.close(null)}>{t("popup.import.close_button")}</button>
                 {:else}
                     <button class="hd2mm-button" onclick={() => w.back()}>{t("popup.import.back_button")}</button>
