@@ -129,6 +129,126 @@ enum ArchiveInner {
     Rar(PathBuf),
 }
 
+/// Which format [`Archive::open`] opens `path` as, and whether the file's
+/// own signature said so (`false`: a zip recognized only by its name, with
+/// something else -- zero padding, a self-extractor stub, data an uploader
+/// prepended -- in front; the zip reader finds it from the end of the
+/// file). Every failure is an [`ArchiveError`] in plain words.
+fn classify(path: &Path) -> anyhow::Result<(Format, bool)> {
+    let meta = std::fs::metadata(path).map_err(|e| errors::io_error(e, "couldn't read the file"))?;
+    if !meta.is_file() {
+        return Err(ArchiveError::new("it is a folder, not an archive file").into());
+    }
+    if let Some(ext) = split_archive_part(path) {
+        return Err(ArchiveError::with_hint(
+            format!("it is one part (.{ext}) of an archive split into several files, which can't be opened on its own"),
+            errors::HINT_SPLIT,
+        )
+        .into());
+    }
+
+    let mut header = Vec::with_capacity(SNIFF_LEN);
+    File::open(path)
+        .and_then(|f| f.take(SNIFF_LEN as u64).read_to_end(&mut header))
+        .map_err(|e| errors::io_error(e, "couldn't read the file"))?;
+
+    let by_extension = Format::from_extension(path);
+    let classified = match sniff(&header) {
+        Sniffed::Archive(format) => {
+            if by_extension.is_some_and(|e| e != format) {
+                log::info!(
+                    "{:?} is named like a {} archive but is a {} archive; opening it as {}",
+                    path,
+                    by_extension.map(Format::name).unwrap_or_default(),
+                    format.name(),
+                    format.name()
+                );
+            }
+            (format, true)
+        }
+        Sniffed::Empty => {
+            return Err(ArchiveError::with_hint(
+                "the file is empty (0 bytes): the download didn't finish, or the browser hasn't written it yet",
+                errors::HINT_REDOWNLOAD,
+            )
+            .into())
+        }
+        // The whole file was read, and every byte is zero.
+        Sniffed::Zeros if meta.len() <= header.len() as u64 => {
+            return Err(ArchiveError::with_hint(
+                format!(
+                    "every byte of the file is zero (all {} bytes checked): the download didn't finish or was damaged",
+                    meta.len()
+                ),
+                errors::HINT_REDOWNLOAD,
+            )
+            .into())
+        }
+        // Only the start was checked: a zip may be padded in front, so
+        // the zip reader (which starts from the end) decides.
+        Sniffed::Zeros if matches!(by_extension, None | Some(Format::Zip)) => (Format::Zip, false),
+        Sniffed::Zeros => {
+            let f = by_extension.map(Format::name).unwrap_or_default();
+            return Err(ArchiveError::with_hint(
+                format!(
+                    "it's named .{f} but its first {} bytes are all zero where a {f} archive's signature should \
+                     be, so it is damaged or not a {f} archive",
+                    header.len()
+                ),
+                errors::HINT_REDOWNLOAD,
+            )
+            .into())
+        }
+        Sniffed::NotArchive(what) => {
+            let hint = if what.starts_with("a web page") {
+                errors::HINT_WEB_PAGE
+            } else if what.starts_with("a Windows program") {
+                errors::HINT_EXE
+            } else {
+                errors::HINT_REPACK
+            };
+            return Err(ArchiveError::with_hint(
+                format!("it is not a supported archive (zip, 7z or rar): it's {what}"),
+                hint,
+            )
+            .into());
+        }
+        // A zip may legitimately start with something else (a
+        // self-extractor stub, or data an uploader prepended): the zip
+        // reader finds its table of contents from the end of the file.
+        Sniffed::Unknown if by_extension == Some(Format::Zip) => (Format::Zip, false),
+        Sniffed::Unknown => {
+            return Err(ArchiveError::with_hint(
+                match by_extension {
+                    Some(f) => format!(
+                        "it is not a supported archive (zip, 7z or rar): it's named .{} but doesn't start like one, \
+                         so it is damaged or something else renamed",
+                        f.name()
+                    ),
+                    None => "it is not a supported archive (zip, 7z or rar)".to_string(),
+                },
+                errors::HINT_REDOWNLOAD,
+            )
+            .into())
+        }
+    };
+    Ok(classified)
+}
+
+/// Whether `path` is an archive DDMM can install, decided exactly the way
+/// [`Archive::open`] decides it (content first, then the name for a zip
+/// with something in front of it) -- so every install route, the browser
+/// extension's included, accepts and refuses the same files. A zip
+/// recognized only by its name is also checked to really be one.
+pub fn detect_format(path: &Path) -> anyhow::Result<Format> {
+    let (format, by_signature) = classify(path)?;
+    if format == Format::Zip && !by_signature {
+        let file = File::open(path).map_err(|e| errors::io_error(e, "couldn't read the file"))?;
+        zip::ZipArchive::new(file).map_err(zip_error)?;
+    }
+    Ok(format)
+}
+
 pub struct Archive(ArchiveInner);
 
 impl Archive {
@@ -138,103 +258,7 @@ impl Archive {
     /// in plain words what is wrong with the file, with a hint when there's
     /// something the user can do about it.
     pub fn open(path: &Path) -> anyhow::Result<Archive> {
-        let meta = std::fs::metadata(path).map_err(|e| errors::io_error(e, "couldn't read the file"))?;
-        if !meta.is_file() {
-            return Err(ArchiveError::new("it is a folder, not an archive file").into());
-        }
-        if let Some(ext) = split_archive_part(path) {
-            return Err(ArchiveError::with_hint(
-                format!("it is one part (.{ext}) of an archive split into several files, which can't be opened on its own"),
-                errors::HINT_SPLIT,
-            )
-            .into());
-        }
-
-        let mut header = Vec::with_capacity(SNIFF_LEN);
-        File::open(path)
-            .and_then(|f| f.take(SNIFF_LEN as u64).read_to_end(&mut header))
-            .map_err(|e| errors::io_error(e, "couldn't read the file"))?;
-
-        let by_extension = Format::from_extension(path);
-        let format = match sniff(&header) {
-            Sniffed::Archive(format) => {
-                if by_extension.is_some_and(|e| e != format) {
-                    log::info!(
-                        "{:?} is named like a {} archive but is a {} archive; opening it as {}",
-                        path,
-                        by_extension.map(Format::name).unwrap_or_default(),
-                        format.name(),
-                        format.name()
-                    );
-                }
-                format
-            }
-            Sniffed::Empty => {
-                return Err(ArchiveError::with_hint(
-                    "the file is empty (0 bytes): the download didn't finish, or the browser hasn't written it yet",
-                    errors::HINT_REDOWNLOAD,
-                )
-                .into())
-            }
-            // The whole file was read, and every byte is zero.
-            Sniffed::Zeros if meta.len() <= header.len() as u64 => {
-                return Err(ArchiveError::with_hint(
-                    format!(
-                        "every byte of the file is zero (all {} bytes checked): the download didn't finish or was damaged",
-                        meta.len()
-                    ),
-                    errors::HINT_REDOWNLOAD,
-                )
-                .into())
-            }
-            // Only the start was checked: a zip may be padded in front, so
-            // the zip reader (which starts from the end) decides.
-            Sniffed::Zeros if matches!(by_extension, None | Some(Format::Zip)) => Format::Zip,
-            Sniffed::Zeros => {
-                let f = by_extension.map(Format::name).unwrap_or_default();
-                return Err(ArchiveError::with_hint(
-                    format!(
-                        "it's named .{f} but its first {} bytes are all zero where a {f} archive's signature should \
-                         be, so it is damaged or not a {f} archive",
-                        header.len()
-                    ),
-                    errors::HINT_REDOWNLOAD,
-                )
-                .into())
-            }
-            Sniffed::NotArchive(what) => {
-                let hint = if what.starts_with("a web page") {
-                    errors::HINT_WEB_PAGE
-                } else if what.starts_with("a Windows program") {
-                    errors::HINT_EXE
-                } else {
-                    errors::HINT_REPACK
-                };
-                return Err(ArchiveError::with_hint(
-                    format!("it is not a supported archive (zip, 7z or rar): it's {what}"),
-                    hint,
-                )
-                .into());
-            }
-            // A zip may legitimately start with something else (a
-            // self-extractor stub, or data an uploader prepended): the zip
-            // reader finds its table of contents from the end of the file.
-            Sniffed::Unknown if by_extension == Some(Format::Zip) => Format::Zip,
-            Sniffed::Unknown => {
-                return Err(ArchiveError::with_hint(
-                    match by_extension {
-                        Some(f) => format!(
-                            "it is not a supported archive (zip, 7z or rar): it's named .{} but doesn't start like one, \
-                             so it is damaged or something else renamed",
-                            f.name()
-                        ),
-                        None => "it is not a supported archive (zip, 7z or rar)".to_string(),
-                    },
-                    errors::HINT_REDOWNLOAD,
-                )
-                .into())
-            }
-        };
+        let (format, _) = classify(path)?;
 
         match format {
             Format::Zip => {

@@ -65,6 +65,9 @@ pub struct AppState {
     bridge_queue_depth: AtomicUsize,
     /// Serializes actual bridge installs to one at a time.
     bridge_install_lock: Mutex<()>,
+    /// Files the extension is installing / just installed, which
+    /// auto-import must not offer again (`bridge::RecentBridgeFiles`).
+    bridge_recent_files: bridge::RecentBridgeFiles,
     /// `true` while the Mods page is mounted with its bridge listeners
     /// registered and profiles loaded -- i.e. while a consent prompt or an
     /// `afterInstall` step emitted now would actually be handled. Set by
@@ -143,6 +146,7 @@ impl AppState {
             bridge_pending: Mutex::default(),
             bridge_queue_depth: AtomicUsize::new(0),
             bridge_install_lock: Mutex::new(()),
+            bridge_recent_files: bridge::RecentBridgeFiles::default(),
             bridge_frontend_ready: tokio::sync::watch::Sender::new(false),
             close_ack: AtomicBool::new(false),
             data_move_running: AtomicBool::new(false),

@@ -144,7 +144,12 @@ export class HandoffPopup extends Popup<HandoffResult> {
 export class BridgeConsentPopup extends Popup<BridgeConsentDecision> {
     component = BridgeConsentPopupComponent;
 
-    constructor(public readonly site: string) {
+    /** `site` is null when the install carried no web URL: then there is
+     * nothing to "Always allow", and `fileName` says what's being installed. */
+    constructor(
+        public readonly site: string | null,
+        public readonly fileName: string = "",
+    ) {
         super();
     }
 }

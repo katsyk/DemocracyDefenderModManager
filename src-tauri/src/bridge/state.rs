@@ -96,14 +96,19 @@ pub async fn remove_bridge_file(base_path: &Path) {
 }
 
 /// Best-effort check for whether `pid` still refers to a live process.
-/// Only used to decide whether a stale `bridge.json` is worth trying to
-/// connect to at all before falling back to "start DDMM" -- a false
-/// positive here just costs one failed connection attempt, not a security
-/// decision.
+/// Only used to skip a stale `bridge.json` (DDMM crashed without removing
+/// it) instead of connecting to whatever now holds its port -- the token
+/// handshake is still what authenticates the app.
 #[cfg(unix)]
 pub fn process_is_alive(pid: u32) -> bool {
+    // 0 and anything that would turn negative mean "a process group" to
+    // kill(2), never one process.
+    let Ok(pid) = i32::try_from(pid) else { return false };
+    if pid <= 0 {
+        return false;
+    }
     // Signal 0: no signal sent, just existence/permission checked.
-    unsafe { libc_kill(pid as i32, 0) == 0 }
+    unsafe { libc_kill(pid, 0) == 0 }
 }
 
 #[cfg(unix)]
@@ -114,16 +119,24 @@ extern "C" {
 
 #[cfg(windows)]
 pub fn process_is_alive(pid: u32) -> bool {
-    use std::process::Command;
-    // No extra crate: ask `tasklist` to filter on this exact PID and see
-    // whether it printed a matching line.
-    let Ok(output) = Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .output()
-    else {
-        return true; // Can't tell; don't block on it.
+    // Asked of the OS directly: spawning `tasklist` would flash a console
+    // window from host mode, and is slow for the host's repeated checks.
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, STILL_ACTIVE},
+        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
     };
-    String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+    // SAFETY: plain Win32 calls; the handle is closed before returning.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // Exists but belongs to someone we can't query: alive.
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        !ok || code == STILL_ACTIVE as u32
+    }
 }
 
 #[cfg(test)]
@@ -198,13 +211,11 @@ mod tests {
         assert!(read_bridge_file(dir.path()).await.is_err());
     }
 
-    #[cfg(unix)]
     #[test]
     fn process_is_alive_true_for_self() {
         assert!(process_is_alive(std::process::id()));
     }
 
-    #[cfg(unix)]
     #[test]
     fn process_is_alive_false_for_bogus_pid() {
         // PID 1 is always init/systemd (alive); use a PID far outside any

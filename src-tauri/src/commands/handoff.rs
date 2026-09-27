@@ -102,6 +102,21 @@ pub struct HandoffEvent {
     pub warning: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// A download that turned up but was left alone (see [`IgnoredDownload`]);
+    /// sent with `Waiting`, since the handoff keeps waiting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignored: Option<IgnoredDownload>,
+}
+
+/// A new archive in the Downloads folder that is plainly *another* mod's
+/// file (a Nexus Mods archive name carries its mod id), so the handoff
+/// didn't install it -- least of all over the mod being updated -- and
+/// kept waiting. The frontend tells the user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct IgnoredDownload {
+    pub file_name: String,
+    pub mod_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -288,7 +303,7 @@ async fn run_handoff(
     existing_guid: Option<Uuid>,
     cancel: Arc<AtomicBool>,
 ) {
-    let outcome = wait_for_download(&app, &downloads_dir, &subject, &cancel).await;
+    let outcome = wait_for_download(|e| emit(&app, e), &downloads_dir, &subject, &source, &cancel).await;
 
     match outcome {
         Ok(WaitOutcome::Found(path)) => {
@@ -299,11 +314,12 @@ async fn run_handoff(
                     r#mod: None,
                     warning: None,
                     message: None,
+                    ignored: None,
                 },
             );
 
             let state = app.state::<AppState>();
-            match install_found_file(&state, &path, &source, existing_guid).await {
+            match install_holding_data_op(&state, &path, &source, existing_guid).await {
                 Ok((r#mod, warning)) => emit(
                     &app,
                     HandoffEvent {
@@ -311,6 +327,7 @@ async fn run_handoff(
                         r#mod: Some(r#mod),
                         warning,
                         message: None,
+                        ignored: None,
                     },
                 ),
                 Err(e) => emit(
@@ -320,6 +337,7 @@ async fn run_handoff(
                         r#mod: None,
                         warning: None,
                         message: Some(e.to_string()),
+                        ignored: None,
                     },
                 ),
             }
@@ -331,6 +349,7 @@ async fn run_handoff(
                 r#mod: None,
                 warning: None,
                 message: None,
+                ignored: None,
             },
         ),
         Ok(WaitOutcome::TimedOut) => emit(
@@ -340,6 +359,7 @@ async fn run_handoff(
                 r#mod: None,
                 warning: None,
                 message: None,
+                ignored: None,
             },
         ),
         Err(e) => {
@@ -351,6 +371,7 @@ async fn run_handoff(
                     r#mod: None,
                     warning: None,
                     message: Some(e.to_string()),
+                    ignored: None,
                 },
             )
         }
@@ -361,17 +382,50 @@ async fn run_handoff(
     *guard = None;
 }
 
+/// [`install_found_file`] for the background watch: installing writes to
+/// the data folder, so it holds the same guard every other install holds (a
+/// data-folder move can't start in the middle of it, and it can't start
+/// during one). The watch itself doesn't hold it -- that can take 15
+/// minutes, and a move would have to wait for it.
+async fn install_holding_data_op(
+    state: &AppState,
+    archive_path: &Path,
+    source: &Source,
+    existing_guid: Option<Uuid>,
+) -> anyhow::Result<(Mod, Option<String>)> {
+    let _data_op = state.data_op()?;
+    install_found_file(state, archive_path, source, existing_guid).await
+}
+
 async fn install_found_file(
     state: &AppState,
     archive_path: &Path,
     source: &Source,
     existing_guid: Option<Uuid>,
 ) -> anyhow::Result<(Mod, Option<String>)> {
+    // A file of another Nexus mod (its archive name says which) is never
+    // installed as an update of this one. Chosen by hand as a new install,
+    // it's installed -- as the mod it really is.
+    let file_name = archive_path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let mut source = source.clone();
+    if let Some(other) = sources::other_nexus_mod(&source, file_name) {
+        if existing_guid.is_some() {
+            anyhow::bail!(
+                "{file_name} is a file of another Nexus Mods mod (ID {other}), not a new version of this one, so it \
+                 wasn't installed over it. Download the update from this mod's own page, or add that file with Add \
+                 to install it as a separate mod."
+            );
+        }
+        source.id = Some(other);
+        source.version = None;
+    }
+    let source = &source;
+
     // Done before taking the mods lock so a slow/failed metadata fetch
     // never holds up anything else touching the mod list. Best-effort:
     // falls back to the plain source (no Version) on any failure.
     let (mut sidecar_source, installed_files) =
-        crate::commands::updates::enrich_install_source(source, Some(archive_path)).await;
+        crate::commands::updates::enrich_install_source(source, Some(archive_path), None).await;
     // An update the last check found, arriving without a version of its
     // own: record the version that check reported.
     if sidecar_source.version.is_none() {
@@ -430,24 +484,25 @@ enum WaitOutcome {
 }
 
 async fn wait_for_download(
-    app: &AppHandle,
+    emit: impl Fn(HandoffEvent),
     downloads_dir: &Path,
     subject: &str,
+    source: &Source,
     cancel: &AtomicBool,
 ) -> Result<WaitOutcome, InstallError> {
     let start = SystemTime::now();
-    let existing_before = snapshot_names(downloads_dir)
+    let mut existing_before = snapshot_names(downloads_dir)
         .await
         .map_err(|e| downloads_folder_error(subject, downloads_dir, e))?;
     let deadline = start + HANDOFF_TIMEOUT;
 
     emit(
-        app,
         HandoffEvent {
             status: HandoffStatus::Waiting,
             r#mod: None,
             warning: None,
             message: None,
+            ignored: None,
         },
     );
 
@@ -469,6 +524,25 @@ async fn wait_for_download(
             .await
             .map_err(|e| downloads_folder_error(subject, downloads_dir, e))?;
         if let Some(candidate) = found {
+            // Another Nexus mod's file (say a requirement the user grabbed
+            // from the same page): never install it as this mod, least of
+            // all over the mod being updated. Leave it where it is, say so,
+            // and keep waiting for this mod's file.
+            let name = candidate.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+            if let Some(mod_id) = sources::other_nexus_mod(source, &name) {
+                log::info!("Handoff: ignoring {name:?}, a file of Nexus mod {mod_id}, not {:?}", source.id);
+                existing_before.insert(name.clone());
+                emit(
+                    HandoffEvent {
+                        status: HandoffStatus::Waiting,
+                        r#mod: None,
+                        warning: None,
+                        message: None,
+                        ignored: Some(IgnoredDownload { file_name: name, mod_id }),
+                    },
+                );
+                continue;
+            }
             let limits = WaitLimits { deadline, stale_after: PARTIAL_STALE_AFTER };
             match wait_until_stable(&candidate, cancel, limits).await? {
                 Some(path) => return Ok(WaitOutcome::Found(path)),
@@ -648,6 +722,137 @@ fn downloads_folder_error(subject: &str, dir: &Path, e: std::io::Error) -> Insta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn nexus_source(id: &str) -> Source {
+        Source { provider: "nexus".into(), id: Some(id.into()), url: None, version: None }
+    }
+
+    #[test]
+    fn other_nexus_mods_files_are_recognized_by_name() {
+        let src = nexus_source("1234");
+        assert_eq!(sources::other_nexus_mod(&src, "Req-5678-1-0-1718000000.zip").as_deref(), Some("5678"));
+        assert_eq!(sources::other_nexus_mod(&src, "Req 5678 1.0 2026-06-24T03-45Z G8alq8bQH.zip").as_deref(), Some("5678"));
+        assert_eq!(sources::other_nexus_mod(&src, "Better Stims-1234-1-1-1718100000.zip"), None);
+        // A name that doesn't say which mod it is: not refused.
+        assert_eq!(sources::other_nexus_mod(&src, "better-stims.zip"), None);
+        // Only Nexus names carry a mod id.
+        let gb = Source { provider: "gamebanana".into(), id: Some("1234".into()), url: None, version: None };
+        assert_eq!(sources::other_nexus_mod(&gb, "Req-5678-1-0-1718000000.zip"), None);
+    }
+
+    fn make_mod_zip(path: &Path, data: &[u8]) {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        writer.start_file("0123456789abcdef.patch_0", zip::write::SimpleFileOptions::default()).unwrap();
+        writer.write_all(data).unwrap();
+        writer.finish().unwrap();
+    }
+
+    /// A data folder with Nexus mod 1234 installed.
+    async fn state_with_nexus_mod(dir: &Path) -> (AppState, Uuid, PathBuf) {
+        tokio::fs::create_dir_all(dir.join("mods")).await.unwrap();
+        let state = AppState::new(dir.to_path_buf());
+        *state.mods.lock().await = Some(Vec::new());
+        let first = dir.join("Better Stims-1234-1-0-1718000000.zip");
+        make_mod_zip(&first, b"1234 v1");
+        let (m, _) = install_found_file(&state, &first, &nexus_source("1234"), None).await.unwrap();
+        (state, m.guid(), m.directory.clone())
+    }
+
+    #[tokio::test]
+    async fn another_nexus_mods_file_is_never_installed_as_the_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, guid, mod_dir) = state_with_nexus_mod(dir.path()).await;
+
+        let req = dir.path().join("Req-5678-2-0-1718200000.zip");
+        make_mod_zip(&req, b"5678");
+        let err = install_found_file(&state, &req, &nexus_source("1234"), Some(guid)).await.unwrap_err();
+        assert!(format!("{err:#}").contains("another Nexus Mods mod (ID 5678)"), "{err:#}");
+        assert_eq!(std::fs::read(mod_dir.join("0123456789abcdef.patch_0")).unwrap(), b"1234 v1");
+        assert_eq!(state.mods.lock().await.as_ref().unwrap().len(), 1);
+
+        // Chosen by hand as a *new* install, it's installed -- as mod 5678.
+        let (m, _) = install_found_file(&state, &req, &nexus_source("1234"), None).await.unwrap();
+        assert_ne!(m.guid(), guid);
+        let sidecar = sources::load_origin_sidecar(&m.directory).await.unwrap();
+        assert_eq!(sidecar.sources[0].id.as_deref(), Some("5678"));
+    }
+
+    /// A low mod id with a date-like version: the file is this mod's own
+    /// update, not "another mod" (the id is read against the page's).
+    #[tokio::test]
+    async fn an_update_whose_version_looks_like_a_longer_id_is_still_the_update() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("mods")).await.unwrap();
+        let state = AppState::new(dir.path().to_path_buf());
+        *state.mods.lock().await = Some(Vec::new());
+        let first = dir.path().join("Cool Mod-456-2024-06-01-1718000000.zip");
+        make_mod_zip(&first, b"v1");
+        let (m, _) = install_found_file(&state, &first, &nexus_source("456"), None).await.unwrap();
+
+        let update = dir.path().join("Cool Mod-456-2024-07-15-1720000000.zip");
+        make_mod_zip(&update, b"v2");
+        assert_eq!(sources::other_nexus_mod(&nexus_source("456"), "Cool Mod-456-2024-07-15-1720000000.zip"), None);
+        let (updated, _) = install_found_file(&state, &update, &nexus_source("456"), Some(m.guid())).await.unwrap();
+        assert_eq!(updated.guid(), m.guid());
+        assert_eq!(std::fs::read(updated.directory.join("0123456789abcdef.patch_0")).unwrap(), b"v2");
+        let sidecar = sources::load_origin_sidecar(&updated.directory).await.unwrap();
+        assert_eq!(sidecar.sources[0].version.as_deref(), Some("2024.07.15"));
+    }
+
+    /// The handoff watch leaves another Nexus mod's file alone, says so, and
+    /// keeps waiting for this mod's own file.
+    #[tokio::test]
+    async fn the_watch_skips_another_nexus_mods_file_and_keeps_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = events.clone();
+        let downloads = dir.path().to_path_buf();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel2 = cancel.clone();
+        let watch = tokio::spawn(async move {
+            wait_for_download(
+                move |e| log.lock().unwrap().push(e),
+                &downloads,
+                "test",
+                &nexus_source("1234"),
+                &cancel2,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        make_mod_zip(&dir.path().join("Req-5678-1-0-1718000000.zip"), b"req");
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        make_mod_zip(&dir.path().join("Better Stims-1234-1-1-1718100000.zip"), b"update");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(20), watch).await.unwrap().unwrap().unwrap();
+        match outcome {
+            WaitOutcome::Found(path) => assert_eq!(path.file_name().unwrap(), "Better Stims-1234-1-1-1718100000.zip"),
+            _ => panic!("expected the mod's own file"),
+        }
+        let events = events.lock().unwrap();
+        let ignored: Vec<_> = events.iter().filter_map(|e| e.ignored.clone()).collect();
+        assert_eq!(
+            ignored,
+            vec![IgnoredDownload { file_name: "Req-5678-1-0-1718000000.zip".into(), mod_id: "5678".into() }]
+        );
+        cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// The background install holds the data-folder guard: while the data
+    /// folder is being moved (or after a move), it installs nothing.
+    #[tokio::test]
+    async fn the_background_install_holds_the_data_folder_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _guid, _) = state_with_nexus_mod(dir.path()).await;
+        state.freeze_data_ops(None);
+
+        let f = dir.path().join("Other-99-1-0-1718000000.zip");
+        make_mod_zip(&f, b"x");
+        let err = install_holding_data_op(&state, &f, &nexus_source("99"), None).await.unwrap_err();
+        assert_eq!(err.to_string(), crate::DATA_FOLDER_BUSY);
+        assert_eq!(state.mods.lock().await.as_ref().unwrap().len(), 1, "nothing was installed");
+    }
 
     async fn touch(path: &Path, contents: &[u8]) {
         tokio::fs::write(path, contents).await.unwrap();

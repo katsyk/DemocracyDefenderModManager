@@ -49,11 +49,23 @@ The host is the **same `ddmm` executable** started in *host mode*. The browser l
 `ddmm` enters host mode when argv matches either shape, and must then **never open a window**. It speaks standard native
 messaging on stdin/stdout: each message is a 32-bit **native-endian** (little-endian on all supported targets) length
 followed by UTF-8 JSON. Messages from the host to the browser must be ≤ 1 MB; messages from the browser are capped at
-64 MB by the browser but DDMM rejects anything > 1 MB.
+64 MB by the browser but DDMM rejects anything > 1 MB. The loopback connection has the same limits: the app rejects a
+request line over 1 MB (plus room for the added `origin`) with `BAD_REQUEST`, and the host drops a reply line over
+1 MB (its request then times out in the extension) instead of passing on something the browser would refuse.
 
 The host is a **relay**. It validates framing, forwards each JSON message to the running app, and writes back each
 reply. It adds the caller origin (`chrome-extension://…` or the Firefox ID) as `origin` to every forwarded request, and
 the app rejects origins not in its allowlist.
+
+The relay is **full duplex**: it forwards each request as soon as it arrives, without waiting for earlier replies, and
+passes each reply back as soon as the app sends it, matched to its request by `id`. The app handles the requests of
+one connection concurrently too. So a request that waits on the user (an `install` at its consent prompt, up to
+2 minutes, or waiting up to 60 s for DDMM's window to be ready) never delays the `hello`/`query`/`status` the extension
+sends meanwhile, which have a 10 s timeout. Replies can therefore arrive in a different order than their requests,
+and requests sent without waiting for an earlier reply may reach the app in any order. At most 64 requests may be
+in progress through one host (32 per app connection); beyond that a request gets `BUSY` at once. The host gives up on
+a request DDMM hasn't answered after a little longer than the extension's own timeout for it (5½ min for `install`,
+90 s for `open`, 30 s otherwise) and replies `INTERNAL`, so an unanswered request never holds its place forever.
 
 ### Reaching the running app
 
@@ -69,7 +81,10 @@ Windows) and deleted on clean exit. The token is regenerated on every start.
 
 The host resolves the data folder with the **same logic as the app** (a `ddmm-data-location.json` pointer, the
 portable marker, app-data; see [Data folder](../using/data-folder.md#how-ddmm-remembers-the-folder)), reads
-`bridge.json`, connects, and sends `{"hello": "<token>"}` followed by a newline. It resolves the folder again for every
+`bridge.json`, connects, and sends `{"hello": "<token>"}` followed by a newline. A `bridge.json` whose `pid` is no
+longer running is stale (DDMM crashed) and is ignored without connecting. Connecting plus the handshake must finish
+within 5 s. On the app side the handshake line must be at most 256 bytes and arrive within 5 s, or the connection is
+dropped; nothing else is read from a connection before its token checks out. It resolves the folder again for every
 (re)connect, so a host the browser kept alive finds the app after the user moves the data folder (the app restarts
 after a move and writes a fresh `bridge.json` in the new folder). The host never creates the data folder. The app replies `{"ok": true}` and closes the connection
 on a wrong token. After that, both sides exchange **newline-delimited JSON** (one object per line).
@@ -107,7 +122,9 @@ doesn't know whether the mod is installed, and never guesses.
 
 ## Messages
 
-Every request has a string `id` chosen by the extension. Every reply echoes the `id`. Unknown `type` → error
+Every request has a string `id` chosen by the extension. Every reply echoes the `id`, which is how replies are matched to
+requests (they can arrive in any order, see [Native messaging host](#native-messaging-host)). An `id` must be unique
+among the requests still in progress; a request reusing one gets `BAD_REQUEST`. Unknown `type` → error
 `UNSUPPORTED`. Unknown fields are ignored (forward compatibility).
 
 ### `hello`
@@ -134,8 +151,11 @@ The extension sends this after a download **has completed** in the browser.
   "afterInstall": null }
 ```
 
-- `file`: absolute path of the finished download. The app requires a regular file (not a symlink), an allowed archive
-  type by **magic bytes**, and ≤ 2 GiB. The app never deletes or moves it.
+- `file`: absolute path of the finished download. The app requires a regular file (not a symlink), ≤ 2 GiB, that is a
+  zip, 7z or rar by the **same detection every other install route uses** (Add, Add URL, the Downloads-folder handoff):
+  by its content (magic bytes), never by its name alone. The one case where the name counts is a file named `.zip` that
+  starts with something else (zero padding, a self-extractor stub, data an uploader prepended): the zip reader finds a
+  zip from the end of the file, so it is accepted if it really is one. The app never deletes or moves it.
 - `pageUrl`: the mod page the user was on (the source of truth for `Sources`; parsed with the same rules as
   `source_from_page_url`). It may be null for context-menu installs from arbitrary pages; then `downloadUrl` host detection
   is used.
@@ -143,13 +163,35 @@ The extension sends this after a download **has completed** in the browser.
   origin sidecar.
 - `afterInstall`: `null` means "use the app setting". Otherwise one of `"library"`, `"profile"` or `"deploy"`.
 
-If a mod from the same source (provider + id) is already installed, the app performs an **in-place update** (like
-"Update from …") instead of failing with a duplicate. The mod keeps its GUID, and so its profile entries (enabled state,
-options, position), only when the new archive has no `manifest.json` of its own. If the new archive ships a manifest with
-its own `Guid`, that GUID replaces the old one and profile entries that point at the old GUID no longer match (they are
-not migrated; the Mods page shows them as missing). Because an update replaces an
+If the installed mod that this file is a new version of came from the same source (provider + id), the app performs an
+**in-place update** (like "Update from …") instead of failing with a duplicate. The mod keeps its GUID, and so its
+profile entries (enabled state, options, position), only when the new archive has no `manifest.json` of its own. If the
+new archive ships a manifest with its own `Guid`, that GUID replaces the old one and profile entries that point at the
+old GUID no longer match (they are not migrated; the Mods page shows them as missing). Because an update replaces an
 installed mod's files, the app only does it when the id came from a recognized mod-page `pageUrl`. A source derived
 from `downloadUrl` host detection never has an id and always installs as a new mod.
+
+One mod page can offer several files that are installed side by side (GameBanana variants, a Nexus Mods main file and
+its optional files), so sharing a source isn't enough: the app records which file each mod was installed from
+(`InstalledFiles` in its origin sidecar) and updates a mod only with **the same file**:
+
+- Nexus Mods: the archive names (both of Nexus's naming schemes) have the same mod id and the same file name; the
+  version and upload time may differ. The names are read against the page's mod id, so a version made of long
+  numbers (`Cool Mod-456-2024-06-01-….zip`) isn't mistaken for another mod's id.
+- Other sites: the names have the same "shape": the extension, a browser's ` (1)`, GameBanana's upload suffix and
+  version-shaped parts (`v2`, `1.2.0`, `1-2-0`, a date) are removed, and everything else counts, numbers included. So
+  `cool_mod_v2_ff3bb.zip` updates the mod installed from `cool_mod_v1_ab12c.zip`, but `cool_mod_red_….zip` never
+  replaces `cool_mod_blue_….zip`, nor `armor_4k_….zip` replaces `armor_2k_….zip` (or `1440p` `1080p`, or `Option 2`
+  `Option 1`). When in doubt, the file installs as a new mod.
+
+Any other file from that page installs as a new mod. The one exception is a mod installed before DDMM recorded its
+file: when it's the only mod from that page, it's updated in place as before (there's nothing to tell files apart by),
+unless the file's Nexus archive name says it's from a different Nexus mod. Such a file (a requirement linked from
+the page, say) is never an update of the page's mod: it installs as a new mod, recorded as the mod it really is.
+
+For a GitHub release asset, the version recorded is the release tag named in `downloadUrl`
+(`https://github.com/<owner>/<repo>/releases/download/<tag>/<file>`), the same rule Add URL uses, not whatever the
+latest release is.
 
 **Which `pageUrl` the extension sends.** The page the user is on is only context, since a link on mod A's page can be
 mod B's file. The extension therefore attributes every download to the mod the *file's* URL names:
@@ -174,10 +216,15 @@ referrer is that mod's page). The armed state is kept in `storage.session`, so a
 
 `downloadUrl` is the URL the user chose (the right-clicked link or the page's download link).
 
-**Permission check (app side):** the first time a site (registrable domain of `pageUrl`/`downloadUrl`) sends an install,
-DDMM asks: *"Allow the DDMM browser extension to install mods from **ayakamods.com**?"* with **Always allow**, **Just this
-once** and **Deny**. "Always allow" is stored in settings (`BridgeAllowedSites`) and can be revoked in Settings. The prompt
-is skipped for allowed sites; that's what makes it one click.
+**Permission check (app side):** the first time a site (registrable domain of `pageUrl`, else `downloadUrl`; only an
+`http(s)` URL names a site) sends an install, DDMM asks: *"Allow the DDMM browser extension to install mods from
+**ayakamods.com**?"* with **Always allow**, **Just this once** and **Deny**. "Always allow" is stored in settings
+(`BridgeAllowedSites`) and can be revoked in Settings. The prompt is skipped for allowed sites; that's what makes it one
+click. An install with no `http(s)` URL at all has no site that could have been allowed, so it **always** gets the prompt
+(naming the file, with only **Just this once** and **Deny**).
+
+While DDMM installs a file for the extension, and for 10 minutes after, the opt-in auto-import from the Downloads
+folder doesn't offer that same file.
 
 Reply on success:
 ```json
@@ -242,7 +289,8 @@ Reply: `{ "id": "5", "ok": true, "type": "opened" }`
 | `BUSY` | Another install/deploy is running; retry |
 | `INTERNAL` | Anything else (message says what) |
 
-Installs are serialized in the app; concurrent requests queue (up to 20), and beyond that they get `BUSY`.
+Installs are serialized in the app; concurrent installs queue (up to 20), and beyond that they get `BUSY`. Other
+requests are answered while installs wait.
 
 ## `ddmm://` links
 
@@ -268,11 +316,17 @@ the restart fails with links, it's retried once without them.
 
 ## Security checklist
 
-- TCP listener bound to loopback only, random port, per-run 256-bit token, constant-time token compare.
+- TCP listener bound to loopback only, random port, per-run 256-bit token, constant-time token compare. Nothing is
+  handled on a connection before its token handshake succeeds.
 - `bridge.json` is owner-only, deleted on exit.
-- Host mode never opens a GUI and only relays. Message size limits are enforced both ways.
+- Host mode never opens a GUI and only relays. Message size limits are enforced both ways, on stdin/stdout and on
+  the loopback connection, and the number of requests in progress is capped.
 - App-side origin allowlist (the extension IDs above).
-- Per-site "Always allow" consent for extension installs. `ddmm://` always confirms.
+- Per-site "Always allow" consent for extension installs; an install with no `http(s)` URL is always confirmed.
+  `ddmm://` always confirms.
+- Consent prompts and afterInstall reports are matched to their install by a fresh key the app generates for each,
+  never by the extension's request `id` (which restarts when the browser restarts the extension), so a late answer
+  can't resolve a different install.
 - Content-script buttons act only on trusted clicks (`event.isTrusted`), so a page can't script-click them.
 - Every install still goes through archive validation (paths, symlinks, magic bytes, size cap).
 - No credentials, cookies or tokens for any mod site ever cross the bridge.

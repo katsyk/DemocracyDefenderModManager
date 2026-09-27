@@ -9,11 +9,18 @@
 
 <PopupBase>
     <span class="text-xl text-yellow-300 font-blockletter self-center">{t("popup.bridge_consent.title")}</span>
-    <p class="min-w-40 text-sm">{t("popup.bridge_consent.question", { site: popup.site })}</p>
+    {#if popup.site}
+        <p class="min-w-40 text-sm">{t("popup.bridge_consent.question", { site: popup.site })}</p>
+    {:else}
+        <!-- No website to remember: asked every time, no "Always allow". -->
+        <p class="min-w-40 text-sm">{t("popup.bridge_consent.question_no_site", { file: popup.fileName })}</p>
+    {/if}
     <div class="flex flex-col gap-1">
-        <button class="hd2mm-button" onclick={() => popup.close("AlwaysAllow")}>
-            {t("popup.bridge_consent.always_allow_button.text")}
-        </button>
+        {#if popup.site}
+            <button class="hd2mm-button" onclick={() => popup.close("AlwaysAllow")}>
+                {t("popup.bridge_consent.always_allow_button.text")}
+            </button>
+        {/if}
         <button class="hd2mm-button" onclick={() => popup.close("JustOnce")}>
             {t("popup.bridge_consent.just_once_button.text")}
         </button>

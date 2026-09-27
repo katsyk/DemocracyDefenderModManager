@@ -129,6 +129,16 @@ async fn run(app: AppHandle) {
             let Ok(size) = tokio::fs::metadata(&path).await.map(|m| m.len()) else {
                 continue;
             };
+            // The browser extension already handed this file to DDMM (it's
+            // being installed, or just was): offering it too would only
+            // end in "already installed". Remembered as seen, so it isn't
+            // offered later either unless it changes.
+            if state.bridge_recent_files.contains(&path) {
+                pending.remove(&path);
+                seen.insert(path, size);
+                continue;
+            }
+
             // Still being downloaded: a `.part`/`.crdownload`/... next to
             // it was written to recently (a stale leftover doesn't count).
             let in_progress = crate::commands::handoff::download_in_progress(&path).await;

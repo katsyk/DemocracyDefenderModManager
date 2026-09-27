@@ -4,24 +4,26 @@
 //! opens a GUI; it only relays.
 
 use std::{
+    collections::HashMap,
     io,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
-use futures::FutureExt;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpStream,
     },
+    sync::oneshot,
 };
 
 use super::{
     allowlist::FIREFOX_EXTENSION_ID,
-    protocol::{ErrorCode, ErrorReply, MAX_MESSAGE_BYTES},
-    state::{read_bridge_file, tokens_match},
+    protocol::{read_bounded_line, BoundedLine, ErrorCode, ErrorReply, MAX_MESSAGE_BYTES},
+    state::{process_is_alive, read_bridge_file, tokens_match},
 };
 
 /// Which browser shape argv matched, carrying the exact `origin` string the
@@ -77,12 +79,27 @@ fn spawn_detached(exe: &Path) -> io::Result<()> {
 /// `None` for anything short of a fully successful handshake (missing
 /// file, connection refused, wrong token, ...) -- every failure mode here
 /// is treated identically: "not reachable right now".
+///
+/// A `bridge.json` whose `pid` is no longer running is stale (DDMM
+/// crashed), and the whole connect + handshake must finish within
+/// [`CONNECT_TIMEOUT`]: a port some other program now holds, which accepts
+/// but never answers, must not hang a request forever.
 async fn try_connect(base_path: &Path) -> Option<TcpStream> {
     let info = read_bridge_file(base_path).await.ok()?;
-    let mut stream = TcpStream::connect(("127.0.0.1", info.port)).await.ok()?;
+    if info.pid != 0 && !process_is_alive(info.pid) {
+        return None;
+    }
+    tokio::time::timeout(CONNECT_TIMEOUT, connect_and_handshake(info.port, &info.token)).await.ok()?
+}
+
+/// How long connecting to DDMM and its token handshake may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn connect_and_handshake(port: u16, token: &str) -> Option<TcpStream> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.ok()?;
 
     stream
-        .write_all(format!("{{\"hello\":\"{}\"}}\n", info.token).as_bytes())
+        .write_all(format!("{{\"hello\":\"{token}\"}}\n").as_bytes())
         .await
         .ok()?;
 
@@ -94,7 +111,7 @@ async fn try_connect(base_path: &Path) -> Option<TcpStream> {
 
     // Belt and braces: the app already closes the connection on a bad
     // token, but double check the ack is unambiguous rather than assuming.
-    if ok && tokens_match(&info.token, &info.token) {
+    if ok && tokens_match(token, token) {
         Some(stream)
     } else {
         None
@@ -215,27 +232,216 @@ pub fn poll_timeout() -> Duration {
         .unwrap_or(DEFAULT_POLL_TIMEOUT)
 }
 
-type AppConnection = (BufReader<OwnedReadHalf>, OwnedWriteHalf);
+/// Most requests the relay has in progress at once; beyond that a request
+/// is answered `BUSY` right away. (The extension sends a handful at most.)
+const MAX_IN_FLIGHT: usize = 64;
 
-fn split_connection(stream: TcpStream) -> AppConnection {
-    let (read, write) = stream.into_split();
-    (BufReader::new(read), write)
+/// Why a request couldn't be registered on an [`AppLink`].
+enum RegisterError {
+    /// The connection has closed: reconnect (nothing was sent yet).
+    Closed,
+    /// Another request with the same `id` is still in progress.
+    DuplicateId,
+    TooMany,
 }
 
-/// Whether the app side of `conn` is still open, checked without blocking
-/// or consuming anything: the app never sends unsolicited data, so a
-/// readable socket between requests can only mean EOF (DDMM exited) or an
-/// error. `fill_buf` is cancel-safe, so dropping it while pending is fine.
-fn connection_alive(conn: &mut AppConnection) -> bool {
-    match conn.0.fill_buf().now_or_never() {
-        None => true,
-        Some(Ok(buf)) => !buf.is_empty(),
-        Some(Err(_)) => false,
+/// One authenticated connection to the running app, used full duplex:
+/// requests are written as they arrive, and a reader task hands each reply
+/// to whichever request has its `id`. So a slow request (an install waiting
+/// for the consent prompt) never holds up the quick ones behind it.
+struct AppLink {
+    writer: tokio::sync::Mutex<OwnedWriteHalf>,
+    /// Requests sent and waiting for their reply, by `id`. `None` once the
+    /// connection has closed (dropping every waiting sender, which each
+    /// waiting request sees as "lost connection").
+    pending: std::sync::Mutex<Option<HashMap<String, oneshot::Sender<String>>>>,
+}
+
+impl AppLink {
+    fn start(stream: TcpStream) -> Arc<AppLink> {
+        let (read, write) = stream.into_split();
+        let link = Arc::new(AppLink {
+            writer: tokio::sync::Mutex::new(write),
+            pending: std::sync::Mutex::new(Some(HashMap::new())),
+        });
+        tokio::spawn(Self::read_replies(link.clone(), BufReader::new(read)));
+        link
+    }
+
+    async fn read_replies(link: Arc<AppLink>, mut reader: BufReader<OwnedReadHalf>) {
+        loop {
+            match read_bounded_line(&mut reader, MAX_MESSAGE_BYTES as usize).await {
+                Ok(Some(BoundedLine::Line(line))) => {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let id = extract_id(line.as_bytes());
+                    let waiting = link.pending.lock().ok().and_then(|mut p| p.as_mut()?.remove(&id));
+                    match waiting {
+                        Some(tx) => {
+                            let _ = tx.send(line.to_string());
+                        }
+                        None => log::debug!("Bridge host: dropping a reply no request is waiting for"),
+                    }
+                }
+                // Can't be passed on to the browser (1 MB limit); its request
+                // gets no reply and times out in the extension.
+                Ok(Some(BoundedLine::TooLong)) => log::warn!("Bridge host: dropping an oversized reply from DDMM"),
+                Ok(None) | Err(_) => break,
+            }
+        }
+        link.close();
+    }
+
+    fn close(&self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            *pending = None;
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.pending.lock().is_ok_and(|p| p.is_some())
+    }
+
+    fn register(&self, id: &str) -> Result<oneshot::Receiver<String>, RegisterError> {
+        let mut guard = self.pending.lock().map_err(|_| RegisterError::Closed)?;
+        let pending = guard.as_mut().ok_or(RegisterError::Closed)?;
+        if pending.contains_key(id) {
+            return Err(RegisterError::DuplicateId);
+        }
+        if pending.len() >= MAX_IN_FLIGHT {
+            return Err(RegisterError::TooMany);
+        }
+        let (tx, rx) = oneshot::channel();
+        pending.insert(id.to_string(), tx);
+        Ok(rx)
+    }
+
+    fn unregister(&self, id: &str) {
+        if let Ok(mut guard) = self.pending.lock() {
+            if let Some(pending) = guard.as_mut() {
+                pending.remove(id);
+            }
+        }
+    }
+}
+
+/// How long the host waits for DDMM's reply to one request before giving
+/// up on it (and freeing its place): a little longer than the extension
+/// itself waits (see bridge-protocol.md, "Client-side timeouts"), so the
+/// extension normally times out first.
+/// `DDMM_BRIDGE_REQUEST_TIMEOUT_MS` overrides it for every request type, so
+/// the integration test doesn't wait half a minute.
+fn request_timeout(request_type: &str) -> Duration {
+    if let Some(ms) = std::env::var("DDMM_BRIDGE_REQUEST_TIMEOUT_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        return Duration::from_millis(ms);
+    }
+    match request_type {
+        "install" => Duration::from_secs(5 * 60 + 30),
+        "open" => Duration::from_secs(90),
+        _ => Duration::from_secs(30),
+    }
+}
+
+/// Shared by every request the relay is handling.
+struct Relay {
+    resolve_base: fn() -> PathBuf,
+    link: tokio::sync::Mutex<Option<Arc<AppLink>>>,
+    /// Held while starting DDMM, so two installs don't both launch it.
+    launcher: tokio::sync::Mutex<Launcher>,
+    /// Frames for stdout, written in order by one task.
+    out: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl Relay {
+    fn reply(&self, line: String) {
+        let _ = self.out.send(line.into_bytes());
+    }
+
+    fn error(&self, id: &str, code: ErrorCode, message: &str) {
+        self.reply(ErrorReply::new(id, code, message).to_line());
+    }
+
+    /// The open connection to DDMM, connecting (and, for `may_launch`,
+    /// starting DDMM) if there isn't one. Only called *before* a request
+    /// is sent: a request is never resent after the app may have received it.
+    async fn link(&self, may_launch: bool) -> Option<Arc<AppLink>> {
+        if let Some(link) = self.link.lock().await.as_ref().filter(|l| l.is_open()) {
+            return Some(link.clone());
+        }
+        let stream = if may_launch {
+            self.launcher
+                .lock()
+                .await
+                .ensure_app_running_and_connect(self.resolve_base, poll_timeout())
+                .await
+        } else {
+            try_connect(&(self.resolve_base)()).await
+        }?;
+        let mut current = self.link.lock().await;
+        // Another request connected meanwhile: use that one.
+        if let Some(link) = current.as_ref().filter(|l| l.is_open()) {
+            return Some(link.clone());
+        }
+        let link = AppLink::start(stream);
+        *current = Some(link.clone());
+        Some(link)
+    }
+
+    /// Relay one request (already carrying `origin`) and pass its reply on.
+    async fn handle(self: Arc<Self>, id: String, request_type: String, mut line: String) {
+        line.push('\n');
+        let may_launch = may_launch_app(&request_type);
+        // Registering fails only if the connection closed after `link`
+        // returned it; nothing was sent then, so connecting again is safe.
+        for _ in 0..2 {
+            let Some(link) = self.link(may_launch).await else {
+                let message = if may_launch { "Host couldn't start or reach DDMM" } else { "DDMM isn't running" };
+                return self.error(&id, ErrorCode::AppNotRunning, message);
+            };
+            let rx = match link.register(&id) {
+                Ok(rx) => rx,
+                Err(RegisterError::Closed) => continue,
+                Err(RegisterError::DuplicateId) => {
+                    return self.error(&id, ErrorCode::BadRequest, "a request with this id is still in progress")
+                }
+                Err(RegisterError::TooMany) => {
+                    return self.error(&id, ErrorCode::Busy, "too many requests at once, try again shortly")
+                }
+            };
+            let written = {
+                let mut writer = link.writer.lock().await;
+                writer.write_all(line.as_bytes()).await
+            };
+            if written.is_err() {
+                link.unregister(&id);
+                link.close();
+                return self.error(&id, ErrorCode::AppNotRunning, "lost connection to DDMM");
+            }
+            match tokio::time::timeout(request_timeout(&request_type), rx).await {
+                Ok(Ok(reply)) => self.reply(reply),
+                Ok(Err(_)) => self.error(&id, ErrorCode::AppNotRunning, "lost connection to DDMM"),
+                Err(_) => {
+                    link.unregister(&id);
+                    self.error(&id, ErrorCode::Internal, "DDMM didn't answer in time");
+                }
+            }
+            return;
+        }
+        self.error(&id, ErrorCode::AppNotRunning, "lost connection to DDMM");
     }
 }
 
 /// Run the host-mode relay to completion (until stdin closes). Never opens
 /// a window, never touches Tauri.
+///
+/// Full duplex: every request from the browser is relayed as soon as it
+/// arrives and handled concurrently, and each reply is passed back as soon
+/// as DDMM sends it, matched to its request by `id` (so replies can come
+/// back in a different order than their requests). A request waiting on
+/// the user -- an install at its consent prompt -- never delays the
+/// `hello`/`query`/`status` the extension sends meanwhile.
 ///
 /// The browser keeps this process (and its port) alive for as long as the
 /// extension holds the connection, which can far outlive one DDMM session.
@@ -253,17 +459,34 @@ pub async fn run(origin: HostOrigin, resolve_base: fn() -> PathBuf) {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
 
-    let mut launcher = Launcher::default();
+    let (out, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(async move {
+        while let Some(frame) = out_rx.recv().await {
+            if write_frame(&mut stdout, &frame).await.is_err() {
+                break;
+            }
+        }
+    });
+
     // Connect to an already-running DDMM only; launching waits for a
     // request that's allowed to (see `may_launch_app`).
-    let mut conn = try_connect(&resolve_base()).await.map(split_connection);
+    let initial = try_connect(&resolve_base()).await.map(AppLink::start);
+    let relay = Arc::new(Relay {
+        resolve_base,
+        link: tokio::sync::Mutex::new(initial),
+        launcher: tokio::sync::Mutex::new(Launcher::default()),
+        out,
+    });
+
+    // Bounds every request task, including ones still connecting or
+    // starting DDMM (which haven't registered with a connection yet).
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
 
     loop {
         let data = match read_frame(&mut stdin, MAX_MESSAGE_BYTES).await {
             Ok(Frame::Eof) | Err(_) => break,
             Ok(Frame::TooLarge) => {
-                let reply = ErrorReply::new("", ErrorCode::BadRequest, "message too large").to_line();
-                let _ = write_frame(&mut stdout, reply.as_bytes()).await;
+                relay.error("", ErrorCode::BadRequest, "message too large");
                 continue;
             }
             Ok(Frame::Data(data)) => data,
@@ -272,8 +495,7 @@ pub async fn run(origin: HostOrigin, resolve_base: fn() -> PathBuf) {
         let mut value: serde_json::Value = match serde_json::from_slice(&data) {
             Ok(v) => v,
             Err(_) => {
-                let reply = ErrorReply::new("", ErrorCode::BadRequest, "malformed JSON").to_line();
-                let _ = write_frame(&mut stdout, reply.as_bytes()).await;
+                relay.error("", ErrorCode::BadRequest, "malformed JSON");
                 continue;
             }
         };
@@ -282,53 +504,18 @@ pub async fn run(origin: HostOrigin, resolve_base: fn() -> PathBuf) {
             obj.insert("origin".to_string(), serde_json::Value::String(origin.0.clone()));
         }
 
-        let mut line = match serde_json::to_string(&value) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        line.push('\n');
-
-        // Only (re)connect *before* sending: a request is never resent
-        // after the app may already have received it.
-        let request_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let may_launch = may_launch_app(request_type);
-        if !conn.as_mut().is_some_and(connection_alive) {
-            let stream = if may_launch {
-                launcher.ensure_app_running_and_connect(resolve_base, poll_timeout()).await
-            } else {
-                try_connect(&resolve_base()).await
-            };
-            conn = stream.map(split_connection);
-        }
-        let Some((app_reader, app_write)) = conn.as_mut() else {
-            let message = if may_launch {
-                "Host couldn't start or reach DDMM"
-            } else {
-                "DDMM isn't running"
-            };
-            let reply = ErrorReply::new(extract_id(&data), ErrorCode::AppNotRunning, message).to_line();
-            let _ = write_frame(&mut stdout, reply.as_bytes()).await;
+        let Ok(line) = serde_json::to_string(&value) else { continue };
+        let id = extract_id(&data);
+        let request_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+        let Ok(permit) = in_flight.clone().try_acquire_owned() else {
+            relay.error(&id, ErrorCode::Busy, "too many requests at once, try again shortly");
             continue;
         };
-
-        if app_write.write_all(line.as_bytes()).await.is_err() {
-            let reply = ErrorReply::new(extract_id(&data), ErrorCode::AppNotRunning, "lost connection to DDMM").to_line();
-            let _ = write_frame(&mut stdout, reply.as_bytes()).await;
-            conn = None;
-            continue;
-        }
-
-        let mut reply_line = String::new();
-        match app_reader.read_line(&mut reply_line).await {
-            Ok(0) | Err(_) => {
-                let reply = ErrorReply::new(extract_id(&data), ErrorCode::AppNotRunning, "lost connection to DDMM").to_line();
-                let _ = write_frame(&mut stdout, reply.as_bytes()).await;
-                conn = None;
-            }
-            Ok(_) => {
-                let _ = write_frame(&mut stdout, reply_line.trim().as_bytes()).await;
-            }
-        }
+        let relay = relay.clone();
+        tokio::spawn(async move {
+            relay.handle(id, request_type, line).await;
+            drop(permit);
+        });
     }
 }
 

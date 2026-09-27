@@ -164,7 +164,9 @@ fn spawn_fake_app_server(expected_token: &str) -> (u16, std::sync::mpsc::Receive
 }
 
 fn write_bridge_json(dir: &Path, port: u16, token: &str) {
-    let content = serde_json::json!({ "port": port, "token": token, "pid": 999999u32, "protocol": 1 });
+    // A live pid (this test process): the host skips a bridge.json whose
+    // process is gone.
+    let content = serde_json::json!({ "port": port, "token": token, "pid": std::process::id(), "protocol": 1 });
     std::fs::write(dir.join("bridge.json"), content.to_string()).unwrap();
 }
 
@@ -406,6 +408,213 @@ fn reconnects_after_the_app_restarts_instead_of_failing() {
     assert_eq!(reply["servedBy"], "second");
     second.join().unwrap();
 
+    drop(stdin);
+    let _ = child.wait_timeout_or_kill();
+}
+
+/// A fake "app" that answers requests out of order, like the real one
+/// does while an install waits for the user: it holds back the reply to
+/// `install` until it has answered everything sent after it.
+fn spawn_slow_install_app_server(token: &str) -> (u16, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token = token.to_string();
+    let handle = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let handshake: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(handshake["hello"], token);
+        stream.write_all(b"{\"ok\":true}\n").unwrap();
+
+        let mut held_install: Option<serde_json::Value> = None;
+        let mut answered_after_install = 0;
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            let req: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            if req["type"] == "install" {
+                held_install = Some(req);
+                continue;
+            }
+            let reply = serde_json::json!({ "id": req["id"], "ok": true, "type": req["type"] });
+            stream.write_all(format!("{reply}\n").as_bytes()).unwrap();
+            if held_install.is_some() {
+                answered_after_install += 1;
+                if answered_after_install == 2 {
+                    let install = held_install.take().unwrap();
+                    let reply = serde_json::json!({ "id": install["id"], "ok": true, "type": "installed" });
+                    stream.write_all(format!("{reply}\n").as_bytes()).unwrap();
+                }
+            }
+        }
+    });
+    (port, handle)
+}
+
+#[test]
+fn replies_are_routed_by_id_while_an_install_is_still_waiting() {
+    let (dir, exe) = portable_copy_of_binary();
+    let token = "c".repeat(64);
+    let (port, _server) = spawn_slow_install_app_server(&token);
+    write_bridge_json(dir.path(), port, &token);
+
+    let mut child = spawn_host(&exe, &[]);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    write_frame(&mut stdin, br#"{"id":"1","type":"install","file":"/tmp/x.zip"}"#);
+    // Requests are relayed concurrently, so their order at the app isn't
+    // fixed; give the install a head start so the fake app sees it first.
+    std::thread::sleep(Duration::from_millis(300));
+    // The install's reply is still outstanding: these must not queue
+    // behind it (the extension gives them 10 seconds).
+    write_frame(&mut stdin, br#"{"id":"2","type":"hello"}"#);
+    let reply = read_frame_json(&mut stdout);
+    assert_eq!(reply["id"], "2", "{reply}");
+    assert_eq!(reply["type"], "hello");
+
+    // A request reusing the id of one still in progress is refused.
+    write_frame(&mut stdin, br#"{"id":"1","type":"status"}"#);
+    let reply = read_frame_json(&mut stdout);
+    assert_eq!(reply["id"], "1");
+    assert_eq!(reply["error"]["code"], "BAD_REQUEST", "{reply}");
+
+    write_frame(&mut stdin, br#"{"id":"3","type":"status"}"#);
+    let mut replies = [read_frame_json(&mut stdout), read_frame_json(&mut stdout)];
+    replies.sort_by_key(|r| r["id"].as_str().unwrap().to_string());
+    assert_eq!(replies[0]["id"], "1");
+    assert_eq!(replies[0]["type"], "installed");
+    assert_eq!(replies[1]["id"], "3");
+    assert_eq!(replies[1]["type"], "status");
+
+    drop(stdin);
+    let _ = child.wait_timeout_or_kill();
+}
+
+/// A `bridge.json` left behind by a DDMM that crashed (its pid is gone) is
+/// ignored, even if something now listens on its port: no connection is
+/// attempted, and a passive request gets APP_NOT_RUNNING right away.
+#[test]
+fn a_stale_bridge_json_with_a_dead_pid_is_ignored() {
+    let (dir, exe) = portable_copy_of_binary();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    // A pid that can't be running.
+    let content = serde_json::json!({ "port": port, "token": "d".repeat(64), "pid": u32::MAX - 1, "protocol": 1 });
+    std::fs::write(dir.path().join("bridge.json"), content.to_string()).unwrap();
+
+    let mut child = spawn_host(&exe, &[]);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    write_frame(&mut stdin, br#"{"id":"1","type":"status"}"#);
+    let reply = read_frame_json(&mut stdout);
+    assert_eq!(reply["error"]["code"], "APP_NOT_RUNNING", "{reply}");
+    assert!(listener.accept().is_err(), "the host must not connect to a dead DDMM's port");
+
+    drop(stdin);
+    let _ = child.wait_timeout_or_kill();
+}
+
+/// Something that accepts on DDMM's port but never answers the handshake
+/// can't hang the host: the request fails within the handshake timeout.
+#[test]
+fn a_silent_listener_times_out_the_handshake() {
+    let (dir, exe) = portable_copy_of_binary();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    write_bridge_json(dir.path(), port, &"e".repeat(64));
+    let _hold = std::thread::spawn(move || {
+        let conns: Vec<_> = listener.incoming().take(2).collect();
+        std::thread::sleep(Duration::from_secs(15));
+        drop(conns);
+    });
+
+    let mut child = spawn_host(&exe, &[]);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let started = std::time::Instant::now();
+    write_frame(&mut stdin, br#"{"id":"1","type":"status"}"#);
+    let reply = read_frame_json(&mut stdout);
+    assert_eq!(reply["error"]["code"], "APP_NOT_RUNNING", "{reply}");
+    assert!(started.elapsed() < Duration::from_secs(14), "took {:?}", started.elapsed());
+
+    drop(stdin);
+    let _ = child.wait_timeout_or_kill();
+}
+
+/// A fake "app" that authenticates, reads everything, and never replies.
+fn spawn_unresponsive_app_server(token: &str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token = token.to_string();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let handshake: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(handshake["hello"], token);
+        stream.write_all(b"{\"ok\":true}\n").unwrap();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+        }
+    });
+    port
+}
+
+/// A request DDMM never answers gets an error once the host's per-request
+/// timeout passes, and its place (and id) is free again.
+#[test]
+fn an_unanswered_request_times_out_and_frees_its_place() {
+    let (dir, exe) = portable_copy_of_binary();
+    let token = "f".repeat(64);
+    let port = spawn_unresponsive_app_server(&token);
+    write_bridge_json(dir.path(), port, &token);
+
+    let mut child = spawn_host(&exe, &[("DDMM_BRIDGE_REQUEST_TIMEOUT_MS", "300")]);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    for _ in 0..2 {
+        // The same id twice: the first one's place was freed.
+        write_frame(&mut stdin, br#"{"id":"1","type":"status"}"#);
+        let reply = read_frame_json(&mut stdout);
+        assert_eq!(reply["id"], "1");
+        assert_eq!(reply["error"]["code"], "INTERNAL", "{reply}");
+    }
+    drop(stdin);
+    let _ = child.wait_timeout_or_kill();
+}
+
+/// However many requests the browser sends, the host keeps a bounded number
+/// in progress; the rest are answered BUSY at once.
+#[test]
+fn requests_in_progress_are_bounded() {
+    let (dir, exe) = portable_copy_of_binary();
+    let token = "9".repeat(64);
+    let port = spawn_unresponsive_app_server(&token);
+    write_bridge_json(dir.path(), port, &token);
+
+    let mut child = spawn_host(&exe, &[]);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    for i in 0..70 {
+        write_frame(&mut stdin, format!(r#"{{"id":"{i}","type":"status"}}"#).as_bytes());
+    }
+    for _ in 0..6 {
+        let reply = read_frame_json(&mut stdout);
+        assert_eq!(reply["error"]["code"], "BUSY", "{reply}");
+    }
     drop(stdin);
     let _ = child.wait_timeout_or_kill();
 }
