@@ -60,6 +60,21 @@ describe('ProtocolClient', () => {
     await expect(promise).resolves.toMatchObject({ gameFound: true });
   });
 
+  it('answers a hello while an install is still waiting (replies routed by id, any order)', async () => {
+    // The app answers an install only once the user has answered its
+    // consent prompt; the hello sent meanwhile must not wait for that.
+    const install = client.install({ file: 'a', pageUrl: null, downloadUrl: null });
+    await Promise.resolve();
+    const hello = client.hello({ extensionVersion: '1', browser: 'chrome' });
+    expect(port.sent.map((m) => m.type)).toEqual(['install', 'hello']);
+
+    port.reply({ id: '2', ok: true, type: 'hello' });
+    await expect(hello).resolves.toMatchObject({ type: 'hello' });
+
+    port.reply({ id: '1', ok: true, type: 'installed' });
+    await expect(install).resolves.toMatchObject({ type: 'installed' });
+  });
+
   it('reuses the same port across requests', async () => {
     const p1 = client.hello({ extensionVersion: '1', browser: 'chrome' });
     port.reply({ id: '1', ok: true });
