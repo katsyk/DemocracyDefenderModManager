@@ -498,7 +498,9 @@ mod tests {
             resolved.join("Foo").join("inner"),
             resolved.join(".."),
             resolved.join("..").join("mods"),
-            resolved.join("Foo").join("..").join("Bar"),
+            // (Not built on `resolved`: on Windows a `\\?\` path drops a
+            // pushed `..` together with the name before it.)
+            root.join("Foo").join("..").join("Bar"),
             std::fs::canonicalize(base.path()).unwrap().join("elsewhere"),
         ] {
             assert!(ensure_mod_folder(&root, &bad).is_err(), "{bad:?}");
