@@ -51,3 +51,16 @@ export function deployableEntries(configs: Config[], loadedGuids: Iterable<strin
     const loaded = configs.filter(c => known.has(c.Guid));
     return { loaded, missing: configs.length - loaded.length };
 }
+
+/** Take every entry of the mod `guid` out of `configs`, in place (so a
+ * list shown on the page updates too); returns how many there were. */
+export function removeEntriesOf(configs: Config[], guid: string): number {
+    let removed = 0;
+    for (let i = configs.length - 1; i >= 0; i--) {
+        if (configs[i].Guid === guid) {
+            configs.splice(i, 1);
+            removed++;
+        }
+    }
+    return removed;
+}
