@@ -39,14 +39,13 @@ export async function getMods(): Promise<Mod[]> {
     return mods.map(rawModToMod);
 }
 
-/** Delete a mod: its folder, its entries in the saved profiles, and what
- * the last update check said about it. Either it's removed completely or
- * this throws (the "Couldn't remove ..." message) and nothing changed.
- * Resolves to a note when some of its files were still in use and are
- * deleted on the next start instead. */
-export async function deleteMod(guid: UUID): Promise<string | null> {
+/** Delete a mod: it's out of the mod list and the saved profiles when
+ * this resolves (its files are deleted in the background, or on the next
+ * start if some are still in use). Either that, or this throws (the
+ * "Couldn't remove ..." message) and nothing changed. */
+export async function deleteMod(guid: UUID): Promise<void> {
     log.debug("Invoking `delete_mod`.");
-    return await invoke<string | null>("delete_mod", { guid });
+    await invoke<void>("delete_mod", { guid });
 }
 
 export async function addMod(archiveFile: string): Promise<InstalledMod> {

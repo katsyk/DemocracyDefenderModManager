@@ -409,7 +409,22 @@
         return reset;
     }
 
+    /** The delete in progress, if any: closing waits for it (see
+     * `handleCloseRequest`), so the profiles saved on close already have
+     * the deleted mod taken out. */
+    let deleteInFlight: Promise<void> | null = null;
+
     async function doDeleteMod(guid: string) {
+        const run = deleteModNow(guid);
+        deleteInFlight = run;
+        try {
+            await run;
+        } finally {
+            if (deleteInFlight === run) deleteInFlight = null;
+        }
+    }
+
+    async function deleteModNow(guid: string) {
         const mod = mods.find(m => m.guid == guid);
         if (!mod) return;
 
@@ -420,7 +435,7 @@
             // The backend deletes first. Only a mod it really removed leaves
             // the lists here: a delete that fails changes nothing, on either
             // side, so the mod can't linger unseen and block adding it again.
-            const note = await deleteMod(mod.guid);
+            await deleteMod(mod.guid);
             const i = mods.findIndex(m => m.guid === mod.guid);
             if (i !== -1) mods.splice(i, 1);
             removeModFromProfiles(mod.guid);
@@ -429,7 +444,6 @@
             // back as "Mod not found".
             const saved = await doSaveProfiles();
             if (!saved.ok) log.warn(`Failed to save profiles after deleting a mod: ${saved.error}`);
-            if (note) showPopup(new NotificationPopup("warning", note));
         } catch(ex: unknown) {
             showPopup(new ErrorPopup(t("pages.mods.popup.error.delete.message"), errorMessage(ex)));
             // Show what the backend really has (e.g. the mod was already gone).
@@ -911,6 +925,19 @@
             if (!confirmed) {
                 log.info("Close cancelled: deploy in progress.");
                 return;
+            }
+        }
+
+        // A delete that's still running would otherwise race this save:
+        // profiles saved with the mod still in them would bring it back as
+        // "Mod not found". Wait for it (it's quick: its files are deleted
+        // in the background).
+        if (deleteInFlight) {
+            log.info("Close requested during a delete; waiting for it first.");
+            try {
+                await withTimeout(deleteInFlight, CLOSE_SAVE_TIMEOUT_MS, "delete still running");
+            } catch (ex: unknown) {
+                log.warn(`Closing without waiting any longer for the delete: ${errorMessage(ex)}`);
             }
         }
 
