@@ -699,19 +699,28 @@ async fn run_check_with(
         results.push(e);
     }
 
-    let report = UpdateCheckReport {
+    let mut report = UpdateCheckReport {
         trigger,
         checked_at: now_unix(),
         results,
         nexus_rate_limit: nexus_rate,
         nexus_checked_recently: nexus_all_recent,
     };
+    // A mod deleted while the check waited on the network must not get its
+    // update status back. The mod list stays locked until the report is
+    // stored (the same order `delete_mod` locks them in), so a delete can't
+    // slip in between.
+    let listed = state.mods.lock().await;
+    if let Some(listed) = listed.as_ref() {
+        report.results.retain(|e| listed.iter().any(|m| m.guid() == e.guid));
+    }
     log::info!(
         "Update check done: {} source(s) checked, {} mod(s) with updates.",
         report.results.len(),
         report.available_count()
     );
     *state.last_update_report.lock().await = Some(report.clone());
+    drop(listed);
     *state.last_update_check.lock().await = Some(tokio::time::Instant::now());
     Ok(report)
 }
@@ -1360,6 +1369,29 @@ mod tests {
         backdate_nexus_checks(&state, 40 * 86_400).await;
         run_check_with(&state, CheckTrigger::Manual, &factory).await.unwrap();
         assert!(matches!(used.lock().unwrap().as_slice(), [NexusAuth::ApiKey(_)]));
+    }
+
+    /// A mod deleted while a check waits on the network doesn't get its
+    /// update status back when the check stores its report.
+    #[tokio::test]
+    async fn a_mod_deleted_during_a_check_is_left_out_of_its_report() {
+        let (base, _seen) = mock_nexus("[]".into()).await;
+        let (_dir, state, guid) = nexus_only_state().await;
+        let state = std::sync::Arc::new(state);
+        let during = state.clone();
+        let factory = move |auth: NexusAuth| {
+            // The check is past reading the mod list: delete the mod now.
+            if let Ok(mut mods) = during.mods.try_lock() {
+                if let Some(mods) = mods.as_mut() {
+                    mods.retain(|m| m.guid() != guid);
+                }
+            }
+            NexusClient::with_base(auth, &base)
+        };
+        let report = run_check_with(&state, CheckTrigger::Manual, &factory).await.unwrap();
+        assert!(report.results.iter().all(|e| e.guid != guid), "{:?}", report.results);
+        let stored = state.last_update_report.lock().await.clone().unwrap();
+        assert!(stored.results.iter().all(|e| e.guid != guid));
     }
 
     #[tokio::test]
