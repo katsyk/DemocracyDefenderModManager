@@ -111,6 +111,12 @@ pub fn numbered(base: &str, n: usize) -> String {
 /// `mods_root` joined with a single plain name (no `.`, `..`, root or
 /// drive), whose parent resolves to the same folder as `mods_root` -- and
 /// fail otherwise. Every delete inside the mod storage calls this first.
+///
+/// The same folder can be spelled differently on Windows: with or without
+/// the `\\?\` prefix `canonicalize` adds, or in another letter case. Such a
+/// `target` is accepted only when both its parent and `mods_root` resolve,
+/// and resolve to the same folder -- the name check alone is never enough
+/// for it.
 pub fn ensure_mod_folder(mods_root: &Path, target: &Path) -> anyhow::Result<()> {
     let refuse = || {
         anyhow::anyhow!(
@@ -119,21 +125,37 @@ pub fn ensure_mod_folder(mods_root: &Path, target: &Path) -> anyhow::Result<()> 
             mods_root
         )
     };
-    let rest = target.strip_prefix(mods_root).map_err(|_| refuse())?;
-    let mut components = rest.components();
-    match (components.next(), components.next()) {
-        (Some(Component::Normal(name)), None) if !name.is_empty() => {
-            // Windows drops trailing dots and spaces from names, so a
-            // delete of `Foo.` would remove `Foo`.
-            if cfg!(windows) && has_windows_alias_ending(&name.to_string_lossy()) {
-                return Err(refuse());
+    let lexically_inside = match target.strip_prefix(mods_root) {
+        Ok(rest) => {
+            let mut components = rest.components();
+            match (components.next(), components.next()) {
+                (Some(Component::Normal(name)), None) if !name.is_empty() => true,
+                _ => return Err(refuse()),
             }
         }
-        _ => return Err(refuse()),
+        // Another spelling of the storage (see above): only a plain last
+        // name, and no `.`/`..` anywhere, may go on to the resolved check.
+        Err(_) => {
+            let plain = target
+                .components()
+                .all(|c| !matches!(c, Component::CurDir | Component::ParentDir));
+            if !plain || !matches!(target.components().next_back(), Some(Component::Normal(_))) {
+                return Err(refuse());
+            }
+            false
+        }
+    };
+    let name = target.file_name().ok_or_else(refuse)?;
+    // Windows drops trailing dots and spaces from names, so a delete of
+    // `Foo.` would remove `Foo`.
+    if cfg!(windows) && has_windows_alias_ending(&name.to_string_lossy()) {
+        return Err(refuse());
     }
     let parent = target.parent().ok_or_else(refuse)?;
     match (std::fs::canonicalize(parent), std::fs::canonicalize(mods_root)) {
         (Ok(canonical_parent), Ok(canonical_root)) => {
+            // Both resolved the same way (prefix, on-disk letter case), so
+            // one folder gives equal paths.
             if canonical_parent != canonical_root {
                 return Err(refuse());
             }
@@ -142,7 +164,7 @@ pub fn ensure_mod_folder(mods_root: &Path, target: &Path) -> anyhow::Result<()> 
         // canonicalized: the lexical check above -- `mods_root` plus one
         // plain name -- still holds, so rely on it rather than refusing
         // every delete there.
-        (parent_result, root_result) => {
+        (parent_result, root_result) if lexically_inside => {
             log::warn!(
                 "Couldn't resolve {:?} / {:?} ({:?} / {:?}); relying on the name check alone.",
                 parent,
@@ -151,6 +173,7 @@ pub fn ensure_mod_folder(mods_root: &Path, target: &Path) -> anyhow::Result<()> 
                 root_result.err()
             );
         }
+        _ => return Err(refuse()),
     }
     Ok(())
 }
@@ -163,11 +186,123 @@ pub fn has_windows_alias_ending(name: &str) -> bool {
 
 /// `remove_dir_all(target)`, but only after [`ensure_mod_folder`] agrees
 /// that `target` is a single folder directly inside `mods_root`.
+///
+/// A folder that's already gone counts as removed. When the delete fails,
+/// read-only attributes inside the folder are cleared (Windows won't
+/// delete a read-only file on drives without POSIX deletes, such as FAT32
+/// or exFAT) and it's tried again a few times, a moment apart (a virus
+/// scanner or the search indexer often has a new file open briefly).
 pub async fn remove_mod_folder(mods_root: &Path, target: &Path) -> anyhow::Result<()> {
     ensure_mod_folder(mods_root, target)?;
-    tokio::fs::remove_dir_all(target)
+    let target_owned = target.to_path_buf();
+    tokio::task::spawn_blocking(move || remove_tree_with_retries(&target_owned, REMOVE_RETRY_DELAYS))
         .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r)
         .with_context(|| format!("couldn't delete {:?}", target))
+}
+
+/// How long to wait before each retry of a failed delete.
+pub const REMOVE_RETRY_DELAYS: &[std::time::Duration] = &[
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(300),
+    std::time::Duration::from_millis(700),
+];
+
+/// Delete the tree at `target` (never following symlinks or junctions),
+/// retrying after each of `delays` with read-only attributes cleared.
+/// Already gone is success.
+fn remove_tree_with_retries(target: &Path, delays: &[std::time::Duration]) -> anyhow::Result<()> {
+    let mut last = match remove_tree_once(target) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    for delay in delays {
+        log::info!("Deleting {:?} failed ({}); clearing read-only attributes and trying again.", target, last);
+        clear_readonly_tree(target);
+        std::thread::sleep(*delay);
+        last = match remove_tree_once(target) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+    }
+    Err(last.into())
+}
+
+fn remove_tree_once(target: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(target) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // `remove_dir_all` also says "not found" for a file that vanished
+            // under it; only a missing folder is done.
+            if std::fs::symlink_metadata(target).is_err() {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+        other => other,
+    }
+}
+
+/// Make everything in the tree at `root` (itself included) writable, so it
+/// can be deleted. Symlinks and junctions are neither changed nor
+/// followed. Best effort: errors are ignored.
+pub fn clear_readonly_tree(root: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(root) else { return };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    make_writable(root, &meta);
+    if meta.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                clear_readonly_tree(&entry.path());
+            }
+        }
+    }
+}
+
+// On Windows `set_readonly(false)` only clears the read-only attribute.
+#[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
+fn make_writable(path: &Path, meta: &std::fs::Metadata) {
+    let mut perms = meta.permissions();
+    if perms.readonly() {
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+#[cfg(unix)]
+fn make_writable(path: &Path, meta: &std::fs::Metadata) {
+    use std::os::unix::fs::PermissionsExt;
+    // Owner only: a folder also needs to be listable and enterable.
+    let wanted = if meta.is_dir() { 0o700 } else { 0o200 };
+    let mode = meta.permissions().mode();
+    if mode & wanted != wanted {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | wanted));
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+fn make_writable(_path: &Path, _meta: &std::fs::Metadata) {}
+
+/// Prefix of the folder a deleted mod's folder is renamed to before its
+/// files are deleted. Taking the whole folder out of the storage in one
+/// rename first means a mod is never left half deleted: either the rename
+/// works and the mod is gone from the list at once (its files follow, at
+/// the latest on the next start), or it fails and nothing was touched.
+pub const PENDING_DELETE_PREFIX: &str = ".delete-";
+/// Suffix of the small file written next to a pending delete before the
+/// rename. Only a `.delete-<id>` folder that has one is ever deleted at
+/// startup, so a folder DDMM didn't set aside itself is never removed.
+pub const PENDING_DELETE_RECORD_SUFFIX: &str = ".pending";
+
+/// The record file for the pending-delete folder `dir`.
+pub fn pending_delete_record_path(dir: &Path) -> PathBuf {
+    let mut name = dir.file_name().unwrap_or_default().to_os_string();
+    name.push(PENDING_DELETE_RECORD_SUFFIX);
+    dir.with_file_name(name)
 }
 
 /// Prefix of the throwaway folder an update is extracted into.
@@ -345,5 +480,152 @@ mod tests {
         assert!(base.path().join("settings.json").is_file());
         remove_mod_folder(&root, &root.join("Keep")).await.unwrap();
         assert!(!root.join("Keep").exists());
+    }
+
+    /// The storage spelled another way (here: resolved, as `canonicalize`
+    /// gives it) still passes for a folder directly in it -- and still
+    /// refuses anything else.
+    #[test]
+    fn another_spelling_of_the_storage_passes_only_for_single_folders() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("mods");
+        std::fs::create_dir_all(root.join("Foo").join("inner")).unwrap();
+        let resolved = std::fs::canonicalize(&root).unwrap();
+        assert!(ensure_mod_folder(&root, &resolved.join("Foo")).is_ok());
+        assert!(ensure_mod_folder(&resolved, &root.join("Foo")).is_ok());
+        for bad in [
+            resolved.clone(),
+            resolved.join("Foo").join("inner"),
+            resolved.join(".."),
+            resolved.join("..").join("mods"),
+            // (Not built on `resolved`: on Windows a `\\?\` path drops a
+            // pushed `..` together with the name before it.)
+            root.join("Foo").join("..").join("Bar"),
+            std::fs::canonicalize(base.path()).unwrap().join("elsewhere"),
+        ] {
+            assert!(ensure_mod_folder(&root, &bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// Another spelling that can't be resolved is refused: the name check
+    /// alone only counts for `mods_root` itself plus one name.
+    #[test]
+    fn an_unresolvable_other_spelling_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("mods");
+        std::fs::create_dir_all(&root).unwrap();
+        let other = base.path().join("not-there").join("mods");
+        assert!(ensure_mod_folder(&root, &other.join("Foo")).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_folder_that_is_already_gone_counts_as_removed() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("mods");
+        std::fs::create_dir_all(&root).unwrap();
+        remove_mod_folder(&root, &root.join("Gone")).await.unwrap();
+    }
+
+    #[test]
+    fn clearing_read_only_makes_a_tree_deletable() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("Foo");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let file = dir.join("sub").join("a.patch_0");
+        std::fs::write(&file, b"x").unwrap();
+        for p in [&file, &dir.join("sub")] {
+            let mut perms = std::fs::metadata(p).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(p, perms).unwrap();
+        }
+        clear_readonly_tree(&dir);
+        assert!(!std::fs::metadata(&file).unwrap().permissions().readonly());
+        assert!(!std::fs::metadata(dir.join("sub")).unwrap().permissions().readonly());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A link inside a mod's folder pointing outside the storage: deleting
+    /// the mod removes the link, never what it points to (and clearing
+    /// read-only never follows it).
+    #[tokio::test]
+    async fn a_link_inside_a_mod_never_takes_its_target_with_it() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("mods");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(root.join("Foo")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let precious = outside.join("precious.txt");
+        std::fs::write(&precious, b"keep").unwrap();
+        let mut perms = std::fs::metadata(&precious).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&precious, perms).unwrap();
+        let link = root.join("Foo").join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        #[cfg(windows)]
+        {
+            // A junction: needs no special rights, unlike a symlink.
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(&outside)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        clear_readonly_tree(&root.join("Foo"));
+        assert!(std::fs::metadata(&precious).unwrap().permissions().readonly(), "the link was followed");
+        remove_mod_folder(&root, &root.join("Foo")).await.unwrap();
+        assert!(!root.join("Foo").exists());
+        assert_eq!(std::fs::read(&precious).unwrap(), b"keep");
+    }
+
+    /// Windows: `canonicalize` gives `\\?\C:\...`, the storage path DDMM
+    /// builds doesn't have the prefix; letter case can differ too. Both
+    /// spellings are one folder and delete; the guard still refuses
+    /// anything but a single folder in either spelling.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn verbatim_and_other_case_spellings_work_on_windows() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("mods");
+        for name in ["A", "B", "C"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(root.join(name).join("x.patch_0"), b"x").unwrap();
+        }
+        let verbatim = std::fs::canonicalize(&root).unwrap();
+        assert!(verbatim.to_string_lossy().starts_with(r"\\?\"), "{verbatim:?}");
+        let upper = PathBuf::from(root.to_string_lossy().to_uppercase());
+        assert!(ensure_mod_folder(&root, &verbatim.join("A")).is_ok());
+        assert!(ensure_mod_folder(&verbatim, &root.join("A")).is_ok());
+        assert!(ensure_mod_folder(&root, &upper.join("A")).is_ok());
+        for bad in [verbatim.join("A").join("x.patch_0"), verbatim.clone(), verbatim.join(".."), upper.join("A").join("x.patch_0")] {
+            assert!(ensure_mod_folder(&root, &bad).is_err(), "{bad:?}");
+        }
+        // A trailing-dot alias is refused in the verbatim spelling too.
+        assert!(ensure_mod_folder(&root, &verbatim.join("A.")).is_err());
+        remove_mod_folder(&root, &verbatim.join("A")).await.unwrap();
+        remove_mod_folder(&verbatim, &root.join("B")).await.unwrap();
+        remove_mod_folder(&root, &upper.join("C")).await.unwrap();
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    /// Windows: a read-only file (attribute set, as RAR archives and
+    /// copied folders can bring along) inside a mod's folder is deleted.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn read_only_files_are_deleted_on_windows() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("mods");
+        let dir = root.join("Foo");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for f in [dir.join("manifest.json"), dir.join("sub").join("a.patch_0")] {
+            std::fs::write(&f, b"x").unwrap();
+            let mut perms = std::fs::metadata(&f).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(&f, perms).unwrap();
+        }
+        remove_mod_folder(&root, &dir).await.unwrap();
+        assert!(!dir.exists());
     }
 }

@@ -247,34 +247,168 @@ pub(crate) async fn ensure_mods_loaded<'a>(
     Ok(state_mods.insert(mods))
 }
 
+/// Delete the mod with `guid`: its folder, the versions its updates
+/// replaced, its entries in every profile (profiles.json on disk too, so it
+/// can't come back as "Mod not found"), and what the last update check said
+/// about it.
+///
+/// Either the mod is removed completely, or nothing changes and the error
+/// (in the "Couldn't remove ..." shape) says why -- see
+/// [`delete_installed_mod`]. Returns as soon as the mod is out of the list
+/// and the profiles, so the page can drop it right away; deleting its
+/// files goes on in the background (and, for files still in use, finishes
+/// on the next start).
 #[tauri::command]
 pub async fn delete_mod(state: State<'_, AppState>, guid: Uuid) -> TAResult<()> {
-    let _data_op = state.data_op().into_ta_result()?;
+    let cleanup = delete_mod_with(&state, guid).await.into_ta_result()?;
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = cleanup.run().await {
+            log::warn!("Some files of a deleted mod couldn't be deleted yet; the next start deletes them: {:#}", e);
+        }
+    });
+    Ok(())
+}
+
+/// [`delete_mod`] without Tauri's `State` wrapper; the returned cleanup
+/// deletes the files.
+pub(crate) async fn delete_mod_with(state: &AppState, guid: Uuid) -> anyhow::Result<PendingCleanup> {
+    let data_op = state.data_op()?;
     let mut mods = state.mods.lock().await;
-    if mods.is_none() {
-        return anyhow::anyhow!("mods not read").into_ta_result();
-    }
-    let mods = mods.as_mut().unwrap();
+    let Some(mods) = mods.as_mut() else {
+        anyhow::bail!("mods not read");
+    };
 
     log::info!("Deleting mod \"{}\"...", guid);
+    let mut cleanup = delete_installed_mod(&state.base_path, mods, guid).await?;
+    cleanup.data_op = Some(data_op);
 
-    if let Some(i) = mods.iter().position(|m| m.guid() == guid) {
-        let mods_root = state.base_path.join(MODS_DIRECTORY);
-        // Checked before the mod leaves the list, so a refused delete
-        // doesn't leave a mod that silently comes back on the next launch.
-        mod_folder::ensure_mod_folder(&mods_root, &mods[i].directory).into_ta_result()?;
-        let r#mod = mods.remove(i);
-        log::info!("Mod removed form registry.");
+    // An update found for the deleted mod must not show up on a new
+    // install of it (which may come from another site).
+    if let Some(report) = state.last_update_report.lock().await.as_mut() {
+        report.results.retain(|e| e.guid != guid);
+    }
+    log::info!("Mod removed; deleting its files.");
+    Ok(cleanup)
+}
 
-        log::info!("Deleting files...");
-        mod_folder::remove_mod_folder(&mods_root, &r#mod.directory).await.into_ta_result()?;
-        remove_replaced_versions_of(&mods_root, &r#mod.directory).await;
+/// What's left to delete of a removed mod: its set-aside folder and the
+/// versions its updates replaced. Everything in it is already hidden and
+/// recorded so that it's never loaded or restored, whether or not this
+/// finishes.
+#[derive(Debug)]
+pub(crate) struct PendingCleanup {
+    mods_root: PathBuf,
+    set_aside: Option<PathBuf>,
+    backups: Vec<PathBuf>,
+    /// Keeps a data folder move from starting while files are deleted.
+    data_op: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
 
+impl PendingCleanup {
+    /// Delete it all. An error means something is left for the next start.
+    pub(crate) async fn run(self) -> anyhow::Result<()> {
+        for backup in &self.backups {
+            match mod_folder::remove_mod_folder(&self.mods_root, backup).await {
+                Ok(()) => {
+                    let _ = tokio::fs::remove_file(mod_folder::backup_record_path(backup)).await;
+                }
+                Err(e) => log::warn!("Couldn't remove {:?} yet: {:#}", backup, e),
+            }
+        }
+        if let Some(set_aside) = &self.set_aside {
+            finish_pending_delete(&self.mods_root, set_aside).await?;
+        }
         log::info!("Mod deletion complete.");
         Ok(())
-    } else {
-        anyhow_tauri::bail!("mod with GUID {{{}}} not found", guid);
     }
+}
+
+/// The work of [`delete_mod`], on the already-locked mod list.
+///
+/// 1. The mod's folder must pass [`mod_folder::ensure_mod_folder`].
+/// 2. The whole folder is renamed to a hidden `.delete-<id>` folder (with a
+///    record next to it saying DDMM set it aside). A rename either works or
+///    changes nothing, so a file in use (Windows) can't leave the mod half
+///    deleted: it stays installed and listed, and the error says so.
+/// 3. Only then does the mod leave the list and the saved profiles, and
+///    the versions its updates set aside are marked so they're never put
+///    back (see [`claim_replaced_versions_of`]).
+/// 4. The returned [`PendingCleanup`] deletes the set-aside folder
+///    (read-only files included) and those versions. What it can't delete
+///    (a file still in use) stays hidden -- never loaded, never in the way
+///    of adding the mod again -- and the next start finishes it.
+///
+/// A mod whose folder is already gone (deleted by hand while DDMM was
+/// open) is simply removed.
+pub(crate) async fn delete_installed_mod(base_path: &Path, mods: &mut Vec<Mod>, guid: Uuid) -> anyhow::Result<PendingCleanup> {
+    use crate::install_error::{RemoveError, RemoveStep};
+    let Some(i) = mods.iter().position(|m| m.guid() == guid) else {
+        anyhow::bail!("mod with GUID {{{}}} not found", guid);
+    };
+    let mods_root = base_path.join(MODS_DIRECTORY);
+    let name = mods[i].name().to_string();
+    let dir = mods[i].directory.clone();
+
+    // Checked before the mod leaves the list, so a refused delete doesn't
+    // leave a mod that silently comes back on the next launch.
+    mod_folder::ensure_mod_folder(&mods_root, &dir).map_err(|e| RemoveError::new(&name, RemoveStep::CheckFolder, e))?;
+    let set_aside = take_out_mod_folder(&mods_root, &dir)
+        .await
+        .map_err(|e| RemoveError::new(&name, RemoveStep::TakeOut, e))?;
+
+    mods.remove(i);
+    log::info!("Mod removed from the mod list.");
+    match crate::commands::profiles::remove_from_saved_profiles(base_path, guid).await {
+        Ok(0) => {}
+        Ok(n) => log::info!("Removed {n} profile entr(ies) of the deleted mod."),
+        Err(e) => log::warn!("Couldn't remove the deleted mod from profiles.json: {:#}", e),
+    }
+    let backups = claim_replaced_versions_of(&mods_root, &dir, guid, mods).await;
+    Ok(PendingCleanup { mods_root, set_aside, backups, data_op: None })
+}
+
+/// Rename the mod folder `dir` to a new `.delete-<id>` folder in
+/// `mods_root`, after writing the record that marks it as set aside by
+/// DDMM. Returns the new folder, or `None` if `dir` is already gone. On
+/// failure nothing is left changed. A rename that fails is tried again a
+/// few times, a moment apart (a virus scanner or the search indexer often
+/// has a new file open briefly).
+async fn take_out_mod_folder(mods_root: &Path, dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    match tokio::fs::symlink_metadata(dir).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            log::info!("{:?} is already gone.", dir);
+            return Ok(None);
+        }
+        _ => {}
+    }
+    let set_aside = mods_root.join(format!("{}{}", mod_folder::PENDING_DELETE_PREFIX, Uuid::new_v4()));
+    mod_folder::ensure_mod_folder(mods_root, &set_aside)?;
+    let record = mod_folder::pending_delete_record_path(&set_aside);
+    let data = serde_json::json!({ "folder": dir.file_name().map(|n| n.to_string_lossy().into_owned()) });
+    tokio::fs::write(&record, data.to_string())
+        .await
+        .with_context(|| format!("couldn't write {:?}", record))?;
+
+    let mut attempt = tokio::fs::rename(dir, &set_aside).await;
+    for delay in mod_folder::REMOVE_RETRY_DELAYS {
+        if attempt.is_ok() {
+            break;
+        }
+        tokio::time::sleep(*delay).await;
+        attempt = tokio::fs::rename(dir, &set_aside).await;
+    }
+    if let Err(e) = attempt {
+        let _ = tokio::fs::remove_file(&record).await;
+        return Err(anyhow::Error::from(e).context(format!("couldn't move {:?} to {:?}", dir, set_aside)));
+    }
+    Ok(Some(set_aside))
+}
+
+/// Delete a folder [`take_out_mod_folder`] set aside, then its record.
+async fn finish_pending_delete(mods_root: &Path, set_aside: &Path) -> anyhow::Result<()> {
+    mod_folder::remove_mod_folder(mods_root, set_aside).await?;
+    let _ = tokio::fs::remove_file(mod_folder::pending_delete_record_path(set_aside)).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1328,6 +1462,8 @@ pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Vec<PathBuf> {
     let mut staging = Vec::new();
     let mut hidden_mods = Vec::new();
     let mut records = Vec::new();
+    let mut pending_deletes = Vec::new();
+    let mut pending_records = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
         if !name.starts_with('.') {
@@ -1335,6 +1471,20 @@ pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Vec<PathBuf> {
         }
         let path = entry.path();
         let is_dir = tokio::fs::symlink_metadata(&path).await.map(|m| m.is_dir()).unwrap_or(false);
+        if let Some(rest) = name.strip_prefix(mod_folder::PENDING_DELETE_PREFIX) {
+            if is_dir && Uuid::parse_str(rest).is_ok() {
+                pending_deletes.push(path);
+                continue;
+            }
+            if !is_dir
+                && rest
+                    .strip_suffix(mod_folder::PENDING_DELETE_RECORD_SUFFIX)
+                    .is_some_and(|id| Uuid::parse_str(id).is_ok())
+            {
+                pending_records.push(path);
+                continue;
+            }
+        }
         if let Some(rest) = name.strip_prefix(mod_folder::UPDATE_BACKUP_PREFIX) {
             if is_dir && Uuid::parse_str(rest).is_ok() {
                 backups.push(path);
@@ -1354,6 +1504,30 @@ pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Vec<PathBuf> {
         }
     }
 
+    // Deletes that couldn't finish (a file was in use): only folders DDMM
+    // set aside itself, i.e. with their record, are deleted.
+    for dir in pending_deletes {
+        if tokio::fs::symlink_metadata(mod_folder::pending_delete_record_path(&dir)).await.is_err() {
+            log::warn!("Keeping {:?}: it has no record saying DDMM set it aside for deleting.", dir);
+            continue;
+        }
+        match finish_pending_delete(mods_root, &dir).await {
+            Ok(()) => log::info!("Finished deleting {:?} (a removed mod's files that were in use).", dir),
+            Err(e) => log::warn!("Couldn't finish deleting {:?} yet: {:#}", dir, e),
+        }
+    }
+    for record in pending_records {
+        let dir = record.with_file_name(
+            record
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .trim_end_matches(mod_folder::PENDING_DELETE_RECORD_SUFFIX),
+        );
+        if tokio::fs::symlink_metadata(&dir).await.is_err() && mod_folder::ensure_mod_folder(mods_root, &record).is_ok() {
+            let _ = tokio::fs::remove_file(&record).await;
+        }
+    }
     for backup in backups {
         if let Err(e) = recover_update_backup(mods_root, &backup).await {
             log::error!("Couldn't recover {:?}, left as it is: {:#}", backup, e);
@@ -1558,36 +1732,66 @@ async fn recover_update_backup(mods_root: &Path, backup: &Path) -> anyhow::Resul
     Ok(())
 }
 
-/// After the mod in `mod_dir` was deleted: delete what's left of the
-/// versions its updates replaced (their `.update-backup-*` folders), so a
-/// later start doesn't find them. One that can't be deleted yet keeps its
-/// record, which says the update finished, so it's never restored.
-async fn remove_replaced_versions_of(mods_root: &Path, mod_dir: &Path) {
-    let Some(folder) = mod_dir.file_name().map(|n| n.to_string_lossy().into_owned()) else { return };
-    let Ok(mut entries) = tokio::fs::read_dir(mods_root).await else { return };
+/// After the mod in `mod_dir` (ID `guid`) was deleted: find what's left
+/// of the versions its updates set aside (`.update-backup-*` folders), so
+/// a later start never puts one back where the mod was. Returns the ones
+/// to delete.
+///
+/// A backup belongs to the deleted mod when its record names `mod_dir`'s
+/// folder -- whether that update finished or not (an unfinished one would
+/// otherwise be restored into the now-missing folder) -- or, for a backup
+/// without a record (older versions wrote none), when it has the deleted
+/// mod's ID. Each is first marked as a finished update's leftover, which
+/// is never restored; then:
+///
+/// - a recorded one is deleted, unless its ID belongs to a mod that's
+///   still in `remaining` (the list without the deleted mod) -- that one
+///   is only kept hidden;
+/// - an unrecorded one is only kept hidden (it's never deleted for its ID
+///   alone).
+async fn claim_replaced_versions_of(mods_root: &Path, mod_dir: &Path, guid: Uuid, remaining: &[Mod]) -> Vec<PathBuf> {
+    let mut to_delete = Vec::new();
+    let Some(folder) = mod_dir.file_name().map(|n| n.to_string_lossy().into_owned()) else { return to_delete };
+    let Ok(mut entries) = tokio::fs::read_dir(mods_root).await else { return to_delete };
+    let mut backups = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(id) = name
-            .strip_prefix(mod_folder::UPDATE_BACKUP_PREFIX)
-            .and_then(|r| r.strip_suffix(mod_folder::UPDATE_BACKUP_RECORD_SUFFIX))
-        else {
-            continue;
-        };
-        if Uuid::parse_str(id).is_err() {
-            continue;
-        }
-        let record = read_backup_record(mods_root, &entry.path()).await;
-        if !record.swapped || record.folder.as_deref() != Some(folder.as_str()) {
-            continue;
-        }
-        let backup = mods_root.join(format!("{}{}", mod_folder::UPDATE_BACKUP_PREFIX, id));
-        match mod_folder::remove_mod_folder(mods_root, &backup).await {
-            Ok(()) => {
-                let _ = tokio::fs::remove_file(entry.path()).await;
-            }
-            Err(e) => log::warn!("Couldn't remove {:?} yet: {:#}", backup, e),
+        let Some(id) = name.strip_prefix(mod_folder::UPDATE_BACKUP_PREFIX) else { continue };
+        if Uuid::parse_str(id).is_ok() && entry.path().is_dir() {
+            backups.push(entry.path());
         }
     }
+    for backup in backups {
+        let record = mod_folder::backup_record_path(&backup);
+        let recorded = tokio::fs::symlink_metadata(&record).await.is_ok();
+        let backup_guid = read_manifest_quietly(&backup.join(MANIFEST_FILE)).await.map(|m| manifest_guid(&m));
+        let ours = if recorded {
+            read_backup_record(mods_root, &record).await.folder.as_deref() == Some(folder.as_str())
+        } else {
+            backup_guid == Some(guid)
+        };
+        if !ours {
+            continue;
+        }
+        // An unrecorded one gets a record naming no folder: a later delete
+        // of a mod in that folder never claims it for deleting.
+        let marked = if recorded {
+            write_backup_record(&record, mod_dir, true).await
+        } else {
+            tokio::fs::write(&record, serde_json::json!({ "folder": null, "swapped": true }).to_string()).await
+        };
+        if let Err(e) = marked {
+            log::warn!("Couldn't mark {:?} as never to be restored: {}", backup, e);
+            continue;
+        }
+        let still_installed = backup_guid.is_some_and(|g| remaining.iter().any(|m| m.guid() == g));
+        if recorded && !still_installed {
+            to_delete.push(backup);
+        } else {
+            log::info!("Keeping {:?} hidden (never restored): it may belong to a mod that's still installed.", backup);
+        }
+    }
+    to_delete
 }
 
 async fn read_manifest_quietly(file: &Path) -> Option<Manifest> {
@@ -2824,7 +3028,10 @@ mod tests {
         write_v1_mod(&other, GUID_A, "Alpha");
         write_swapped_record(&other, "Alpha");
 
-        remove_replaced_versions_of(&root, &root.join("Beta")).await;
+        for backup in claim_replaced_versions_of(&root, &root.join("Beta"), Uuid::parse_str(GUID_B).unwrap(), &[]).await {
+            mod_folder::remove_mod_folder(&root, &backup).await.unwrap();
+            std::fs::remove_file(mod_folder::backup_record_path(&backup)).unwrap();
+        }
         assert!(!backup.exists());
         assert!(!mod_folder::backup_record_path(&backup).exists());
         assert!(other.is_dir(), "another mod's backup must stay");
@@ -2906,5 +3113,477 @@ mod tests {
         let msg = err_text(install_from_folder(base.path(), guard.as_mut().unwrap(), &staging).await);
         assert!(msg.contains("working"), "{msg}");
         assert!(staging.join(MANIFEST_FILE).is_file());
+    }
+
+    // --- deleting a mod (issue #45) ---
+
+    fn write_profiles(base: &Path, profiles: &[(&str, &[&str])]) {
+        let profiles: Vec<serde_json::Value> = profiles
+            .iter()
+            .map(|(name, guids)| {
+                serde_json::json!({
+                    "Version": "V1",
+                    "Name": name,
+                    "Configs": guids
+                        .iter()
+                        .map(|g| serde_json::json!({ "For": "V1", "Guid": g, "Enabled": true, "Toggled": [], "Selected": [] }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let data = serde_json::json!({ "Profiles": profiles, "Active": 0 });
+        std::fs::write(base.join("profiles.json"), data.to_string()).unwrap();
+    }
+
+    fn saved_profile_guids(base: &Path) -> Vec<Vec<String>> {
+        let data: serde_json::Value = serde_json::from_slice(&std::fs::read(base.join("profiles.json")).unwrap()).unwrap();
+        data["Profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                p["Configs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c["Guid"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Everything in `mods/`, hidden working folders and records included.
+    fn storage_entries(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    async fn listed(state: &AppState) -> Vec<Uuid> {
+        state.mods.lock().await.as_ref().unwrap().iter().map(|m| m.guid()).collect()
+    }
+
+    /// The whole reported sequence: delete a mod, then add the same file
+    /// again. It used to fail with "already has that ID", with the old
+    /// folder still in the storage and the mod still in profiles.json.
+    #[tokio::test]
+    async fn a_deleted_mod_is_gone_everywhere_and_can_be_added_again() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        let state = fresh_library(base.path()).await;
+        let a = install_v1(&state, src.path(), "Alpha.zip", GUID_A, "Alpha").await;
+        let b = install_v1(&state, src.path(), "Smarter Guard Dogs.zip", GUID_B, "Smarter Guard Dogs").await;
+        write_profiles(base.path(), &[("Default", &[GUID_A, GUID_B]), ("Other", &[GUID_B]), ("Empty", &[])]);
+        // An update of it that couldn't be deleted yet, and a finished
+        // update's backup of it.
+        let backup = root.join(format!(".update-backup-{}", Uuid::new_v4()));
+        write_v1_mod(&backup, GUID_B, "Smarter Guard Dogs");
+        write_swapped_record(&backup, &b.directory.file_name().unwrap().to_string_lossy());
+        *state.last_update_report.lock().await = Some(
+            serde_json::from_value(serde_json::json!({
+                "Trigger": "Manual",
+                "CheckedAt": 0,
+                "Results": [
+                    { "Guid": GUID_A, "Provider": "nexus", "DisplayName": "Alpha", "Status": { "Kind": "UpToDate" } },
+                    { "Guid": GUID_B, "Provider": "nexus", "DisplayName": "Dogs", "Status": { "Kind": "UpdateAvailable" } },
+                ],
+            }))
+            .unwrap(),
+        );
+
+        let cleanup = delete_mod_with(&state, b.guid()).await.unwrap();
+        // Before any file is deleted, the mod is out of the list and the
+        // profiles, and its folder name is free.
+        assert_eq!(listed(&state).await, vec![a.guid()]);
+        assert_eq!(saved_profile_guids(base.path()), vec![vec![GUID_A.to_string()], vec![], vec![]]);
+        assert!(!b.directory.exists());
+        cleanup.run().await.unwrap();
+        assert_eq!(listed(&state).await, vec![a.guid()]);
+        assert!(!b.directory.exists());
+        assert_eq!(storage_entries(&root), vec!["Alpha".to_string()], "nothing of it is left behind");
+        assert_eq!(
+            saved_profile_guids(base.path()),
+            vec![vec![GUID_A.to_string()], vec![], vec![]],
+            "every profile entry of it is gone from profiles.json"
+        );
+        let report = state.last_update_report.lock().await.clone().unwrap();
+        assert!(report.results.iter().all(|e| e.guid != b.guid()));
+        assert_eq!(report.results.len(), 1);
+
+        // Adding it again works, right away and after a restart.
+        let again = install_v1(&state, src.path(), "Smarter Guard Dogs.zip", GUID_B, "Smarter Guard Dogs").await;
+        assert_eq!(again.directory, b.directory, "it gets its old folder name back, not \"(2)\"");
+        let reloaded = load(base.path()).await;
+        assert_eq!(reloaded.len(), 2);
+    }
+
+    /// The folder was deleted by hand while DDMM was open: removing the
+    /// mod still works (it used to fail with "couldn't delete").
+    #[tokio::test]
+    async fn a_mod_whose_folder_was_deleted_by_hand_is_removed_cleanly() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let b = install_v1(&state, src.path(), "Beta.zip", GUID_B, "Beta").await;
+        write_profiles(base.path(), &[("Default", &[GUID_B])]);
+        std::fs::remove_dir_all(&b.directory).unwrap();
+
+        delete_mod_with(&state, b.guid()).await.unwrap().run().await.unwrap();
+        assert!(listed(&state).await.is_empty());
+        assert_eq!(saved_profile_guids(base.path()), vec![Vec::<String>::new()]);
+        assert!(storage_entries(&base.path().join(MODS_DIRECTORY)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_mod_that_isnt_listed_is_an_error_and_touches_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let a = install_v1(&state, src.path(), "Alpha.zip", GUID_A, "Alpha").await;
+        let err = delete_mod_with(&state, Uuid::parse_str(GUID_B).unwrap()).await.unwrap_err();
+        assert!(format!("{err:#}").contains("not found"), "{err:#}");
+        assert!(a.directory.is_dir());
+        assert_eq!(listed(&state).await, vec![a.guid()]);
+    }
+
+    /// A mod whose folder isn't a single folder in the storage is refused
+    /// -- in the unified error shape -- and stays listed (it used to stay
+    /// in the backend's list while the page dropped it).
+    #[tokio::test]
+    async fn a_refused_delete_keeps_the_mod_and_says_why() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        write_v1_mod(outside.path(), GUID_A, "Alpha");
+        state.mods.lock().await.as_mut().unwrap().push(Mod {
+            manifest: Manifest::parse(v1_manifest(GUID_A, "Alpha").as_bytes(), "manifest.json").unwrap(),
+            directory: outside.path().to_path_buf(),
+            sources: Vec::new(),
+        });
+        write_profiles(base.path(), &[("Default", &[GUID_A])]);
+
+        let err = format!("{:#}", delete_mod_with(&state, Uuid::parse_str(GUID_A).unwrap()).await.unwrap_err());
+        assert!(
+            err.starts_with("Couldn't remove \"Alpha\".\nStep: checking its folder in DDMM's mod storage\nCause: refusing to touch"),
+            "{err}"
+        );
+        assert!(err.contains("\nHint: Nothing was deleted and the mod is still installed."), "{err}");
+        assert!(outside.path().join(MANIFEST_FILE).is_file());
+        assert_eq!(listed(&state).await.len(), 1);
+        assert_eq!(saved_profile_guids(base.path()), vec![vec![GUID_A.to_string()]]);
+    }
+
+    /// When the folder can't be taken out of the storage (on Windows: a
+    /// file in it is in use), nothing is deleted: the mod stays installed,
+    /// complete and listed, and the error says so. It used to leave the
+    /// list first and then be half deleted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_delete_that_cant_start_leaves_the_mod_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        let state = fresh_library(base.path()).await;
+        let b = install_v1(&state, src.path(), "Beta.zip", GUID_B, "Beta").await;
+        write_profiles(base.path(), &[("Default", &[GUID_B])]);
+        let before = tree_size(&b.directory);
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(root.join("probe"), b"").is_ok() {
+            // Running as root: permissions don't stop anything.
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let result = delete_mod_with(&state, b.guid()).await;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.starts_with("Couldn't remove \"Beta\".\nStep: "), "{err}");
+        assert!(err.contains("\nHint: Nothing was deleted and the mod is still installed."), "{err}");
+        assert_eq!(tree_size(&b.directory), before, "not a single file is gone");
+        assert_eq!(listed(&state).await, vec![b.guid()]);
+        assert_eq!(saved_profile_guids(base.path()), vec![vec![GUID_B.to_string()]]);
+        assert_eq!(storage_entries(&root), vec!["Beta".to_string()], "no record or set-aside folder left");
+
+        // Once the cause is gone it deletes normally.
+        delete_mod_with(&state, b.guid()).await.unwrap().run().await.unwrap();
+        assert!(storage_entries(&root).is_empty());
+    }
+
+    /// Read-only files and folders inside a mod (as some archives and
+    /// copies bring them) don't stop a delete.
+    #[tokio::test]
+    async fn a_mod_with_read_only_files_is_deleted() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        let state = fresh_library(base.path()).await;
+        let b = install_v1(&state, src.path(), "Beta.zip", GUID_B, "Beta").await;
+        let sub = b.directory.join("textures");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("a.dds"), b"x").unwrap();
+        let top_files = std::fs::read_dir(&b.directory)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_file());
+        for file in top_files.chain([sub.join("a.dds")]) {
+            let mut perms = std::fs::metadata(&file).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(&file, perms).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let mut perms = std::fs::metadata(&sub).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(&sub, perms).unwrap();
+        }
+
+        delete_mod_with(&state, b.guid()).await.unwrap().run().await.unwrap();
+        assert!(!b.directory.exists());
+        assert!(storage_entries(&root).is_empty(), "{:?}", storage_entries(&root));
+        install_v1(&state, src.path(), "Beta.zip", GUID_B, "Beta").await;
+    }
+
+    /// A delete whose files couldn't all go (in use) is finished at the
+    /// next start; the set-aside folder is never loaded or shown again.
+    #[tokio::test]
+    async fn a_pending_delete_is_finished_at_startup_and_never_loaded() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        write_v1_mod(&root.join("Alpha"), GUID_A, "Alpha");
+        let pending = root.join(format!("{}{}", mod_folder::PENDING_DELETE_PREFIX, Uuid::new_v4()));
+        write_v1_mod(&pending, GUID_B, "Beta");
+        std::fs::write(mod_folder::pending_delete_record_path(&pending), br#"{"folder":"Beta"}"#).unwrap();
+        // A record whose folder is already gone.
+        let stale = root.join(format!("{}{}", mod_folder::PENDING_DELETE_PREFIX, Uuid::new_v4()));
+        std::fs::write(mod_folder::pending_delete_record_path(&stale), br#"{"folder":"Gamma"}"#).unwrap();
+
+        let mods = load(base.path()).await;
+        assert_eq!(mods.iter().map(|m| m.name().to_string()).collect::<Vec<_>>(), vec!["Alpha"]);
+        assert_eq!(storage_entries(&root), vec!["Alpha".to_string()]);
+    }
+
+    /// Only folders DDMM set aside itself (with their record) are deleted
+    /// at startup; one without is kept, and still never loaded as a mod or
+    /// renamed into view.
+    #[tokio::test]
+    async fn a_delete_folder_without_its_record_is_kept() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        let unrecorded = root.join(format!("{}{}", mod_folder::PENDING_DELETE_PREFIX, Uuid::new_v4()));
+        write_v1_mod(&unrecorded, GUID_B, "Beta");
+        let mods = load(base.path()).await;
+        assert!(mods.is_empty());
+        assert!(unrecorded.join(MANIFEST_FILE).is_file());
+        assert_eq!(storage_entries(&root).len(), 1);
+    }
+
+    /// Windows: a file in the mod's folder held open without delete
+    /// sharing (as the game, a viewer or a scanner can). Whatever Windows
+    /// allows, the mod is never half deleted: either nothing changed and
+    /// the error says why, or the mod is fully removed from the list and
+    /// its files are deleted on the next start. Both ways it can be added
+    /// again once the file is closed.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_file_in_use_never_leaves_a_half_deleted_mod_on_windows() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        let state = fresh_library(base.path()).await;
+        let b = install_v1(&state, src.path(), "Beta.zip", GUID_B, "Beta").await;
+        write_profiles(base.path(), &[("Default", &[GUID_B])]);
+        let before = tree_size(&b.directory);
+
+        const FILE_SHARE_READ: u32 = 1;
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(b.directory.join(MANIFEST_FILE))
+            .unwrap();
+        let result = delete_mod_with(&state, b.guid()).await;
+        match &result {
+            Err(e) => {
+                let err = format!("{e:#}");
+                println!("in use -> refused: {err}");
+                assert!(
+                    err.starts_with("Couldn't remove \"Beta\".\nStep: taking its folder out of DDMM's mod storage\nCause: "),
+                    "{err}"
+                );
+                assert!(err.contains("A file in its folder is in use"), "{err}");
+                assert_eq!(tree_size(&b.directory), before, "not a single file is gone");
+                assert_eq!(listed(&state).await, vec![b.guid()]);
+                assert_eq!(saved_profile_guids(base.path()), vec![vec![GUID_B.to_string()]]);
+                assert_eq!(storage_entries(&root), vec!["Beta".to_string()]);
+            }
+            Ok(_) => {
+                assert!(listed(&state).await.is_empty());
+                assert_eq!(saved_profile_guids(base.path()), vec![Vec::<String>::new()]);
+                assert!(!b.directory.exists(), "the mod's folder name is free again");
+            }
+        }
+        let result = match result {
+            Ok(cleanup) => {
+                let finished = cleanup.run().await;
+                println!("in use -> set aside, files deleted now: {finished:?}");
+                if finished.is_err() {
+                    assert!(load(base.path()).await.is_empty(), "never loaded while pending");
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+        drop(held);
+
+        if result.is_err() {
+            delete_mod_with(&state, b.guid()).await.unwrap().run().await.unwrap();
+        } else {
+            // The next start finishes the delete.
+            assert!(load(base.path()).await.is_empty());
+        }
+        assert!(storage_entries(&root).is_empty(), "{:?}", storage_entries(&root));
+        install_v1(&state, src.path(), "Beta.zip", GUID_B, "Beta").await;
+    }
+
+    /// Windows: a mod listed under the storage's `\\?\` spelling (or in
+    /// another letter case) is still one folder inside it, and deletes.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_mod_listed_under_another_spelling_of_the_storage_deletes_on_windows() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        let state = fresh_library(base.path()).await;
+        let a = install_v1(&state, src.path(), "Alpha.zip", GUID_A, "Alpha").await;
+        let b = install_v1(&state, src.path(), "Beta.zip", GUID_B, "Beta").await;
+        let verbatim = std::fs::canonicalize(&root).unwrap();
+        assert!(verbatim.to_string_lossy().starts_with(r"\\?\"), "{verbatim:?}");
+        let upper = PathBuf::from(root.to_string_lossy().to_uppercase());
+        {
+            let mut guard = state.mods.lock().await;
+            for m in guard.as_mut().unwrap().iter_mut() {
+                let name = m.directory.file_name().unwrap().to_owned();
+                m.directory = if m.guid() == a.guid() { verbatim.join(name) } else { upper.join(name) };
+            }
+        }
+        delete_mod_with(&state, a.guid()).await.unwrap().run().await.unwrap();
+        delete_mod_with(&state, b.guid()).await.unwrap().run().await.unwrap();
+        assert!(storage_entries(&root).is_empty(), "{:?}", storage_entries(&root));
+    }
+
+    fn backups_in(root: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_dir() && p.file_name().unwrap().to_string_lossy().starts_with(".update-backup-"))
+            .collect();
+        found.sort();
+        found
+    }
+
+    fn names(mods: &[Mod]) -> Vec<String> {
+        let mut n: Vec<String> = mods.iter().map(|m| m.name().to_string()).collect();
+        n.sort();
+        n
+    }
+
+    /// The review's repro: an update of Beta that never finished left its
+    /// old version set aside (record not marked finished). Deleting Beta
+    /// used to leave it, and the next start restored "Beta OLD" into the
+    /// now-free folder.
+    #[tokio::test]
+    async fn a_deleted_mods_unfinished_update_backup_is_not_restored() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        write_v1_mod(&root.join("Beta"), GUID_B, "Beta");
+        let backup = root.join(format!(".update-backup-{}", Uuid::new_v4()));
+        write_v1_mod(&backup, GUID_B, "Beta OLD");
+        write_record(&backup, "Beta");
+
+        let state = fresh_library(base.path()).await;
+        assert_eq!(listed(&state).await, vec![Uuid::parse_str(GUID_B).unwrap()]);
+        assert!(backup.is_dir(), "kept while Beta is installed");
+
+        delete_mod_with(&state, Uuid::parse_str(GUID_B).unwrap()).await.unwrap().run().await.unwrap();
+        assert!(!backup.exists());
+        assert!(!mod_folder::backup_record_path(&backup).exists());
+        assert!(load(base.path()).await.is_empty());
+        assert!(storage_entries(&root).is_empty(), "{:?}", storage_entries(&root));
+    }
+
+    /// Closed (or crashed) right after the delete, before any file was
+    /// deleted: the next start still never brings the mod or its old
+    /// version back.
+    #[tokio::test]
+    async fn a_delete_interrupted_before_its_cleanup_never_brings_the_mod_back() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        write_v1_mod(&root.join("Beta"), GUID_B, "Beta");
+        let backup = root.join(format!(".update-backup-{}", Uuid::new_v4()));
+        write_v1_mod(&backup, GUID_B, "Beta OLD");
+        write_record(&backup, "Beta");
+        let state = fresh_library(base.path()).await;
+
+        let cleanup = delete_mod_with(&state, Uuid::parse_str(GUID_B).unwrap()).await.unwrap();
+        drop(cleanup);
+        assert!(load(base.path()).await.is_empty());
+        assert!(load(base.path()).await.is_empty(), "nor on the start after");
+        assert!(!root.join("Beta").exists());
+    }
+
+    /// A backup recorded for the deleted mod's folder but carrying the ID
+    /// of a mod that's still installed is never deleted -- and never
+    /// restored into the deleted mod's folder either.
+    #[tokio::test]
+    async fn a_backup_with_a_still_installed_mods_id_is_kept_hidden() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        write_v1_mod(&root.join("Alpha"), GUID_A, "Alpha");
+        write_v1_mod(&root.join("Beta"), GUID_B, "Beta");
+        let backup = root.join(format!(".update-backup-{}", Uuid::new_v4()));
+        write_v1_mod(&backup, GUID_A, "Alpha OLD");
+        write_record(&backup, "Beta");
+        let state = fresh_library(base.path()).await;
+
+        delete_mod_with(&state, Uuid::parse_str(GUID_B).unwrap()).await.unwrap().run().await.unwrap();
+        assert!(backup.join(MANIFEST_FILE).is_file(), "never deleted");
+        assert_eq!(names(&load(base.path()).await), vec!["Alpha"]);
+        assert_eq!(names(&load(base.path()).await), vec!["Alpha"]);
+        assert!(backup.is_dir());
+    }
+
+    /// A backup from an older version (no record) with the deleted mod's
+    /// ID: never deleted for its ID alone, but never restored as the
+    /// deleted mod either -- not even after the mod is added and deleted
+    /// again.
+    #[tokio::test]
+    async fn an_unrecorded_backup_of_a_deleted_mod_is_kept_hidden() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        write_v1_mod(&root.join("Beta"), GUID_B, "Beta");
+        let backup = root.join(format!(".update-backup-{}", Uuid::new_v4()));
+        write_v1_mod(&backup, GUID_B, "Beta OLD");
+        let state = fresh_library(base.path()).await;
+
+        delete_mod_with(&state, Uuid::parse_str(GUID_B).unwrap()).await.unwrap().run().await.unwrap();
+        assert!(backup.join(MANIFEST_FILE).is_file());
+        assert!(load(base.path()).await.is_empty());
+
+        install_v1(&state, src.path(), "Beta.zip", GUID_B, "Beta").await;
+        delete_mod_with(&state, Uuid::parse_str(GUID_B).unwrap()).await.unwrap().run().await.unwrap();
+        assert_eq!(backups_in(&root), vec![backup.clone()]);
+        assert!(load(base.path()).await.is_empty());
     }
 }

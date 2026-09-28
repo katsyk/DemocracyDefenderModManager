@@ -1,7 +1,7 @@
 // Run with `pnpm run test:unit` (plain Node; it strips the TypeScript types).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { configFits, deployableEntries, fitConfig, defaultConfigFor } from "../../src/lib/utils/profileEntries.ts";
+import { configFits, deployableEntries, fitConfig, defaultConfigFor, removeEntriesOf } from "../../src/lib/utils/profileEntries.ts";
 
 const v1 = (options) => ({ Version: 1, Guid: "g1", Name: "M", Description: "", Options: options });
 const opt = (subs = 0) => ({ Name: "o", Description: "", SubOptions: subs ? Array.from({ length: subs }, () => ({ Name: "s", Description: "", Include: [] })) : undefined });
@@ -36,4 +36,16 @@ test("stale option choices are reset to the defaults, keeping on/off", () => {
     assert.ok(configFits({ For: "Legacy", Guid: "g1", Enabled: true, Selected: 1 }, legacy));
     assert.ok(!configFits({ For: "Legacy", Guid: "g1", Enabled: true, Selected: 2 }, legacy));
     assert.ok(configFits({ For: "Legacy", Guid: "g1", Enabled: true, Selected: 0 }, { ...legacy, Options: undefined }));
+});
+
+test("a deleted mod leaves every profile, all of its entries, in place", () => {
+    const entry = (guid) => ({ For: "V1", Guid: guid, Enabled: true, Toggled: [], Selected: [] });
+    const configs = [entry("gone"), entry("keep"), entry("gone")];
+    const shown = configs;
+    assert.equal(removeEntriesOf(configs, "gone"), 2);
+    assert.deepEqual(configs.map(c => c.Guid), ["keep"]);
+    // The same array, so a list shown from it updates too.
+    assert.equal(shown, configs);
+    assert.equal(removeEntriesOf(configs, "gone"), 0);
+    assert.equal(removeEntriesOf([], "gone"), 0);
 });

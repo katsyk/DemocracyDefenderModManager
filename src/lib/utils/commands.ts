@@ -39,6 +39,10 @@ export async function getMods(): Promise<Mod[]> {
     return mods.map(rawModToMod);
 }
 
+/** Delete a mod: it's out of the mod list and the saved profiles when
+ * this resolves (its files are deleted in the background, or on the next
+ * start if some are still in use). Either that, or this throws (the
+ * "Couldn't remove ..." message) and nothing changed. */
 export async function deleteMod(guid: UUID): Promise<void> {
     log.debug("Invoking `delete_mod`.");
     await invoke<void>("delete_mod", { guid });
