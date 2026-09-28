@@ -72,11 +72,18 @@ delete this mod?"), DDMM deletes the mod's files from `mods/` and removes it fro
 it. This is different from a profile's **Remove**, which only takes the mod out of the current profile and leaves
 it installed in your Library.
 
+A delete is all or nothing. If DDMM can't take the mod's folder out of `mods/` (on Windows, usually because a file in
+it is open in the game or in File Explorer), nothing is deleted and the mod stays installed. The message says
+**Couldn't remove "…"**, with the step, the cause and a hint. Close whatever has the file open and delete it again.
+If only a few files are still in use after the mod is gone, DDMM deletes them the next time it starts. You can add
+the mod again right away.
+
 ## Mods that can't be found
 
 If a mod in a profile isn't in your Library when DDMM starts (its folder was removed by hand, or its
 `manifest.json` is damaged), the profile keeps its entry, shown as **Mod not found**, in the same place in the load
-order. Fix or re-add the mod and it's back where it was; **Remove** takes the entry out for good.
+order. Fix or re-add the mod and it's back where it was; **Remove** takes the entry out for good, straight away.
+A mod you deleted with the trash-can button never shows up here.
 
 - **Deploy** skips missing mods and says how many it skipped. If *every* mod in the profile is missing, it refuses
   and leaves the game's mods as they are.
