@@ -61,3 +61,30 @@ pub async fn save_profiles(state: State<'_, AppState>, config: ProfilesConfig) -
 
     Ok(())
 }
+
+/// Take every entry of the mod `guid` out of every profile in the saved
+/// profiles.json, and return how many there were. Called when a mod is
+/// deleted, so that a deleted mod never comes back as "Mod not found" --
+/// even if DDMM is closed before the frontend saves its profiles again.
+/// Nothing is written when no profile has it (or there's no file yet).
+pub async fn remove_from_saved_profiles(base_path: &std::path::Path, guid: uuid::Uuid) -> anyhow::Result<usize> {
+    if !tokio::fs::try_exists(base_path.join(PROFILES_FILE)).await? {
+        return Ok(0);
+    }
+    let mut config = do_load_profiles(base_path).await?;
+    let mut removed = 0;
+    for profile in &mut config.profiles {
+        match profile {
+            Profile::V1 { configs, .. } => {
+                let before = configs.len();
+                configs.retain(|c| *c.uuid() != guid);
+                removed += before - configs.len();
+            }
+        }
+    }
+    if removed > 0 {
+        let data = serde_json::to_vec_pretty(&config)?;
+        tokio::fs::write(base_path.join(PROFILES_FILE), data).await?;
+    }
+    Ok(removed)
+}

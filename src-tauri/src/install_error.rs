@@ -118,3 +118,84 @@ impl<T, E: Into<anyhow::Error>> InstallContext<T> for Result<T, E> {
         self.map_err(|e| InstallError::new(subject, step, e))
     }
 }
+
+/// The step of removing a mod that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveStep {
+    /// Making sure its folder is one mod's folder in DDMM's mod storage.
+    CheckFolder,
+    /// Taking its folder out of the mod storage (one rename).
+    TakeOut,
+}
+
+impl RemoveStep {
+    pub fn label(self) -> &'static str {
+        match self {
+            RemoveStep::CheckFolder => "checking its folder in DDMM's mod storage",
+            RemoveStep::TakeOut => "taking its folder out of DDMM's mod storage",
+        }
+    }
+}
+
+/// Why a mod couldn't be removed, in the same shape as [`InstallError`]:
+///
+/// ```text
+/// Couldn't remove "LAS-98 Laser Cannon".
+/// Step: taking its folder out of DDMM's mod storage
+/// Cause: ... (os error 32)
+/// Hint: A file in the mod's folder is in use. ...
+/// ```
+#[derive(Debug)]
+pub struct RemoveError {
+    subject: String,
+    step: RemoveStep,
+    cause: anyhow::Error,
+    hint: Option<String>,
+}
+
+impl RemoveError {
+    /// `subject` is the mod's name as shown in the mod list.
+    pub fn new(subject: impl Into<String>, step: RemoveStep, cause: impl Into<anyhow::Error>) -> Self {
+        let cause = cause.into();
+        let hint = Some(remove_hint(step, &cause).to_string());
+        RemoveError { subject: subject.into(), step, cause, hint }
+    }
+
+    pub fn step(&self) -> RemoveStep {
+        self.step
+    }
+}
+
+/// What to suggest for a failed removal. Every removal error leaves the
+/// mod as it was, so the hint always says so.
+fn remove_hint(step: RemoveStep, cause: &anyhow::Error) -> &'static str {
+    let in_use = cause.chain().any(|e| {
+        e.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            // 5: access denied, 32: sharing violation, 33: lock violation.
+            matches!(io.raw_os_error(), Some(5 | 32 | 33)) || io.kind() == std::io::ErrorKind::PermissionDenied
+        })
+    });
+    match step {
+        RemoveStep::CheckFolder => {
+            "Nothing was deleted and the mod is still installed. Restart DDMM and remove it again; if it's still \
+             refused, close DDMM and delete the mod's folder by hand."
+        }
+        RemoveStep::TakeOut if in_use => {
+            "Nothing was deleted and the mod is still installed. A file in its folder is in use: close Helldivers 2 \
+             and any window showing that folder or a file from it (such as File Explorer), then remove it again."
+        }
+        RemoveStep::TakeOut => "Nothing was deleted and the mod is still installed. Try removing it again.",
+    }
+}
+
+impl fmt::Display for RemoveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Couldn't remove \"{}\".\nStep: {}\nCause: {:#}", self.subject, self.step.label(), self.cause)?;
+        if let Some(hint) = &self.hint {
+            write!(f, "\nHint: {hint}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RemoveError {}
