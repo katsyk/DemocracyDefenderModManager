@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Run on a schedule (or manual dispatch), rustsec/audit-check opens an
       # issue for any advisory it finds, in addition to failing the check.
