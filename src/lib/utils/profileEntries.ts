@@ -16,6 +16,13 @@ export function defaultConfigFor(manifest: Manifest): Config {
     throw "Unknown manifest version!";
 }
 
+/** Whether an option has sub-options to choose from, i.e. whether the
+ * config popup should show a dropdown for it. Manifests may declare
+ * `"SubOptions": []` (or `null`), which has nothing to pick. */
+export function hasSubOptionChoice(option: { readonly SubOptions?: readonly unknown[] | null }): boolean {
+    return Array.isArray(option.SubOptions) && option.SubOptions.length > 0;
+}
+
 function inRange(i: unknown, count: number): boolean {
     return Number.isInteger(i) && (i as number) >= 0 && (i as number) < Math.max(1, count);
 }

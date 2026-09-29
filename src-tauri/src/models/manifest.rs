@@ -593,6 +593,67 @@ mod tests {
         assert!(matches!(m, Manifest::V1(_)));
     }
 
+    /// #55: the config popup builds each option's dropdown from the
+    /// `SubOptions` the frontend receives, i.e. from this manifest as
+    /// serialised by the bridge. Every sub-option must come through, in
+    /// order, under the exact keys `manifest.ts` reads.
+    #[test]
+    fn v1_sub_options_parse_and_reach_the_frontend_intact() {
+        let manifest = fixture("sub_options_v1.json").expect("fixture parses");
+        let Manifest::V1(m) = &manifest else { panic!("expected v1, got {manifest:?}") };
+        let options = m.options.as_ref().unwrap();
+        assert_eq!(options.len(), 3);
+
+        let core = options[0].sub_options.as_ref().expect("core has sub-options");
+        let names: Vec<&str> = core.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["No sway", "Half sway", "Vanilla"]);
+        assert_eq!(core[1].include, [std::path::PathBuf::from("Core/Half")]);
+        assert!(core[2].include.is_empty(), "a sub-option may omit Include");
+
+        // `subOptions` (camelCase) is normalised, not dropped.
+        let primaries = options[1].sub_options.as_ref().expect("camelCase key is kept");
+        assert_eq!(primaries.len(), 2);
+        assert_eq!(options[2].sub_options.as_deref().map(<[_]>::len), Some(0));
+
+        let value = serde_json::to_value(&manifest).unwrap();
+        let sent = &value["Options"][0]["SubOptions"];
+        assert_eq!(sent.as_array().map(Vec::len), Some(3), "{value:#}");
+        assert_eq!(sent[0]["Name"], "No sway");
+        assert_eq!(sent[0]["Description"], "0%");
+        assert_eq!(sent[0]["Include"][0], "Core/None");
+        assert_eq!(value["Options"][1]["SubOptions"][1]["Name"], "Primaries: half sway");
+
+        // And what the frontend sends back (e.g. in a manifest round trip)
+        // parses to the same sub-options.
+        let again: Manifest = serde_json::from_value(value).unwrap();
+        let Manifest::V1(again) = again else { panic!("expected v1") };
+        assert_eq!(again.options.unwrap()[0].sub_options.as_ref().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn v2_sub_options_parse_and_reach_the_frontend_intact() {
+        let manifest = Manifest::parse(
+            br#"{"version": "2", "guid": "{11111111-1111-1111-1111-111111111111}", "name": "x",
+                "options": [{"guid": "22222222-2222-2222-2222-222222222222", "name": "Sway", "description": "",
+                    "sub_options": [
+                        {"guid": "33333333-3333-3333-3333-333333333333", "name": "None", "include": ["A"]},
+                        {"guid": "44444444-4444-4444-4444-444444444444", "name": "Half", "include": ["B"]}
+                    ]}]}"#,
+            "m.json",
+        )
+        .unwrap();
+        let Manifest::V2(m) = &manifest else { panic!("expected v2, got {manifest:?}") };
+        let subs = m.options.as_ref().unwrap()[0].sub_options.as_ref().expect("sub_options kept");
+        assert_eq!(subs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["None", "Half"]);
+
+        let value = serde_json::to_value(&manifest).unwrap();
+        let sent = &value["Options"][0]["SubOptions"];
+        assert_eq!(sent.as_array().map(Vec::len), Some(2), "{value:#}");
+        assert_eq!(sent[1]["Name"], "Half");
+        assert_eq!(sent[1]["Include"][0], "B");
+        assert_eq!(sent[1]["Guid"], "44444444-4444-4444-4444-444444444444");
+    }
+
     #[test]
     fn legacy_manifest_without_version_still_loads() {
         let json = serde_json::json!({

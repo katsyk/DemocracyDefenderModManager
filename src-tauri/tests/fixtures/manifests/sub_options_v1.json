@@ -1,0 +1,34 @@
+{
+    // Shaped like the mod in #55: every option has a dropdown of
+    // sub-options. One uses a camelCase key, which the parser normalises.
+    "Version": 1,
+    "Guid": "3f6e2b10-8c4d-4a57-9b1e-2d7c5a9e6f01",
+    "Name": "Weapon Sway Fixture",
+    "Description": "Sub-option fixture",
+    "Options": [
+        {
+            "Name": "Core (keep this on)",
+            "Description": "Required. Choose how much sway is left.",
+            "Include": ["Core"],
+            "SubOptions": [
+                { "Name": "No sway", "Description": "0%", "Include": ["Core/None"] },
+                { "Name": "Half sway", "Description": "50%", "Include": ["Core/Half"] },
+                { "Name": "Vanilla", "Description": "100%" }
+            ]
+        },
+        {
+            "Name": "All primaries",
+            "Description": "Every primary weapon.",
+            "subOptions": [
+                { "Name": "Primaries: no sway", "Description": "", "Include": ["Primaries/None"] },
+                { "Name": "Primaries: half sway", "Description": "", "Include": ["Primaries/Half"] },
+            ],
+        },
+        {
+            "Name": "No choices",
+            "Description": "An empty dropdown list declares nothing to pick.",
+            "Include": ["Extra"],
+            "SubOptions": []
+        }
+    ]
+}
