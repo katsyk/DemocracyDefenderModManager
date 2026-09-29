@@ -9,6 +9,7 @@
     import type { UUID } from "$lib/types/uuid";
     import PopupBase from "./PopupBase.svelte";
     import Select from "../Select.svelte";
+    import { hasSubOptionChoice } from "$lib/utils/profileEntries";
 
     const { t } = useLocalization();
 
@@ -145,10 +146,11 @@
                             <div class="flex flex-col flex-1 self-stretch min-w-0">
                                 <h2 class="text-xl">{option.Name}</h2>
                                 <p class="flex-1 text-base truncate" title={option.Description}>{option.Description}</p>
-                                {#if option.SubOptions}
+                                {#if option.SubOptions && hasSubOptionChoice(option)}
                                     <Select
                                         bind:selectedIndex={selected[index]}
                                         items={option.SubOptions}
+                                        itemLabel={(sub) => sub.Name}
                                     >
                                         {#snippet renderItem(sub)}
                                             {@const subImage = sub.Image ? imagePaths.get(sub.Image) : undefined}

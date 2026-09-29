@@ -549,6 +549,58 @@ mod tests {
         assert_eq!(total_patches, 2, "Base + Blue, but not Red");
     }
 
+    /// #55: the sub-option picked in the popup (stored as `Selected` in
+    /// the profile) decides which folder is deployed, for every option.
+    #[tokio::test]
+    async fn v1_deploy_uses_the_selected_sub_option_of_each_option() {
+        let dir = tempfile::tempdir().unwrap();
+        for (i, folder) in ["Core", "Core/None", "Core/Half", "Primaries/None", "Primaries/Half", "Extra"]
+            .iter()
+            .enumerate()
+        {
+            write_patch_file(&dir.path().join(folder), i as u32).await;
+        }
+        let manifest = Manifest::parse(
+            include_bytes!("../../tests/fixtures/manifests/sub_options_v1.json"),
+            "sub_options_v1.json",
+        )
+        .unwrap();
+        let r#mod = Mod { manifest, directory: dir.path().to_path_buf(), sources: Vec::new() };
+        let guid = r#mod.guid();
+
+        // A profile saved by the popup: Half sway for core, no sway for primaries.
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "For": "V1", "Guid": guid, "Enabled": true,
+            "Toggled": [true, true, true], "Selected": [1, 0, 0],
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(&config).unwrap()["Selected"], serde_json::json!([1, 0, 0]));
+
+        let mut groups = HashMap::new();
+        collect_files_for_mod(&r#mod, &config, &mut groups).await.unwrap();
+        let mut deployed: Vec<PathBuf> = groups
+            .values()
+            .flatten()
+            .map(|t| t.patch.clone().unwrap().strip_prefix(dir.path()).unwrap().parent().unwrap().to_path_buf())
+            .collect();
+        deployed.sort();
+        let expected: Vec<PathBuf> = ["Core", "Core/Half", "Extra", "Primaries/None"].iter().map(PathBuf::from).collect();
+        assert_eq!(deployed, expected);
+
+        // The default entry (first sub-option everywhere) deploys the first choices.
+        let config = Config::V1 { guid, enabled: true, toggled: vec![true, true, false], selected: vec![0, 0, 0] };
+        let mut groups = HashMap::new();
+        collect_files_for_mod(&r#mod, &config, &mut groups).await.unwrap();
+        let mut deployed: Vec<PathBuf> = groups
+            .values()
+            .flatten()
+            .map(|t| t.patch.clone().unwrap().strip_prefix(dir.path()).unwrap().parent().unwrap().to_path_buf())
+            .collect();
+        deployed.sort();
+        let expected: Vec<PathBuf> = ["Core", "Core/None", "Primaries/None"].iter().map(PathBuf::from).collect();
+        assert_eq!(deployed, expected);
+    }
+
     #[tokio::test]
     async fn v2_deploy_skips_disabled_mod() {
         let (_dir, r#mod) = v2_fixture_mod().await;
