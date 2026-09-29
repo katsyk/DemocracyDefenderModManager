@@ -1,0 +1,25 @@
+# cargo-audit configuration. Read by `cargo audit` when run from src-tauri/
+# (ci.yml and local runs). The rustsec/audit-check action runs from the repo
+# root and does not see this file, so audit.yml and build.yml pass the same IDs
+# through the action's `ignore:` input -- keep all three lists in sync.
+#
+# Only advisories with no fix reachable on Tauri 2's GTK3 / webkit2gtk-4.1
+# stack are listed here. Anything new still fails / opens an issue.
+
+[advisories]
+ignore = [
+    # proc-macro-error 1.0.4 is unmaintained. Build-time only: a proc-macro
+    # dependency of glib-macros 0.18 and gtk3-macros 0.18 (gtk-rs GTK3
+    # bindings used by tauri/wry/tao/muda on Linux). gtk-rs dropped it in
+    # 0.19+, which is GTK4-only; there is no 0.18.x without it. Remove once
+    # Tauri moves off gtk-rs 0.18.
+    "RUSTSEC-2024-0370",
+
+    # glib 0.18.5: unsound Iterator impls for glib::VariantStrIter (fixed in
+    # glib >= 0.20; no patched 0.18.x release exists). glib 0.18 is pinned by
+    # gtk 0.18 / webkit2gtk 2.0 via tauri, wry, tao and muda on Linux. Neither
+    # DDMM nor any crate in our dependency tree calls VariantStrIter /
+    # Variant::array_iter_str (only glib's own definition and unit tests
+    # reference it), so the unsound code path is not reachable.
+    "RUSTSEC-2024-0429",
+]
