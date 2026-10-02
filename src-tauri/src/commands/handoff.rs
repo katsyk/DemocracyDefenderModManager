@@ -58,22 +58,42 @@ pub(crate) async fn download_in_progress(path: &Path) -> bool {
     active_partial(path, PARTIAL_STALE_AFTER).await.is_some()
 }
 
-/// The actively written partial-download file next to `path`, if any.
+/// The actively written partial-download file for `path`, if any: one
+/// named after it (`<name>.part`, ...), or -- while `path` is still empty
+/// -- any partial download in the same folder. Firefox may write into a
+/// randomly named `<random>.zip.part` while the empty placeholder carries
+/// the real name, so an empty file next to *any* fresh partial is most
+/// likely that placeholder (issue #59: the 0-byte zips).
 async fn active_partial(path: &Path, stale_after: Duration) -> Option<PathBuf> {
     let name = path.file_name()?;
+    let fresh = |meta: &std::fs::Metadata| match meta.modified().ok().map(|m| SystemTime::now().duration_since(m)) {
+        // Modified in the future (clock skew) counts as fresh.
+        Some(Ok(age)) => age <= stale_after,
+        Some(Err(_)) => true,
+        None => true,
+    };
     for suffix in IGNORED_SUFFIXES {
         let mut sibling = name.to_os_string();
         sibling.push(suffix);
         let sibling = path.with_file_name(sibling);
         let Ok(meta) = tokio::fs::symlink_metadata(&sibling).await else { continue };
-        let fresh = match meta.modified().ok().map(|m| SystemTime::now().duration_since(m)) {
-            // Modified in the future (clock skew) counts as fresh.
-            Some(Ok(age)) => age <= stale_after,
-            Some(Err(_)) => true,
-            None => true,
-        };
-        if fresh {
+        if fresh(&meta) {
             return Some(sibling);
+        }
+    }
+    let empty = tokio::fs::symlink_metadata(path).await.is_ok_and(|m| m.is_file() && m.len() == 0);
+    if !empty {
+        return None;
+    }
+    let mut entries = tokio::fs::read_dir(path.parent()?).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let lower = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if !IGNORED_SUFFIXES.iter().any(|s| lower.ends_with(s)) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata().await else { continue };
+        if meta.is_file() && fresh(&meta) {
+            return Some(entry.path());
         }
     }
     None
@@ -978,6 +998,37 @@ mod tests {
             .expect("must not hang")
             .unwrap();
         assert_eq!(found.as_deref(), Some(path.as_path()));
+    }
+
+    /// Issue #59: Firefox can write into a randomly named `.part` while
+    /// the empty placeholder has the real name. The placeholder must be
+    /// waited out, not installed as a 0-byte zip.
+    #[tokio::test]
+    async fn an_empty_placeholder_next_to_a_randomly_named_part_is_waited_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CasemateTurrets.zip");
+        let part = dir.path().join("Xq3vB7aZ.zip.part");
+        touch(&path, b"").await;
+        touch(&part, b"PK\x03\x04").await;
+        assert!(download_in_progress(&path).await);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let (path, cancel) = (path.clone(), cancel.clone());
+            tokio::spawn(async move { wait_until_stable(&path, &cancel, long_limits()).await })
+        };
+        tokio::time::sleep(POLL_INTERVAL * 4).await;
+        assert!(!waiter.is_finished(), "must not take the empty placeholder");
+
+        tokio::fs::write(&part, b"PK\x03\x04the whole archive").await.unwrap();
+        tokio::fs::rename(&part, &path).await.unwrap();
+        let found = tokio::time::timeout(POLL_INTERVAL * 6, waiter).await.unwrap().unwrap().unwrap();
+        assert_eq!(found.as_deref(), Some(path.as_path()));
+
+        // Once it has content, an unrelated partial elsewhere in the folder
+        // doesn't hold it up.
+        touch(&dir.path().join("other.7z.part"), b"x").await;
+        assert!(!download_in_progress(&path).await);
     }
 
     #[tokio::test]

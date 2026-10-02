@@ -224,9 +224,10 @@ pub fn format_timestamp(ts: i64) -> String {
     format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", secs / 3600, (secs % 3600) / 60)
 }
 
-/// Parse an RFC 3339 / ISO-8601 UTC timestamp like
-/// `2026-04-30T04:30:31.000000Z` into Unix seconds (just enough for the
-/// sites here; no timezone offsets other than `Z`).
+/// Parse an RFC 3339 / ISO-8601 timestamp like
+/// `2026-04-30T04:30:31.000000Z` or `2026-10-01T22:10:08+01:00` into Unix
+/// seconds (just enough for the sites here: `Z`, no zone (read as UTC), or
+/// a `+HH:MM` / `+HHMM` / `-HH:MM` offset).
 pub fn parse_iso_utc(s: &str) -> Option<i64> {
     let s = s.trim();
     let (date, time) = s.split_once('T')?;
@@ -234,7 +235,17 @@ pub fn parse_iso_utc(s: &str) -> Option<i64> {
     let y: i64 = dp.next()?.parse().ok()?;
     let m: i64 = dp.next()?.parse().ok()?;
     let d: i64 = dp.next()?.parse().ok()?;
-    let time = time.trim_end_matches('Z');
+    let (time, offset) = match time.find(['+', '-']) {
+        Some(i) => {
+            let zone = time[i + 1..].replace(':', "");
+            if zone.len() != 4 || !zone.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let secs = zone[..2].parse::<i64>().ok()? * 3600 + zone[2..].parse::<i64>().ok()? * 60;
+            (&time[..i], if time.as_bytes()[i] == b'-' { -secs } else { secs })
+        }
+        None => (time.trim_end_matches('Z'), 0),
+    };
     let time = time.split('.').next()?;
     let mut tp = time.split(':');
     let hh: i64 = tp.next()?.parse().ok()?;
@@ -248,7 +259,7 @@ pub fn parse_iso_utc(s: &str) -> Option<i64> {
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + hh * 3600 + mm * 60 + ss)
+    Some(days * 86_400 + hh * 3600 + mm * 60 + ss - offset)
 }
 
 /// A comparable "shape" of a file name or label -- what stays the same
@@ -342,6 +353,12 @@ mod tests {
         assert_eq!(parse_iso_utc("2026-04-30T04:30:31.000000Z"), Some(1777523431));
         assert_eq!(parse_iso_utc("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_iso_utc("garbage"), None);
+        // AyakaMods (XenForo) writes local time with an offset.
+        assert_eq!(parse_iso_utc("2026-10-01T22:10:08+01:00"), Some(1790889008));
+        assert_eq!(parse_iso_utc("2026-10-01T22:10:08+0100"), Some(1790889008));
+        assert_eq!(parse_iso_utc("2026-10-01T16:10:08-05:00"), Some(1790889008));
+        assert_eq!(parse_iso_utc("2026-10-01T21:10:08Z"), Some(1790889008));
+        assert_eq!(parse_iso_utc("2026-10-01T21:10:08+1"), None);
     }
 
     #[test]
