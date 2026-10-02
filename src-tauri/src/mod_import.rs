@@ -1286,8 +1286,13 @@ fn sidecar_for(item: &ScanItem, installed: &Mod, fingerprint: Option<ArchiveFing
         skipped_versions: Vec::new(),
         imported_archive: None,
     });
-    sidecar.installed_at =
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    // A carried-over record keeps its original install time: update checks
+    // compare a site's "last updated" time against it (AyakaMods), and
+    // "now" would hide an update that was already pending.
+    if sidecar.installed_at == 0 {
+        sidecar.installed_at =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    }
     if let Some(nexus) = &item.nexus {
         add_nexus_to_sidecar(&mut sidecar, nexus, installed);
     }

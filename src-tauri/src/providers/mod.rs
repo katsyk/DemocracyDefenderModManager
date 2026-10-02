@@ -262,6 +262,21 @@ pub fn parse_iso_utc(s: &str) -> Option<i64> {
     Some(days * 86_400 + hh * 3600 + mm * 60 + ss - offset)
 }
 
+/// Parse an HTTP date (`Wed, 01 Oct 2026 21:10:08 GMT`, the only form
+/// servers may send now) into Unix seconds.
+pub fn parse_http_date(s: &str) -> Option<i64> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    let [_, day, month, year, time, "GMT"] = parts.as_slice() else { return None };
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let month = MONTHS.iter().position(|m| m.eq_ignore_ascii_case(month))? + 1;
+    let day: u32 = day.parse().ok()?;
+    let year: u32 = year.parse().ok()?;
+    if time.len() != 8 {
+        return None;
+    }
+    parse_iso_utc(&format!("{year:04}-{month:02}-{day:02}T{time}Z"))
+}
+
 /// A comparable "shape" of a file name or label -- what stays the same
 /// between versions of one file but differs between different files (say
 /// the variants on one mod page): lowercase, without its extension, a
@@ -359,6 +374,9 @@ mod tests {
         assert_eq!(parse_iso_utc("2026-10-01T16:10:08-05:00"), Some(1790889008));
         assert_eq!(parse_iso_utc("2026-10-01T21:10:08Z"), Some(1790889008));
         assert_eq!(parse_iso_utc("2026-10-01T21:10:08+1"), None);
+        assert_eq!(parse_http_date("Wed, 01 Oct 2026 21:10:08 GMT"), Some(1790889008));
+        assert_eq!(parse_http_date("Wed, 01 Oct 2026 21:10:08 +0000"), None);
+        assert_eq!(parse_http_date("garbage"), None);
     }
 
     #[test]

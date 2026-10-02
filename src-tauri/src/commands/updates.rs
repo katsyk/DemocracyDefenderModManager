@@ -184,6 +184,8 @@ struct Target {
     /// When DDMM itself installed this mod from this site (Unix seconds;
     /// from the origin sidecar, only when it records this provider).
     installed_at: Option<i64>,
+    /// The mod's folder (where its origin sidecar lives).
+    directory: std::path::PathBuf,
 }
 
 /// Every checkable (provider, id) source of every installed mod, once each.
@@ -241,6 +243,7 @@ async fn collect_targets(mods: &[Mod]) -> Vec<Target> {
                 installed_file,
                 skipped_version,
                 installed_at,
+                directory: m.directory.clone(),
             });
         }
     }
@@ -261,9 +264,25 @@ fn status_for(installed: Option<&str>, latest: Option<&str>) -> UpdateState {
 /// a later "last updated" time without that counting as an update -- only
 /// used when the page's own time wasn't recorded at install. The site's
 /// last-update time can trail the file's upload by a minute or two (the
-/// update notes are posted after the file), and the user's clock may be a
-/// little off.
+/// update notes are posted after the file).
 const AYAKAMODS_INSTALL_GRACE_SECS: i64 = 10 * 60;
+
+/// A difference between this PC's clock and the site's smaller than this
+/// is just network delay and rounding, not a wrong clock.
+const CLOCK_SKEW_MIN_SECS: i64 = 60;
+
+/// AyakaMods' update decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AyakaDecision {
+    state: UpdateState,
+    /// The page time to record as this mod's baseline: set when no page
+    /// time was recorded yet and the comparison with the install time
+    /// showed the installed file *is* the page's current one. Later checks
+    /// then compare page time with page time, whatever this PC's clock
+    /// says. (Never set for an update: that must stay flagged until the
+    /// user installs it.)
+    record_baseline: Option<i64>,
+}
 
 /// AyakaMods' update decision. Its version strings are often just the date
 /// of the update (`2026-10-01`), so two updates on one day look the same;
@@ -272,23 +291,41 @@ const AYAKAMODS_INSTALL_GRACE_SECS: i64 = 10 * 60;
 /// (compared with the page time recorded at install, or else with when
 /// DDMM installed it), or when the version differs. Unknown only when
 /// neither can be compared.
+///
+/// `clock_offset` is how far the site's clock is ahead of this PC's (from
+/// the response's `Date` header): the install time was taken from this
+/// PC's clock, so it is moved by that much before comparing it with the
+/// site's time.
 fn ayakamods_status(
     installed_version: Option<&str>,
     recorded_modified: Option<i64>,
     installed_at: Option<i64>,
+    clock_offset: i64,
     meta: &ayakamods::AyakaModsMetadata,
-) -> UpdateState {
+) -> AyakaDecision {
+    let clock_offset = if clock_offset.abs() < CLOCK_SKEW_MIN_SECS { 0 } else { clock_offset };
+    let mut record_baseline = None;
     let newer_on_page = match (meta.modified_at, recorded_modified, installed_at) {
         (Some(page), Some(recorded), _) => Some(page > recorded),
-        (Some(page), None, Some(installed)) => Some(page > installed + AYAKAMODS_INSTALL_GRACE_SECS),
+        (Some(page), None, Some(installed)) => {
+            let newer = page > installed + clock_offset + AYAKAMODS_INSTALL_GRACE_SECS;
+            if !newer {
+                record_baseline = Some(page);
+            }
+            Some(newer)
+        }
         _ => None,
     };
     let by_version = status_for(installed_version, meta.latest_version.as_deref());
-    match (newer_on_page, by_version) {
+    let state = match (newer_on_page, by_version) {
         (Some(true), _) | (_, UpdateState::UpdateAvailable) => UpdateState::UpdateAvailable,
         (Some(false), _) => UpdateState::UpToDate,
         (None, state) => state,
+    };
+    if state != UpdateState::UpToDate {
+        record_baseline = None;
     }
+    AyakaDecision { state, record_baseline }
 }
 
 /// Whether two version strings name the same version, the way update
@@ -422,10 +459,14 @@ async fn check_keyless(client: &reqwest::Client, pacer: &mut Pacer, t: &Target) 
     }
 }
 
-fn ayakamods_entry(t: &Target, meta: &ayakamods::AyakaModsMetadata) -> UpdateStatusEntry {
+/// The entry for an AyakaMods target, and the page time to record as its
+/// baseline, if any (see [`AyakaDecision::record_baseline`]).
+fn ayakamods_entry(t: &Target, meta: &ayakamods::AyakaModsMetadata) -> (UpdateStatusEntry, Option<i64>) {
     let recorded_modified = t.installed_file.as_ref().and_then(|f| f.uploaded_at);
-    let status = ayakamods_status(t.installed_version.as_deref(), recorded_modified, t.installed_at, meta);
-    let mut e = entry(t, status, meta.latest_version.clone());
+    let clock_offset = meta.server_time.map(|server| server - now_unix()).unwrap_or(0);
+    let decision =
+        ayakamods_status(t.installed_version.as_deref(), recorded_modified, t.installed_at, clock_offset, meta);
+    let mut e = entry(t, decision.state, meta.latest_version.clone());
     // Same version string, newer update (two updates on one day): show
     // when the page was updated, so "2026-10-01 -> 2026-10-01" makes sense.
     let same_label = match (t.installed_version.as_deref(), meta.latest_version.as_deref()) {
@@ -436,7 +477,27 @@ fn ayakamods_entry(t: &Target, meta: &ayakamods::AyakaModsMetadata) -> UpdateSta
         e.latest_file_name = meta.modified_at.map(providers::format_timestamp);
     }
     e.method = Some(UpdateMethod::Browser);
-    e
+    (e, decision.record_baseline)
+}
+
+/// Record `page_time` as the AyakaMods page time of what's installed in
+/// `t`'s mod, unless the mod was reinstalled or updated in the meantime
+/// (its install time changed) or a page time is already recorded.
+async fn record_ayakamods_baseline(t: &Target, page_time: i64) -> anyhow::Result<()> {
+    let Some(mut sidecar) = sources::load_origin_sidecar(&t.directory).await else { return Ok(()) };
+    if Some(sidecar.installed_at as i64) != t.installed_at {
+        return Ok(());
+    }
+    match sidecar.installed_files.iter_mut().find(|f| f.provider.eq_ignore_ascii_case("ayakamods")) {
+        Some(f) if f.uploaded_at.is_some() => return Ok(()),
+        Some(f) => f.uploaded_at = Some(page_time),
+        None => sidecar.installed_files.push(InstalledFile {
+            provider: "ayakamods".into(),
+            uploaded_at: Some(page_time),
+            ..Default::default()
+        }),
+    }
+    sources::save_origin_sidecar(&t.directory, &sidecar).await
 }
 
 fn nexus_installed(t: &Target) -> nexus::Installed {
@@ -696,6 +757,7 @@ async fn run_check_with(
     // asked again in this check.
     let mut ayakamods_refusing: Option<String> = None;
     let mut ayakamods_403s = 0;
+    let mut ayakamods_baselines: Vec<(usize, i64)> = Vec::new();
     for (i, t) in targets.iter().enumerate().filter(|(_, t)| t.provider != "nexus") {
         if t.provider == "ayakamods" {
             if let Some(message) = &ayakamods_refusing {
@@ -703,7 +765,13 @@ async fn run_check_with(
                 continue;
             }
             let e = match ayakamods::fetch_ayakamods_metadata(&client, &t.id).await {
-                Ok(Some(meta)) => ayakamods_entry(t, &meta),
+                Ok(Some(meta)) => {
+                    let (e, baseline) = ayakamods_entry(t, &meta);
+                    if let Some(page_time) = baseline {
+                        ayakamods_baselines.push((i, page_time));
+                    }
+                    e
+                }
                 Ok(None) => {
                     log::warn!("Update check: AyakaMods mod {} has no version information on its page.", t.id);
                     entry(t, UpdateState::Unknown, None)
@@ -792,6 +860,16 @@ async fn run_check_with(
     let listed = state.mods.lock().await;
     if let Some(listed) = listed.as_ref() {
         report.results.retain(|e| listed.iter().any(|m| m.guid() == e.guid));
+        // Installs write the sidecar while holding the mod list, so this
+        // can't interleave with one.
+        for (i, page_time) in ayakamods_baselines {
+            let t = &targets[i];
+            if listed.iter().any(|m| m.guid() == t.guid) {
+                if let Err(e) = record_ayakamods_baseline(t, page_time).await {
+                    log::warn!("Couldn't record the AyakaMods page time of mod {}: {e}", t.id);
+                }
+            }
+        }
     }
     let mut failed = 0;
     for e in &report.results {
@@ -958,17 +1036,18 @@ pub async fn enrich_install_source(
     if let Some(name) = file_name {
         files.push(InstalledFile { provider: provider.clone(), file_name: Some(name), ..Default::default() });
     }
-    if source.version.is_some() {
-        return (source, files);
-    }
-    let Some(id) = source.id.clone() else { return (source, files) };
-    let Ok(client) = providers::build_client() else { return (source, files) };
     if provider == "ayakamods" {
-        // The version and the page's last-update time, so later checks
-        // can tell a same-day update apart (see `ayakamods_status`).
+        // Always asked, even when the extension already read the version off
+        // the page: the page's last-update time is what later checks compare
+        // (two same-day updates share a version; see `ayakamods_status`).
+        // A version from the page the user downloaded from is kept.
+        let Some(id) = source.id.clone() else { return (source, files) };
+        let Ok(client) = providers::build_client() else { return (source, files) };
         match ayakamods::fetch_ayakamods_metadata(&client, &id).await {
             Ok(Some(meta)) => {
-                source.version = meta.latest_version;
+                if source.version.is_none() {
+                    source.version = meta.latest_version;
+                }
                 if let Some(modified) = meta.modified_at {
                     match files.iter_mut().find(|f| f.provider == provider) {
                         Some(f) => f.uploaded_at = Some(modified),
@@ -983,10 +1062,15 @@ pub async fn enrich_install_source(
             Ok(None) => log::warn!("AyakaMods mod {id}: no version on its page to record."),
             // Not fatal: the install goes ahead, and update checks then
             // compare against when DDMM installed it.
-            Err(e) => log::warn!("Couldn't record the AyakaMods version of mod {id}: {e}"),
+            Err(e) => log::warn!("Couldn't record the AyakaMods page of mod {id}: {e}"),
         }
         return (source, files);
     }
+    if source.version.is_some() {
+        return (source, files);
+    }
+    let Some(id) = source.id.clone() else { return (source, files) };
+    let Ok(client) = providers::build_client() else { return (source, files) };
     source.version = match provider.as_str() {
         "github" => github::latest_release(&client, &id).await.ok().flatten().and_then(|r| r.tag_name),
         "gamebanana" => gamebanana::fetch_mod(&client, &id).await.ok().and_then(|m| gamebanana::latest_version(&m)),
@@ -1188,7 +1272,17 @@ mod tests {
             latest_version: version.map(str::to_string),
             modified: None,
             modified_at,
+            server_time: None,
         }
+    }
+
+    fn st(
+        version: Option<&str>,
+        recorded: Option<i64>,
+        installed_at: Option<i64>,
+        meta: &ayakamods::AyakaModsMetadata,
+    ) -> UpdateState {
+        ayakamods_status(version, recorded, installed_at, 0, meta).state
     }
 
     /// Issue #59: the Bolt Pistol page (fixture) says "2026-10-01" both
@@ -1200,12 +1294,12 @@ mod tests {
         let page_time = page.modified_at.unwrap();
         // Installed the 15:44 release (recorded its page time then).
         let morning = page_time - 6 * 3600;
-        assert_eq!(ayakamods_status(Some("2026-10-01"), Some(morning), None, &page), UpdateState::UpdateAvailable);
+        assert_eq!(st(Some("2026-10-01"), Some(morning), None, &page), UpdateState::UpdateAvailable);
         // Installed the current one.
-        assert_eq!(ayakamods_status(Some("2026-10-01"), Some(page_time), None, &page), UpdateState::UpToDate);
+        assert_eq!(st(Some("2026-10-01"), Some(page_time), None, &page), UpdateState::UpToDate);
         // A different version string is an update on its own.
-        assert_eq!(ayakamods_status(Some("2026-09-29"), Some(page_time), None, &page), UpdateState::UpdateAvailable);
-        assert_eq!(ayakamods_status(Some("2026-09-29"), None, None, &page), UpdateState::UpdateAvailable);
+        assert_eq!(st(Some("2026-09-29"), Some(page_time), None, &page), UpdateState::UpdateAvailable);
+        assert_eq!(st(Some("2026-09-29"), None, None, &page), UpdateState::UpdateAvailable);
     }
 
     /// Installed before this fix (or the page couldn't be read at
@@ -1215,26 +1309,26 @@ mod tests {
         let t = 1_790_889_008;
         let meta = ayakamods::AyakaModsMetadata { modified_at: Some(t), ..ayaka_meta(Some("2026-10-01"), None) };
         // Installed in the morning, updated in the evening.
-        assert_eq!(ayakamods_status(Some("2026-10-01"), None, Some(t - 6 * 3600), &meta), UpdateState::UpdateAvailable);
+        assert_eq!(st(Some("2026-10-01"), None, Some(t - 6 * 3600), &meta), UpdateState::UpdateAvailable);
         // Installed after the update.
-        assert_eq!(ayakamods_status(Some("2026-10-01"), None, Some(t + 60), &meta), UpdateState::UpToDate);
+        assert_eq!(st(Some("2026-10-01"), None, Some(t + 60), &meta), UpdateState::UpToDate);
         // Installed a minute before the page's time settled: not an update.
-        assert_eq!(ayakamods_status(Some("2026-10-01"), None, Some(t - 90), &meta), UpdateState::UpToDate);
+        assert_eq!(st(Some("2026-10-01"), None, Some(t - 90), &meta), UpdateState::UpToDate);
         // No version recorded at all (the page was unreachable at install):
         // the install time alone still decides.
-        assert_eq!(ayakamods_status(None, None, Some(t - 6 * 3600), &meta), UpdateState::UpdateAvailable);
-        assert_eq!(ayakamods_status(None, None, Some(t + 60), &meta), UpdateState::UpToDate);
+        assert_eq!(st(None, None, Some(t - 6 * 3600), &meta), UpdateState::UpdateAvailable);
+        assert_eq!(st(None, None, Some(t + 60), &meta), UpdateState::UpToDate);
     }
 
     #[test]
     fn ayakamods_without_times_compares_versions() {
         let meta = ayaka_meta(Some("v1.7"), None);
-        assert_eq!(ayakamods_status(Some("1.5"), None, None, &meta), UpdateState::UpdateAvailable);
-        assert_eq!(ayakamods_status(Some("1.7"), None, None, &meta), UpdateState::UpToDate);
-        assert_eq!(ayakamods_status(None, None, None, &meta), UpdateState::Unknown);
-        assert_eq!(ayakamods_status(Some("1.7"), Some(5), None, &ayaka_meta(None, None)), UpdateState::Unknown);
+        assert_eq!(st(Some("1.5"), None, None, &meta), UpdateState::UpdateAvailable);
+        assert_eq!(st(Some("1.7"), None, None, &meta), UpdateState::UpToDate);
+        assert_eq!(st(None, None, None, &meta), UpdateState::Unknown);
+        assert_eq!(st(Some("1.7"), Some(5), None, &ayaka_meta(None, None)), UpdateState::Unknown);
         // A newer version installed by hand isn't an update.
-        assert_eq!(ayakamods_status(Some("2.0"), None, None, &meta), UpdateState::UpToDate);
+        assert_eq!(st(Some("2.0"), None, None, &meta), UpdateState::UpToDate);
     }
 
     #[tokio::test]
@@ -1262,6 +1356,127 @@ mod tests {
         sources::set_skipped_version(dir2.path(), "ayakamods", Some("x")).await.unwrap();
         let targets = collect_targets(&[mod_with_sources(dir2.path(), vec![declared])]).await;
         assert_eq!(targets[0].installed_at, None);
+    }
+
+
+    /// The PC's clock was an hour behind when the mod was installed: the
+    /// site's clock (its `Date` header) corrects the install time, so a
+    /// fresh install isn't flagged; the page time is then recorded as the
+    /// baseline. A real pending update is flagged and nothing is recorded.
+    #[test]
+    fn ayakamods_install_time_is_corrected_for_a_wrong_clock() {
+        let page = 1_790_889_008;
+        let meta = ayakamods::AyakaModsMetadata { modified_at: Some(page), ..ayaka_meta(Some("2026-10-01"), None) };
+        let installed_at = page + 120 - 3600; // installed 2 min after the update, clock 1 h behind
+        let skewed = ayakamods_status(Some("2026-10-01"), None, Some(installed_at), 3600, &meta);
+        assert_eq!(skewed, AyakaDecision { state: UpdateState::UpToDate, record_baseline: Some(page) });
+        // Without the correction it would have been a false update.
+        assert_eq!(st(Some("2026-10-01"), None, Some(installed_at), &meta), UpdateState::UpdateAvailable);
+        // Network-delay-sized differences are ignored.
+        assert_eq!(
+            ayakamods_status(Some("2026-10-01"), None, Some(page - 700), 30, &meta).state,
+            UpdateState::UpdateAvailable
+        );
+        // A pending update stays an update, and isn't recorded as a baseline.
+        let pending = ayakamods_status(Some("2026-10-01"), None, Some(page - 6 * 3600), 0, &meta);
+        assert_eq!(pending, AyakaDecision { state: UpdateState::UpdateAvailable, record_baseline: None });
+        // Already recorded: nothing more to record.
+        assert_eq!(ayakamods_status(Some("2026-10-01"), Some(page), None, 0, &meta).record_baseline, None);
+    }
+
+    /// Writes an AyakaMods mod as DDMM recorded it before page times were
+    /// recorded: version and install time only.
+    async fn add_old_ayakamods_mod(base: &Path, id: &str, installed_at: u64) -> (Uuid, std::path::PathBuf) {
+        let mod_dir = base.join("mods").join(format!("ayaka-{id}"));
+        tokio::fs::create_dir_all(&mod_dir).await.unwrap();
+        let guid = Uuid::new_v4();
+        tokio::fs::write(
+            mod_dir.join("manifest.json"),
+            format!(r#"{{"Guid":"{guid}","Name":"Ayaka {id}","Description":"","IconPath":null,"Options":null}}"#),
+        )
+        .await
+        .unwrap();
+        let sidecar = sources::OriginSidecar {
+            sources: vec![Source { provider: "ayakamods".into(), id: Some(id.into()), url: None, version: Some("2026-10-01".into()) }],
+            installed_at,
+            installed_files: vec![InstalledFile { provider: "ayakamods".into(), file_name: Some("m.zip".into()), ..Default::default() }],
+            skipped_versions: Vec::new(),
+            imported_archive: None,
+        };
+        sources::save_origin_sidecar(&mod_dir, &sidecar).await.unwrap();
+        (guid, mod_dir)
+    }
+
+    #[tokio::test]
+    async fn the_first_check_records_the_page_time_as_the_baseline() {
+        use ayakamods::test_support::{page, reply, server, BASE};
+        let page_time = 1_790_889_008; // 2026-10-01T21:10:08Z
+        let dir = tempfile::tempdir().unwrap();
+        // Installed just after the update, but this PC's clock is 1 h behind.
+        let (current, current_dir) = add_old_ayakamods_mod(dir.path(), "11", (page_time + 120 - 3600) as u64).await;
+        // Installed hours before the update: a real pending update.
+        let (pending, pending_dir) = add_old_ayakamods_mod(dir.path(), "12", (page_time - 6 * 3600) as u64).await;
+        let date = {
+            // The site's clock: the real "now", which is this PC's now
+            // plus the hour it is behind.
+            let real_now = now_unix() + 3600;
+            http_date(real_now)
+        };
+        let (base, _seen) =
+            server(vec![reply("200 OK", &format!("Date: {date}\r\n"), &page("2026-10-01", "2026-10-01T22:10:08+01:00"))])
+                .await;
+        let state = AppState::new(dir.path().to_path_buf());
+        let factory = |key| NexusClient::new(key);
+
+        let report = BASE.scope(base.clone(), run_check_with(&state, CheckTrigger::Manual, &factory)).await.unwrap();
+        let status = |r: &UpdateCheckReport, g: Uuid| r.results.iter().find(|e| e.guid == g).unwrap().status.clone();
+        assert_eq!(status(&report, current), UpdateState::UpToDate);
+        assert_eq!(status(&report, pending), UpdateState::UpdateAvailable);
+        let recorded = |d: &Path| {
+            let d = d.to_path_buf();
+            async move { sources::load_origin_sidecar(&d).await.unwrap().installed_files[0].uploaded_at }
+        };
+        assert_eq!(recorded(&current_dir).await, Some(page_time), "baseline recorded");
+        assert_eq!(recorded(&pending_dir).await, None, "a pending update is never recorded as current");
+
+        // From now on it's page time vs page time: even with the clock
+        // wildly off (no usable Date header), no false update.
+        let (base2, _seen2) = server(vec![reply("200 OK", "", &page("2026-10-01", "2026-10-01T22:10:08+01:00"))]).await;
+        let report = BASE.scope(base2, run_check_with(&state, CheckTrigger::Manual, &factory)).await.unwrap();
+        assert_eq!(status(&report, current), UpdateState::UpToDate);
+        assert_eq!(status(&report, pending), UpdateState::UpdateAvailable, "still flagged until installed");
+    }
+
+    fn http_date(ts: i64) -> String {
+        // `format_timestamp` gives "YYYY-MM-DD HH:MM UTC"; build the HTTP form.
+        const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        let f = providers::format_timestamp(ts);
+        let (y, m, d) = (&f[0..4], f[5..7].parse::<usize>().unwrap(), &f[8..10]);
+        let secs = ts.rem_euclid(60);
+        format!("Thu, {d} {} {y} {}:{secs:02} GMT", MONTHS[m - 1], &f[11..16])
+    }
+
+    /// Issue #59 review: the extension always sends the page's version, and
+    /// installs from it used to skip the page lookup, so the page time was
+    /// never recorded. The extension's version is kept; the time is added.
+    #[tokio::test]
+    async fn extension_installs_still_record_the_ayakamods_page_time() {
+        use ayakamods::test_support::{page, reply, server, BASE};
+        let (base, seen) = server(vec![reply("200 OK", "", &page("2026-10-01", "2026-10-01T22:10:08+01:00"))]).await;
+        let source = Source {
+            provider: "ayakamods".into(),
+            id: Some("13".into()),
+            url: None,
+            version: Some("2026-10-01-from-page".into()),
+        };
+        let (s, files) = BASE
+            .scope(base, enrich_install_source(&source, Some(Path::new("/dl/Bolt-v1.7.zip")), None))
+            .await;
+        assert_eq!(s.version.as_deref(), Some("2026-10-01-from-page"));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_name.as_deref(), Some("Bolt-v1.7.zip"));
+        assert_eq!(files[0].uploaded_at, Some(1_790_889_008));
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -1366,6 +1581,7 @@ mod tests {
             installed_file: None,
             skipped_version: None,
             installed_at: None,
+            directory: dir.path().to_path_buf(),
         };
         // No fallback file in this data dir. (On a dev machine with a real
         // keychain entry this would find it -- so only assert when none.)

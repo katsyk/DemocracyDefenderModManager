@@ -188,7 +188,8 @@ DDMM records the version automatically wherever it can:
 
 - **AyakaMods, GameBanana, ModWorkshop:** when a mod is installed through DDMM (browser extension, browser
   handoff or "choose file"), DDMM looks up the mod's current version on the site once and records it. For
-  AyakaMods it also records the page's "last updated" time.
+  AyakaMods it also records the page's "last updated" time (also when the browser extension already read the
+  version off the page).
 - **GitHub:** the release tag, from the release-asset link or the update itself.
 - **Nexus Mods:** Nexus puts the mod id and version in every download's file name, so DDMM reads the version and
   the exact file from the archive's own name. No key and no request is needed for that. Both of Nexus's naming
@@ -208,8 +209,10 @@ newest file was uploaded (for example `2026-04-29 05:49 UTC`) as its version.
 
 On AyakaMods the version is often just the date of the update (`2026-10-01`), so two updates on the same day
 have the same version. DDMM therefore also compares the page's "last updated" time with the one it recorded at
-install (or, for a mod installed before DDMM recorded it, with when DDMM installed the mod): a newer time **or** a
-different version means an update. In the results, such an update shows the time the page was updated next to
+install (or, for a mod installed before DDMM recorded it, with when DDMM installed the mod, corrected by how far
+your PC's clock is from the site's): a newer time **or** a different version means an update. For such older
+installs, the first check that finds the mod up to date records the page's time, so from then on it's always page
+time against page time. In the results, such an update shows the time the page was updated next to
 the version.
 
 **For mod authors:** if you declare a source in your manifest's `Sources` field, set its `Version` to match what

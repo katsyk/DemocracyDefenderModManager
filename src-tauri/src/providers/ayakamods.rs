@@ -45,6 +45,9 @@ pub struct AyakaModsMetadata {
     pub modified: Option<String>,
     /// `dateModified` as Unix seconds: when the mod was last updated.
     pub modified_at: Option<i64>,
+    /// The server's clock (its `Date` header, Unix seconds) when the page
+    /// was fetched -- lets a check tell how far off this PC's clock is.
+    pub server_time: Option<i64>,
 }
 
 /// Why an AyakaMods page couldn't be read. The `Display` text is what the
@@ -152,7 +155,75 @@ pub(crate) async fn fetch_ayakamods_metadata(
     client: &reqwest::Client,
     id: &str,
 ) -> Result<Option<AyakaModsMetadata>, AyakaError> {
+    #[cfg(test)]
+    if let Ok(base) = test_support::BASE.try_with(|b| b.clone()) {
+        // Tests elsewhere point AyakaMods at a local (plain http) server.
+        let client = reqwest::Client::builder()
+            .user_agent(super::user_agent())
+            .build()
+            .map_err(|e| AyakaError::Other(e.to_string()))?;
+        return fetch_from(&client, &base, id, test_support::FAST).await;
+    }
     fetch_from(client, BASE, id, TIMING).await
+}
+
+/// A scripted local AyakaMods for tests (here and in other modules).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::Timing;
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::task_local! {
+        /// While set (`BASE.scope(...)`), `fetch_ayakamods_metadata` asks
+        /// this base URL instead of the real site.
+        pub(crate) static BASE: String;
+    }
+
+    pub(super) const FAST: Timing = Timing {
+        gap: Duration::from_millis(0),
+        retry_delay: Duration::from_millis(10),
+        max_retry_wait: Duration::from_secs(5),
+    };
+
+    /// Answers each request with the next response (repeating the last),
+    /// and records the raw requests.
+    pub(crate) async fn server(responses: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            let mut i = 0usize;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                log.lock().unwrap().push(req);
+                let resp = responses[i.min(responses.len() - 1)].replace("{addr}", &addr.to_string());
+                i += 1;
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    pub(crate) fn reply(status: &str, extra_headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/html\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A mod page with this version and `dateModified`.
+    pub(crate) fn page(version: &str, date_modified: &str) -> String {
+        format!(
+            r#"<script type="application/ld+json">[{{"@type":"SoftwareApplication","name":"M","softwareVersion":"{version}","dateModified":"{date_modified}"}}]</script>"#
+        )
+    }
 }
 
 async fn fetch_from(
@@ -179,13 +250,13 @@ async fn fetch_from(
         let result = get_once(client, &url).await;
         *gate = Some(tokio::time::Instant::now());
         match result {
-            Ok((html, final_url)) => {
+            Ok((html, final_url, server_time)) => {
                 if let Some(final_url) = final_url.filter(|u| is_canonical_page(u, base, &id)) {
                     if let Ok(mut m) = canonical_urls().lock() {
                         m.insert(cache_key, final_url);
                     }
                 }
-                return Ok(parse_ayakamods_page(&html));
+                return Ok(parse_ayakamods_page(&html).map(|meta| AyakaModsMetadata { server_time, ..meta }));
             }
             // The remembered address stopped working: forget it and ask
             // the plain one (the site redirects that to wherever it is now).
@@ -223,7 +294,7 @@ enum Attempt {
 
 /// One GET: the page body and the address it ended up at (after
 /// redirects), or what went wrong.
-async fn get_once(client: &reqwest::Client, url: &str) -> Result<(String, Option<String>), Attempt> {
+async fn get_once(client: &reqwest::Client, url: &str) -> Result<(String, Option<String>, Option<i64>), Attempt> {
     let response = client
         .get(url)
         .header(header::ACCEPT, ACCEPT)
@@ -234,8 +305,13 @@ async fn get_once(client: &reqwest::Client, url: &str) -> Result<(String, Option
     let status = response.status();
     let final_url = response.url().to_string();
     if status.is_success() {
+        let server_time = response
+            .headers()
+            .get(header::DATE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(super::parse_http_date);
         let body = read_capped(response).await.map_err(|e| Attempt::Failed(e.to_string()))?;
-        return Ok((body, Some(final_url)));
+        return Ok((body, Some(final_url), server_time));
     }
     let headers = response.headers().clone();
     let mut challenge = is_challenge_header(&headers);
@@ -301,6 +377,7 @@ pub fn parse_ayakamods_page(html: &str) -> Option<AyakaModsMetadata> {
                     .filter(|v| !v.is_empty())
                     .map(str::to_string),
                 modified_at: modified.as_deref().and_then(super::parse_iso_utc),
+                server_time: None,
                 modified,
             });
         }
@@ -343,17 +420,12 @@ fn find_software_application(value: &serde_json::Value) -> Option<&serde_json::V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use std::sync::Mutex;
 
     const FIXTURE: &str = include_str!("../../tests/fixtures/ayakamods_mod_page.html");
     const BOLT_PISTOL: &str = include_str!("../../tests/fixtures/ayakamods_bolt_pistol_4101.html");
 
-    const FAST: Timing = Timing {
-        gap: Duration::from_millis(0),
-        retry_delay: Duration::from_millis(10),
-        max_retry_wait: Duration::from_secs(5),
-    };
+    const FAST: Timing = test_support::FAST;
 
     #[test]
     fn parses_real_ayakamods_fixture() {
@@ -453,39 +525,10 @@ mod tests {
         assert!(!is_canonical_page("https://evil.example/mods/x.4101/", base, "4101"));
     }
 
-    /// A scripted local server: answers each request with the next
-    /// response (repeating the last), and records the paths asked for.
-    async fn server(responses: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let log = seen.clone();
-        tokio::spawn(async move {
-            let mut i = 0usize;
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 8192];
-                let n = sock.read(&mut buf).await.unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
-                log.lock().unwrap().push(req);
-                let resp = responses[i.min(responses.len() - 1)].replace("{addr}", &addr.to_string());
-                i += 1;
-                let _ = sock.write_all(resp.as_bytes()).await;
-            }
-        });
-        (format!("http://{addr}"), seen)
-    }
-
-    fn reply(status: &str, extra_headers: &str, body: &str) -> String {
-        format!(
-            "HTTP/1.1 {status}\r\nContent-Type: text/html\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )
-    }
+    use test_support::{reply, server};
 
     fn page(version: &str) -> String {
-        format!(
-            r#"<script type="application/ld+json">[{{"@type":"SoftwareApplication","name":"M","softwareVersion":"{version}","dateModified":"2026-10-01T22:10:08+01:00"}}]</script>"#
-        )
+        test_support::page(version, "2026-10-01T22:10:08+01:00")
     }
 
     fn client() -> reqwest::Client {
@@ -504,6 +547,14 @@ mod tests {
         assert!(req.contains("user-agent: democracydefendermodmanager/"), "{req}");
         assert!(req.contains("accept: text/html"), "{req}");
         assert!(req.contains("accept-language: en"), "{req}");
+    }
+
+    #[tokio::test]
+    async fn the_server_clock_is_reported() {
+        let (base, _seen) =
+            server(vec![reply("200 OK", "Date: Wed, 01 Oct 2026 21:10:08 GMT\r\n", &page("1.0"))]).await;
+        let meta = fetch_from(&client(), &base, "8", FAST).await.unwrap().unwrap();
+        assert_eq!(meta.server_time, Some(1_790_889_008));
     }
 
     #[tokio::test]

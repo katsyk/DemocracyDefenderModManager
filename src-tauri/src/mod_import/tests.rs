@@ -1214,3 +1214,46 @@ async fn a_folder_renamed_on_import_is_known_again() {
         assert!(matches!(item.status, ItemStatus::Installed { .. }), "{:?}: {:?}", item.path, item.status);
     }
 }
+
+/// Re-importing a mod that carries DDMM's own install record keeps its
+/// original install time (and the AyakaMods page time): resetting it to
+/// "now" would hide an AyakaMods update that was already pending.
+#[test]
+fn import_keeps_a_carried_install_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("Bolt Pistol");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join(PATCH), b"x").unwrap();
+    let carried = OriginSidecar {
+        sources: vec![Source { provider: "ayakamods".into(), id: Some("4101".into()), url: None, version: Some("2026-09-29".into()) }],
+        installed_at: 1_790_700_000,
+        installed_files: vec![InstalledFile { provider: "ayakamods".into(), uploaded_at: Some(1_790_677_379), ..Default::default() }],
+        skipped_versions: Vec::new(),
+        imported_archive: None,
+    };
+    std::fs::write(folder.join(ORIGIN_SIDECAR_FILE), serde_json::to_vec(&carried).unwrap()).unwrap();
+
+    let item = inspect(0, &Candidate { kind: ItemKind::Folder, path: folder.clone() });
+    assert!(item.carried_sidecar.is_some());
+    let installed = Mod {
+        manifest: Manifest::Legacy(crate::models::manifest::legacy::Manifest {
+            guid: Uuid::new_v4(),
+            name: "Bolt Pistol".into(),
+            description: String::new(),
+            icon_path: None,
+            options: None,
+        }),
+        directory: folder,
+        sources: Vec::new(),
+    };
+    let sidecar = sidecar_for(&item, &installed, None);
+    assert_eq!(sidecar.installed_at, 1_790_700_000);
+    assert_eq!(sidecar.installed_files[0].uploaded_at, Some(1_790_677_379));
+
+    // Nothing carried: the import time is recorded.
+    let plain = dir.path().join("Plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(plain.join(PATCH), b"y").unwrap();
+    let item = inspect(1, &Candidate { kind: ItemKind::Folder, path: plain });
+    assert!(sidecar_for(&item, &installed, None).installed_at > 1_700_000_000);
+}

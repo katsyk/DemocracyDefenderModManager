@@ -58,13 +58,24 @@ pub(crate) async fn download_in_progress(path: &Path) -> bool {
     active_partial(path, PARTIAL_STALE_AFTER).await.is_some()
 }
 
+/// A partial download that means `path` isn't finished yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Partial {
+    path: PathBuf,
+    /// Named after `path` (`<name>.part`, ...), so certainly its download;
+    /// otherwise found elsewhere in the folder while `path` is empty.
+    named: bool,
+}
+
 /// The actively written partial-download file for `path`, if any: one
 /// named after it (`<name>.part`, ...), or -- while `path` is still empty
-/// -- any partial download in the same folder. Firefox may write into a
-/// randomly named `<random>.zip.part` while the empty placeholder carries
-/// the real name, so an empty file next to *any* fresh partial is most
-/// likely that placeholder (issue #59: the 0-byte zips).
-async fn active_partial(path: &Path, stale_after: Duration) -> Option<PathBuf> {
+/// -- a partial download elsewhere in the folder that looks like its own.
+/// Firefox may write into a randomly named `<random>.zip.part` while the
+/// empty placeholder carries the real name (issue #59: the 0-byte zips).
+/// Such a partial counts only if it ends with the same extension plus a
+/// partial suffix (`.zip.part`), or was created after the empty file, so an
+/// unrelated download (a video's `.crdownload`) doesn't hold it up.
+async fn active_partial(path: &Path, stale_after: Duration) -> Option<Partial> {
     let name = path.file_name()?;
     let fresh = |meta: &std::fs::Metadata| match meta.modified().ok().map(|m| SystemTime::now().duration_since(m)) {
         // Modified in the future (clock skew) counts as fresh.
@@ -78,22 +89,27 @@ async fn active_partial(path: &Path, stale_after: Duration) -> Option<PathBuf> {
         let sibling = path.with_file_name(sibling);
         let Ok(meta) = tokio::fs::symlink_metadata(&sibling).await else { continue };
         if fresh(&meta) {
-            return Some(sibling);
+            return Some(Partial { path: sibling, named: true });
         }
     }
-    let empty = tokio::fs::symlink_metadata(path).await.is_ok_and(|m| m.is_file() && m.len() == 0);
-    if !empty {
-        return None;
-    }
+    let own = tokio::fs::symlink_metadata(path).await.ok().filter(|m| m.is_file() && m.len() == 0)?;
+    let own_created = own.created().or_else(|_| own.modified()).ok();
+    let extension = path.extension().map(|e| format!(".{}", e.to_string_lossy().to_ascii_lowercase()));
     let mut entries = tokio::fs::read_dir(path.parent()?).await.ok()?;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let lower = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        if !IGNORED_SUFFIXES.iter().any(|s| lower.ends_with(s)) {
+        let Some(suffix) = IGNORED_SUFFIXES.iter().find(|s| lower.ends_with(*s)) else { continue };
+        let Ok(meta) = entry.metadata().await else { continue };
+        if !meta.is_file() || !fresh(&meta) {
             continue;
         }
-        let Ok(meta) = entry.metadata().await else { continue };
-        if meta.is_file() && fresh(&meta) {
-            return Some(entry.path());
+        let same_type = extension.as_ref().is_some_and(|ext| lower.ends_with(&format!("{ext}{suffix}")));
+        let created_after = match (meta.created().ok(), own_created) {
+            (Some(created), Some(own)) => created >= own,
+            _ => false,
+        };
+        if same_type || created_after {
+            return Some(Partial { path: entry.path(), named: false });
         }
     }
     None
@@ -672,7 +688,10 @@ async fn wait_until_stable(path: &Path, cancel: &AtomicBool, limits: WaitLimits)
         let partial = active_partial(path, limits.stale_after).await;
 
         if SystemTime::now() >= limits.deadline {
-            return Err(still_unfinished(&subject, size, partial.as_deref()));
+            // A partial found elsewhere in the folder may not be this
+            // file's after all: name it only when it certainly is.
+            let named = partial.as_ref().filter(|p| p.named).map(|p| p.path.as_path());
+            return Err(still_unfinished(&subject, size, named));
         }
 
         if partial.is_some() {
@@ -1029,6 +1048,40 @@ mod tests {
         // doesn't hold it up.
         touch(&dir.path().join("other.7z.part"), b"x").await;
         assert!(!download_in_progress(&path).await);
+    }
+
+    /// A really empty download isn't held up by some other download going
+    /// on in the folder (a video's `.crdownload` started earlier).
+    #[tokio::test]
+    async fn an_unrelated_partial_does_not_hold_up_an_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("Some Movie.mkv.crdownload"), b"frames").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let path = dir.path().join("mod.zip");
+        touch(&path, b"").await;
+        assert!(!download_in_progress(&path).await);
+        let found = tokio::time::timeout(POLL_INTERVAL * 6, wait_until_stable(&path, &AtomicBool::new(false), short_limits(60)))
+            .await
+            .expect("must not wait for the unrelated download")
+            .unwrap();
+        assert_eq!(found.as_deref(), Some(path.as_path()));
+    }
+
+    /// If the wait ends while only a folder-wide partial was seen, the
+    /// message is about the empty file, never the other file's name.
+    #[tokio::test]
+    async fn the_deadline_names_only_this_files_own_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CasemateTurrets.zip");
+        touch(&path, b"").await;
+        touch(&dir.path().join("Xq3vB7aZ.zip.part"), b"PK").await;
+        let err = tokio::time::timeout(POLL_INTERVAL * 8, wait_until_stable(&path, &AtomicBool::new(false), short_limits(2)))
+            .await
+            .expect("must stop at the deadline")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Cause: the file was still empty (0 bytes) after 15 minutes"), "{err}");
+        assert!(!err.contains("Xq3vB7aZ"), "{err}");
     }
 
     #[tokio::test]
