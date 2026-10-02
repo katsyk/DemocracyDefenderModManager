@@ -334,16 +334,22 @@ async fn handle_query(app: &AppHandle, raw: serde_json::Value, id: String) -> St
                 .iter()
                 .find(|s| s.provider.eq_ignore_ascii_case(&source.provider))
                 .and_then(|s| s.version.clone());
-            let update_available = match (&installed_version, &req.page_version) {
+            let by_version = match (&installed_version, &req.page_version) {
                 (Some(installed), Some(latest)) if !latest.is_empty() => Some(
                     crate::providers::compare_versions(installed, latest) == crate::providers::VersionRelation::Update,
                 ),
-                // The page doesn't expose a version (e.g. Nexus), but DDMM's
-                // own update check found one for this mod: not a guess.
-                _ if crate::commands::updates::known_update_available(&state, m.guid(), &source.provider).await => {
-                    Some(true)
-                }
                 _ => None,
+            };
+            // DDMM's own update check found one for this mod: not a guess.
+            // Covers pages that don't expose a version (Nexus) and pages
+            // whose version didn't change for a same-day update (AyakaMods
+            // versions are often just the date).
+            let update_available = if by_version != Some(true)
+                && crate::commands::updates::known_update_available(&state, m.guid(), &source.provider).await
+            {
+                Some(true)
+            } else {
+                by_version
             };
             (
                 true,

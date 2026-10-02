@@ -33,7 +33,7 @@ becomes clickable, and **Update all (N)** appears next to Check for Updates.
 | GitHub | The repository's latest release (public API, no key) | **One click**: DDMM downloads the release's `.zip`/`.7z`/`.rar` asset itself |
 | GameBanana | The mod's public API entry (version and files, no key) | **One click**: DDMM downloads the new file itself |
 | ModWorkshop | The mod's public API entry (version and files, no key) | **One click**: DDMM downloads the new file itself (a mod whose download is an external link goes through the browser) |
-| AyakaMods | The version published on the mod page | **In your browser** (downloads need your login) |
+| AyakaMods | The version and the "last updated" time published on the mod page | **In your browser** (downloads need your login) |
 | Nexus Mods | The Nexus Mods API, **only if you (optionally) add your own API key** (or, once available, sign in to Nexus Mods), and only when you click Check for Updates | **In your browser**, always |
 | Anything else | Not checked | — |
 
@@ -42,6 +42,14 @@ Mods with no recognized source are simply skipped.
 
 DDMM is polite to every site: requests are spaced out per site, time out after 20 seconds, identify DDMM with a
 clear User-Agent, use HTTPS only, and read at most 5 MB per response.
+
+AyakaMods sits behind Cloudflare, so DDMM is extra careful there: it asks for one mod page at a time, a couple of
+seconds apart, and after a refusal (403, 429 or 503) it waits and tries once more (as long as the site asks it to
+wait, if that's reasonable). If AyakaMods shows a "checking your browser" challenge instead of the page, DDMM never
+tries to get past it: that mod, and the rest of the AyakaMods mods in that check, show "AyakaMods is blocking
+automated checks right now". Try again later, or open the mod's page in your browser. A mod whose page is gone shows
+"This mod's page on AyakaMods can't be found (it may have been removed or moved)". Every source that couldn't be
+checked is also written to the [log](../help/logs.md), with the site, the mod's id and the reason.
 
 ## Updating
 
@@ -179,7 +187,9 @@ installed version, the result is "unknown", never a guess. The installed version
 DDMM records the version automatically wherever it can:
 
 - **AyakaMods, GameBanana, ModWorkshop:** when a mod is installed through DDMM (browser extension, browser
-  handoff or "choose file"), DDMM looks up the mod's current version on the site once and records it.
+  handoff or "choose file"), DDMM looks up the mod's current version on the site once and records it. For
+  AyakaMods it also records the page's "last updated" time (also when the browser extension already read the
+  version off the page).
 - **GitHub:** the release tag, from the release-asset link or the update itself.
 - **Nexus Mods:** Nexus puts the mod id and version in every download's file name, so DDMM reads the version and
   the exact file from the archive's own name. No key and no request is needed for that. Both of Nexus's naming
@@ -196,6 +206,14 @@ DDMM records the version automatically wherever it can:
 
 When a site doesn't publish a version number at all (common on GameBanana and ModWorkshop), DDMM uses the date the
 newest file was uploaded (for example `2026-04-29 05:49 UTC`) as its version.
+
+On AyakaMods the version is often just the date of the update (`2026-10-01`), so two updates on the same day
+have the same version. DDMM therefore also compares the page's "last updated" time with the one it recorded at
+install (or, for a mod installed before DDMM recorded it, with when DDMM installed the mod, corrected by how far
+your PC's clock is from the site's): a newer time **or** a different version means an update. For such older
+installs, the first check that finds the mod up to date records the page's time, so from then on it's always page
+time against page time. In the results, such an update shows the time the page was updated next to
+the version.
 
 **For mod authors:** if you declare a source in your manifest's `Sources` field, set its `Version` to match what
 the site publishes. That makes update checks work even for people who didn't install through DDMM. See
