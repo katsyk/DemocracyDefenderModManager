@@ -982,7 +982,7 @@ fn tree_hash(dir: &Path) -> std::io::Result<String> {
             let entry = entry?;
             let ft = entry.file_type()?;
             if ft.is_file() {
-                if depth == 0 && entry.file_name() == ORIGIN_SIDECAR_FILE {
+                if depth == 0 && sources::is_origin_sidecar_name(&entry.file_name()) {
                     continue;
                 }
                 files.push(entry.path());

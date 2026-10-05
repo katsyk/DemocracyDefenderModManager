@@ -20,6 +20,14 @@ use crate::models::manifest::Source;
 /// overwriting, the author's own manifest.
 pub const ORIGIN_SIDECAR_FILE: &str = ".hd2mm-origin.json";
 
+/// Whether `name` is the origin sidecar, or a temporary file left by an
+/// interrupted (atomic) save of it.
+pub fn is_origin_sidecar_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name == ORIGIN_SIDECAR_FILE
+        || name.strip_prefix(ORIGIN_SIDECAR_FILE).is_some_and(|rest| rest.starts_with('.') && rest.ends_with(".tmp"))
+}
+
 /// Where a [`ResolvedSource`] came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -108,6 +116,14 @@ pub struct InstalledFile {
 pub struct SkippedVersion {
     pub provider: String,
     pub version: String,
+    /// The page's last-update time (Unix seconds) when the user skipped,
+    /// for sites that report one (AyakaMods). Its versions are often a date
+    /// or never change, so the version alone would also hide every later
+    /// update with the same version string: a page updated after this time
+    /// is a new update, whatever its version. Skips saved before this was
+    /// recorded don't have it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<i64>,
 }
 
 /// Only ever allow a page URL through if it is a plain `http(s)` URL. This is
@@ -392,18 +408,24 @@ pub async fn write_origin_sidecar_with_files(
 }
 
 /// Write `sidecar` as-is (used to update skip lists without touching the
-/// recorded sources).
+/// recorded sources). Atomic (temporary file + rename), so a reader never
+/// sees it half written -- which would read as "no sidecar".
 pub async fn save_origin_sidecar(mod_dir: &Path, sidecar: &OriginSidecar) -> anyhow::Result<()> {
-    let path = mod_dir.join(ORIGIN_SIDECAR_FILE);
     let data = serde_json::to_vec_pretty(sidecar)?;
-    tokio::fs::write(path, data).await?;
-    Ok(())
+    crate::fs_util::replace_file(&mod_dir.join(ORIGIN_SIDECAR_FILE), &data).await
 }
 
 /// Set (`Some`) or clear (`None`) the skipped version for `provider` in a
 /// mod's sidecar, creating an otherwise-empty sidecar if the mod has none
-/// (a mod whose sources all come from its own manifest).
-pub async fn set_skipped_version(mod_dir: &Path, provider: &str, version: Option<&str>) -> anyhow::Result<()> {
+/// (a mod whose sources all come from its own manifest). `modified_at` is
+/// the page's last-update time of the skipped update, when the site has
+/// one (see [`SkippedVersion::modified_at`]).
+pub async fn set_skipped_version(
+    mod_dir: &Path,
+    provider: &str,
+    version: Option<&str>,
+    modified_at: Option<i64>,
+) -> anyhow::Result<()> {
     let mut sidecar = match load_origin_sidecar(mod_dir).await {
         Some(s) => s,
         None => OriginSidecar {
@@ -423,8 +445,29 @@ pub async fn set_skipped_version(mod_dir: &Path, provider: &str, version: Option
         sidecar.skipped_versions.push(SkippedVersion {
             provider: provider.to_string(),
             version: version.to_string(),
+            modified_at,
         });
     }
+    save_origin_sidecar(mod_dir, &sidecar).await
+}
+
+/// Give a skip saved before page times were recorded (no
+/// [`SkippedVersion::modified_at`]) the page time it was found at, so a
+/// later update of the page shows again. Only touches the skip of
+/// `provider` that is still exactly `version` with no time; anything else
+/// (the user unskipped, skipped another version, or the mod was updated)
+/// is left alone. Re-reads the sidecar, so call it with the mod list
+/// locked, like every other sidecar write during a check.
+pub async fn stamp_legacy_skip(mod_dir: &Path, provider: &str, version: &str, modified_at: i64) -> anyhow::Result<()> {
+    let Some(mut sidecar) = load_origin_sidecar(mod_dir).await else { return Ok(()) };
+    let Some(skip) = sidecar
+        .skipped_versions
+        .iter_mut()
+        .find(|s| s.provider.eq_ignore_ascii_case(provider) && s.version == version && s.modified_at.is_none())
+    else {
+        return Ok(());
+    };
+    skip.modified_at = Some(modified_at);
     save_origin_sidecar(mod_dir, &sidecar).await
 }
 
@@ -891,20 +934,93 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_origin_sidecar(dir.path(), vec![source("github", Some("o/r"), None)]).await.unwrap();
 
-        set_skipped_version(dir.path(), "github", Some("v2")).await.unwrap();
-        set_skipped_version(dir.path(), "github", Some("v3")).await.unwrap();
+        set_skipped_version(dir.path(), "github", Some("v2"), None).await.unwrap();
+        set_skipped_version(dir.path(), "github", Some("v3"), None).await.unwrap();
         let s = load_origin_sidecar(dir.path()).await.unwrap();
-        assert_eq!(s.skipped_versions, vec![SkippedVersion { provider: "github".into(), version: "v3".into() }]);
+        assert_eq!(s.skipped_versions, vec![SkippedVersion { provider: "github".into(), version: "v3".into(), modified_at: None }]);
         assert_eq!(s.sources.len(), 1, "skipping must not touch the recorded sources");
 
-        set_skipped_version(dir.path(), "github", None).await.unwrap();
+        set_skipped_version(dir.path(), "github", None, None).await.unwrap();
         assert!(load_origin_sidecar(dir.path()).await.unwrap().skipped_versions.is_empty());
+    }
+
+    /// Skips saved before page times were recorded still load (no time),
+    /// and new ones keep theirs.
+    #[tokio::test]
+    async fn skipped_versions_with_and_without_a_page_time_load() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join(ORIGIN_SIDECAR_FILE),
+            br#"{"Sources":[],"InstalledAt":1,"SkippedVersions":[{"Provider":"ayakamods","Version":"1.0"}]}"#,
+        )
+        .await
+        .unwrap();
+        let s = load_origin_sidecar(dir.path()).await.unwrap();
+        assert_eq!(s.skipped_versions, vec![SkippedVersion { provider: "ayakamods".into(), version: "1.0".into(), modified_at: None }]);
+
+        set_skipped_version(dir.path(), "ayakamods", Some("1.0"), Some(1_790_000_000)).await.unwrap();
+        let raw = tokio::fs::read_to_string(dir.path().join(ORIGIN_SIDECAR_FILE)).await.unwrap();
+        assert!(raw.contains(r#""ModifiedAt": 1790000000"#), "{raw}");
+        let s = load_origin_sidecar(dir.path()).await.unwrap();
+        assert_eq!(s.skipped_versions[0].modified_at, Some(1_790_000_000));
+    }
+
+    #[tokio::test]
+    async fn stamping_a_legacy_skip_only_touches_that_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        set_skipped_version(dir.path(), "ayakamods", Some("1.0"), None).await.unwrap();
+        // A different version: left alone.
+        stamp_legacy_skip(dir.path(), "ayakamods", "1.1", 5).await.unwrap();
+        assert_eq!(load_origin_sidecar(dir.path()).await.unwrap().skipped_versions[0].modified_at, None);
+        stamp_legacy_skip(dir.path(), "ayakamods", "1.0", 5).await.unwrap();
+        assert_eq!(load_origin_sidecar(dir.path()).await.unwrap().skipped_versions[0].modified_at, Some(5));
+        // Already has a time: never moved.
+        stamp_legacy_skip(dir.path(), "ayakamods", "1.0", 9).await.unwrap();
+        assert_eq!(load_origin_sidecar(dir.path()).await.unwrap().skipped_versions[0].modified_at, Some(5));
+        // No sidecar: nothing created.
+        let empty = tempfile::tempdir().unwrap();
+        stamp_legacy_skip(empty.path(), "ayakamods", "1.0", 5).await.unwrap();
+        assert!(load_origin_sidecar(empty.path()).await.is_none());
+    }
+
+    #[test]
+    fn sidecar_temp_files_count_as_the_sidecar() {
+        use std::ffi::OsStr;
+        assert!(is_origin_sidecar_name(OsStr::new(".hd2mm-origin.json")));
+        assert!(is_origin_sidecar_name(OsStr::new(".hd2mm-origin.json.0f3a.tmp")));
+        assert!(!is_origin_sidecar_name(OsStr::new(".hd2mm-origin.jsonx")));
+        assert!(!is_origin_sidecar_name(OsStr::new("manifest.json")));
+    }
+
+    /// Saved atomically: readers racing many saves always see a whole
+    /// sidecar, and no temporary file is left behind.
+    #[tokio::test]
+    async fn sidecar_saves_are_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        write_origin_sidecar(dir.path(), vec![source("github", Some("o/r"), None)]).await.unwrap();
+        let writer = {
+            let d = dir.path().to_path_buf();
+            tokio::spawn(async move {
+                for i in 0..200 {
+                    let v = format!("v{i}");
+                    set_skipped_version(&d, "github", Some(&v), None).await.unwrap();
+                }
+            })
+        };
+        while !writer.is_finished() {
+            assert!(load_origin_sidecar(dir.path()).await.is_some(), "a half-written sidecar was seen");
+            tokio::task::yield_now().await;
+        }
+        writer.await.unwrap();
+        let names: Vec<String> =
+            std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec![ORIGIN_SIDECAR_FILE.to_string()]);
     }
 
     #[tokio::test]
     async fn skipping_creates_a_sidecar_when_none_exists() {
         let dir = tempfile::tempdir().unwrap();
-        set_skipped_version(dir.path(), "nexus", Some("2.0")).await.unwrap();
+        set_skipped_version(dir.path(), "nexus", Some("2.0"), None).await.unwrap();
         let s = load_origin_sidecar(dir.path()).await.unwrap();
         assert!(s.sources.is_empty());
         assert_eq!(s.skipped_versions.len(), 1);

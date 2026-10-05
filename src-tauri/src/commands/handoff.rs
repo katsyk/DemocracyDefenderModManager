@@ -67,15 +67,30 @@ struct Partial {
     named: bool,
 }
 
+/// How long before an empty placeholder its browser's randomly named
+/// partial download may have been created (Firefox creates the `.part`
+/// first, then the placeholder) and still count as its own.
+const PLACEHOLDER_AFTER_PARTIAL: Duration = Duration::from_secs(120);
+
 /// The actively written partial-download file for `path`, if any: one
 /// named after it (`<name>.part`, ...), or -- while `path` is still empty
 /// -- a partial download elsewhere in the folder that looks like its own.
 /// Firefox may write into a randomly named `<random>.zip.part` while the
 /// empty placeholder carries the real name (issue #59: the 0-byte zips).
-/// Such a partial counts only if it ends with the same extension plus a
-/// partial suffix (`.zip.part`), or was created after the empty file, so an
-/// unrelated download (a video's `.crdownload`) doesn't hold it up.
+/// Such a partial counts if it was created after the empty file, or if it
+/// has the same extension plus a partial suffix (`.zip.part`) and was
+/// created at most [`PLACEHOLDER_AFTER_PARTIAL`] before it (Firefox creates
+/// the `.part` first) or has the same name (`mod (1).zip.part`). So an
+/// unrelated download (a video's `.crdownload`, or another mod's
+/// `.zip.part` started long before) doesn't hold it up. On a filesystem
+/// without creation times, any same-extension partial counts.
 async fn active_partial(path: &Path, stale_after: Duration) -> Option<Partial> {
+    active_partial_with(path, stale_after, PLACEHOLDER_AFTER_PARTIAL).await
+}
+
+/// [`active_partial`] with the "created shortly before" window injectable
+/// (tests can't backdate a creation time).
+async fn active_partial_with(path: &Path, stale_after: Duration, placeholder_after: Duration) -> Option<Partial> {
     let name = path.file_name()?;
     let fresh = |meta: &std::fs::Metadata| match meta.modified().ok().map(|m| SystemTime::now().duration_since(m)) {
         // Modified in the future (clock skew) counts as fresh.
@@ -95,6 +110,7 @@ async fn active_partial(path: &Path, stale_after: Duration) -> Option<Partial> {
     let own = tokio::fs::symlink_metadata(path).await.ok().filter(|m| m.is_file() && m.len() == 0)?;
     let own_created = own.created().or_else(|_| own.modified()).ok();
     let extension = path.extension().map(|e| format!(".{}", e.to_string_lossy().to_ascii_lowercase()));
+    let own_stem = path.file_stem().map(|s| undecorated(&s.to_string_lossy().to_ascii_lowercase()).to_string());
     let mut entries = tokio::fs::read_dir(path.parent()?).await.ok()?;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let lower = entry.file_name().to_string_lossy().to_ascii_lowercase();
@@ -104,15 +120,56 @@ async fn active_partial(path: &Path, stale_after: Duration) -> Option<Partial> {
             continue;
         }
         let same_type = extension.as_ref().is_some_and(|ext| lower.ends_with(&format!("{ext}{suffix}")));
-        let created_after = match (meta.created().ok(), own_created) {
-            (Some(created), Some(own)) => created >= own,
-            _ => false,
+        // How long before the empty file this partial was created
+        // (`Some(ZERO)`: at the same time or after it).
+        let created_before = match (meta.created().ok(), own_created) {
+            (Some(created), Some(own)) => Some(own.duration_since(created).unwrap_or(Duration::ZERO)),
+            _ => None,
         };
-        if same_type || created_after {
+        let holds = match created_before {
+            Some(before) if before.is_zero() => true,
+            // Started before the empty file. Firefox creates its randomly
+            // named `.part` *first* and the placeholder right after (issue
+            // #59), so a same-type partial started shortly before still
+            // counts; one started long before is another download, unless
+            // it is plainly this one (`mod (1).zip.part` for `mod.zip`).
+            // Holding on too long only costs a wait; letting go too early
+            // installs a 0-byte archive.
+            Some(before) => {
+                same_type
+                    && (before <= placeholder_after
+                        || own_stem.as_deref().is_some_and(|own| partial_stem(&lower, suffix) == own))
+            }
+            // No creation times on this filesystem: the type has to do.
+            None => same_type,
+        };
+        if holds {
             return Some(Partial { path: entry.path(), named: false });
         }
     }
     None
+}
+
+/// The name of the download a partial file (`lower`, lowercased, ending in
+/// `suffix`) is for, without its extension or a browser's " (1)" -- e.g.
+/// `mod (1).zip.part` -> `mod`.
+fn partial_stem<'a>(lower: &'a str, suffix: &str) -> &'a str {
+    let name = &lower[..lower.len() - suffix.len()];
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    undecorated(stem)
+}
+
+/// `name` without a trailing " (N)" / "(N)" a browser adds to tell
+/// same-named downloads apart.
+fn undecorated(name: &str) -> &str {
+    let Some(inner) = name.strip_suffix(')') else { return name };
+    let Some(open) = inner.rfind('(') else { return name };
+    let number = &inner[open + 1..];
+    if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) {
+        name[..open].trim_end()
+    } else {
+        name
+    }
 }
 
 /// Limits for [`wait_until_stable`] (tests use short ones).
@@ -1065,6 +1122,61 @@ mod tests {
             .expect("must not wait for the unrelated download")
             .unwrap();
         assert_eq!(found.as_deref(), Some(path.as_path()));
+    }
+
+    /// Issue #59 as Firefox really does it: the randomly named `.part` is
+    /// created *first*, the empty placeholder right after. It must still be
+    /// waited out, not installed as a 0-byte zip.
+    #[tokio::test]
+    async fn a_random_part_created_just_before_the_placeholder_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("Xq3vB7aZ.zip.part"), b"PK").await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let path = dir.path().join("CasemateTurrets.zip");
+        touch(&path, b"").await;
+        assert!(download_in_progress(&path).await);
+    }
+
+    /// An empty `mod.zip` isn't held up for 15 minutes by another mod's
+    /// `.zip.part` started long before it appeared -- unless that partial
+    /// is plainly this download (`mod (1).zip.part`). (The "long before"
+    /// window is shortened here: creation times can't be backdated.)
+    #[tokio::test]
+    async fn an_older_partial_of_another_zip_does_not_hold_up_an_empty_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("Other Mod.zip.part");
+        touch(&other, b"PK").await;
+        let decorated = dir.path().join("mod (1).zip.part");
+        touch(&decorated, b"PK").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let path = dir.path().join("mod.zip");
+        touch(&path, b"").await;
+        if std::fs::metadata(&other).and_then(|m| m.created()).is_err() {
+            return; // no creation times here: the extension alone decides
+        }
+        let window = Duration::from_millis(10);
+        assert!(active_partial_with(&path, PARTIAL_STALE_AFTER, window).await.is_some(), "its own (renamed) partial");
+        assert!(active_partial(&path, PARTIAL_STALE_AFTER).await.is_some(), "within the window: held");
+        tokio::fs::remove_file(&decorated).await.unwrap();
+        assert!(active_partial_with(&path, PARTIAL_STALE_AFTER, window).await.is_none(), "another mod's partial");
+        // A non-archive partial started before never holds it.
+        tokio::fs::remove_file(&other).await.unwrap();
+        touch(&dir.path().join("Movie.mkv.crdownload"), b"x").await;
+        let later = dir.path().join("late.zip");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        touch(&later, b"").await;
+        assert!(active_partial(&later, PARTIAL_STALE_AFTER).await.is_none());
+    }
+
+    #[test]
+    fn partial_stems_drop_extension_and_browser_numbering() {
+        assert_eq!(partial_stem("mod (1).zip.part", ".part"), "mod");
+        assert_eq!(partial_stem("mod(12).zip.crdownload", ".crdownload"), "mod");
+        assert_eq!(partial_stem("mod.zip.part", ".part"), "mod");
+        assert_eq!(partial_stem("xq3vb7az.zip.part", ".part"), "xq3vb7az");
+        assert_eq!(undecorated("mod (v2)"), "mod (v2)");
+        assert_eq!(undecorated("mod ()"), "mod ()");
+        assert_eq!(undecorated("(1)"), "");
     }
 
     /// If the wait ends while only a folder-wide partial was seen, the

@@ -1233,7 +1233,7 @@
 
     async function onSkipVersion(entry: UpdateStatusEntry, skip: boolean) {
         try {
-            await skipUpdateVersion(entry.Guid, entry.Provider, skip ? (entry.LatestVersion ?? null) : null);
+            await skipUpdateVersion(entry.Guid, entry.Provider, skip ? (entry.LatestVersion ?? null) : null, skip ? (entry.LatestModifiedAt ?? null) : null);
             await refreshUpdateStatuses();
         } catch (ex: unknown) {
             showPopup(new ErrorPopup(t("pages.mods.popup.error.skip_version.message"), errorMessage(ex)));

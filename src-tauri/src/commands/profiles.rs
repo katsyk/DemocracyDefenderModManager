@@ -95,26 +95,17 @@ pub async fn remove_from_saved_profiles(base_path: &std::path::Path, guid: uuid:
 static PROFILES_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Write profiles.json atomically: into a temporary file next to it, then
-/// renamed over it, so it's never seen (or left, on a crash) half written.
+/// renamed over it (retried while another program has it open), so it's
+/// never seen (or left, on a crash) half written.
 async fn write_profiles(base_path: &std::path::Path, config: &ProfilesConfig) -> anyhow::Result<()> {
     let data = serde_json::to_vec_pretty(config)?;
-    let file = base_path.join(PROFILES_FILE);
-    let temp = base_path.join(format!("{PROFILES_FILE}.{}.tmp", uuid::Uuid::new_v4()));
-    let written = async {
-        tokio::fs::write(&temp, &data).await?;
-        tokio::fs::rename(&temp, &file).await
-    }
-    .await;
-    if let Err(e) = written {
-        let _ = tokio::fs::remove_file(&temp).await;
-        return Err(anyhow::Error::from(e).context(format!("couldn't write {:?}", file)));
-    }
-    Ok(())
+    crate::fs_util::replace_file(&base_path.join(PROFILES_FILE), &data).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs_util::replace_file_with;
 
     fn profiles_with(guids: &[&str]) -> ProfilesConfig {
         let configs = guids
@@ -159,6 +150,90 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec![PROFILES_FILE.to_string()]);
+    }
+
+    fn in_use() -> std::io::Error {
+        std::io::Error::from_raw_os_error(32) // ERROR_SHARING_VIOLATION on Windows
+    }
+
+    const FAST: &[std::time::Duration] = &[std::time::Duration::from_millis(1); 3];
+
+    /// The file is busy for a moment (Windows antivirus/sync client): the
+    /// rename is retried and the save goes through.
+    #[tokio::test]
+    async fn a_briefly_busy_profiles_file_is_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let tries = std::sync::atomic::AtomicUsize::new(0);
+        replace_file_with(&dir.path().join(PROFILES_FILE), &serde_json::to_vec_pretty(&profiles_with(&[A])).unwrap(), FAST, |e| e.raw_os_error() == Some(32), |from, to| {
+            let n = tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { if n < 2 { Err(in_use()) } else { tokio::fs::rename(from, to).await } }
+        })
+        .await
+        .unwrap();
+        assert_eq!(tries.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let loaded = do_load_profiles(dir.path()).await.unwrap();
+        assert_eq!(loaded.profiles[0].configs().len(), 1);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp file left");
+    }
+
+    /// Still busy after every retry: a clear error, the old file untouched
+    /// and no temp file left. Other errors aren't retried at all.
+    #[tokio::test]
+    async fn a_profiles_file_that_stays_busy_fails_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        write_profiles(dir.path(), &profiles_with(&[A, B])).await.unwrap();
+        let tries = std::sync::atomic::AtomicUsize::new(0);
+        let err = replace_file_with(&dir.path().join(PROFILES_FILE), &serde_json::to_vec_pretty(&profiles_with(&[A])).unwrap(), FAST, |e| e.raw_os_error() == Some(32), |_, _| {
+            tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(in_use()) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(tries.load(std::sync::atomic::Ordering::SeqCst), 4, "first try + 3 retries");
+        assert!(format!("{err:#}").contains("in use by another program"), "{err:#}");
+        assert_eq!(do_load_profiles(dir.path()).await.unwrap().profiles[0].configs().len(), 2);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp file left");
+
+        tries.store(0, std::sync::atomic::Ordering::SeqCst);
+        let err = replace_file_with(&dir.path().join(PROFILES_FILE), &serde_json::to_vec_pretty(&profiles_with(&[A])).unwrap(), FAST, |e| e.raw_os_error() == Some(32), |_, _| {
+            tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(std::io::Error::from(std::io::ErrorKind::NotFound)) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(tries.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!format!("{err:#}").contains("in use by another program"), "{err:#}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp file left");
+    }
+
+    /// Real Windows behaviour: profiles.json held open without delete
+    /// sharing (as a scanner does) makes the rename fail; once it's closed
+    /// within the retry window, the save goes through.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_save_waits_for_a_scanner_to_close_profiles_json() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        let dir = tempfile::tempdir().unwrap();
+        write_profiles(dir.path(), &profiles_with(&[A, B])).await.unwrap();
+        let path = dir.path().join(PROFILES_FILE);
+
+        let held = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&path).unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(held);
+        });
+        write_profiles(dir.path(), &profiles_with(&[A])).await.unwrap();
+        closer.join().unwrap();
+        assert_eq!(do_load_profiles(dir.path()).await.unwrap().profiles[0].configs().len(), 1);
+
+        // Held open the whole time: fails cleanly, old file kept.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&path).unwrap();
+        let err = write_profiles(dir.path(), &profiles_with(&[A, B])).await.unwrap_err();
+        drop(held);
+        assert!(format!("{err:#}").contains("in use by another program"), "{err:#}");
+        assert_eq!(do_load_profiles(dir.path()).await.unwrap().profiles[0].configs().len(), 1);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp file left");
     }
 
     #[tokio::test]
