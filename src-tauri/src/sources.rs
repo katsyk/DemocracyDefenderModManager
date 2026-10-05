@@ -20,6 +20,14 @@ use crate::models::manifest::Source;
 /// overwriting, the author's own manifest.
 pub const ORIGIN_SIDECAR_FILE: &str = ".hd2mm-origin.json";
 
+/// Whether `name` is the origin sidecar, or a temporary file left by an
+/// interrupted (atomic) save of it.
+pub fn is_origin_sidecar_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name == ORIGIN_SIDECAR_FILE
+        || name.strip_prefix(ORIGIN_SIDECAR_FILE).is_some_and(|rest| rest.starts_with('.') && rest.ends_with(".tmp"))
+}
+
 /// Where a [`ResolvedSource`] came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -400,12 +408,11 @@ pub async fn write_origin_sidecar_with_files(
 }
 
 /// Write `sidecar` as-is (used to update skip lists without touching the
-/// recorded sources).
+/// recorded sources). Atomic (temporary file + rename), so a reader never
+/// sees it half written -- which would read as "no sidecar".
 pub async fn save_origin_sidecar(mod_dir: &Path, sidecar: &OriginSidecar) -> anyhow::Result<()> {
-    let path = mod_dir.join(ORIGIN_SIDECAR_FILE);
     let data = serde_json::to_vec_pretty(sidecar)?;
-    tokio::fs::write(path, data).await?;
-    Ok(())
+    crate::fs_util::replace_file(&mod_dir.join(ORIGIN_SIDECAR_FILE), &data).await
 }
 
 /// Set (`Some`) or clear (`None`) the skipped version for `provider` in a
@@ -974,6 +981,40 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         stamp_legacy_skip(empty.path(), "ayakamods", "1.0", 5).await.unwrap();
         assert!(load_origin_sidecar(empty.path()).await.is_none());
+    }
+
+    #[test]
+    fn sidecar_temp_files_count_as_the_sidecar() {
+        use std::ffi::OsStr;
+        assert!(is_origin_sidecar_name(OsStr::new(".hd2mm-origin.json")));
+        assert!(is_origin_sidecar_name(OsStr::new(".hd2mm-origin.json.0f3a.tmp")));
+        assert!(!is_origin_sidecar_name(OsStr::new(".hd2mm-origin.jsonx")));
+        assert!(!is_origin_sidecar_name(OsStr::new("manifest.json")));
+    }
+
+    /// Saved atomically: readers racing many saves always see a whole
+    /// sidecar, and no temporary file is left behind.
+    #[tokio::test]
+    async fn sidecar_saves_are_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        write_origin_sidecar(dir.path(), vec![source("github", Some("o/r"), None)]).await.unwrap();
+        let writer = {
+            let d = dir.path().to_path_buf();
+            tokio::spawn(async move {
+                for i in 0..200 {
+                    let v = format!("v{i}");
+                    set_skipped_version(&d, "github", Some(&v), None).await.unwrap();
+                }
+            })
+        };
+        while !writer.is_finished() {
+            assert!(load_origin_sidecar(dir.path()).await.is_some(), "a half-written sidecar was seen");
+            tokio::task::yield_now().await;
+        }
+        writer.await.unwrap();
+        let names: Vec<String> =
+            std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec![ORIGIN_SIDECAR_FILE.to_string()]);
     }
 
     #[tokio::test]

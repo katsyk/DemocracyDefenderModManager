@@ -94,86 +94,18 @@ pub async fn remove_from_saved_profiles(base_path: &std::path::Path, guid: uuid:
 /// interleave.
 static PROFILES_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// How long to wait before each retry of a failed rename over
-/// profiles.json (about 1 s in all).
-const RENAME_RETRY_DELAYS: &[std::time::Duration] = &[
-    std::time::Duration::from_millis(100),
-    std::time::Duration::from_millis(300),
-    std::time::Duration::from_millis(600),
-];
-
-/// Whether a failed rename over profiles.json is worth retrying: on
-/// Windows, an antivirus scanner, search indexer or sync client that has
-/// the file open without delete sharing makes the rename fail for a moment
-/// (access denied, sharing or lock violation). Nothing else is retried.
-fn is_transient_rename_error(e: &std::io::Error) -> bool {
-    cfg!(windows) && e.raw_os_error().is_some_and(is_windows_file_in_use_code)
-}
-
-/// ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION.
-fn is_windows_file_in_use_code(code: i32) -> bool {
-    matches!(code, 5 | 32 | 33)
-}
-
 /// Write profiles.json atomically: into a temporary file next to it, then
-/// renamed over it, so it's never seen (or left, on a crash) half written.
+/// renamed over it (retried while another program has it open), so it's
+/// never seen (or left, on a crash) half written.
 async fn write_profiles(base_path: &std::path::Path, config: &ProfilesConfig) -> anyhow::Result<()> {
-    write_profiles_with(base_path, config, RENAME_RETRY_DELAYS, is_transient_rename_error, |from, to| {
-        tokio::fs::rename(from, to)
-    })
-    .await
-}
-
-/// [`write_profiles`] with the retry delays, the "retry this?" test and the
-/// rename step injectable, so the retries can be tested on every platform.
-async fn write_profiles_with<R, Fut>(
-    base_path: &std::path::Path,
-    config: &ProfilesConfig,
-    delays: &[std::time::Duration],
-    retryable: impl Fn(&std::io::Error) -> bool,
-    rename: R,
-) -> anyhow::Result<()>
-where
-    R: Fn(std::path::PathBuf, std::path::PathBuf) -> Fut,
-    Fut: std::future::Future<Output = std::io::Result<()>>,
-{
     let data = serde_json::to_vec_pretty(config)?;
-    let file = base_path.join(PROFILES_FILE);
-    let temp = base_path.join(format!("{PROFILES_FILE}.{}.tmp", uuid::Uuid::new_v4()));
-    let written = async {
-        tokio::fs::write(&temp, &data).await?;
-        let mut delays = delays.iter();
-        loop {
-            match rename(temp.clone(), file.clone()).await {
-                Ok(()) => return Ok(()),
-                Err(e) if retryable(&e) => match delays.next() {
-                    Some(delay) => {
-                        log::info!("Replacing {:?} failed ({e}); another program may have it open. Trying again.", file);
-                        tokio::time::sleep(*delay).await;
-                    }
-                    None => return Err(e),
-                },
-                Err(e) => return Err(e),
-            }
-        }
-    }
-    .await;
-    if let Err(e) = written {
-        let _ = tokio::fs::remove_file(&temp).await;
-        let in_use = retryable(&e);
-        let e = anyhow::Error::from(e).context(format!("couldn't write {:?}", file));
-        return Err(if in_use {
-            e.context("profiles.json is in use by another program (an antivirus or sync app?); close it or try again")
-        } else {
-            e
-        });
-    }
-    Ok(())
+    crate::fs_util::replace_file(&base_path.join(PROFILES_FILE), &data).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs_util::replace_file_with;
 
     fn profiles_with(guids: &[&str]) -> ProfilesConfig {
         let configs = guids
@@ -232,7 +164,7 @@ mod tests {
     async fn a_briefly_busy_profiles_file_is_retried() {
         let dir = tempfile::tempdir().unwrap();
         let tries = std::sync::atomic::AtomicUsize::new(0);
-        write_profiles_with(dir.path(), &profiles_with(&[A]), FAST, |e| e.raw_os_error() == Some(32), |from, to| {
+        replace_file_with(&dir.path().join(PROFILES_FILE), &serde_json::to_vec_pretty(&profiles_with(&[A])).unwrap(), FAST, |e| e.raw_os_error() == Some(32), |from, to| {
             let n = tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async move { if n < 2 { Err(in_use()) } else { tokio::fs::rename(from, to).await } }
         })
@@ -251,7 +183,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_profiles(dir.path(), &profiles_with(&[A, B])).await.unwrap();
         let tries = std::sync::atomic::AtomicUsize::new(0);
-        let err = write_profiles_with(dir.path(), &profiles_with(&[A]), FAST, |e| e.raw_os_error() == Some(32), |_, _| {
+        let err = replace_file_with(&dir.path().join(PROFILES_FILE), &serde_json::to_vec_pretty(&profiles_with(&[A])).unwrap(), FAST, |e| e.raw_os_error() == Some(32), |_, _| {
             tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async { Err(in_use()) }
         })
@@ -263,7 +195,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp file left");
 
         tries.store(0, std::sync::atomic::Ordering::SeqCst);
-        let err = write_profiles_with(dir.path(), &profiles_with(&[A]), FAST, |e| e.raw_os_error() == Some(32), |_, _| {
+        let err = replace_file_with(&dir.path().join(PROFILES_FILE), &serde_json::to_vec_pretty(&profiles_with(&[A])).unwrap(), FAST, |e| e.raw_os_error() == Some(32), |_, _| {
             tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async { Err(std::io::Error::from(std::io::ErrorKind::NotFound)) }
         })
@@ -272,17 +204,6 @@ mod tests {
         assert_eq!(tries.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(!format!("{err:#}").contains("in use by another program"), "{err:#}");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp file left");
-    }
-
-    #[test]
-    fn only_windows_file_in_use_errors_are_retried() {
-        assert!(is_windows_file_in_use_code(5));
-        assert!(is_windows_file_in_use_code(32));
-        assert!(is_windows_file_in_use_code(33));
-        assert!(!is_windows_file_in_use_code(2));
-        assert!(!is_transient_rename_error(&std::io::Error::from(std::io::ErrorKind::NotFound)));
-        #[cfg(not(windows))]
-        assert!(!is_transient_rename_error(&in_use()), "not retried off Windows");
     }
 
     /// Real Windows behaviour: profiles.json held open without delete

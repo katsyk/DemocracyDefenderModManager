@@ -229,8 +229,144 @@ pub fn ensure_no_overlap(src: &Path, dst: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// How long to wait before each retry of a failed [`replace_file`]
+/// rename (about 1 s in all).
+pub const REPLACE_RETRY_DELAYS: &[std::time::Duration] = &[
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(300),
+    std::time::Duration::from_millis(600),
+];
+
+/// Whether a failed rename over an existing file is worth retrying: on
+/// Windows, an antivirus scanner, search indexer or sync client that has
+/// the file open without delete sharing makes the rename fail for a moment
+/// (access denied, sharing or lock violation). Nothing else is retried.
+pub fn is_transient_rename_error(e: &io::Error) -> bool {
+    cfg!(windows) && e.raw_os_error().is_some_and(is_windows_file_in_use_code)
+}
+
+/// ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION.
+fn is_windows_file_in_use_code(code: i32) -> bool {
+    matches!(code, 5 | 32 | 33)
+}
+
+/// Replace `file` with `data` atomically: write a temporary file next to
+/// it, then rename it over `file`, so `file` is never seen (or left, on a
+/// crash) half written. While another program has `file` open the rename
+/// is retried for about a second; a read-only `file` is reported as such.
+/// The temporary file is removed on any failure.
+pub async fn replace_file(file: &Path, data: &[u8]) -> anyhow::Result<()> {
+    replace_file_with(file, data, REPLACE_RETRY_DELAYS, is_transient_rename_error, tokio::fs::rename)
+        .await
+}
+
+/// [`replace_file`] with the retry delays, the "retry this?" test and the
+/// rename step injectable, so the retries can be tested on every platform.
+pub(crate) async fn replace_file_with<R, Fut>(
+    file: &Path,
+    data: &[u8],
+    delays: &[std::time::Duration],
+    retryable: impl Fn(&io::Error) -> bool,
+    rename: R,
+) -> anyhow::Result<()>
+where
+    R: Fn(PathBuf, PathBuf) -> Fut,
+    Fut: std::future::Future<Output = io::Result<()>>,
+{
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let temp = file.with_file_name(format!("{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let read_only = || std::fs::metadata(file).is_ok_and(|m| m.permissions().readonly());
+    let written = async {
+        tokio::fs::write(&temp, data).await?;
+        let mut delays = delays.iter();
+        loop {
+            match rename(temp.clone(), file.to_path_buf()).await {
+                Ok(()) => return Ok(()),
+                // A read-only file fails the same way, and never clears up.
+                Err(e) if retryable(&e) && !read_only() => match delays.next() {
+                    Some(delay) => {
+                        log::info!("Replacing {:?} failed ({e}); another program may have it open. Trying again.", file);
+                        tokio::time::sleep(*delay).await;
+                    }
+                    None => return Err(e),
+                },
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&temp).await;
+        let in_use = retryable(&e);
+        let e = anyhow::Error::from(e).context(format!("couldn't write {:?}", file));
+        return Err(if in_use && read_only() {
+            e.context(format!("{name} is read-only; clear its read-only attribute (file Properties) and try again"))
+        } else if in_use {
+            e.context(format!("{name} is in use by another program (an antivirus or sync app?); close it or try again"))
+        } else {
+            e
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_windows_file_in_use_errors_are_retried() {
+        use super::{is_transient_rename_error, is_windows_file_in_use_code};
+        assert!(is_windows_file_in_use_code(5));
+        assert!(is_windows_file_in_use_code(32));
+        assert!(is_windows_file_in_use_code(33));
+        assert!(!is_windows_file_in_use_code(2));
+        assert!(!is_transient_rename_error(&std::io::Error::from(std::io::ErrorKind::NotFound)));
+        #[cfg(not(windows))]
+        assert!(!is_transient_rename_error(&std::io::Error::from_raw_os_error(32)), "not retried off Windows");
+    }
+
+    /// A read-only file isn't retried and isn't blamed on another program.
+    #[tokio::test]
+    async fn a_read_only_file_is_reported_as_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("profiles.json");
+        std::fs::write(&file, b"old").unwrap();
+        let mut perms = std::fs::metadata(&file).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&file, perms).unwrap();
+        let tries = std::sync::atomic::AtomicUsize::new(0);
+        let delays = [std::time::Duration::from_millis(1); 3];
+        let err = super::replace_file_with(&file, b"new", &delays, |e| e.raw_os_error() == Some(5), |_, _| {
+            tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(std::io::Error::from_raw_os_error(5)) }
+        })
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("profiles.json is read-only"), "{msg}");
+        assert!(!msg.contains("in use by another program"), "{msg}");
+        assert_eq!(tries.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp file left");
+    }
+
+    /// Real Windows: replacing a read-only file says so (if Windows refuses
+    /// it at all).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_read_only_file_is_reported_as_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("profiles.json");
+        std::fs::write(&file, b"old").unwrap();
+        let mut perms = std::fs::metadata(&file).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&file, perms).unwrap();
+        let started = std::time::Instant::now();
+        if let Err(err) = super::replace_file(&file, b"new").await {
+            let msg = format!("{err:#}");
+            assert!(msg.contains("profiles.json is read-only"), "{msg}");
+            assert!(started.elapsed() < std::time::Duration::from_millis(500), "not retried");
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp file left");
+    }
     use super::*;
 
     fn exdev() -> io::Error {
