@@ -242,12 +242,74 @@ pub const REPLACE_RETRY_DELAYS: &[std::time::Duration] = &[
 /// the file open without delete sharing makes the rename fail for a moment
 /// (access denied, sharing or lock violation). Nothing else is retried.
 pub fn is_transient_rename_error(e: &io::Error) -> bool {
+    is_transient_file_error(e)
+}
+
+/// Whether opening, reading or renaming a file failed only because the
+/// file is busy for a moment, on Windows: another program (an antivirus
+/// scanner, search indexer, sync client) has it open without sharing, or
+/// it is being replaced by a rename right now (the file being replaced is
+/// "delete pending" until its last handle closes, and opening it in that
+/// window fails with access denied). Such a file is not missing, and not
+/// broken: the same call a moment later succeeds.
+pub fn is_transient_file_error(e: &io::Error) -> bool {
     cfg!(windows) && e.raw_os_error().is_some_and(is_windows_file_in_use_code)
 }
 
-/// ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION.
+/// ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION,
+/// ERROR_DELETE_PENDING.
 fn is_windows_file_in_use_code(code: i32) -> bool {
-    matches!(code, 5 | 32 | 33)
+    matches!(code, 5 | 32 | 33 | 303)
+}
+
+/// How long to wait before each retry of a file read that failed with a
+/// [`is_transient_file_error`] (about 1 s in all): short at first, since
+/// a rename in progress clears up within milliseconds.
+pub const READ_RETRY_DELAYS: &[std::time::Duration] = &[
+    std::time::Duration::from_millis(5),
+    std::time::Duration::from_millis(20),
+    std::time::Duration::from_millis(50),
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(250),
+    std::time::Duration::from_millis(600),
+];
+
+/// Run `op`, and again after each of `delays` while it fails with an error
+/// `retryable` accepts. Returns the last result. For blocking code only
+/// (it sleeps the thread).
+pub fn retry_blocking<T>(
+    delays: &[std::time::Duration],
+    retryable: impl Fn(&io::Error) -> bool,
+    mut op: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    let mut delays = delays.iter();
+    loop {
+        match op() {
+            Err(e) if retryable(&e) => match delays.next() {
+                Some(delay) => std::thread::sleep(*delay),
+                None => return Err(e),
+            },
+            result => return result,
+        }
+    }
+}
+
+/// Read a whole file, retrying briefly while it is busy (see
+/// [`is_transient_file_error`]). A file that's still busy after that is an
+/// error, never "missing": only `NotFound` means there is no file.
+pub fn read_file_blocking(file: &Path) -> io::Result<Vec<u8>> {
+    retry_blocking(READ_RETRY_DELAYS, is_transient_file_error, || std::fs::read(file))
+}
+
+/// Whether `file` exists (as a file), retrying briefly while it is busy.
+/// Only a definite answer is `Ok`: a file whose existence can't be checked
+/// is an error, not `false`, so a caller can't mistake "busy" for "absent".
+pub fn file_exists_blocking(file: &Path) -> io::Result<bool> {
+    match retry_blocking(READ_RETRY_DELAYS, is_transient_file_error, || std::fs::metadata(file)) {
+        Ok(meta) => Ok(meta.is_file()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Replace `file` with `data` atomically: write a temporary file next to
@@ -258,6 +320,92 @@ fn is_windows_file_in_use_code(code: i32) -> bool {
 pub async fn replace_file(file: &Path, data: &[u8]) -> anyhow::Result<()> {
     replace_file_with(file, data, REPLACE_RETRY_DELAYS, is_transient_rename_error, tokio::fs::rename)
         .await
+}
+
+/// [`replace_file`] for blocking code (deciding the data folder happens
+/// before any async runtime exists), and durable: the temporary file (and,
+/// on Unix, the folder after the rename) is synced to disk before this
+/// returns, so a crash right after can't leave `file` empty or old. Same
+/// temporary file, same retries, same errors as [`replace_file`].
+pub fn replace_file_durably_blocking(file: &Path, data: &[u8]) -> anyhow::Result<()> {
+    replace_file_durably_blocking_with(file, data, REPLACE_RETRY_DELAYS, is_transient_rename_error, |a, b| {
+        std::fs::rename(a, b)
+    })
+}
+
+/// [`replace_file_durably_blocking`] with the retries and the rename step
+/// injectable, like [`replace_file_with`].
+pub(crate) fn replace_file_durably_blocking_with(
+    file: &Path,
+    data: &[u8],
+    delays: &[std::time::Duration],
+    retryable: impl Fn(&io::Error) -> bool,
+    rename: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let temp = temp_path_for(file);
+    let read_only = || std::fs::metadata(file).is_ok_and(|m| m.permissions().readonly());
+    let written = (|| -> io::Result<()> {
+        let mut f = std::fs::File::create(&temp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
+        let mut delays = delays.iter();
+        loop {
+            match rename(&temp, file) {
+                Ok(()) => return Ok(()),
+                // A read-only file fails the same way, and never clears up.
+                Err(e) if retryable(&e) && !read_only() => match delays.next() {
+                    Some(delay) => {
+                        log::info!("Replacing {:?} failed ({e}); another program may have it open. Trying again.", file);
+                        std::thread::sleep(*delay);
+                    }
+                    None => return Err(e),
+                },
+                Err(e) => return Err(e),
+            }
+        }
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(replace_error(file, e, &retryable, read_only()));
+    }
+    sync_parent_dir(file);
+    Ok(())
+}
+
+/// Make a rename in `file`'s folder durable, where the OS allows syncing a
+/// folder (Unix). On Windows, NTFS journals the rename itself.
+pub fn sync_parent_dir(file: &Path) {
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(file.parent().unwrap_or(Path::new("."))) {
+        let _ = d.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+}
+
+/// The temporary file [`replace_file`] writes before renaming it over
+/// `file`: next to it, and unique, so two processes (or threads) replacing
+/// the same file at once never write to the same temporary file.
+fn temp_path_for(file: &Path) -> PathBuf {
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    file.with_file_name(format!("{name}.{}.tmp", uuid::Uuid::new_v4()))
+}
+
+/// The error a failed [`replace_file`] reports: in use, or read-only, gets a
+/// hint for the user.
+fn replace_error(file: &Path, e: io::Error, retryable: impl Fn(&io::Error) -> bool, read_only: bool) -> anyhow::Error {
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let in_use = retryable(&e);
+    let e = anyhow::Error::from(e).context(format!("couldn't write {:?}", file));
+    if in_use && read_only {
+        e.context(format!("{name} is read-only; clear its read-only attribute (file Properties) and try again"))
+    } else if in_use {
+        e.context(format!("{name} is in use by another program (an antivirus or sync app?); close it or try again"))
+    } else {
+        e
+    }
 }
 
 /// [`replace_file`] with the retry delays, the "retry this?" test and the
@@ -273,8 +421,7 @@ where
     R: Fn(PathBuf, PathBuf) -> Fut,
     Fut: std::future::Future<Output = io::Result<()>>,
 {
-    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let temp = file.with_file_name(format!("{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let temp = temp_path_for(file);
     let read_only = || std::fs::metadata(file).is_ok_and(|m| m.permissions().readonly());
     let written = async {
         tokio::fs::write(&temp, data).await?;
@@ -297,15 +444,7 @@ where
     .await;
     if let Err(e) = written {
         let _ = tokio::fs::remove_file(&temp).await;
-        let in_use = retryable(&e);
-        let e = anyhow::Error::from(e).context(format!("couldn't write {:?}", file));
-        return Err(if in_use && read_only() {
-            e.context(format!("{name} is read-only; clear its read-only attribute (file Properties) and try again"))
-        } else if in_use {
-            e.context(format!("{name} is in use by another program (an antivirus or sync app?); close it or try again"))
-        } else {
-            e
-        });
+        return Err(replace_error(file, e, &retryable, read_only()));
     }
     Ok(())
 }
@@ -318,10 +457,82 @@ mod tests {
         assert!(is_windows_file_in_use_code(5));
         assert!(is_windows_file_in_use_code(32));
         assert!(is_windows_file_in_use_code(33));
+        assert!(is_windows_file_in_use_code(303));
         assert!(!is_windows_file_in_use_code(2));
         assert!(!is_transient_rename_error(&std::io::Error::from(std::io::ErrorKind::NotFound)));
         #[cfg(not(windows))]
         assert!(!is_transient_rename_error(&std::io::Error::from_raw_os_error(32)), "not retried off Windows");
+    }
+
+    /// Transient errors are retried up to the given delays; others, and
+    /// success, end it at once.
+    #[test]
+    fn retry_blocking_retries_only_transient_errors_and_is_bounded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let delays = [std::time::Duration::from_millis(1); 3];
+        let busy = |e: &std::io::Error| e.raw_os_error() == Some(32);
+        let tries = AtomicUsize::new(0);
+        let got = super::retry_blocking(&delays, busy, || match tries.fetch_add(1, Ordering::SeqCst) {
+            0 | 1 => Err(std::io::Error::from_raw_os_error(32)),
+            _ => Ok("read"),
+        });
+        assert_eq!((got.unwrap(), tries.load(Ordering::SeqCst)), ("read", 3));
+
+        let tries = AtomicUsize::new(0);
+        let got: std::io::Result<()> = super::retry_blocking(&delays, busy, || {
+            tries.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::from_raw_os_error(32))
+        });
+        assert_eq!((got.unwrap_err().raw_os_error(), tries.load(Ordering::SeqCst)), (Some(32), 4));
+
+        let tries = AtomicUsize::new(0);
+        let got: std::io::Result<()> = super::retry_blocking(&delays, busy, || {
+            tries.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::ErrorKind::NotFound.into())
+        });
+        assert_eq!((got.unwrap_err().kind(), tries.load(Ordering::SeqCst)), (std::io::ErrorKind::NotFound, 1));
+    }
+
+    #[test]
+    fn file_exists_blocking_is_definite() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        assert!(!super::file_exists_blocking(&file).unwrap());
+        std::fs::write(&file, b"x").unwrap();
+        assert!(super::file_exists_blocking(&file).unwrap());
+        assert!(!super::file_exists_blocking(dir.path()).unwrap(), "a folder isn't a file");
+        assert_eq!(super::read_file_blocking(&file).unwrap(), b"x");
+    }
+
+    /// The blocking replace retries a rename the way `replace_file` does,
+    /// writes the whole file, and leaves no temp file either way.
+    #[test]
+    fn blocking_replace_retries_a_busy_rename_then_reports_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ddmm-data-location.json");
+        std::fs::write(&file, b"old").unwrap();
+        let delays = [std::time::Duration::from_millis(1); 3];
+        let busy = |e: &std::io::Error| e.raw_os_error() == Some(32);
+        let tries = AtomicUsize::new(0);
+        super::replace_file_durably_blocking_with(&file, b"new", &delays, busy, |a, b| {
+            if tries.fetch_add(1, Ordering::SeqCst) < 2 {
+                return Err(std::io::Error::from_raw_os_error(32));
+            }
+            std::fs::rename(a, b)
+        })
+        .unwrap();
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp file left");
+
+        let err = super::replace_file_durably_blocking_with(&file, b"newer", &delays, busy, |_, _| {
+            Err(std::io::Error::from_raw_os_error(32))
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("in use by another program"), "{err:#}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp file left");
     }
 
     /// A read-only file isn't retried and isn't blamed on another program.

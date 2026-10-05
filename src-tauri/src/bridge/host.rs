@@ -92,6 +92,12 @@ async fn try_connect(base_path: &Path) -> Option<TcpStream> {
     tokio::time::timeout(CONNECT_TIMEOUT, connect_and_handshake(info.port, &info.token)).await.ok()?
 }
 
+/// [`try_connect`] to the app whose data folder `resolve_base` finds now;
+/// none when that folder can't be used (see `resolve_base_path` in lib.rs).
+async fn try_connect_to(resolve_base: fn() -> Option<PathBuf>) -> Option<TcpStream> {
+    try_connect(&resolve_base()?).await
+}
+
 /// How long connecting to DDMM and its token handshake may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -146,8 +152,8 @@ impl Launcher {
     /// Reach the running app, starting it (detached, no window is opened by
     /// *this* process either way -- the launched instance runs normally) and
     /// polling for up to `poll_timeout` if it isn't already up.
-    async fn ensure_app_running_and_connect(&mut self, resolve_base: fn() -> PathBuf, poll_timeout: Duration) -> Option<TcpStream> {
-        if let Some(stream) = try_connect(&resolve_base()).await {
+    async fn ensure_app_running_and_connect(&mut self, resolve_base: fn() -> Option<PathBuf>, poll_timeout: Duration) -> Option<TcpStream> {
+        if let Some(stream) = try_connect_to(resolve_base).await {
             return Some(stream);
         }
 
@@ -164,7 +170,7 @@ impl Launcher {
         let deadline = tokio::time::Instant::now() + poll_timeout;
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(400)).await;
-            if let Some(stream) = try_connect(&resolve_base()).await {
+            if let Some(stream) = try_connect_to(resolve_base).await {
                 return Some(stream);
             }
         }
@@ -346,7 +352,7 @@ fn request_timeout(request_type: &str) -> Duration {
 
 /// Shared by every request the relay is handling.
 struct Relay {
-    resolve_base: fn() -> PathBuf,
+    resolve_base: fn() -> Option<PathBuf>,
     link: tokio::sync::Mutex<Option<Arc<AppLink>>>,
     /// Held while starting DDMM, so two installs don't both launch it.
     launcher: tokio::sync::Mutex<Launcher>,
@@ -377,7 +383,7 @@ impl Relay {
                 .ensure_app_running_and_connect(self.resolve_base, poll_timeout())
                 .await
         } else {
-            try_connect(&(self.resolve_base)()).await
+            try_connect_to(self.resolve_base).await
         }?;
         let mut current = self.link.lock().await;
         // Another request connected meanwhile: use that one.
@@ -455,7 +461,7 @@ impl Relay {
 /// every (re)connect rather than once: if the user moves DDMM's data folder
 /// while the browser keeps this host alive, the restarted app writes its
 /// `bridge.json` to the new folder and this finds it there.
-pub async fn run(origin: HostOrigin, resolve_base: fn() -> PathBuf) {
+pub async fn run(origin: HostOrigin, resolve_base: fn() -> Option<PathBuf>) {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
 
@@ -470,7 +476,7 @@ pub async fn run(origin: HostOrigin, resolve_base: fn() -> PathBuf) {
 
     // Connect to an already-running DDMM only; launching waits for a
     // request that's allowed to (see `may_launch_app`).
-    let initial = try_connect(&resolve_base()).await.map(AppLink::start);
+    let initial = try_connect_to(resolve_base).await.map(AppLink::start);
     let relay = Arc::new(Relay {
         resolve_base,
         link: tokio::sync::Mutex::new(initial),

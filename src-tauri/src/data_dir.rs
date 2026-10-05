@@ -176,7 +176,7 @@ pub enum PointerAccess {
 /// is never changed or removed. An unreadable old pointer is copied as it
 /// is, so the recovery screen still says so.
 fn copy_pointer_if_missing(old: &Path, new: &Path) -> anyhow::Result<()> {
-    if new.is_file() {
+    if pointer_present(new) {
         return Ok(());
     }
     match read_pointer(old) {
@@ -184,8 +184,16 @@ fn copy_pointer_if_missing(old: &Path, new: &Path) -> anyhow::Result<()> {
         // path would now be relative to the wrong folder).
         Ok(Some(target)) => write_pointer_raw(new, &PointerFile { version: POINTER_VERSION, path: target }),
         Ok(None) => Ok(()),
-        Err(_) => write_bytes_durably(new, &std::fs::read(old)?),
+        Err(_) => write_bytes_durably(new, &crate::fs_util::read_file_blocking(old)?),
     }
+}
+
+/// Whether a pointer file is there. One whose existence can't be checked
+/// (still busy after retrying, see [`crate::fs_util::file_exists_blocking`])
+/// counts as there: it is then read, and an error reading it is reported
+/// (the recovery screen), never taken as "no pointer" (the default folder).
+fn pointer_present(pointer_file: &Path) -> bool {
+    crate::fs_util::file_exists_blocking(pointer_file).unwrap_or(true)
 }
 
 /// Which installed pointer file to read: `new` (authoritative) or the
@@ -197,13 +205,13 @@ fn copy_pointer_if_missing(old: &Path, new: &Path) -> anyhow::Result<()> {
 /// - Both exist and disagree: the one whose folder exists wins; if both
 ///   exist, the more recently written file. Neither is ever deleted.
 fn installed_pointer_to_read(new: &Path, old: Option<&Path>, access: PointerAccess) -> (PathBuf, Option<String>) {
-    let Some(old) = old.filter(|o| *o != new && o.is_file()) else { return (new.to_path_buf(), None) };
-    if !new.is_file() {
+    let Some(old) = old.filter(|o| *o != new && pointer_present(o)) else { return (new.to_path_buf(), None) };
+    if !pointer_present(new) {
         if access == PointerAccess::Migrate {
             if let Err(e) = copy_pointer_if_missing(old, new) {
                 eprintln!("warning: couldn't copy {} to {}: {e:#}", old.display(), new.display());
             }
-            if new.is_file() {
+            if pointer_present(new) {
                 return (new.to_path_buf(), None);
             }
         }
@@ -280,9 +288,16 @@ pub fn log_dir(decision: &DataDirDecision) -> PathBuf {
     }
 }
 
-/// Read a pointer file. `Ok(None)` when there is none.
+/// Read a pointer file. `Ok(None)` only when there is none (`NotFound`).
+///
+/// On Windows a pointer that another process is replacing at this moment
+/// (the app migrating or moving the data folder, a second launch, the
+/// browser helper reading alongside) can't be opened for a few
+/// milliseconds: access denied or a sharing violation. That is retried
+/// briefly; if it persists it is an error (the recovery screen), never "no
+/// pointer", which would silently use the default folder.
 pub fn read_pointer(pointer_file: &Path) -> Result<Option<PathBuf>, String> {
-    let data = match std::fs::read(pointer_file) {
+    let data = match crate::fs_util::read_file_blocking(pointer_file) {
         Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("couldn't read {}: {e}", pointer_file.display())),
@@ -313,10 +328,12 @@ fn write_pointer_raw(pointer_file: &Path, contents: &PointerFile) -> anyhow::Res
     write_bytes_durably(pointer_file, &serde_json::to_vec_pretty(contents)?)
 }
 
+/// Write a pointer file atomically and durably, retrying while another
+/// program has it open: [`crate::fs_util::replace_file_durably_blocking`].
+/// Its temporary file has a unique name, since the app and the browser
+/// helper (or two app launches) may write at the same moment.
 fn write_bytes_durably(pointer_file: &Path, data: &[u8]) -> anyhow::Result<()> {
     use anyhow::Context;
-    use std::io::Write;
-    static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = pointer_file.parent().unwrap_or(Path::new("."));
     let existed = dir.is_dir();
     std::fs::create_dir_all(dir).with_context(|| format!("couldn't create {}", dir.display()))?;
@@ -324,29 +341,7 @@ fn write_bytes_durably(pointer_file: &Path, data: &[u8]) -> anyhow::Result<()> {
         // The new folder's own entry must be durable too.
         sync_dir(dir.parent().unwrap_or(Path::new(".")));
     }
-    // Unique per process and call: the app and the browser helper (or two
-    // app launches) may write at the same moment.
-    let tmp = dir.join(format!(
-        ".{}.{}.{}.tmp",
-        pointer_file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let written = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(data)?;
-        file.sync_all()
-    })();
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("couldn't write {}", tmp.display()));
-    }
-    if let Err(e) = std::fs::rename(&tmp, pointer_file) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("couldn't write {}", pointer_file.display()));
-    }
-    sync_dir(dir);
-    Ok(())
+    crate::fs_util::replace_file_durably_blocking(pointer_file, data)
 }
 
 /// Make a rename or removal in `dir` durable, where the OS allows syncing a
@@ -362,7 +357,8 @@ fn sync_dir(dir: &Path) {
 
 /// Remove a pointer file ("Reset to default"). Already gone is fine.
 pub fn remove_pointer(pointer_file: &Path) -> anyhow::Result<()> {
-    match std::fs::remove_file(pointer_file) {
+    use crate::fs_util::{is_transient_file_error, retry_blocking, REPLACE_RETRY_DELAYS};
+    match retry_blocking(REPLACE_RETRY_DELAYS, is_transient_file_error, || std::fs::remove_file(pointer_file)) {
         Ok(()) => {
             sync_dir(pointer_file.parent().unwrap_or(Path::new(".")));
             Ok(())
@@ -1019,10 +1015,14 @@ mod tests {
     }
 
     /// Two processes (two launches, or the app and the browser helper)
-    /// deciding at the same moment must both find the data.
+    /// deciding at the same moment must all find the data -- never the
+    /// default folder, and never a recovery screen. On Windows a pointer
+    /// another thread is renaming into place can't be opened for a moment
+    /// (access denied); that used to be taken as an unreadable pointer, and
+    /// with it the default folder.
     #[test]
     fn concurrent_migrations_all_find_the_data() {
-        for _ in 0..40 {
+        for _ in 0..200 {
             let l = std::sync::Arc::new(layout());
             write_pointer(&l.old_file(), &l.d.custom).unwrap();
             let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
@@ -1032,17 +1032,99 @@ mod tests {
                     std::thread::spawn(move || {
                         barrier.wait();
                         let access = if i % 2 == 0 { PointerAccess::Migrate } else { PointerAccess::ReadOnly };
-                        l.decide(access).path
+                        l.decide(access)
                     })
                 })
                 .collect();
             for h in handles {
-                assert_eq!(h.join().unwrap(), l.d.custom);
+                let decision = h.join().unwrap();
+                assert_eq!((&decision.path, &decision.problem), (&l.d.custom, &None), "{}", decision.reason);
             }
             assert_eq!(read_pointer(&l.new_file()).unwrap(), Some(l.d.custom.clone()));
             let leftovers: Vec<_> = std::fs::read_dir(&l.new_dir).unwrap().flatten().map(|e| e.file_name()).collect();
             assert_eq!(leftovers.len(), 1, "no temp files left behind: {leftovers:?}");
         }
+    }
+
+    /// The app rewriting both pointers (a move, or a second launch
+    /// migrating) while others decide: every reader still finds the data.
+    #[test]
+    fn deciding_while_the_pointers_are_rewritten_always_finds_the_data() {
+        let l = std::sync::Arc::new(layout());
+        write_pointer(&l.old_file(), &l.d.custom).unwrap();
+        let decision = std::sync::Arc::new(l.decide(PointerAccess::Migrate));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..3)
+            .map(|_| {
+                let (l, decision, stop) = (l.clone(), decision.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut writes = 0;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        commit_pointer(&decision, &l.d.custom).unwrap();
+                        writes += 1;
+                    }
+                    writes
+                })
+            })
+            .collect();
+        let readers: Vec<_> = (0..5)
+            .map(|i| {
+                let l = l.clone();
+                std::thread::spawn(move || {
+                    let access = if i % 2 == 0 { PointerAccess::Migrate } else { PointerAccess::ReadOnly };
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+                    let mut reads = 0;
+                    while std::time::Instant::now() < deadline || reads < 50 {
+                        let decision = l.decide(access);
+                        assert_eq!((&decision.path, &decision.problem), (&l.d.custom, &None), "{}", decision.reason);
+                        reads += 1;
+                    }
+                })
+            })
+            .collect();
+        for r in readers {
+            r.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for w in writers {
+            assert!(w.join().unwrap() > 0);
+        }
+        for dir in [&l.new_dir, &l.old_dir] {
+            let temps: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".tmp"))
+                .collect();
+            assert!(temps.is_empty(), "no temp files left behind: {temps:?}");
+        }
+    }
+
+    /// A pointer another program holds open without sharing (an antivirus
+    /// scan, a sync client) is waited for briefly; one that stays locked is
+    /// the recovery screen, never the default folder.
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_pointer_is_waited_for_and_then_reported_never_ignored() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = dirs();
+        let pointer = d.config.join(POINTER_FILENAME);
+        write_pointer(&pointer, &d.custom).unwrap();
+        let lock = || std::fs::OpenOptions::new().read(true).share_mode(0).open(&pointer).unwrap();
+
+        let held = lock();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+        });
+        let decision = decide_data_dir(&d.exe, &d.app_data, &d.config);
+        release.join().unwrap();
+        assert_eq!((&decision.path, &decision.problem), (&d.custom, &None), "{}", decision.reason);
+
+        let _held = lock();
+        let decision = decide_data_dir(&d.exe, &d.app_data, &d.config);
+        assert!(matches!(decision.problem, Some(DataDirProblem::BadPointer(_))), "{decision:?}");
+        assert!(decision.pointed);
     }
 
     /// Both pointers exist and disagree: the one whose folder exists wins,

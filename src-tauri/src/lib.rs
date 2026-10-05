@@ -191,8 +191,17 @@ impl AppState {
 /// Compute the base data directory the same way the desktop app does,
 /// without touching Tauri at all, for host mode (which never constructs
 /// it). Read-only: the host never copies or writes a pointer file.
-fn resolve_base_path() -> PathBuf {
-    data_dir::decide_data_dir_for_this_machine_read_only().path
+///
+/// `None` when the chosen folder can't be used right now (it's missing, or
+/// its pointer file can't be read): the app is on its recovery screen then,
+/// and the default folder is the wrong place to look for `bridge.json`.
+fn resolve_base_path() -> Option<PathBuf> {
+    let decision = data_dir::decide_data_dir_for_this_machine_read_only();
+    if let Some(problem) = &decision.problem {
+        log::warn!("Not looking for DDMM: its data folder can't be used ({problem:?}; {})", decision.reason);
+        return None;
+    }
+    Some(decision.path)
 }
 
 /// Run as the browser's native-messaging host: relay only, no window, no
