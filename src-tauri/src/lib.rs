@@ -236,11 +236,7 @@ pub fn run() {
 
     let base_path = decision.path.clone();
     let asset_base_path = base_path.clone();
-    let log_dir = if recovery {
-        std::env::temp_dir().join(format!("{}-logs", data_dir::APP_IDENTIFIER))
-    } else {
-        base_path.join("logs")
-    };
+    let log_dir = data_dir::log_dir(&decision);
     let _ = std::fs::create_dir_all(&log_dir);
 
     // The base-directory decision itself is logged again once the log
@@ -509,6 +505,7 @@ pub fn run() {
             deep_link::take_pending_deep_links,
             commands::force_exit,
             commands::ack_close_requested,
+            commands::open_log_folder,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

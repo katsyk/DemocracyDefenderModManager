@@ -89,6 +89,18 @@ DDMM opens a zip, 7z or RAR by what's inside, not by its name, so a RAR uploaded
 - Check the [log file](logs.md) — a failed add shows a popup with the specific error, and the same detail is in
   the log.
 
+## The Mods page stays on "Loading..." forever
+
+Fixed in the release after rc.13. A profile that listed the same mod twice kept the mod list from showing at all, while Settings and
+the other pages still worked. Up to rc.9, editing a mod's options while the search box filtered the list could save
+such a repeat, and it then stayed in `profiles.json` (also through reinstalling and data folder moves). DDMM now
+removes the extra entries when it starts, keeping the one highest in the list, and says which mods it changed;
+check their options before deploying.
+
+If the Mods page ever can't be shown for another reason, it now says so with the error, a **Reload** button, and an
+**Open log folder** button, and the error is in the [log file](logs.md). Please include the log when you
+[report it](bugs.md).
+
 ## My mods folder filled the disk with nested copies of itself
 
 Versions up to and including 2.0.0-rc.6 had a bug: using **Add Folder** (or dragging a folder in) on DDMM's own

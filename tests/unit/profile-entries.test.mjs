@@ -1,7 +1,7 @@
 // Run with `pnpm run test:unit` (plain Node; it strips the TypeScript types).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { configFits, deployableEntries, fitConfig, defaultConfigFor, removeEntriesOf } from "../../src/lib/utils/profileEntries.ts";
+import { configFits, deployableEntries, fitConfig, defaultConfigFor, removeDuplicateEntries, removeEntriesOf } from "../../src/lib/utils/profileEntries.ts";
 
 const v1 = (options) => ({ Version: 1, Guid: "g1", Name: "M", Description: "", Options: options });
 const opt = (subs = 0) => ({ Name: "o", Description: "", SubOptions: subs ? Array.from({ length: subs }, () => ({ Name: "s", Description: "", Include: [] })) : undefined });
@@ -48,4 +48,16 @@ test("a deleted mod leaves every profile, all of its entries, in place", () => {
     assert.equal(shown, configs);
     assert.equal(removeEntriesOf(configs, "gone"), 0);
     assert.equal(removeEntriesOf([], "gone"), 0);
+});
+
+test("repeated entries of a mod are removed, keeping the first (issue #71)", () => {
+    const e = (guid, enabled = true) => ({ For: "V1", Guid: guid, Enabled: enabled, Toggled: [], Selected: [] });
+    const configs = [e("a"), e("b"), e("a", false), e("c"), e("B"), e("a")];
+    const first = configs[0];
+    assert.deepEqual(removeDuplicateEntries(configs), ["a", "B"]);
+    assert.deepEqual(configs.map(c => c.Guid), ["a", "b", "c"]);
+    // In place, and the kept entry is the first one (its options and on/off).
+    assert.equal(configs[0], first);
+    assert.deepEqual(removeDuplicateEntries(configs), []);
+    assert.deepEqual(removeDuplicateEntries([]), []);
 });

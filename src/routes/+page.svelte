@@ -11,7 +11,7 @@
     import { useLocalization } from "$lib/state/localization.svelte";
     import { Mod } from "$lib/models/mod";
     import type {Config, Profile, ProfilesConfig} from "$lib/models/profile";
-    import { defaultConfigFor, deployableEntries, fitConfig, removeEntriesOf } from "$lib/utils/profileEntries";
+    import { defaultConfigFor, deployableEntries, fitConfig, removeDuplicateEntries, removeEntriesOf } from "$lib/utils/profileEntries";
     import {
         addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles,
         loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath,
@@ -48,6 +48,7 @@
     import type { ModAddResult } from "$lib/types/results";
     import { onMount } from "svelte";
     import Select from "$lib/components/Select.svelte";
+    import ModsLoadError from "$lib/components/ModsLoadError.svelte";
     import { FALLBACK_MOD_IMAGE, useFallbackImage } from "$lib/utils/modImages";
 
     const { t } = useLocalization();
@@ -150,7 +151,12 @@
     });
 
     onMount(() => {
-        initPromise = init();
+        // A failed init shows the error (the `{:catch}` below), and says
+        // why in the log file.
+        initPromise = init().catch((ex: unknown) => {
+            log.error(`The Mods page couldn't load: ${describeError(ex)}`);
+            throw ex;
+        });
 
         const unlisten = appWindow.onCloseRequested(async (event) => {
             // We take full control of closing here rather than letting the
@@ -313,6 +319,9 @@
             .flatMap(p => p.Configs)
             .filter(c => !loadedMods.some(mod => mod.guid === c.Guid)).length;
         if (missing > 0) log.warn(`${missing} profile entr(ies) refer to mods that couldn't be loaded; keeping them.`);
+        // A mod listed twice in a profile (saved by older versions, see
+        // `removeDuplicateEntries`) would keep the list from showing at all.
+        const repeated = removeRepeatedEntries(loadedConfig.Profiles, loadedMods);
         const resetOptions = fitProfilesToMods(loadedConfig.Profiles, loadedMods);
         if (resetOptions.length > 0) {
             log.warn(`Options reset to defaults (they no longer fit the mod): ${resetOptions.join(", ")}`);
@@ -323,6 +332,16 @@
         profiles = loadedConfig.Profiles;
         activeProfile = loadedConfig.Active;
         profilesLoaded = true;
+
+        if (repeated.length > 0) {
+            // Saved at once, so the repaired list is what's on disk even if
+            // DDMM isn't closed normally.
+            try {
+                await saveProfiles({ Profiles: profiles, Active: activeProfile });
+            } catch (ex: unknown) {
+                log.warn(`Couldn't save the profiles after removing repeated entries: ${errorMessage(ex)}`);
+            }
+        }
 
         const settings = await loadSettings();
         if (settings.Version === "V1") {
@@ -390,6 +409,23 @@
 
     function makeConfigForMod(mod: Mod): Config {
         return defaultConfigFor(mod.Manifest);
+    }
+
+    /** Take repeated entries of a mod out of every profile (keeping the
+     * first); returns the names of those mods (their GUID when missing). */
+    function removeRepeatedEntries(allProfiles: Profile[], loaded: Mod[]): string[] {
+        const names: string[] = [];
+        for (const profile of allProfiles) {
+            const repeated = removeDuplicateEntries(profile.Configs);
+            if (repeated.length === 0) continue;
+            const named = repeated.map(guid => loaded.find(m => m.guid.toLowerCase() === guid.toLowerCase())?.name ?? guid);
+            log.warn(`Profile "${profile.Name}" listed some mods more than once; removed the extra entries of: ${named.join(", ")}`);
+            for (const name of named) if (!names.includes(name)) names.push(name);
+        }
+        if (names.length > 0) {
+            showPopup(new NotificationPopup("warning", t("pages.mods.popup.notification.duplicate_entries.message", { names: names.join(", ") })));
+        }
+        return names;
     }
 
     /** Reset the option choices of entries that no longer fit their mod
@@ -843,6 +879,24 @@
         return "Unknown error!";
     }
 
+    /** An error for the log file and the error screen: its message, and
+     * where it happened when known. */
+    function describeError(ex: unknown): string {
+        if (ex instanceof Error) return ex.stack && !ex.stack.includes(ex.message) ? `${ex.message}\n${ex.stack}` : (ex.stack ?? ex.message);
+        if (typeof ex === "string") return ex;
+        try {
+            return JSON.stringify(ex);
+        } catch {
+            return String(ex);
+        }
+    }
+
+    /** The mod list failed to render (or to update): the page shows the
+     * error instead, and the log says what it was. */
+    function onRenderError(ex: unknown) {
+        log.error(`The Mods page couldn't be shown: ${describeError(ex)}`);
+    }
+
     async function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: string): Promise<T> {
         let timer: ReturnType<typeof setTimeout>;
         const timeout = new Promise<never>((_, reject) => {
@@ -1007,7 +1061,12 @@
         if (!mod) return;
         const newConfig = await showPopup(new ModConfigPopup(mod, config));
         if (!newConfig) return;
-        profileConfigs[i] = newConfig;
+        // The list may have changed while the popup was open: write back
+        // only to this mod's own entry, never over another mod's (that
+        // would list a mod twice; see issue #71).
+        const at = profileConfigs[i]?.Guid === config.Guid ? i : profileConfigs.findIndex(c => c.Guid === config.Guid);
+        if (at === -1 || newConfig.Guid !== config.Guid) return;
+        profileConfigs[at] = newConfig;
     }
 
     function onRemove(i: number) {
@@ -1504,6 +1563,7 @@
         </div>
     </div>
 {:then _}
+    <svelte:boundary onerror={onRenderError}>
     <div class="w-full h-full flex flex-col gap-1 relative">
         <div class="flex flex-row gap-1">
             <!-- Profiles -->
@@ -1925,13 +1985,10 @@
             </div>
         {/if}
     </div>
+    {#snippet failed(error)}
+        <ModsLoadError message={describeError(error)} />
+    {/snippet}
+    </svelte:boundary>
 {:catch ex}
-    <div class="w-full h-full flex justify-center items-center">
-        <div class="p-4 bg-zinc-800 border-2 border-zinc-500 flex flex-col">
-            <span class="text-red-500 text-xl self-center">
-                {t("pages.mods.loading_failed.title")}
-            </span>
-            <p class="text-zinc-300 text-sm font-mono">{ex.toString()}</p>
-        </div>
-    </div>
+    <ModsLoadError message={describeError(ex)} />
 {/await}

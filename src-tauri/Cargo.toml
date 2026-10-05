@@ -70,3 +70,9 @@ windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros"] }
+
+# `tauri::test::mock_app`, to check the asset protocol scope itself. Not on
+# Windows: with Tauri's mock runtime the lib test binary there doesn't start
+# (STATUS_ENTRYPOINT_NOT_FOUND, the comctl32 v6 manifest only the app gets).
+[target.'cfg(not(windows))'.dev-dependencies]
+tauri = { version = "2", features = ["protocol-asset", "test"] }
