@@ -67,6 +67,11 @@ pub struct UpdateStatusEntry {
     /// The newer file's title, for sites with several files per mod.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_file_name: Option<String>,
+    /// When the mod's page was last updated (Unix seconds), for sites that
+    /// say (AyakaMods). "Skip this version" records it, so a later update
+    /// with the same version string isn't hidden too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_modified_at: Option<i64>,
     pub status: UpdateState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_url: Option<String>,
@@ -180,7 +185,8 @@ struct Target {
     page_url: Option<String>,
     installed_version: Option<String>,
     installed_file: Option<InstalledFile>,
-    skipped_version: Option<String>,
+    /// "Skip this version" for this provider, if the user chose it.
+    skipped: Option<sources::SkippedVersion>,
     /// When DDMM itself installed this mod from this site (Unix seconds;
     /// from the origin sidecar, only when it records this provider).
     installed_at: Option<i64>,
@@ -221,12 +227,9 @@ async fn collect_targets(mods: &[Mod]) -> Vec<Target> {
             let installed_file = sidecar
                 .as_ref()
                 .and_then(|s| s.installed_files.iter().find(|f| f.provider.eq_ignore_ascii_case(&provider)).cloned());
-            let skipped_version = sidecar.as_ref().and_then(|s| {
-                s.skipped_versions
-                    .iter()
-                    .find(|v| v.provider.eq_ignore_ascii_case(&provider))
-                    .map(|v| v.version.clone())
-            });
+            let skipped = sidecar
+                .as_ref()
+                .and_then(|s| s.skipped_versions.iter().find(|v| v.provider.eq_ignore_ascii_case(&provider)).cloned());
             let installed_at = sidecar
                 .as_ref()
                 .filter(|s| s.sources.iter().any(|src| src.provider.eq_ignore_ascii_case(&provider)))
@@ -241,7 +244,7 @@ async fn collect_targets(mods: &[Mod]) -> Vec<Target> {
                 page_url: source.page_url.clone(),
                 installed_version,
                 installed_file,
-                skipped_version,
+                skipped,
                 installed_at,
                 directory: m.directory.clone(),
             });
@@ -336,6 +339,24 @@ fn same_version(a: &str, b: &str) -> bool {
     compare_versions(a, b) == VersionRelation::Same
 }
 
+/// Whether "Skip this version" `skip` covers the update `latest` whose page
+/// was last updated at `page_time` (AyakaMods only). The version must match;
+/// and when both the skip and the page have a time, the page must not have
+/// been updated since the skip -- AyakaMods versions are often a date or
+/// never change, so a newer page time is a new update even with the same
+/// version string. Skips saved before times were recorded, and sites
+/// without page times, go by the version alone.
+fn skip_covers(skip: &sources::SkippedVersion, latest: Option<&str>, page_time: Option<i64>) -> bool {
+    let Some(latest) = latest else { return false };
+    if !same_version(&skip.version, latest) {
+        return false;
+    }
+    match (page_time, skip.modified_at) {
+        (Some(page), Some(skipped_at)) => page <= skipped_at,
+        _ => true,
+    }
+}
+
 fn entry(t: &Target, status: UpdateState, latest: Option<String>) -> UpdateStatusEntry {
     UpdateStatusEntry {
         guid: t.guid,
@@ -345,6 +366,7 @@ fn entry(t: &Target, status: UpdateState, latest: Option<String>) -> UpdateStatu
         installed_version: t.installed_version.clone(),
         latest_version: latest,
         latest_file_name: None,
+        latest_modified_at: None,
         status,
         page_url: t.page_url.clone(),
         method: None,
@@ -476,6 +498,7 @@ fn ayakamods_entry(t: &Target, meta: &ayakamods::AyakaModsMetadata) -> (UpdateSt
     if same_label {
         e.latest_file_name = meta.modified_at.map(providers::format_timestamp);
     }
+    e.latest_modified_at = meta.modified_at;
     e.method = Some(UpdateMethod::Browser);
     (e, decision.record_baseline)
 }
@@ -827,15 +850,23 @@ async fn run_check_with(
     }
 
     let mut results = Vec::with_capacity(targets.len());
-    for (t, e) in targets.iter().zip(by_index) {
+    // Skips saved without a page time that this check found the page time
+    // for: (target, page time), recorded below with the mod list locked.
+    let mut legacy_skips: Vec<(usize, i64)> = Vec::new();
+    for (i, (t, e)) in targets.iter().zip(by_index).enumerate() {
         let mut e = e.unwrap_or_else(|| entry(t, UpdateState::Unknown, None));
         if e.method == Some(UpdateMethod::Direct) {
             e.preselected_file = preselect(&e.files, t.installed_file.as_ref());
         }
         if e.status == UpdateState::UpdateAvailable {
-            if let (Some(skipped), Some(latest)) = (&t.skipped_version, &e.latest_version) {
-                if same_version(skipped, latest) {
+            if let Some(skip) = &t.skipped {
+                if skip_covers(skip, e.latest_version.as_deref(), e.latest_modified_at) {
                     e.status = UpdateState::Skipped;
+                    // Stamp an old skip with the time of the update it
+                    // covers, so the page's next update shows again.
+                    if let (None, Some(page)) = (skip.modified_at, e.latest_modified_at) {
+                        legacy_skips.push((i, page));
+                    }
                 }
             }
         } else {
@@ -867,6 +898,15 @@ async fn run_check_with(
             if listed.iter().any(|m| m.guid() == t.guid) {
                 if let Err(e) = record_ayakamods_baseline(t, page_time).await {
                     log::warn!("Couldn't record the AyakaMods page time of mod {}: {e}", t.id);
+                }
+            }
+        }
+        for (i, page_time) in legacy_skips {
+            let t = &targets[i];
+            let Some(skip) = t.skipped.as_ref() else { continue };
+            if listed.iter().any(|m| m.guid() == t.guid) {
+                if let Err(e) = sources::stamp_legacy_skip(&t.directory, &t.provider, &skip.version, page_time).await {
+                    log::warn!("Couldn't record the page time of the skipped update of {} mod {}: {e}", t.provider, t.id);
                 }
             }
         }
@@ -909,14 +949,28 @@ pub async fn get_last_update_report(state: State<'_, AppState>) -> TAResult<Opti
 }
 
 /// "Skip this version" (`version: Some`) / "Stop skipping" (`None`).
+/// `modified_at` is the skipped update's page time
+/// ([`UpdateStatusEntry::latest_modified_at`]), for sites that have one;
+/// when not given, it is taken from the last check's matching entry.
 #[tauri::command]
 pub async fn skip_update_version(
     state: State<'_, AppState>,
     guid: Uuid,
     provider: String,
     version: Option<String>,
+    modified_at: Option<i64>,
 ) -> TAResult<()> {
-    let _data_op = state.data_op().into_ta_result()?;
+    set_skip(&state, guid, provider, version, modified_at).await.into_ta_result()
+}
+
+async fn set_skip(
+    state: &AppState,
+    guid: Uuid,
+    provider: String,
+    version: Option<String>,
+    modified_at: Option<i64>,
+) -> anyhow::Result<()> {
+    let _data_op = state.data_op()?;
     let dir = {
         let guard = state.mods.lock().await;
         guard
@@ -924,14 +978,28 @@ pub async fn skip_update_version(
             .and_then(|mods| mods.iter().find(|m| m.guid() == guid))
             .map(|m| m.directory.clone())
     }
-    .ok_or_else(|| anyhow::anyhow!("mod {{{guid}}} not found"))
-    .into_ta_result()?;
-    sources::set_skipped_version(&dir, &provider, version.as_deref()).await.into_ta_result()?;
+    .ok_or_else(|| anyhow::anyhow!("mod {{{guid}}} not found"))?;
+    let mut report = state.last_update_report.lock().await;
+    let modified_at = match (&version, modified_at) {
+        (Some(v), None) => report.as_ref().and_then(|r| {
+            r.results
+                .iter()
+                .filter(|e| e.guid == guid && e.provider.eq_ignore_ascii_case(&provider))
+                .find(|e| e.latest_version.as_deref().is_some_and(|l| same_version(v, l)))
+                .and_then(|e| e.latest_modified_at)
+        }),
+        (Some(_), t) => t,
+        (None, _) => None,
+    };
+    sources::set_skipped_version(&dir, &provider, version.as_deref(), modified_at).await?;
 
-    if let Some(report) = state.last_update_report.lock().await.as_mut() {
+    if let Some(report) = report.as_mut() {
+        let skip = version.map(|version| sources::SkippedVersion { provider: provider.clone(), version, modified_at });
         for e in report.results.iter_mut().filter(|e| e.guid == guid && e.provider.eq_ignore_ascii_case(&provider)) {
-            match (&version, &e.status) {
-                (Some(v), UpdateState::UpdateAvailable) if e.latest_version.as_deref().is_some_and(|l| same_version(v, l)) => {
+            match (&skip, &e.status) {
+                (Some(skip), UpdateState::UpdateAvailable)
+                    if skip_covers(skip, e.latest_version.as_deref(), e.latest_modified_at) =>
+                {
                     e.status = UpdateState::Skipped
                 }
                 (None, UpdateState::Skipped) => e.status = UpdateState::UpdateAvailable,
@@ -1145,16 +1213,6 @@ pub async fn update_mod_direct(
     .await
     .into_ta_result()?;
 
-    let result = {
-        let mut guard = state.mods.lock().await;
-        match guard.as_mut() {
-            Some(mods) => install_update_from_archive(&state, mods, &downloaded.path, guid).await,
-            None => anyhow::anyhow!("mods not read").into_ta_result(),
-        }
-    };
-    let _ = tokio::fs::remove_dir_all(&downloaded.temp_dir).await;
-    let (mut r#mod, warning) = result?;
-
     // Record where it came from and exactly what was installed.
     let mut recorded_sources: Vec<Source> = old_sidecar.as_ref().map(|s| s.sources.clone()).unwrap_or_default();
     recorded_sources.retain(|s| !s.provider.eq_ignore_ascii_case(&provider));
@@ -1168,18 +1226,34 @@ pub async fn update_mod_direct(
         label: file.label.clone(),
         uploaded_at: file.uploaded_at,
     });
-    if let Err(e) = sources::write_origin_sidecar_with_files(&r#mod.directory, recorded_sources, installed_files).await {
-        log::error!("Failed to write origin sidecar after update: {e}");
-    }
-    r#mod.resolve_sources().await;
-    {
+
+    // The new sidecar is written before the mod list is unlocked, like the
+    // browser updates do: an update check records AyakaMods page times
+    // (and skip times) into the sidecar with the list locked, and must
+    // never read it while this write is half done or still to come.
+    let result = {
         let mut guard = state.mods.lock().await;
-        if let Some(mods) = guard.as_mut() {
-            if let Some(existing) = mods.iter_mut().find(|m| m.guid() == r#mod.guid()) {
-                *existing = r#mod.clone();
-            }
+        match guard.as_mut() {
+            Some(mods) => match install_update_from_archive(&state, mods, &downloaded.path, guid).await {
+                Ok((mut r#mod, warning)) => {
+                    if let Err(e) =
+                        sources::write_origin_sidecar_with_files(&r#mod.directory, recorded_sources, installed_files).await
+                    {
+                        log::error!("Failed to write origin sidecar after update: {e}");
+                    }
+                    r#mod.resolve_sources().await;
+                    if let Some(existing) = mods.iter_mut().find(|m| m.guid() == r#mod.guid()) {
+                        *existing = r#mod.clone();
+                    }
+                    Ok((r#mod, warning))
+                }
+                Err(e) => Err(e),
+            },
+            None => anyhow::anyhow!("mods not read").into_ta_result(),
         }
-    }
+    };
+    let _ = tokio::fs::remove_dir_all(&downloaded.temp_dir).await;
+    let (r#mod, warning) = result?;
     debug_assert_eq!(r#mod.directory, mod_dir);
 
     mark_mod_updated(&state, guid, r#mod.guid(), Some(&provider), version.as_deref()).await;
@@ -1353,7 +1427,7 @@ mod tests {
         // A manifest-declared source with no install record has no install time.
         let dir2 = tempfile::tempdir().unwrap();
         let declared = sources::resolve(&source);
-        sources::set_skipped_version(dir2.path(), "ayakamods", Some("x")).await.unwrap();
+        sources::set_skipped_version(dir2.path(), "ayakamods", Some("x"), None).await.unwrap();
         let targets = collect_targets(&[mod_with_sources(dir2.path(), vec![declared])]).await;
         assert_eq!(targets[0].installed_at, None);
     }
@@ -1479,6 +1553,139 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
+    /// Recording an AyakaMods baseline re-reads the sidecar at write time
+    /// (with the mod list locked), so whatever was written to it since the
+    /// check collected its targets -- another site's file, a skip -- is
+    /// kept, never replaced by the copy read at the start of the check.
+    #[tokio::test]
+    async fn recording_a_baseline_keeps_what_was_written_since_the_check_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_guid, mod_dir) = add_old_ayakamods_mod(dir.path(), "31", 1_789_990_000).await;
+        let mut resolved = sources::resolve(&Source {
+            provider: "ayakamods".into(),
+            id: Some("31".into()),
+            url: None,
+            version: Some("2026-10-01".into()),
+        });
+        resolved.origin = SourceOrigin::Install;
+        let targets = collect_targets(&[mod_with_sources(&mod_dir, vec![resolved])]).await;
+
+        // Meanwhile: a one-click GitHub file and a skip are recorded.
+        let mut sidecar = sources::load_origin_sidecar(&mod_dir).await.unwrap();
+        sidecar.installed_files.push(InstalledFile { provider: "github".into(), file_name: Some("new.zip".into()), ..Default::default() });
+        sources::save_origin_sidecar(&mod_dir, &sidecar).await.unwrap();
+        sources::set_skipped_version(&mod_dir, "github", Some("v9"), None).await.unwrap();
+
+        record_ayakamods_baseline(&targets[0], 1_790_000_000).await.unwrap();
+        let after = sources::load_origin_sidecar(&mod_dir).await.unwrap();
+        assert_eq!(after.installed_files.len(), 2);
+        assert_eq!(after.installed_files[0].uploaded_at, Some(1_790_000_000));
+        assert_eq!(after.installed_files[1].file_name.as_deref(), Some("new.zip"));
+        assert_eq!(after.skipped_versions.len(), 1);
+    }
+
+    fn skip(version: &str, modified_at: Option<i64>) -> sources::SkippedVersion {
+        sources::SkippedVersion { provider: "ayakamods".into(), version: version.into(), modified_at }
+    }
+
+    #[test]
+    fn a_skip_with_a_page_time_covers_only_that_update() {
+        let skipped_at = 1_790_889_008;
+        let s = skip("2026-10-01", Some(skipped_at));
+        assert!(skip_covers(&s, Some("2026-10-01"), Some(skipped_at)));
+        assert!(skip_covers(&s, Some("v2026-10-01"), Some(skipped_at - 60)));
+        // Same version string, page updated since: a new update.
+        assert!(!skip_covers(&s, Some("2026-10-01"), Some(skipped_at + 1)));
+        // A different version is never covered.
+        assert!(!skip_covers(&s, Some("2026-10-02"), Some(skipped_at)));
+        assert!(!skip_covers(&s, None, Some(skipped_at)));
+        // No page time this check: the version decides.
+        assert!(skip_covers(&s, Some("2026-10-01"), None));
+        // A skip saved before times were recorded (or another site): the
+        // version decides.
+        assert!(skip_covers(&skip("1.0", None), Some("1.0"), Some(skipped_at)));
+        assert!(!skip_covers(&skip("1.0", None), Some("1.1"), None));
+    }
+
+    /// QA repro: page time recorded at install 1_790_000_000, "2026-10-01"
+    /// skipped (its page time recorded with it), then the page is updated
+    /// on 2026-12-24 still saying "2026-10-01": that's a new update, not
+    /// the skipped one.
+    #[tokio::test]
+    async fn skipping_an_ayakamods_update_does_not_hide_later_ones_with_the_same_version() {
+        use ayakamods::test_support::{page, reply, server, BASE};
+        let dir = tempfile::tempdir().unwrap();
+        let (guid, mod_dir) = add_old_ayakamods_mod(dir.path(), "21", 1_789_990_000).await;
+        let mut sidecar = sources::load_origin_sidecar(&mod_dir).await.unwrap();
+        sidecar.installed_files[0].uploaded_at = Some(1_790_000_000);
+        sources::save_origin_sidecar(&mod_dir, &sidecar).await.unwrap();
+        let state = AppState::new(dir.path().to_path_buf());
+        let factory = |key| NexusClient::new(key);
+        let status = |r: &UpdateCheckReport| r.results.iter().find(|e| e.guid == guid).unwrap().status.clone();
+        let check = |date: &'static str| {
+            let state = &state;
+            async move {
+                let (base, _seen) = server(vec![reply("200 OK", "", &page("2026-10-01", date))]).await;
+                BASE.scope(base, run_check_with(state, CheckTrigger::Manual, &factory)).await.unwrap()
+            }
+        };
+
+        let report = check("2026-10-01T22:10:08+01:00").await;
+        assert_eq!(status(&report), UpdateState::UpdateAvailable);
+        let e = report.results.iter().find(|e| e.guid == guid).unwrap();
+        assert_eq!(e.latest_modified_at, Some(1_790_889_008));
+
+        // "Skip this version" without a time (an older frontend): the time
+        // comes from the last check.
+        set_skip(&state, guid, "ayakamods".into(), Some("2026-10-01".into()), None).await.unwrap();
+        let stored = sources::load_origin_sidecar(&mod_dir).await.unwrap().skipped_versions;
+        assert_eq!(stored, vec![skip("2026-10-01", Some(1_790_889_008))]);
+        let last = state.last_update_report.lock().await.clone().unwrap();
+        assert_eq!(status(&last), UpdateState::Skipped);
+
+        // The same update: still skipped.
+        assert_eq!(status(&check("2026-10-01T22:10:08+01:00").await), UpdateState::Skipped);
+        // A later update with the same version string: shown.
+        assert_eq!(status(&check("2026-12-24T10:00:00+00:00").await), UpdateState::UpdateAvailable);
+
+        // Stop skipping clears it.
+        set_skip(&state, guid, "ayakamods".into(), None, None).await.unwrap();
+        assert!(sources::load_origin_sidecar(&mod_dir).await.unwrap().skipped_versions.is_empty());
+
+        // The frontend's own time wins over the report's.
+        set_skip(&state, guid, "ayakamods".into(), Some("2026-10-01".into()), Some(1_798_106_400)).await.unwrap();
+        let stored = sources::load_origin_sidecar(&mod_dir).await.unwrap().skipped_versions;
+        assert_eq!(stored, vec![skip("2026-10-01", Some(1_798_106_400))]);
+        assert_eq!(status(&check("2026-12-24T10:00:00+00:00").await), UpdateState::Skipped);
+    }
+
+    /// A skip saved before page times were recorded keeps hiding the update
+    /// it was made for, takes that update's page time, and so no longer
+    /// hides the page's next update.
+    #[tokio::test]
+    async fn an_old_skip_without_a_page_time_heals_on_the_next_check() {
+        use ayakamods::test_support::{page, reply, server, BASE};
+        let dir = tempfile::tempdir().unwrap();
+        let (guid, mod_dir) = add_old_ayakamods_mod(dir.path(), "22", 1_789_990_000).await;
+        let mut sidecar = sources::load_origin_sidecar(&mod_dir).await.unwrap();
+        sidecar.installed_files[0].uploaded_at = Some(1_790_000_000);
+        sources::save_origin_sidecar(&mod_dir, &sidecar).await.unwrap();
+        sources::set_skipped_version(&mod_dir, "ayakamods", Some("2026-10-01"), None).await.unwrap();
+        let state = AppState::new(dir.path().to_path_buf());
+        let factory = |key| NexusClient::new(key);
+        let status = |r: &UpdateCheckReport| r.results.iter().find(|e| e.guid == guid).unwrap().status.clone();
+
+        let (base, _seen) = server(vec![reply("200 OK", "", &page("2026-10-01", "2026-10-01T22:10:08+01:00"))]).await;
+        let report = BASE.scope(base, run_check_with(&state, CheckTrigger::Manual, &factory)).await.unwrap();
+        assert_eq!(status(&report), UpdateState::Skipped);
+        let stored = sources::load_origin_sidecar(&mod_dir).await.unwrap().skipped_versions;
+        assert_eq!(stored, vec![skip("2026-10-01", Some(1_790_889_008))]);
+
+        let (base, _seen) = server(vec![reply("200 OK", "", &page("2026-10-01", "2026-12-24T10:00:00+00:00"))]).await;
+        let report = BASE.scope(base, run_check_with(&state, CheckTrigger::Manual, &factory)).await.unwrap();
+        assert_eq!(status(&report), UpdateState::UpdateAvailable);
+    }
+
     #[test]
     fn skipped_versions_match_ignoring_a_leading_v() {
         assert!(same_version("v1.2", "1.2"));
@@ -1560,12 +1767,12 @@ mod tests {
         });
         let m = mod_with_sources(dir.path(), vec![manifest_src, install_src, unsupported]);
 
-        sources::set_skipped_version(dir.path(), "gamebanana", Some("1.2")).await.unwrap();
+        sources::set_skipped_version(dir.path(), "gamebanana", Some("1.2"), None).await.unwrap();
         let targets = collect_targets(&[m]).await;
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].id, "5");
         assert_eq!(targets[0].installed_version.as_deref(), Some("1.1"));
-        assert_eq!(targets[0].skipped_version.as_deref(), Some("1.2"));
+        assert_eq!(targets[0].skipped.as_ref().map(|s| s.version.as_str()), Some("1.2"));
     }
 
     #[tokio::test]
@@ -1579,7 +1786,7 @@ mod tests {
             page_url: None,
             installed_version: Some("1.0".into()),
             installed_file: None,
-            skipped_version: None,
+            skipped: None,
             installed_at: None,
             directory: dir.path().to_path_buf(),
         };
@@ -1972,7 +2179,7 @@ mod tests {
     #[tokio::test]
     async fn a_skipped_version_stays_skipped_when_the_site_adds_a_v() {
         let (_dir, state, guid) = nexus_only_state().await; // latest on the mock: 1.2
-        sources::set_skipped_version(&state.base_path.join("mods").join("nexus-mod"), "nexus", Some("v1.2"))
+        sources::set_skipped_version(&state.base_path.join("mods").join("nexus-mod"), "nexus", Some("v1.2"), None)
             .await
             .unwrap();
         let (base, _seen) = mock_nexus("[]".into()).await;
@@ -2000,6 +2207,7 @@ mod tests {
             installed_version: None,
             latest_version: None,
             latest_file_name: None,
+            latest_modified_at: None,
             status,
             page_url: None,
             method: None,

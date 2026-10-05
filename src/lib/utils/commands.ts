@@ -145,6 +145,9 @@ export type UpdateStatusEntry = {
     InstalledVersion?: string,
     LatestVersion?: string,
     LatestFileName?: string,
+    /** When the mod's page was last updated (Unix seconds), for sites that
+     * say (AyakaMods). Sent back with "Skip this version". */
+    LatestModifiedAt?: number,
     Status: UpdateState,
     PageUrl?: string,
     Method?: UpdateMethod,
@@ -177,9 +180,12 @@ export async function getLastUpdateReport(): Promise<UpdateCheckReport | null> {
 }
 
 /** "Skip this version" (a version) or stop skipping (null). */
-export async function skipUpdateVersion(guid: UUID, provider: string, version: string | null): Promise<void> {
+/** "Skip this version" (`version` set) / "Stop skipping" (`null`).
+ * `modifiedAt` is the skipped update's page time (`LatestModifiedAt`), so a
+ * later update with the same version string still shows. */
+export async function skipUpdateVersion(guid: UUID, provider: string, version: string | null, modifiedAt: number | null = null): Promise<void> {
     log.debug("Invoking `skip_update_version`.");
-    await invoke<void>("skip_update_version", { guid, provider, version });
+    await invoke<void>("skip_update_version", { guid, provider, version, modifiedAt });
 }
 
 /** One-click in-place update from a public direct download. Progress comes
