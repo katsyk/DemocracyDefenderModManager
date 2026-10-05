@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { withUniqueKeys } from "$lib/utils/eachKeys";
     import { SvelteMap } from "svelte/reactivity";
     import { Plus, Dash, Backspace, ArrowBarRight, ArrowBarLeft, Arrow90degLeft, ArrowReturnLeft, PencilSquare, Download, ThreeDotsVertical, CaretUpFill, CaretDownFill, Trash3, ArrowBarUp, ArrowBarDown, CaretUp, CaretDown, Eraser, FolderPlus, Link45deg, BoxArrowUpRight, ArrowRepeat, CloudArrowDownFill, GripVertical, InfoCircle, SkipForward, ArrowCounterclockwise, Key, BoxArrowInDown } from "svelte-bootstrap-icons";
     import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -889,6 +890,20 @@
         } catch {
             return String(ex);
         }
+    }
+
+    /** Before the error screen's Reload: keep what was changed this session
+     * (best effort, never more than a few seconds), and tell the backend
+     * this page is gone so browser installs wait for the reloaded one. */
+    async function beforeReload() {
+        const saving = (async () => {
+            if (!profilesLoaded || !currentProfile) return;
+            applyCurrentConfigChanges();
+            await saveProfiles({ Profiles: profiles, Active: activeProfile });
+        })();
+        await withTimeout(saving, CLOSE_SAVE_TIMEOUT_MS, "timed out").catch((ex: unknown) =>
+            log.warn(`Couldn't save the profiles before reloading: ${errorMessage(ex)}`).catch(() => {}));
+        await withTimeout(setBridgeFrontendReady(false), CLOSE_SAVE_TIMEOUT_MS, "timed out").catch(() => {});
     }
 
     /** The mod list failed to render (or to update): the page shows the
@@ -1986,9 +2001,9 @@
         {/if}
     </div>
     {#snippet failed(error)}
-        <ModsLoadError message={describeError(error)} />
+        <ModsLoadError message={describeError(error)} {beforeReload} />
     {/snippet}
     </svelte:boundary>
 {:catch ex}
-    <ModsLoadError message={describeError(ex)} />
+    <ModsLoadError message={describeError(ex)} {beforeReload} />
 {/await}

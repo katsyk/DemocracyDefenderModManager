@@ -8,9 +8,26 @@
     /** Shown instead of the Mods page when it couldn't load or render
      * (issue #71: it used to stay on "Loading..." for good). The error
      * itself is logged by whoever caught it. */
-    let { message }: { message: string } = $props();
+    let { message, beforeReload }: {
+        message: string;
+        /** Best effort before reloading (e.g. saving the profiles); its
+         * errors are ignored, and it may not hold up the reload. */
+        beforeReload?: () => Promise<void>;
+    } = $props();
 
     let openError = $state<string | null>(null);
+    let reloading = $state(false);
+
+    async function onReload() {
+        if (reloading) return;
+        reloading = true;
+        try {
+            await beforeReload?.();
+        } catch {
+            // Reload anyway: that's the way out of this screen.
+        }
+        location.reload();
+    }
 
     async function onOpenLogFolder() {
         openError = null;
@@ -39,7 +56,7 @@
                 <FolderSymlink />
                 {t("pages.mods.loading_failed.open_log_folder_button.text")}
             </button>
-            <button class="hd2mm-button flex flex-row gap-1 items-center" onclick={() => location.reload()} data-testid="mods-reload">
+            <button class="hd2mm-button flex flex-row gap-1 items-center" onclick={onReload} disabled={reloading} data-testid="mods-reload">
                 <ArrowRepeat />
                 {t("pages.mods.loading_failed.reload_button.text")}
             </button>
