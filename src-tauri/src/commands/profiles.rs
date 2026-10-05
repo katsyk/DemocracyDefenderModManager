@@ -11,7 +11,7 @@ pub async fn do_load_profiles(base_path: &std::path::Path) -> anyhow::Result<Pro
     log::info!("Loading profiles...");
 
     log::info!("Looking for {:?}", &profiles_file);
-    let profiles = if tokio::fs::try_exists(&profiles_file).await? {
+    let mut profiles = if tokio::fs::try_exists(&profiles_file).await? {
         log::info!("Opening...");
         let data = tokio::fs::read(profiles_file).await?;
 
@@ -31,8 +31,33 @@ pub async fn do_load_profiles(base_path: &std::path::Path) -> anyhow::Result<Pro
         }
     };
 
+    let repeated = remove_repeated_entries(&mut profiles);
+    if repeated > 0 {
+        log::warn!("profiles.json listed some mods more than once in a profile; ignoring {repeated} extra entr(ies) (the first of each is kept).");
+    }
+
     log::info!("Profiles loaded.");
     Ok(profiles)
+}
+
+/// Drop every entry of a mod after its first one in each profile; returns
+/// how many were dropped. Up to 2.0.0-rc.9 the Mods page could save a mod
+/// twice in a profile (issue #71); everything that reads profiles.json gets
+/// it without the repeats (the page also repairs it, and its next save
+/// writes the file without them).
+fn remove_repeated_entries(config: &mut ProfilesConfig) -> usize {
+    let mut removed = 0;
+    for profile in &mut config.profiles {
+        match profile {
+            Profile::V1 { configs, .. } => {
+                let mut seen = std::collections::HashSet::new();
+                let before = configs.len();
+                configs.retain(|c| seen.insert(*c.uuid()));
+                removed += before - configs.len();
+            }
+        }
+    }
+    removed
 }
 
 #[tauri::command]
@@ -118,6 +143,22 @@ mod tests {
 
     const A: &str = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
     const B: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+
+    #[tokio::test]
+    async fn loading_drops_repeated_entries_keeping_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = profiles_with(&[A, B, A, "AAAAAAAA-1111-4111-8111-AAAAAAAAAAAA", B]);
+        let Profile::V1 { configs, .. } = &mut config.profiles[0];
+        // The first entry of A is off; that's the one kept.
+        configs[0] = serde_json::from_value(serde_json::json!({ "For": "V1", "Guid": A, "Enabled": false, "Toggled": [], "Selected": [] })).unwrap();
+        write_profiles(dir.path(), &config).await.unwrap();
+
+        let loaded = do_load_profiles(dir.path()).await.unwrap();
+        let configs = loaded.profiles[0].configs();
+        let guids: Vec<String> = configs.iter().map(|c| c.uuid().to_string()).collect();
+        assert_eq!(guids, [A, B]);
+        assert!(!configs[0].enabled());
+    }
 
     /// Saves and a delete's removal running at once (all without the
     /// deleted mod, as the page's saves are once the delete returned):

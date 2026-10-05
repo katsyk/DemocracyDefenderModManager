@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { withUniqueKeys } from "$lib/utils/eachKeys";
     import { open } from "@tauri-apps/plugin-dialog";
     import { openPath, openUrl } from "@tauri-apps/plugin-opener";
     import { beforeNavigate, onNavigate } from "$app/navigation";
@@ -554,7 +555,7 @@
             <div class="flex flex-col gap-1 self-start">
                 <h2 class="text-zinc-300 text-xl">{t("pages.settings.skip_list.title")}</h2>
                 <ol class="w-80 h-40 border-2 border-zinc-500 overflow-y-scroll">
-                    {#each skipList as entry, i (entry)}
+                    {#each withUniqueKeys(skipList, e => e) as [entry, key], i (key)}
                         <li>
                             <button
                                 class="w-full px-1 text-zinc-300 font-mono text-start"
@@ -746,7 +747,7 @@
                     <p class="text-zinc-500 text-sm">{t("pages.settings.browser_install.allowed_sites.empty")}</p>
                 {:else}
                     <ul class="w-80 border-2 border-zinc-500 max-h-40 overflow-y-scroll">
-                        {#each bridgeAllowedSites as site (site)}
+                        {#each withUniqueKeys(bridgeAllowedSites, s => s) as [site, key] (key)}
                             <li class="flex flex-row items-center justify-between px-1 py-0.5 text-zinc-300 text-sm">
                                 <span class="truncate">{site}</span>
                                 <button
@@ -769,7 +770,7 @@
                     {t("pages.settings.browser_integration.get_extension_button.text")}
                 </button>
                 <ul class="w-96 border-2 border-zinc-500 max-h-56 overflow-y-scroll">
-                    {#each browserIntegration as browser (browser.browserId)}
+                    {#each withUniqueKeys(browserIntegration, b => b.browserId) as [browser, key] (key)}
                         <li class="flex flex-row items-center gap-2 px-1 py-0.5 text-sm">
                             <span
                                 class="w-2.5 h-2.5 rounded-full shrink-0"

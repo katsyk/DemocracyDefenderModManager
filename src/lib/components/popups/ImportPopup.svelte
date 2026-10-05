@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { withUniqueKeys } from "$lib/utils/eachKeys";
     import { onMount } from "svelte";
     import { open } from "@tauri-apps/plugin-dialog";
     import PopupBase from "./PopupBase.svelte";
@@ -125,7 +126,7 @@
                 <p class="text-sm text-zinc-400">{t("popup.import.none_found")}</p>
             {:else}
                 <ul class="flex flex-col border border-zinc-600 divide-y divide-zinc-700" data-testid="import-sources">
-                    {#each w.sources as source (source.Path)}
+                    {#each withUniqueKeys(w.sources, s => s.Path) as [source, key] (key)}
                         <li class="flex flex-row items-center gap-2 px-2 py-1.5">
                             <FolderSymlink class="shrink-0 text-yellow-300" />
                             <div class="flex-1 min-w-0 flex flex-col">
@@ -198,7 +199,7 @@
                     </div>
                 </div>
                 <ul class="min-h-24 shrink overflow-y-auto border border-zinc-600 divide-y divide-zinc-700" data-testid="import-items">
-                    {#each visible as item (item.Id)}
+                    {#each withUniqueKeys(visible, it => String(it.Id)) as [item, key] (key)}
                         <li class="flex flex-row gap-2 items-start px-2 py-1 text-sm" class:opacity-60={blocked(item)}>
                             <input
                                 type="checkbox"
@@ -299,7 +300,7 @@
             {/if}
             {#if w.report.Failed.length > 0}
                 <ul class="min-h-16 shrink overflow-y-auto border border-zinc-600 divide-y divide-zinc-700" data-testid="import-failures">
-                    {#each w.report.Failed as failure (failure.Id)}
+                    {#each withUniqueKeys(w.report.Failed, f => String(f.Id)) as [failure, key] (key)}
                         <li class="flex flex-col px-2 py-1 text-sm">
                             <span class="text-zinc-200">{failure.Name}</span>
                             <span class="text-xs text-red-400 whitespace-pre-wrap break-words">{failure.Reason}</span>

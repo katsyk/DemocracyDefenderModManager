@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { withUniqueKeys } from "$lib/utils/eachKeys";
     import { SvelteMap } from "svelte/reactivity";
     import { Plus, Dash, Backspace, ArrowBarRight, ArrowBarLeft, Arrow90degLeft, ArrowReturnLeft, PencilSquare, Download, ThreeDotsVertical, CaretUpFill, CaretDownFill, Trash3, ArrowBarUp, ArrowBarDown, CaretUp, CaretDown, Eraser, FolderPlus, Link45deg, BoxArrowUpRight, ArrowRepeat, CloudArrowDownFill, GripVertical, InfoCircle, SkipForward, ArrowCounterclockwise, Key, BoxArrowInDown } from "svelte-bootstrap-icons";
     import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -891,6 +892,20 @@
         }
     }
 
+    /** Before the error screen's Reload: keep what was changed this session
+     * (best effort, never more than a few seconds), and tell the backend
+     * this page is gone so browser installs wait for the reloaded one. */
+    async function beforeReload() {
+        const saving = (async () => {
+            if (!profilesLoaded || !currentProfile) return;
+            applyCurrentConfigChanges();
+            await saveProfiles({ Profiles: profiles, Active: activeProfile });
+        })();
+        await withTimeout(saving, CLOSE_SAVE_TIMEOUT_MS, "timed out").catch((ex: unknown) =>
+            log.warn(`Couldn't save the profiles before reloading: ${errorMessage(ex)}`).catch(() => {}));
+        await withTimeout(setBridgeFrontendReady(false), CLOSE_SAVE_TIMEOUT_MS, "timed out").catch(() => {});
+    }
+
     /** The mod list failed to render (or to update): the page shows the
      * error instead, and the log says what it was. */
     function onRenderError(ex: unknown) {
@@ -1622,7 +1637,7 @@
                         <span class="text-zinc-400 text-lg">{t("pages.mods.empty_state.title")}</span>
                         <span class="text-zinc-500 text-sm max-w-100">{t("pages.mods.empty_state.works_with")}</span>
                         <span class="text-zinc-400 text-sm max-w-100 mt-4">{t("pages.mods.empty_state.import_hint")}</span>
-                        {#each importSources.slice(0, 3) as source (source.Path)}
+                        {#each withUniqueKeys(importSources.slice(0, 3), s => s.Path) as [source, key] (key)}
                             <span class="text-zinc-500 text-xs max-w-120 break-all" data-testid="empty-import-found">
                                 {source.Count === 1
                                     ? t("pages.mods.empty_state.import_found_one", { path: source.Path })
@@ -1986,9 +2001,9 @@
         {/if}
     </div>
     {#snippet failed(error)}
-        <ModsLoadError message={describeError(error)} />
+        <ModsLoadError message={describeError(error)} {beforeReload} />
     {/snippet}
     </svelte:boundary>
 {:catch ex}
-    <ModsLoadError message={describeError(ex)} />
+    <ModsLoadError message={describeError(ex)} {beforeReload} />
 {/await}

@@ -95,7 +95,8 @@ Fixed in the release after rc.13. A profile that listed the same mod twice kept 
 the other pages still worked. Up to rc.9, editing a mod's options while the search box filtered the list could save
 such a repeat, and it then stayed in `profiles.json` (also through reinstalling and data folder moves). DDMM now
 removes the extra entries when it starts, keeping the one highest in the list, and says which mods it changed;
-check their options before deploying.
+check their options before deploying. Also check that no mod dropped out of the profile: the old bug wrote the repeated entry over
+another mod's entry, so that mod may need to be added back from the library.
 
 If the Mods page ever can't be shown for another reason, it now says so with the error, a **Reload** button, and an
 **Open log folder** button, and the error is in the [log file](logs.md). Please include the log when you
