@@ -450,6 +450,13 @@
         }
     },
     "popup": {
+        "render_failed": {
+            "title": "Something went wrong",
+            "message": "This window couldn't be shown. The error has been written to the log file; please include the log when you report this.",
+            "close_button": {
+                "text": "Close"
+            }
+        },
         "confirm": {
             "yes_button": {
                 "text": "Yes"

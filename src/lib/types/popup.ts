@@ -35,6 +35,18 @@ export abstract class Popup<T = void> {
         console.debug(this);
         this._resolve(result);
     }
+
+    /** What the popup answers when it couldn't be shown (it failed to
+     * render, and the user closed the error shown instead): the same as
+     * cancelling it, where it can be cancelled. */
+    protected resultOnError(_message: string): T {
+        return null as T;
+    }
+
+    /** Close a popup that failed to render (see `Popup.svelte`). */
+    closeAfterError(message: string) {
+        this.close(this.resultOnError(message));
+    }
 }
 
 export class ConfirmPopup extends Popup<boolean> {
@@ -45,6 +57,10 @@ export class ConfirmPopup extends Popup<boolean> {
         public readonly question: string
     ) {
         super();
+    }
+
+    protected override resultOnError(): boolean {
+        return false;
     }
 }
 
@@ -134,6 +150,10 @@ export class HandoffPopup extends Popup<HandoffResult> {
     ) {
         super();
     }
+
+    protected override resultOnError(message: string): HandoffResult {
+        return { status: "Error", message };
+    }
 }
 
 /**
@@ -152,6 +172,10 @@ export class BridgeConsentPopup extends Popup<BridgeConsentDecision> {
     ) {
         super();
     }
+
+    protected override resultOnError(): BridgeConsentDecision {
+        return "Deny";
+    }
 }
 
 export type AutoImportDecision = "Install" | "InstallAndDeploy" | "Ignore";
@@ -168,6 +192,10 @@ export class AutoImportPopup extends Popup<AutoImportDecision> {
 
     constructor(public readonly file: string) {
         super();
+    }
+
+    protected override resultOnError(): AutoImportDecision {
+        return "Ignore";
     }
 }
 export type UpdatesPopupAction =
@@ -225,6 +253,10 @@ export class UpdateDownloadPopup extends Popup<UpdateDownloadResult> {
     ) {
         super();
     }
+
+    protected override resultOnError(message: string): UpdateDownloadResult {
+        return { ok: false, message };
+    }
 }
 
 export type BrowserUpdateDecision = "Done" | "Handoff" | "Skip" | "Stop";
@@ -265,6 +297,10 @@ export class DataFolderProgressPopup extends Popup<DataFolderProgressResult> {
     ) {
         super();
     }
+
+    protected override resultOnError(message: string): DataFolderProgressResult {
+        return { ok: false, message };
+    }
 }
 
 export class BrowserUpdatePopup extends Popup<BrowserUpdateDecision> {
@@ -277,6 +313,10 @@ export class BrowserUpdatePopup extends Popup<BrowserUpdateDecision> {
         public readonly position?: { index: number; total: number }
     ) {
         super();
+    }
+
+    protected override resultOnError(): BrowserUpdateDecision {
+        return "Stop";
     }
 }
 
