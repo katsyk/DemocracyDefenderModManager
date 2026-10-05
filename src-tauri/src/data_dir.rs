@@ -738,6 +738,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))] // see the `tauri` dev-dependency in Cargo.toml
     fn asset_scope_allows_mod_images_and_nothing_else() {
         // What the asset protocol is asked for: images in mod folders whose
         // names have spaces, dots, brackets and timestamps, under default
