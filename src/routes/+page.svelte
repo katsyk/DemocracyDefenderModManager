@@ -1622,7 +1622,7 @@
                         <span class="text-zinc-400 text-lg">{t("pages.mods.empty_state.title")}</span>
                         <span class="text-zinc-500 text-sm max-w-100">{t("pages.mods.empty_state.works_with")}</span>
                         <span class="text-zinc-400 text-sm max-w-100 mt-4">{t("pages.mods.empty_state.import_hint")}</span>
-                        {#each importSources.slice(0, 3) as source (source.Path)}
+                        {#each withUniqueKeys(importSources.slice(0, 3), s => s.Path) as [source, key] (key)}
                             <span class="text-zinc-500 text-xs max-w-120 break-all" data-testid="empty-import-found">
                                 {source.Count === 1
                                     ? t("pages.mods.empty_state.import_found_one", { path: source.Path })

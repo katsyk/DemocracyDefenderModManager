@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { updateEntryKey, withUniqueKeys } from "$lib/utils/eachKeys";
     import PopupBase from "./PopupBase.svelte";
     import { UpdatesPopup } from "$lib/types/popup";
     import { useLocalization } from "$lib/state/localization.svelte";
@@ -40,7 +41,7 @@
         <p class="text-sm text-zinc-400 max-w-md">{t("popup.updates.nothing_checkable")}</p>
     {:else}
         <ul class="min-w-110 max-w-3xl max-h-80 overflow-y-auto border border-zinc-600 divide-y divide-zinc-700">
-            {#each entries as entry (entry.Guid + entry.Provider)}
+            {#each withUniqueKeys(entries, updateEntryKey) as [entry, key] (key)}
                 <li class="flex flex-row gap-2 items-center px-2 py-1 text-sm">
                     <div class="flex-1 min-w-0 flex flex-col">
                         <span class="truncate text-zinc-200">{name(entry)}</span>

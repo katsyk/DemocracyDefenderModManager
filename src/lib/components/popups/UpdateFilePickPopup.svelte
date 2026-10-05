@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { withUniqueKeys } from "$lib/utils/eachKeys";
     import PopupBase from "./PopupBase.svelte";
     import { UpdateFilePickPopup } from "$lib/types/popup";
     import { useLocalization } from "$lib/state/localization.svelte";
@@ -32,7 +33,7 @@
         {t("popup.update_file_pick.message", { name: popup.modName, site: popup.entry.DisplayName, version: popup.entry.LatestVersion ?? "?" })}
     </p>
     <ul class="min-w-96 max-w-2xl max-h-72 overflow-y-auto border border-zinc-600">
-        {#each files as file (file.Id)}
+        {#each withUniqueKeys(files, f => f.Id) as [file, key] (key)}
             <li>
                 <label class="flex flex-row gap-2 items-center px-2 py-1 text-sm cursor-pointer hover:bg-zinc-800">
                     <input type="radio" name="update-file" value={file.Id} bind:group={selected} />
