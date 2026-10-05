@@ -517,6 +517,11 @@ export async function forceExit(): Promise<void> {
 export async function ackCloseRequested(): Promise<void> {
     await invoke<void>("ack_close_requested");
 }
+
+/** Open the folder with DDMM's log files in the file manager. */
+export async function openLogFolder(): Promise<void> {
+    await invoke<void>("open_log_folder");
+}
 // --- Import mods (see `commands::import` / `mod_import` on the Rust side) ---
 
 /** A folder that looks like somewhere mods can be imported from. `Kind`

@@ -71,3 +71,26 @@ export function removeEntriesOf(configs: Config[], guid: string): number {
     }
     return removed;
 }
+
+/** Take repeated entries of the same mod out of `configs`, in place,
+ * keeping the first (highest in the list) one; returns the GUIDs that had
+ * more than one entry. The Mods page lists a profile's entries keyed by
+ * mod, so a repeat makes the list fail to show at all (issue #71). Before
+ * 2.0.0-rc.10, editing a mod's options while the search box filtered the
+ * list could save such a repeat, and it stays in profiles.json until
+ * removed. */
+export function removeDuplicateEntries(configs: Config[]): string[] {
+    const seen = new Set<string>();
+    const repeated: string[] = [];
+    for (let i = 0; i < configs.length; i++) {
+        const guid = configs[i].Guid.toLowerCase();
+        if (!seen.has(guid)) {
+            seen.add(guid);
+            continue;
+        }
+        if (!repeated.includes(configs[i].Guid)) repeated.push(configs[i].Guid);
+        configs.splice(i, 1);
+        i--;
+    }
+    return repeated;
+}

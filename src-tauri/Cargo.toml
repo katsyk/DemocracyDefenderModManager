@@ -69,4 +69,6 @@ windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# `tauri::test::mock_app`, to check the asset protocol scope itself.
+tauri = { version = "2", features = ["protocol-asset", "test"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros"] }

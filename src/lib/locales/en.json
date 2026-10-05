@@ -102,6 +102,9 @@
                     "options_reset": {
                         "message": "These mods changed since their options were chosen, so their options were reset to the defaults: {names}. Check them before deploying."
                     },
+                    "duplicate_entries": {
+                        "message": "These mods were listed more than once in a profile; the extra entries were removed (the one highest in the list was kept): {names}. Check their options before deploying."
+                    },
                     "purge_success": {
                         "message": "Purge successful."
                     },
@@ -152,7 +155,15 @@
                 "text": "Loading..."
             },
             "loading_failed": {
-                "title": "Loading failed!"
+                "title": "Loading failed!",
+                "message": "The mod list couldn't be shown. The error has been written to the log file; please include the log when you report this.",
+                "reload_button": {
+                    "text": "Reload"
+                },
+                "open_log_folder_button": {
+                    "text": "Open log folder"
+                },
+                "open_log_folder_failed": "Couldn't open the log folder: {error}"
             },
             "add_profile_button": {
                 "tip": "New profile"

@@ -269,6 +269,17 @@ pub struct DataDirDecision {
     pub problem: Option<DataDirProblem>,
 }
 
+/// Where the log files go: `logs/` in the data folder, or a folder in the
+/// temp dir on the recovery screen (the data folder is missing then, and
+/// must not be created just to hold a log).
+pub fn log_dir(decision: &DataDirDecision) -> PathBuf {
+    if decision.problem.is_some() {
+        std::env::temp_dir().join(format!("{APP_IDENTIFIER}-logs"))
+    } else {
+        decision.path.join("logs")
+    }
+}
+
 /// Read a pointer file. `Ok(None)` when there is none.
 pub fn read_pointer(pointer_file: &Path) -> Result<Option<PathBuf>, String> {
     let data = match std::fs::read(pointer_file) {
@@ -713,6 +724,51 @@ mod tests {
         let dirs = asset_scope_dirs(&link);
         assert!(dirs.contains(&link.join("mods")));
         assert!(dirs.contains(&std::fs::canonicalize(real.path().join("mods")).unwrap()));
+    }
+
+    #[test]
+    fn log_dir_is_in_the_data_folder_unless_it_is_missing() {
+        let d = dirs();
+        let custom = d.custom.join("DDMM [data] v1.2");
+        let mut decision = decide_data_dir(&d.exe, &d.app_data, &d.config);
+        decision.path = custom.clone();
+        assert_eq!(log_dir(&decision), custom.join("logs"));
+        decision.problem = Some(DataDirProblem::Missing);
+        assert_eq!(log_dir(&decision), std::env::temp_dir().join(format!("{APP_IDENTIFIER}-logs")));
+    }
+
+    #[test]
+    fn asset_scope_allows_mod_images_and_nothing_else() {
+        // What the asset protocol is asked for: images in mod folders whose
+        // names have spaces, dots, brackets and timestamps, under default
+        // and custom data folders (also with glob characters in them).
+        let root = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_app();
+        for base in [
+            root.path().join("AppData").join("Roaming").join(APP_IDENTIFIER),
+            root.path().join("My Mods [HD2] {v1.2}").join("DDMM Data"),
+        ] {
+            let scope = tauri::scope::fs::Scope::new(&app, &Default::default()).unwrap();
+            std::fs::create_dir_all(base.join("mods")).unwrap();
+            for dir in asset_scope_dirs(&base) {
+                scope.allow_directory(&dir, true).unwrap();
+            }
+            for (folder, file) in [
+                ("AbdoStyled Ironclad Democracy 16609 1.0.0 2026-09-27T03-15Z sZaXo0pG9", "Screenshot 2026-09-26 131540.png"),
+                ("Abdo Styled Crewmates-9947-1-1-9-1778123166", "icon.png"),
+                ("Leopard Super Earth V1.5 [c85057a93f7d]", "images/thumbnail.png"),
+                ("First Person (experimental)", "a*b?.png"),
+            ] {
+                let image = base.join("mods").join(folder).join(file);
+                std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+                std::fs::write(&image, b"png").unwrap();
+                assert!(scope.is_allowed(&image), "{image:?} should be allowed");
+            }
+            std::fs::write(base.join("settings.json"), b"{}").unwrap();
+            assert!(!scope.is_allowed(base.join("settings.json")));
+            assert!(!scope.is_allowed(base.join("mods").join("..").join("settings.json")));
+            assert!(!scope.is_allowed(root.path().join("other.png")));
+        }
     }
 
     #[test]

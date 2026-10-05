@@ -425,6 +425,21 @@ pub fn ack_close_requested(state: State<'_, AppState>) {
     state.close_ack.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Open the folder with DDMM's log files in the file manager (the Mods
+/// page offers this when it couldn't load, so the log is one click away for
+/// a bug report). Opened from here rather than with the opener plugin from
+/// the page, so it works wherever the data folder is.
+#[tauri::command]
+pub fn open_log_folder(app: tauri::AppHandle, state: State<'_, AppState>) -> TAResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = crate::data_dir::log_dir(&state.data_dir);
+    log::info!("Opening the log folder {:?}.", dir);
+    app.opener()
+        .open_path(dir.to_string_lossy(), None::<&str>)
+        .map_err(|e| anyhow::anyhow!("couldn't open the log folder {}: {e}", dir.display()))
+        .into_ta_result()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
