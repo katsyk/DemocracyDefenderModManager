@@ -89,7 +89,8 @@ shows up normally.
 
 On AyakaMods, versions are often just a date, or never change at all, so DDMM also remembers when the mod's page
 was last updated at the time you skipped. If the page is updated again later, that is a new update and shows up
-normally, even when its version reads the same as the one you skipped. (A skip made with an older DDMM version
+normally, even when its version reads the same as the one you skipped. An update whose page gives no version at all can be
+skipped too; DDMM then goes by that page time alone. (A skip made with an older DDMM version
 learns this time at the next check, so only updates after that one show up again.)
 
 **Stop skipping** in the same places undoes it. The skip is stored with the mod (in its `.hd2mm-origin.json`) and
