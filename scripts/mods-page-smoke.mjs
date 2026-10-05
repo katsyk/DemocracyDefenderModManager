@@ -88,6 +88,46 @@ const scenarios = {
         async check(page, r) {
             r.expect(await page.getByTestId("mods-load-error").count() === 1, "the error screen is shown");
             r.expect(r.logs.some(l => l.level === 5 && l.message.includes("couldn't be shown")), "the error is logged at ERROR");
+            // Reload keeps the session's changes and lets go of the bridge first.
+            const saves = r.saves.length;
+            await page.getByTestId("mods-reload").click({ timeout: 2000 });
+            await page.waitForTimeout(1500);
+            r.expect(r.saves.length > saves, "Reload saves the profiles first");
+            r.expect(r.calls.some(c => c.cmd === "set_bridge_frontend_ready" && c.args?.ready === false), "Reload marks the bridge frontend not ready");
+        },
+    },
+    // A mod with two pages on the same site (two Nexus IDs): two rows in
+    // the update check's popup, not a "Checking for updates..." that never
+    // ends.
+    updatekeys: {
+        data: (d) => {
+            const e = (id) => ({ Guid: G(1), Provider: "nexus", DisplayName: "Nexus Mods", SourceId: id, InstalledVersion: "1.0", LatestVersion: "1.0", Method: "Browser", Status: { Kind: "UpToDate" } });
+            d.check_updates = { Trigger: "Manual", Results: [e("100"), e("200")] };
+        },
+        async check(page, r) {
+            await page.locator("button[title^='Check installed mods']").click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(await page.getByText("Checking for updates...").count() === 0, "the check doesn't hang");
+            r.expect(await page.locator("li", { hasText: "Nexus Mods" }).count() === 2, "both sources are listed");
+            r.expect(r.errors.length === 0, "no page error");
+        },
+    },
+    // A popup that throws while rendering: an error with Close, which
+    // closes it, instead of a popup (and its caller) stuck for good.
+    popuperror: {
+        data: (d) => {
+            d.check_updates = { Trigger: "Manual", Results: [{ Guid: G(1), Provider: "nexus", DisplayName: "Nexus Mods", SourceId: "1", Method: "Browser", Status: { Kind: "UpToDate" } }] };
+            d.__poisonInstalledVersion = true;
+        },
+        async check(page, r) {
+            await page.locator("button[title^='Check installed mods']").click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(await page.getByTestId("popup-render-error").count() === 1, "the popup shows its error");
+            r.expect(r.logs.some(l => l.level === 5 && l.message.includes("popup couldn't be shown")), "the error is logged at ERROR");
+            await page.getByText("Close", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            r.expect(await page.getByTestId("popup-render-error").count() === 0, "Close closes it");
+            r.expect((await rows(page)).includes("V1 mod"), "the Mods page is still there");
         },
     },
     // Init itself fails.
@@ -118,10 +158,11 @@ for (const name of process.argv.length > 2 ? process.argv.slice(2) : Object.keys
     const data = fixture();
     s.data?.(data);
     const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
-    const r = { logs: [], saves: [], errors: [], results: [], expect(ok, what) { this.results.push([!!ok, what]); } };
+    const r = { logs: [], saves: [], calls: [], errors: [], results: [], expect(ok, what) { this.results.push([!!ok, what]); } };
     page.on("pageerror", e => r.errors.push(e.message));
     await page.exposeFunction("__smokeLog", (level, message) => r.logs.push({ level, message }));
     await page.exposeFunction("__smokeSave", (config) => r.saves.push(config));
+    await page.exposeFunction("__smokeCall", (cmd, args) => r.calls.push({ cmd, args }));
     await page.addInitScript((responses) => {
         let next = 1;
         window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
@@ -133,8 +174,15 @@ for (const name of process.argv.length > 2 ? process.argv.slice(2) : Object.keys
             async invoke(cmd, args) {
                 if (cmd === "plugin:log|log") return void window.__smokeLog(args.level, args.message);
                 if (cmd.startsWith("plugin:event|listen")) return next++;
+                if (!cmd.startsWith("plugin:")) window.__smokeCall(cmd, args ?? null);
                 if (cmd === "save_profiles") return void window.__smokeSave(JSON.parse(JSON.stringify(args.config)));
-                return cmd in responses ? structuredClone(responses[cmd]) : null;
+                if (!(cmd in responses)) return null;
+                const result = structuredClone(responses[cmd]);
+                if (cmd === "check_updates" && responses.__poisonInstalledVersion) {
+                    // Only the update popup reads this.
+                    Object.defineProperty(result.Results[0], "InstalledVersion", { get() { throw new Error("poisoned InstalledVersion"); } });
+                }
+                return result;
             },
         };
     }, data);
