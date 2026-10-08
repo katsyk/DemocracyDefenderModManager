@@ -282,7 +282,7 @@
           downloadUrl: normalized.finalUrl,
           pageVersion: sendableVersion(attribution, normalized.referrer),
         });
-        broadcastToSiteTabs(site, { type: 'ddmm:installResult', reply });
+        broadcastToSiteTabs(site, { type: 'ddmm:installResult', reply, broadcast: true, pageUrl: attribution.pageUrl });
         return;
       }
       break;
@@ -301,15 +301,19 @@
    * @param {{site: string, pageUrl: string|null, pageVersion: string|null, tabId: number|null}} armed
    */
   async function installCaptured(normalized, armed) {
-    const notifyTab = (message) =>
-      armed.tabId != null ? sendToTab(armed.tabId, message) : broadcastToSiteTabs(armed.site, message);
-    notifyTab({ type: 'ddmm:captureStarted', site: armed.site });
     const contextPageUrl = armed.pageUrl || normalized.referrer;
     const attribution = DDMM.sources.attributeDownload({
       contextPageUrl,
       downloadUrl: normalized.finalUrl,
       trustPage: true,
     });
+    // Sent to every tab of the site only when the arming tab is unknown;
+    // then each tab takes the result only if it's its own mod.
+    const notifyTab = (message) =>
+      armed.tabId != null
+        ? sendToTab(armed.tabId, message)
+        : broadcastToSiteTabs(armed.site, { ...message, broadcast: true, pageUrl: attribution.pageUrl });
+    notifyTab({ type: 'ddmm:captureStarted', site: armed.site });
     const reply = await runInstall({
       file: normalized.filename,
       pageUrl: attribution.pageUrl,

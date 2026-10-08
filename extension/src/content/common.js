@@ -322,6 +322,12 @@
     /** @type {ReturnType<typeof setTimeout>|undefined} */
     let armExpiryTimer;
 
+    /** @param {string|null|undefined} pageUrl @returns {boolean} Whether it names this page's mod. */
+    function isThisPagesMod(pageUrl) {
+      const sources = DDMM_NS.sources;
+      return Boolean(pageUrl) && sources.isSameMod(sources.sourceFromPageUrl(pageUrl), sources.sourceFromPageUrl(location.href));
+    }
+
     /**
      * The armed install never happened; release the button and re-check.
      * Also driven from here (not only by the background's
@@ -338,6 +344,9 @@
 
     DDMM_NS.browserApi.runtime.onMessage.addListener((message) => {
       if (!message) return;
+      if (message.broadcast && message.type === 'ddmm:captureStarted' && !isThisPagesMod(message.pageUrl)) {
+        return;
+      }
       if (message.type === 'ddmm:captureStarted' && message.site === adapter.name) {
         clearTimeout(armExpiryTimer);
         if (state.state === 'waiting') {
@@ -345,6 +354,13 @@
           render();
         }
       } else if (message.type === 'ddmm:installResult') {
+        if (message.broadcast && !isThisPagesMod(message.pageUrl)) {
+          // Another mod's result, sent to every open tab of the site (an
+          // auto-captured download): it says nothing about this page's
+          // mod, so re-check instead of showing it here.
+          if (!state.busy) refresh();
+          return;
+        }
         clearTimeout(armExpiryTimer);
         if (message.reply && message.reply.ok) {
           state.setInstalled();

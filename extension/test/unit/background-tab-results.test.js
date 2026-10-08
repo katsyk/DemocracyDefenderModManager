@@ -13,6 +13,9 @@ const evt = (name) => ({ addListener: (fn) => name && listeners[name].push(fn) }
 let nextDownload = 1;
 const tabMessages = [];
 const installs = [];
+let localStore = {};
+/** id -> DownloadItem for `downloads.search`, when not the default GitHub file. */
+const searchResults = new Map();
 
 beforeAll(async () => {
   globalThis.chrome = {
@@ -34,7 +37,7 @@ beforeAll(async () => {
       onMessage: evt('onMessage'),
       lastError: null,
     },
-    storage: { local: { get: (_k, cb) => cb({}), set: (_v, cb) => cb && cb(), remove: (_k, cb) => cb && cb() } },
+    storage: { local: { get: (_k, cb) => cb({ ...localStore }), set: (_v, cb) => cb && cb(), remove: (_k, cb) => cb && cb() } },
     downloads: {
       download(_opts, cb) {
         if (nextDownload instanceof Error) {
@@ -45,11 +48,12 @@ beforeAll(async () => {
           cb(nextDownload);
         }
       },
-      search: (q, cb) => cb([{ id: q.id, state: 'complete', filename: '/dl/mod.zip', url: 'https://github.com/o/r/releases/download/v1/mod.zip' }]),
+      search: (q, cb) => cb([searchResults.get(q.id) || { id: q.id, state: 'complete', filename: '/dl/mod.zip', url: 'https://github.com/o/r/releases/download/v1/mod.zip' }]),
       onChanged: evt('onChanged'),
       onCreated: evt(),
     },
-    tabs: { query: (_q, cb) => cb([]), sendMessage: (tabId, msg, cb) => { tabMessages.push({ tabId, msg }); if (cb) cb(); } },
+    // Two open Nexus tabs (a broadcast reaches both).
+    tabs: { query: (_q, cb) => cb([{ id: 8 }, { id: 9 }]), sendMessage: (tabId, msg, cb) => { tabMessages.push({ tabId, msg }); if (cb) cb(); } },
     contextMenus: { create() {}, onClicked: evt() },
     notifications: { create: (_o, cb) => cb && cb() },
   };
@@ -117,5 +121,22 @@ describe('direct-link installs whose download never completes', () => {
     changeState(999, 'interrupted');
     await flush();
     expect(tabMessages).toHaveLength(0);
+  });
+});
+
+describe('auto-captured installs', () => {
+  it("send their result to the site's tabs marked with the mod it was for", async () => {
+    localStore = { autoCapture: { nexus: true } };
+    const url = 'https://cf-files.nexusmods.com/cdn/6119/123/Cool Mod-123-1-0-1700000000.zip';
+    searchResults.set(77, { id: 77, state: 'complete', filename: '/dl/cool.zip', url, finalUrl: url, referrer: 'https://www.nexusmods.com/helldivers2/mods/123?tab=files' });
+    changeState(77, 'complete');
+    await flush();
+    localStore = {};
+    expect(installs).toHaveLength(1);
+    const results = tabMessages.filter((m) => m.msg.type === 'ddmm:installResult');
+    expect(results.map((m) => m.tabId)).toEqual([8, 9]);
+    for (const { msg } of results) {
+      expect(msg).toMatchObject({ broadcast: true, pageUrl: 'https://www.nexusmods.com/helldivers2/mods/123?tab=files' });
+    }
   });
 });
