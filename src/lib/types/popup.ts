@@ -139,12 +139,27 @@ export type HandoffResult =
  * side) opens a login-gated mod page and watches the Downloads folder for
  * the archive to land.
  */
+/** What the browser handoff popup shows; kept on the popup so it
+ * survives the component being unmounted while covered. */
+export type HandoffView = {
+    status: "Waiting" | "Installing" | "Error";
+    errorMessage?: string;
+    /** A download left alone because it's another Nexus mod's file. */
+    ignored?: { FileName: string; ModId: string };
+};
+
 export class HandoffPopup extends Popup<HandoffResult> {
     component = HandoffPopupComponent;
     /** Set once the page has been opened and the handoff started, so
      * re-mounting the popup (another popup shown on top and closed again)
      * never does either twice. */
     started = false;
+    view: HandoffView = { status: "Waiting" };
+    /** Set by the shown component to refresh itself. */
+    onViewChange?: () => void;
+    /** "Choose File" is installing a file: the handoff it cancelled
+     * mustn't close the popup as cancelled. */
+    installingChosenFile = false;
 
     constructor(
         public readonly pageUrl: string,
@@ -293,6 +308,10 @@ export type DataFolderProgressResult =
 export class DataFolderProgressPopup extends Popup<DataFolderProgressResult> {
     component = DataFolderProgressPopupComponent;
     started = false;
+    /** Set once the move has finished and the app is about to restart:
+     * until then, the window must not be closed (it would vanish while
+     * the copy goes on, and the app would come back by itself). */
+    finished = false;
 
     constructor(
         public readonly destination: string | null,

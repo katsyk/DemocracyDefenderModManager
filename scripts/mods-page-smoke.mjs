@@ -236,6 +236,77 @@ const scenarios = {
                 && await page.locator("button", { hasText: "Choose File" }).count() === 0, "the handoff popup is closed");
         },
     },
+    movingclose: {
+        data: (d) => {
+            d["plugin:dialog|open"] = "/newdata";
+            d.plan_data_folder_move = { Source: "/data", Picked: "/newdata", Target: "/newdata", IsReset: false, UsedSubfolder: false, ExistingData: false, TotalBytes: 1000, TotalFiles: 3, FreeBytes: null };
+            d.__hang = ["move_data_folder"];
+        },
+        async check(page, r) {
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            await page.getByText("Change...", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            await page.getByText("Move", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(r.calls.some(c => c.cmd === "move_data_folder"), "the move is running");
+            await page.evaluate(() => window.__smokeEmit("tauri://close-requested", null));
+            await page.waitForTimeout(800);
+            r.expect(!r.windowCalls.some(c => c.includes("destroy")), "the window is NOT destroyed mid-move (got " + r.windowCalls.join(",") + ")");
+        },
+    },
+    handofferrcover: {
+        data: (d) => { d.classify_download_url = { Provider: "nexus", DisplayName: "Nexus Mods", RequiresHandoff: true }; d.__fails = { start_handoff: "Downloads folder missing" }; },
+        async check(page, r) {
+            await page.locator("button", { hasText: "Add URL" }).click({ timeout: 2000 });
+            await page.locator("#input").fill("https://www.nexusmods.com/helldivers2/mods/1");
+            await page.getByText("Confirm", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(await page.getByText("Downloads folder missing").count() === 1, "error shown first");
+            await page.evaluate(() => window.__smokeEmit("bridge://consent-request", { requestId: "1", site: "example.com" }));
+            await page.waitForTimeout(300);
+            await page.getByText("Deny", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(await page.getByText("Downloads folder missing").count() === 1, "error still shown after cover");
+        },
+    },
+    // Closing from Settings with an invalid game path: asks first, and
+    // closes without saving only when told to.
+    invalidclose: {
+        data: (d) => { d.validate_game_path = { valid: false, resolvedPath: null, code: "not_found", detail: null, message: null }; },
+        async check(page, r) {
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            await page.evaluate(() => window.__smokeEmit("tauri://close-requested", null));
+            await page.waitForTimeout(500);
+            r.expect(!r.windowCalls.some(c => c.includes("destroy")), "not closed without asking");
+            await page.getByText("Yes", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(r.windowCalls.some(c => c.includes("destroy")), "closed once confirmed");
+            r.expect(!r.calls.some(c => c.cmd === "save_settings"), "the invalid settings aren't saved");
+        },
+    },
+    // "Choose File" in the browser handoff cancels the handoff, whose
+    // "Cancelled" mustn't close the popup while the chosen file installs.
+    handoffchoose: {
+        data: (d) => {
+            d.classify_download_url = { Provider: "nexus", DisplayName: "Nexus Mods", RequiresHandoff: true };
+            d["plugin:dialog|open"] = "/dl/mod.zip";
+            d.__hang = ["install_handoff_file"];
+        },
+        async check(page, r) {
+            await page.locator("button", { hasText: "Add URL" }).click({ timeout: 2000 });
+            await page.locator("#input").fill("https://www.nexusmods.com/helldivers2/mods/1");
+            await page.getByText("Confirm", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            await page.locator("button", { hasText: "Choose File" }).click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            await page.evaluate(() => window.__smokeEmit("handoff", { Status: "Cancelled" }));
+            await page.waitForTimeout(300);
+            r.expect(r.calls.some(c => c.cmd === "install_handoff_file"), "the chosen file is installing");
+            r.expect(await page.locator("button", { hasText: "Choose File" }).count() === 1, "the popup stays open while it installs");
+        },
+    },
     // Init itself fails.
     initfail: {
         data: (d) => { d.load_profiles.Profiles = null; },
@@ -294,6 +365,7 @@ for (const name of process.argv.length > 2 ? process.argv.slice(2) : Object.keys
                 if (cmd.startsWith("plugin:window|")) window.__smokeWindowCall(cmd);
                 if (cmd.startsWith("plugin:") && !cmd.startsWith("plugin:log|")) window.__smokePluginCall(cmd);
                 if (cmd in (responses.__fails ?? {})) throw responses.__fails[cmd];
+                if ((responses.__hang ?? []).includes(cmd)) return new Promise(() => {});
                 if (cmd === "save_profiles") return void window.__smokeSave(JSON.parse(JSON.stringify(args.config)));
                 if (!(cmd in responses)) return null;
                 const result = structuredClone(responses[cmd]);
