@@ -149,8 +149,12 @@ example, a patch file the mod claims to include that doesn't actually exist in i
 
 `V1` and `V2` manifests deploy the same way. If an enabled option (or the selected sub-option) doesn't actually
 contribute any files, check the [log file](logs.md) for a warning naming the mod and an out-of-range option/
-sub-option index, or an `Include` folder that doesn't exist in the mod's own directory — deploy skips that
-option rather than failing the whole deploy, but it also means nothing gets installed for it.
+sub-option index — deploy skips that option rather than failing the whole deploy, but it also means nothing gets
+installed for it.
+
+An option folder (a Legacy `Options` entry, or an `Include` path) that doesn't exist in the mod's own folder is
+different: deploy stops with an error naming that folder, so a broken mod is never deployed half-installed without
+you knowing. Reinstall the mod, or let its author know the manifest names a folder the archive doesn't contain.
 
 ## Browser handoff fails immediately with a Downloads-folder error
 
