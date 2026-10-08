@@ -307,6 +307,48 @@ const scenarios = {
             r.expect(await page.locator("button", { hasText: "Choose File" }).count() === 1, "the popup stays open while it installs");
         },
     },
+    // A settings save that never returns doesn't hold up the later ones
+    // (here: the save before moving the data folder).
+    savehang: {
+        data: (d) => {
+            d.__hangFirst = ["save_settings"];
+            d["plugin:dialog|open"] = "/newdata";
+            d.plan_data_folder_move = { Source: "/data", Picked: "/newdata", Target: "/newdata", IsReset: false, UsedSubfolder: false, ExistingData: false, TotalBytes: 1000, TotalFiles: 3, FreeBytes: null };
+        },
+        async check(page, r) {
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            await page.evaluate(() => window.__smokeEmit("tauri://close-requested", null));
+            await page.waitForTimeout(5500);
+            await page.getByText("Yes", { exact: true }).click({ timeout: 2000 }).catch(() => {});
+            await page.waitForTimeout(300);
+            const before = r.calls.filter(c => c.cmd === "save_settings").length;
+            await page.getByText("Change...", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(6000);
+            r.expect(r.calls.filter(c => c.cmd === "save_settings").length === before + 1, "the next save runs");
+            r.expect(r.calls.some(c => c.cmd === "plan_data_folder_move"), "the move goes on to its plan");
+        },
+    },
+    // "Use existing data": closing waits while the folder is switched.
+    adoptclose: {
+        data: (d) => {
+            d["plugin:dialog|open"] = "/newdata";
+            d.plan_data_folder_move = { Source: "/data", Picked: "/newdata", Target: "/newdata", IsReset: false, UsedSubfolder: false, ExistingData: true, TotalBytes: 1000, TotalFiles: 3, FreeBytes: null };
+            d.__hang = ["adopt_data_folder"];
+        },
+        async check(page, r) {
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            await page.getByText("Change...", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            await page.getByText("Use the Existing Data", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(r.calls.some(c => c.cmd === "adopt_data_folder"), "the switch is running");
+            await page.evaluate(() => window.__smokeEmit("tauri://close-requested", null));
+            await page.waitForTimeout(800);
+            r.expect(!r.windowCalls.some(c => c.includes("destroy")), "the window is not closed meanwhile");
+        },
+    },
     // Init itself fails.
     initfail: {
         data: (d) => { d.load_profiles.Profiles = null; },
@@ -366,6 +408,10 @@ for (const name of process.argv.length > 2 ? process.argv.slice(2) : Object.keys
                 if (cmd.startsWith("plugin:") && !cmd.startsWith("plugin:log|")) window.__smokePluginCall(cmd);
                 if (cmd in (responses.__fails ?? {})) throw responses.__fails[cmd];
                 if ((responses.__hang ?? []).includes(cmd)) return new Promise(() => {});
+                if ((responses.__hangFirst ?? []).includes(cmd)) {
+                    responses.__hangFirst = responses.__hangFirst.filter(c => c !== cmd);
+                    return new Promise(() => {});
+                }
                 if (cmd === "save_profiles") return void window.__smokeSave(JSON.parse(JSON.stringify(args.config)));
                 if (!(cmd in responses)) return null;
                 const result = structuredClone(responses[cmd]);

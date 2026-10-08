@@ -88,10 +88,22 @@
     /** The settings save in progress, if any: saves run one after the
      * other, so a close never starts a second one alongside a running one. */
     let saveInFlight: Promise<void> | null = null;
+    /** How long a save waits for the one before it: a save that never
+     * returns mustn't hold up every later one for the rest of the session. */
+    const PREVIOUS_SAVE_WAIT_MS = 5000;
+    /** "Use existing data" is switching folders (the app restarts after):
+     * closing waits, like during a move. */
+    let adopting = false;
 
     function save(): Promise<void> {
         const settings = currentSettings();
-        const run = (saveInFlight ?? Promise.resolve()).catch(() => {}).then(() => saveSettings(settings));
+        const previous = saveInFlight
+            ? new Promise<void>(resolve => {
+                const timer = setTimeout(resolve, PREVIOUS_SAVE_WAIT_MS);
+                saveInFlight!.catch(() => {}).finally(() => { clearTimeout(timer); resolve(); });
+            })
+            : Promise.resolve();
+        const run = previous.then(() => saveSettings(settings));
         saveInFlight = run;
         run.finally(() => { if (saveInFlight === run) saveInFlight = null; }).catch(() => {});
         return run;
@@ -197,8 +209,8 @@
             // Copying the data folder: the backend refuses the close (the copy
             // would go on with no window, and DDMM would come back by
             // itself); the progress popup asks to wait.
-            if (moveInProgress && !moveInProgress.finished) {
-                log.info("Close requested during a data folder move; not closing.").catch(() => {});
+            if (adopting || (moveInProgress && !moveInProgress.finished)) {
+                log.info("Close requested while switching the data folder; not closing.").catch(() => {});
                 return;
             }
             if (closeRequestInFlight) return;
@@ -465,8 +477,11 @@
             showPopup(wait);
             try {
                 dataFolderMoving = true;
+                adopting = true;
                 await adoptDataFolder(destination, reset);
+                adopting = false;
             } catch (ex: unknown) {
+                adopting = false;
                 dataFolderMoving = false;
                 wait.close();
                 showPopup(new NotificationPopup("error", t("pages.settings.data_dir.popup.adopt_failed", { detail: errorText(ex) })));
