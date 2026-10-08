@@ -31,7 +31,8 @@ class FakePort {
   /** Test helper: simulate the host process going away. */
   simulateDisconnect() {
     this.disconnected = true;
-    for (const fn of this._disconnectListeners) fn();
+    // Both browsers pass the port to onDisconnect listeners.
+    for (const fn of this._disconnectListeners) fn(this);
   }
 }
 
@@ -130,6 +131,15 @@ describe('ProtocolClient', () => {
       globalThis.DDMM.browserApi.runtime.lastError = null;
       await expect(promise).rejects.toMatchObject({ code: 'NATIVE_HOST_MISSING' });
     }
+  });
+
+  it('reads why the port closed from port.error on Firefox (runtime.lastError is never set there)', async () => {
+    // Firefox reports a missing native host only on the port: without this
+    // the button never offered "Get DDMM" on Firefox.
+    const promise = client.hello({ extensionVersion: '1', browser: 'firefox' });
+    port.error = { message: 'No such native application io.github.katsyk.ddmm' };
+    port.simulateDisconnect();
+    await expect(promise).rejects.toMatchObject({ code: 'NATIVE_HOST_MISSING' });
   });
 
   it('keeps DISCONNECTED for a host that crashed or exited', async () => {

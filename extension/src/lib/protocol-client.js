@@ -76,7 +76,7 @@
       if (this._port) return this._port;
       const port = this._connectFn();
       port.onMessage.addListener((msg) => this._handleMessage(msg));
-      port.onDisconnect.addListener(() => this._handleDisconnect());
+      port.onDisconnect.addListener((p) => this._handleDisconnect(p || port));
       this._port = port;
       return port;
     }
@@ -91,9 +91,12 @@
       pending.resolve(msg);
     }
 
-    _handleDisconnect() {
+    /** @param {{error?: {message?: string}}} [port] - The port that closed. */
+    _handleDisconnect(port) {
       this._port = null;
-      const err = DDMM.browserApi.runtime.lastError;
+      // Firefox says why a port closed only on `port.error` (it never sets
+      // runtime.lastError here); Chrome only on runtime.lastError.
+      const err = (port && port.error) || DDMM.browserApi.runtime.lastError;
       const reason = err && err.message ? err.message : 'DDMM disconnected';
       const code = disconnectCode(reason);
       for (const [id, pending] of this._pending) {

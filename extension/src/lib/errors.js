@@ -26,6 +26,7 @@
     INTERNAL: 'Something went wrong in DDMM.',
     TIMEOUT: 'DDMM took too long to respond.',
     DISCONNECTED: 'Lost the connection to DDMM.',
+    DOWNLOAD_FAILED: "The download didn't finish, so nothing was installed. Try again.",
   };
 
   /**

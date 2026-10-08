@@ -64,7 +64,10 @@ pub fn tokens_match(expected: &str, supplied: &str) -> bool {
     diff == 0
 }
 
-/// Write `bridge.json` with owner-only permissions: `0600` on Unix. On
+/// Write `bridge.json` with owner-only permissions: `0600` on Unix, from
+/// the moment the file exists (it's written to a temp file created `0600`
+/// and renamed into place, so the token is never readable by others, not
+/// even briefly, and a leftover file's permissions don't matter). On
 /// Windows there's no direct equivalent of Unix mode bits, but the file
 /// already lives under the per-user app-data directory (or the portable
 /// folder, which is whatever the user already controls), which is not
@@ -73,14 +76,33 @@ pub fn tokens_match(expected: &str, supplied: &str) -> bool {
 pub async fn write_bridge_file(base_path: &Path, info: &BridgeInfo) -> anyhow::Result<()> {
     let path = bridge_file_path(base_path);
     let data = serde_json::to_vec_pretty(info)?;
-    tokio::fs::write(&path, data).await?;
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        tokio::fs::set_permissions(&path, perms).await?;
+        use tokio::io::AsyncWriteExt;
+        let tmp = base_path.join(format!("{BRIDGE_FILE_NAME}.{}.tmp", std::process::id()));
+        let _ = tokio::fs::remove_file(&tmp).await;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .await?;
+        let written = async {
+            file.write_all(&data).await?;
+            file.sync_all().await?;
+            drop(file);
+            tokio::fs::rename(&tmp, &path).await
+        }
+        .await;
+        if written.is_err() {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+        written?;
     }
+
+    #[cfg(not(unix))]
+    tokio::fs::write(&path, data).await?;
 
     Ok(())
 }
@@ -142,6 +164,29 @@ pub fn process_is_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Owner-only from creation (a umask-default file chmod-ed afterwards
+    /// was briefly readable by other users), and over a leftover
+    /// world-readable `bridge.json` from a crashed run too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bridge_file_is_owner_only_from_the_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = bridge_file_path(dir.path());
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let info = BridgeInfo::new(4242, "ab".repeat(32));
+        write_bridge_file(dir.path(), &info).await.unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let back = read_bridge_file(dir.path()).await.unwrap();
+        assert_eq!((back.port, back.token), (4242, "ab".repeat(32)));
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from(BRIDGE_FILE_NAME)], "no temp file left behind");
+    }
 
     #[test]
     fn generated_tokens_are_64_hex_chars_and_differ() {

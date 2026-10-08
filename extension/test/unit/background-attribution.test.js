@@ -45,7 +45,8 @@ describe('context-menu install payload', () => {
     expect(p.pageUrl).toBe('https://ayakamods.com/mods/mod-b.5555/download');
     expect(p.pageUrl).not.toContain('4084');
     expect(p.pageVersion).toBeNull();
-    expect(p.tabId).toBe(7);
+    // Mod B's result must not land on mod A's button.
+    expect(p.tabId).toBeNull();
   });
 
   it("a bare file link on mod A's page sends pageUrl: null (never the tab URL)", () => {
@@ -64,6 +65,7 @@ describe('context-menu install payload', () => {
     const p = payload('https://ayakamods.com/mods/mod-a.4084/download');
     expect(p.pageUrl).toBe(PAGE_A);
     expect(p.pageVersion).toBe('1.2');
+    expect(p.tabId).toBe(7);
   });
 
   it('ignores other menu items and links-less clicks', () => {

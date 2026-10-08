@@ -192,12 +192,34 @@
    */
   async function startDirectDownload(url, context) {
     const downloadId = await api.downloads.download({ url });
+    // A new click for the same file from the same tab supersedes the old
+    // download, and one for the same mod supersedes a failed one: only the
+    // newest is installed and reported.
+    if (context.tabId != null) {
+      for (const [id, old] of directDownloads) {
+        if (old.tabId === context.tabId && old.pageUrl === context.pageUrl && (old.downloadUrl === url || old.interrupted)) {
+          directDownloads.delete(id);
+        }
+      }
+    }
     directDownloads.set(downloadId, { ...context, downloadUrl: url });
+    // It may already have failed before it was registered here (the
+    // onChanged event then found no context): check once.
+    try {
+      const [item] = await api.downloads.search({ id: downloadId });
+      if (item && item.state === 'interrupted') reportInterruptedDirectDownload(downloadId);
+    } catch {
+      // Best effort; onChanged still covers anything later.
+    }
     return downloadId;
   }
 
   api.downloads.onChanged.addListener((delta) => {
     const changed = DDMM.downloadsAdapter.normalizeChangedDelta(delta);
+    if (changed.state === 'interrupted') {
+      reportInterruptedDirectDownload(changed.id);
+      return;
+    }
     if (changed.state !== 'complete') return;
 
     handleCompletedDownload(changed.id).catch(() => {
@@ -206,6 +228,31 @@
       // in an event listener.
     });
   });
+
+  /** The reply a tab gets when the download it started never finished. */
+  function downloadFailedReply(message) {
+    return { ok: false, error: { code: 'DOWNLOAD_FAILED', message: message || '' } };
+  }
+
+  /**
+   * A download we started for a tab's "Install with DDMM" click was
+   * cancelled or failed: tell the tab, so its button doesn't stay on
+   * "Installing…" for good. The context is kept, so a download the user
+   * resumes from the browser's downloads list still installs. Reported
+   * once per download.
+   * @param {number} downloadId
+   */
+  function reportInterruptedDirectDownload(downloadId) {
+    const context = directDownloads.get(downloadId);
+    if (!context || context.interrupted) return;
+    context.interrupted = true;
+    if (context.tabId != null) {
+      sendToTab(context.tabId, { type: 'ddmm:installResult', reply: downloadFailedReply() });
+    } else {
+      // No button is waiting on it (a right-clicked link to another mod).
+      notify('DDMM install failed', DDMM.errors.describeError('DOWNLOAD_FAILED'));
+    }
+  }
 
   /** @param {number} downloadId */
   async function handleCompletedDownload(downloadId) {
@@ -259,7 +306,7 @@
           downloadUrl: normalized.finalUrl,
           pageVersion: sendableVersion(attribution, normalized.referrer),
         });
-        broadcastToSiteTabs(site, { type: 'ddmm:installResult', reply });
+        broadcastToSiteTabs(site, { type: 'ddmm:installResult', reply, broadcast: true, pageUrl: attribution.pageUrl });
         return;
       }
       break;
@@ -278,15 +325,19 @@
    * @param {{site: string, pageUrl: string|null, pageVersion: string|null, tabId: number|null}} armed
    */
   async function installCaptured(normalized, armed) {
-    const notifyTab = (message) =>
-      armed.tabId != null ? sendToTab(armed.tabId, message) : broadcastToSiteTabs(armed.site, message);
-    notifyTab({ type: 'ddmm:captureStarted', site: armed.site });
     const contextPageUrl = armed.pageUrl || normalized.referrer;
     const attribution = DDMM.sources.attributeDownload({
       contextPageUrl,
       downloadUrl: normalized.finalUrl,
       trustPage: true,
     });
+    // Sent to every tab of the site only when the arming tab is unknown;
+    // then each tab takes the result only if it's its own mod.
+    const notifyTab = (message) =>
+      armed.tabId != null
+        ? sendToTab(armed.tabId, message)
+        : broadcastToSiteTabs(armed.site, { ...message, broadcast: true, pageUrl: attribution.pageUrl });
+    notifyTab({ type: 'ddmm:captureStarted', site: armed.site });
     const reply = await runInstall({
       file: normalized.filename,
       pageUrl: attribution.pageUrl,
@@ -358,7 +409,9 @@
     return {
       pageUrl: attribution.pageUrl,
       pageVersion: sendableVersion(attribution, tabUrl),
-      tabId: tab && tab.id != null ? tab.id : null,
+      // Only the page's own mod reports back to the page: its button is
+      // about that mod, and another mod's result there would mislabel it.
+      tabId: attribution.sameModAsPage && tab && tab.id != null ? tab.id : null,
     };
   }
 
@@ -422,12 +475,21 @@
 
       case 'ddmm:installDirect': {
         const tabId = sender.tab ? sender.tab.id : null;
-        const downloadId = await startDirectDownload(message.url, {
-          pageUrl: message.pageUrl ?? null,
-          pageVersion: message.pageVersion ?? null,
-          tabId,
-        });
-        return { ok: true, downloadId };
+        try {
+          const downloadId = await startDirectDownload(message.url, {
+            pageUrl: message.pageUrl ?? null,
+            pageVersion: message.pageVersion ?? null,
+            tabId,
+          });
+          return { ok: true, downloadId };
+        } catch (e) {
+          // The browser refused or the user cancelled the save dialog
+          // (Firefox rejects then): no download will ever complete, so the
+          // tab hears it now instead of waiting on "Installing…".
+          const reply = downloadFailedReply(e && e.message);
+          if (tabId != null) sendToTab(tabId, { type: 'ddmm:installResult', reply });
+          return reply;
+        }
       }
 
       case 'ddmm:armCapture': {
