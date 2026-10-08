@@ -598,11 +598,20 @@ async fn is_site_allowed(app: &AppHandle, site: &str) -> bool {
 
 async fn allow_site(app: &AppHandle, site: &str) {
     let state = app.state::<AppState>();
-    if let Ok(mut settings) = do_load_settings(&state.base_path).await {
-        settings.allow_bridge_site(site.to_string());
-        if let Err(e) = crate::commands::settings::write_settings(&state.base_path, &settings).await {
-            log::error!("Couldn't save \"Always allow\" for {site}: {e:#}");
+    let _data_op = match state.data_op() {
+        Ok(op) => op,
+        Err(e) => {
+            log::warn!("Couldn't save \"Always allow\" for {site}: {e:#}");
+            return;
         }
+    };
+    let saved = crate::commands::settings::update_settings(&state.base_path, |settings| {
+        settings.allow_bridge_site(site.to_string());
+        Ok(())
+    })
+    .await;
+    if let Err(e) = saved {
+        log::error!("Couldn't save \"Always allow\" for {site}: {e:#}");
     }
 }
 

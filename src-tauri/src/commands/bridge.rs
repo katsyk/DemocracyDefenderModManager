@@ -85,9 +85,12 @@ pub async fn get_bridge_allowed_sites(state: State<'_, AppState>) -> TAResult<Ve
 #[tauri::command]
 pub async fn revoke_bridge_site(state: State<'_, AppState>, site: String) -> TAResult<()> {
     let _data_op = state.data_op().into_ta_result()?;
-    let mut settings = do_load_settings(&state.base_path).await.into_ta_result()?;
-    settings.revoke_bridge_site(&site);
-    crate::commands::settings::write_settings(&state.base_path, &settings).await.into_ta_result()?;
+    crate::commands::settings::update_settings(&state.base_path, |settings| {
+        settings.revoke_bridge_site(&site);
+        Ok(())
+    })
+    .await
+    .into_ta_result()?;
     Ok(())
 }
 

@@ -181,6 +181,9 @@ pub async fn move_data_folder(
     reset: bool,
 ) -> TAResult<MoveResult> {
     let guard = lock_data_ops(&state).await.into_ta_result()?;
+    // settings.json is copied and rewritten (stored paths) by the move: no
+    // settings write may land in between.
+    let _settings = crate::commands::settings::lock_settings().await;
     let plan = make_plan(&state, destination, reset).await.into_ta_result()?;
     if plan.existing_data {
         return anyhow::anyhow!(
