@@ -34,6 +34,7 @@
                 // until it does.
                 leftovers = result.Leftovers;
                 restarting = true;
+                popup.finished = true;
             } catch (ex: unknown) {
                 const message = ex instanceof Error ? ex.message : String(ex);
                 popup.close({ ok: false, message });

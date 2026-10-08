@@ -83,6 +83,19 @@
     let dataFolderInfo = $state<DataFolderInfo | null>(null);
     let dataDirBusy = $state(false);
     let dataFolderMoving = false;
+    /** The data folder move being copied, if any (see `onCloseRequested`). */
+    let moveInProgress: DataFolderProgressPopup | null = null;
+    /** The settings save in progress, if any: saves run one after the
+     * other, so a close never starts a second one alongside a running one. */
+    let saveInFlight: Promise<void> | null = null;
+
+    function save(): Promise<void> {
+        const settings = currentSettings();
+        const run = (saveInFlight ?? Promise.resolve()).catch(() => {}).then(() => saveSettings(settings));
+        saveInFlight = run;
+        run.finally(() => { if (saveInFlight === run) saveInFlight = null; }).catch(() => {});
+        return run;
+    }
     /** Set once the settings are loaded into this page. Until then (still
      * loading, or loading failed) there's nothing to save, and leaving
      * mustn't be blocked by the empty game path. */
@@ -164,7 +177,7 @@
     onNavigate(async () => {
         if (!canSave()) return;
         try {
-            await saveSettings(currentSettings());
+            await save();
         } catch (ex: unknown) {
             // The backend says why (e.g. the downloads folder is DDMM's own
             // mod storage); never lose the changes without a word.
@@ -181,16 +194,32 @@
             event.preventDefault();
             await ackCloseRequested().catch((ex: unknown) =>
                 log.error(`Failed to acknowledge close request: ${errorText(ex)}`).catch(() => {}));
+            // Copying the data folder: the backend refuses the close (the copy
+            // would go on with no window, and DDMM would come back by
+            // itself); the progress popup asks to wait.
+            if (moveInProgress && !moveInProgress.finished) {
+                log.info("Close requested during a data folder move; not closing.").catch(() => {});
+                return;
+            }
             if (closeRequestInFlight) return;
             closeRequestInFlight = true;
             try {
-                if (canSave()) {
+                if (settingsLoaded && !dataFolderMoving && gamePathErrors.length > 0) {
+                    const closeAnyway = await showPopup(new ConfirmPopup(
+                        t("pages.settings.popup.confirm.close_invalid.title"),
+                        t("pages.settings.popup.confirm.close_invalid.question"),
+                    ));
+                    if (!closeAnyway) return;
+                } else if (canSave()) {
                     let timer: ReturnType<typeof setTimeout> | undefined;
                     const timeout = new Promise<never>((_, reject) => {
                         timer = setTimeout(() => reject(new Error(t("pages.settings.popup.confirm.close_save_failed.timeout_error"))), 5000);
                     });
                     try {
-                        await Promise.race([saveSettings(currentSettings()), timeout]);
+                        // Waits for a save already running first (leaving
+                        // the page just before closing), within the same
+                        // time limit.
+                        await Promise.race([save(), timeout]);
                     } catch (ex: unknown) {
                         const closeAnyway = await showPopup(new ConfirmPopup(
                             t("pages.settings.popup.confirm.close_save_failed.title"),
@@ -421,7 +450,7 @@
         dataDirBusy = true;
         let plan;
         try {
-            await saveSettings(currentSettings());
+            await save();
             plan = await planDataFolderMove(destination, reset);
         } catch (ex: unknown) {
             showPopup(new NotificationPopup("error", t("pages.settings.data_dir.popup.refused", { detail: errorText(ex) })));
@@ -444,8 +473,11 @@
             }
         } else if (decision === "move") {
             dataFolderMoving = true;
-            const result = await showPopup(new DataFolderProgressPopup(destination, reset, plan.TotalBytes));
+            const progress = new DataFolderProgressPopup(destination, reset, plan.TotalBytes);
+            moveInProgress = progress;
+            const result = await showPopup(progress);
             if (!result.ok) {
+                moveInProgress = null;
                 dataFolderMoving = false;
                 showPopup(new NotificationPopup("error", t("pages.settings.data_dir.popup.move_failed", { detail: result.message })));
             }

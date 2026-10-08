@@ -277,6 +277,10 @@
                     }
                 },
                 "confirm": {
+                    "close_invalid": {
+                        "title": "Settings Not Saved",
+                        "question": "Your settings have a problem (see the game path) and won't be saved. Close anyway?"
+                    },
                     "close_save_failed": {
                         "title": "Couldn't Save Settings",
                         "question": "Couldn't save your settings: {error}. Close anyway? Unsaved changes will be lost.",
