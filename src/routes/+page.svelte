@@ -1148,12 +1148,16 @@
     }
 
     async function onDelete(i: number) {
+        // The mod clicked, taken before asking: the library can change
+        // while the question is shown (a browser install, an import), and
+        // `i` may then be another mod's place.
+        const mod = libraryMods[i];
+        if (!mod) return;
         const confirm = new ConfirmPopup(
             t("pages.mods.popup.confirm.delete.title"),
             t("pages.mods.popup.confirm.delete.question"),
         );
         if (!await showPopup(confirm)) return;
-        const mod = libraryMods[i];
         await doDeleteMod(mod.guid);
     }
 

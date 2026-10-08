@@ -141,6 +141,28 @@ const scenarios = {
         await page.waitForTimeout(400);
         r.expect(r.calls.filter(c => c.cmd === "deploy").length === 1, "Deploy ran once");
     },
+    // Delete in the library, and a browser install lands while "Are you
+    // sure?" is shown: the mod clicked is deleted, not the one now in its
+    // place.
+    deleterace: {
+        data: (d) => d.load_profiles.Profiles[0].Configs.splice(1, 1),
+        async check(page, r) {
+            await page.locator("main button[title='Library']").click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            await page.locator("main li button[title='Delete']").first().click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            await page.evaluate((g) => {
+                const r = window.__smokeResponses;
+                r.get_mods.unshift({ Manifest: { Version: 1, Guid: g, Name: "Browser mod", Description: "", Options: [] }, Directory: "/data/mods/b" });
+                window.__smokeEmit("bridge://mod-installed", { requestId: "1", mod: { guid: g, name: "Browser mod" }, afterInstall: "library" });
+            }, G(5));
+            await page.waitForTimeout(500);
+            await page.getByText("Yes", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            const deleted = r.calls.filter(c => c.cmd === "delete_mod").map(c => c.args.guid);
+            r.expect(deleted.length === 1 && deleted[0] === G(2), `the mod clicked is deleted (deleted ${deleted.join(", ")})`);
+        },
+    },
     // Init itself fails.
     initfail: {
         data: (d) => { d.load_profiles.Profiles = null; },
@@ -184,7 +206,10 @@ for (const name of process.argv.length > 2 ? process.argv.slice(2) : Object.keys
             convertFileSrc: (p, proto = "asset") => `${proto}://localhost/${encodeURIComponent(p)}`,
             async invoke(cmd, args) {
                 if (cmd === "plugin:log|log") return void window.__smokeLog(args.level, args.message);
-                if (cmd.startsWith("plugin:event|listen")) return next++;
+                if (cmd.startsWith("plugin:event|listen")) {
+                    (window.__smokeListeners ??= {})[args.event] = args.handler;
+                    return next++;
+                }
                 if (!cmd.startsWith("plugin:")) window.__smokeCall(cmd, args ?? null);
                 if (cmd === "save_profiles") return void window.__smokeSave(JSON.parse(JSON.stringify(args.config)));
                 if (!(cmd in responses)) return null;
@@ -196,6 +221,8 @@ for (const name of process.argv.length > 2 ? process.argv.slice(2) : Object.keys
                 return result;
             },
         };
+        window.__smokeResponses = responses;
+        window.__smokeEmit = (event, payload) => window[`_${window.__smokeListeners[event]}`]({ event, id: 0, payload });
     }, data);
     await page.goto(`http://127.0.0.1:${server.address().port}/`);
     await page.waitForTimeout(1500);
