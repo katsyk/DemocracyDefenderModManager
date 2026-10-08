@@ -600,8 +600,8 @@ async fn allow_site(app: &AppHandle, site: &str) {
     let state = app.state::<AppState>();
     if let Ok(mut settings) = do_load_settings(&state.base_path).await {
         settings.allow_bridge_site(site.to_string());
-        if let Ok(data) = serde_json::to_vec_pretty(&settings) {
-            let _ = tokio::fs::write(state.base_path.join("settings.json"), data).await;
+        if let Err(e) = crate::commands::settings::write_settings(&state.base_path, &settings).await {
+            log::error!("Couldn't save \"Always allow\" for {site}: {e:#}");
         }
     }
 }

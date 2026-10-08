@@ -54,12 +54,14 @@ pub async fn do_load_settings(base_path: &Path) -> anyhow::Result<Settings> {
     Ok(settings)
 }
 
-/// Write `settings` to settings.json (backend-side changes: the Nexus
-/// account name, "Always allow" sites, ...).
+/// Write `settings` to settings.json. Every save goes through here: the
+/// file is replaced atomically, because it is read all the time (the
+/// auto-import watcher, browser-extension requests, the update scheduler,
+/// deploy) and a reader must never see it half written, nor a crash leave
+/// it so.
 pub async fn write_settings(base_path: &Path, settings: &Settings) -> anyhow::Result<()> {
     let data = serde_json::to_vec_pretty(settings)?;
-    tokio::fs::write(base_path.join(SETTINGS_FILE), data).await?;
-    Ok(())
+    crate::fs_util::replace_file(&base_path.join(SETTINGS_FILE), &data).await
 }
 
 pub async fn do_check_settings(base_path: &Path) -> anyhow::Result<bool> {
@@ -158,8 +160,7 @@ pub async fn save_settings(state: State<'_, AppState>, settings: Settings) -> TA
         check_game_data_dir(&state.base_path, &settings.game_path().join("data")).into_ta_result()?;
     }
 
-    let data = serde_json::to_vec_pretty(&settings).into_ta_result()?;
-    tokio::fs::write(state.base_path.join(SETTINGS_FILE), data).await.into_ta_result()?;
+    write_settings(&state.base_path, &settings).await.into_ta_result()?;
 
     log::info!("Settings saved.");
     Ok(())
@@ -219,8 +220,7 @@ pub async fn auto_detect_and_save_game_path(state: State<'_, AppState>) -> TARes
     let mut settings = do_load_settings(&state.base_path).await.into_ta_result()?;
     settings.set_game_path(path.clone());
 
-    let data = serde_json::to_vec_pretty(&settings).into_ta_result()?;
-    tokio::fs::write(state.base_path.join(SETTINGS_FILE), data).await.into_ta_result()?;
+    write_settings(&state.base_path, &settings).await.into_ta_result()?;
 
     Ok(Some(path.to_string_lossy().into_owned()))
 }
@@ -228,6 +228,38 @@ pub async fn auto_detect_and_save_game_path(state: State<'_, AppState>) -> TARes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// settings.json is read all the time (the auto-import watcher, every
+    /// browser-extension request, the update scheduler, deploy). A save
+    /// must never let one of those reads see a half-written file -- nor
+    /// leave one behind if DDMM dies mid-write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readers_never_see_a_half_written_settings_file() {
+        let base = tempfile::tempdir().unwrap();
+        let mut settings = do_load_settings(base.path()).await.unwrap();
+        // Big enough that a write isn't a single syscall's worth.
+        settings.set_game_path(PathBuf::from("x".repeat(256 * 1024)));
+        write_settings(base.path(), &settings).await.unwrap();
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (base, stop) = (base.path().to_path_buf(), stop.clone());
+            tokio::spawn(async move {
+                let mut failures = 0;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    if do_load_settings(&base).await.is_err() {
+                        failures += 1;
+                    }
+                }
+                failures
+            })
+        };
+        for _ in 0..200 {
+            write_settings(base.path(), &settings).await.unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(reader.await.unwrap(), 0, "a read saw a half-written settings.json");
+    }
 
     #[test]
     fn downloads_folder_may_contain_the_data_folder_but_not_be_inside_the_mod_storage() {
