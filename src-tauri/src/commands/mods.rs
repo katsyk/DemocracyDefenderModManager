@@ -538,7 +538,7 @@ async fn install_archive_steps(
     let mods_root = base_path.join(MODS_DIRECTORY);
     // An unreadable archive counts as "has one": resolving the manifest
     // below then reports the real problem.
-    let has_manifest = !matches!(crate::mod_root::find_archive_manifest(&mut archive), Ok(None));
+    let has_manifest = archive_has_manifest(&mut archive);
     if !has_manifest {
         refuse_if_listed(mods, &mods_root, dir_name, subject)?;
     }
@@ -596,6 +596,21 @@ async fn install_archive_steps(
     mods.push(r#mod.clone());
     log::info!("Mod successfully added.");
     Ok((r#mod, warning))
+}
+
+/// Whether installing `archive` will use a manifest.json from it: one at
+/// its root, or a readable one inside a wrapper folder (a broken one there
+/// is ignored, see [`resolve_manifest`]). An unreadable archive counts as
+/// "has one": resolving the manifest then reports the real problem.
+fn archive_has_manifest(archive: &mut Archive) -> bool {
+    match crate::mod_root::find_archive_manifest(archive) {
+        Ok(None) => false,
+        Ok(Some((root, entry))) if !root.as_os_str().is_empty() => match archive.read_path(&entry) {
+            Ok(data) => Manifest::parse(&data, "manifest.json").is_ok(),
+            Err(_) => true,
+        },
+        _ => true,
+    }
 }
 
 /// Reading the manifest out of an archive fails either because the
@@ -3256,6 +3271,22 @@ mod tests {
         let (m, _) = install_from_folder(base.path(), guard.as_mut().unwrap(), &folder).await.unwrap();
         assert!(is_local_generated(&m.manifest), "{:?}", m.manifest);
         assert!(m.directory.join("Cool Mod").join(patch_file_name()).is_file());
+    }
+
+    /// Adding the same archive with a broken wrapped manifest twice is
+    /// refused like any archive without a manifest, not listed twice.
+    #[tokio::test]
+    async fn a_broken_wrapped_manifest_archive_added_twice_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let patch = format!("Cool Mod/{}", patch_file_name());
+        let zip = src.path().join("Cool Mod.zip");
+        make_zip(&zip, &[("Cool Mod/manifest.json", b"{ broken"), (patch.as_str(), b"x")]);
+        install(&state, &zip).await.unwrap();
+        let msg = message(install(&state, &zip).await);
+        assert!(msg.contains("is already installed"), "{msg}");
+        assert_eq!(state.mods.lock().await.as_ref().unwrap().len(), 1);
     }
 
     /// An archive unpacked for an install that didn't finish is removed on

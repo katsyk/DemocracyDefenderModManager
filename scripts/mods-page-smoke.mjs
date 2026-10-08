@@ -349,6 +349,34 @@ const scenarios = {
             r.expect(!r.windowCalls.some(c => c.includes("destroy")), "the window is not closed meanwhile");
         },
     },
+    // An update gave the legacy mod (installed without its manifest.json)
+    // its author's ID: its entry moves to the new ID, keeping its place and
+    // on/off, with the options reset to fit; an old ID that's still a
+    // loaded mod's is left alone.
+    rename: {
+        async check(page, r) {
+            await page.evaluate(([oldGuid, newGuid, inUse]) => {
+                const res = window.__smokeResponses;
+                const i = res.get_mods.findIndex(m => m.Manifest.Guid === oldGuid);
+                res.get_mods[i] = { Manifest: { Version: 1, Guid: newGuid, Name: "Legacy mod", Description: "author's",
+                    Options: [{ Name: "Red", Description: "", Include: ["Red"] }, { Name: "Blue", Description: "", Include: ["Blue"] }] },
+                    Directory: "/data/mods/legacy", Sources: [] };
+                res.get_guid_renames = [[oldGuid, newGuid], [inUse, newGuid]];
+                window.__smokeEmit("bridge://mod-installed", { requestId: "r1", mod: { guid: newGuid, name: "Legacy mod" }, afterInstall: "library" });
+            }, [G(3), G(50), G(1)]);
+            await page.waitForTimeout(800);
+            r.expect(r.calls.some(c => c.cmd === "get_guid_renames"), "the page asks for the renames");
+            r.expect(await page.getByTestId("missing-mod-entry").count() === 1, "only the entry that was missing before is missing");
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            const configs = r.saves.at(-1)?.Profiles[0].Configs ?? [];
+            const moved = configs[2];
+            r.expect(configs.length === 5 && !configs.some(c => c.Guid === G(3)), `no entry keeps the old ID (${configs.map(c => c.Guid).join(", ")})`);
+            r.expect(moved?.Guid === G(50) && moved.Enabled === false, "the entry keeps its place and stays off");
+            r.expect(moved?.For === "V1" && JSON.stringify(moved.Toggled) === "[true,true]" && JSON.stringify(moved.Selected) === "[0,0]", `its options fit the author's (${JSON.stringify(moved)}; ${r.logs.filter(l => /new ID/.test(l.message)).map(l => l.message).join(" / ")})`);
+            r.expect(configs[0].Guid === G(1), "an old ID that's still loaded isn't renamed");
+        },
+    },
     // Init itself fails.
     initfail: {
         data: (d) => { d.load_profiles.Profiles = null; },

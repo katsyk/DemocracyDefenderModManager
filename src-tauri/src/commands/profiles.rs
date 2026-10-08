@@ -79,15 +79,31 @@ pub async fn save_profiles(state: State<'_, AppState>, config: ProfilesConfig) -
         }
     }
 
-    let mut config = config;
-    apply_guid_renames(&mut config, &state.guid_renames());
-
-    let _saving = PROFILES_WRITE.lock().await;
-    write_profiles(&state.base_path, &config).await.into_ta_result()?;
+    save_profiles_mapped(&state, config).await.into_ta_result()?;
 
     log::info!("Profiles saved.");
 
     Ok(())
+}
+
+/// Write `config`, with entries still listing a mod by an ID it had before
+/// an update this session moved over to its new one. The renames are read
+/// only once the write lock is held: an update records its rename before
+/// it rewrites profiles.json under the same lock, so a save either runs
+/// first (and the update then moves what it wrote) or sees the rename.
+pub(crate) async fn save_profiles_mapped(state: &AppState, mut config: ProfilesConfig) -> anyhow::Result<()> {
+    let _saving = PROFILES_WRITE.lock().await;
+    let mut renames = state.guid_renames();
+    // An old ID that's a loaded mod's again isn't renamed. The mod list is
+    // only looked at when it's free: an install or update holding it may
+    // be waiting for this lock, and a rename it records is always applied.
+    if let Ok(mods) = state.mods.try_lock() {
+        if let Some(mods) = mods.as_ref() {
+            renames.retain(|(old, _)| !mods.iter().any(|m| m.guid() == *old));
+        }
+    }
+    apply_guid_renames(&mut config, &renames);
+    write_profiles(&state.base_path, &config).await
 }
 
 /// The mods whose ID changed in an update this session, as (old, new) in
@@ -274,6 +290,49 @@ mod tests {
         let guids: Vec<String> = configs.iter().map(|c| c.uuid().to_string()).collect();
         assert_eq!(guids, [A, B]);
         assert!(!configs[0].enabled());
+    }
+
+    /// A save that started before an update recorded its rename, but got
+    /// the write lock after it, still writes the new ID.
+    #[tokio::test]
+    async fn a_save_reads_the_renames_once_it_holds_the_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = std::sync::Arc::new(crate::AppState::new(dir.path().to_path_buf()));
+        let (a, b) = (uuid::Uuid::parse_str(A).unwrap(), uuid::Uuid::parse_str(B).unwrap());
+        let held = PROFILES_WRITE.lock().await;
+        let save = {
+            let state = state.clone();
+            tokio::spawn(async move { save_profiles_mapped(&state, profiles_with(&[A])).await })
+        };
+        tokio::task::yield_now().await;
+        state.record_guid_rename(a, b);
+        drop(held);
+        save.await.unwrap().unwrap();
+        let loaded = do_load_profiles(dir.path()).await.unwrap();
+        assert_eq!(loaded.profiles[0].configs()[0].uuid(), &b);
+    }
+
+    /// An old ID that is a loaded mod's again is left alone.
+    #[tokio::test]
+    async fn a_rename_whose_old_id_is_back_in_use_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::AppState::new(dir.path().to_path_buf());
+        let (a, b) = (uuid::Uuid::parse_str(A).unwrap(), uuid::Uuid::parse_str(B).unwrap());
+        state.record_guid_rename(a, b);
+        *state.mods.lock().await = Some(vec![crate::models::Mod {
+            manifest: Manifest::Legacy(crate::models::manifest::legacy::Manifest {
+                guid: a,
+                name: "A".into(),
+                description: String::new(),
+                icon_path: None,
+                options: None,
+            }),
+            directory: dir.path().join("A"),
+            sources: Vec::new(),
+        }]);
+        save_profiles_mapped(&state, profiles_with(&[A])).await.unwrap();
+        let loaded = do_load_profiles(dir.path()).await.unwrap();
+        assert_eq!(loaded.profiles[0].configs()[0].uuid(), &a);
     }
 
     /// Saves and a delete's removal running at once (all without the

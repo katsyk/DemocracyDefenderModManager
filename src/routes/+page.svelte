@@ -405,20 +405,27 @@
         }
         if (renames.length === 0 || !profilesLoaded) return;
         if (currentProfile) applyCurrentConfigChanges();
-        let moved = 0;
+        const moved: UUID[] = [];
         for (const [oldGuid, newGuid] of renames) {
+            // An old ID that's a loaded mod's again stays its own.
+            if (mods.some(m => m.guid.toLowerCase() === oldGuid.toLowerCase())) continue;
             for (const profile of profiles) {
                 switch (profile.Version) {
                     case "V1":
-                        moved += renameEntries(profile.Configs, oldGuid, newGuid);
+                        if (renameEntries(profile.Configs, oldGuid, newGuid) > 0 && !moved.includes(newGuid)) moved.push(newGuid);
                         break;
                 }
             }
         }
-        if (moved === 0) return;
-        log.info(`Moved ${moved} profile entr(ies) to the new ID of an updated mod.`);
-        fitProfilesToMods(profiles, mods);
-        if (currentProfile) profileConfigs = currentProfile.Configs;
+        if (moved.length === 0) return;
+        // Fitted in place: the shown list is the active profile's array.
+        for (const profile of profiles) {
+            profile.Configs.forEach((config, i) => {
+                const mod = moved.includes(config.Guid) ? mods.find(m => m.guid === config.Guid) : undefined;
+                if (mod) profile.Configs[i] = fitConfig(config, mod.Manifest).config;
+            });
+        }
+        log.info(`Moved the profile entries of ${moved.length} updated mod(s) to their new ID.`);
         await refreshUpdateStatuses();
     }
 
