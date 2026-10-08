@@ -130,6 +130,17 @@ const scenarios = {
             r.expect((await rows(page)).includes("V1 mod"), "the Mods page is still there");
         },
     },
+    // Enter or Space while a popup is shown: never presses the page's
+    // button that opened it again (a second deploy behind the first).
+    async keysbehind(page, r) {
+        await page.locator("button.hd2mm-success-button", { hasText: "Deploy" }).click({ timeout: 2000 });
+        await page.waitForTimeout(400);
+        await page.keyboard.press("Enter");
+        await page.waitForTimeout(400);
+        await page.keyboard.press("Space");
+        await page.waitForTimeout(400);
+        r.expect(r.calls.filter(c => c.cmd === "deploy").length === 1, "Deploy ran once");
+    },
     // Init itself fails.
     initfail: {
         data: (d) => { d.load_profiles.Profiles = null; },
