@@ -76,6 +76,12 @@ causes:
 - **Two mods with the same ID.** Some authors copy one mod's `manifest.json` into their next mod, so both claim
   the same GUID. DDMM names the mod already using it. Tell the author; to install it anyway, extract the
   archive, delete its `manifest.json`, and add the folder with Add Folder (DDMM then gives it an ID of its own).
+- **The mod's options are missing, or it shows up twice.** DDMM looks for `manifest.json` at the archive's
+  root and, when the root holds only one folder, inside that folder (up to 3 levels deep). If the archive holds
+  two or more folders with the manifest in one of them, DDMM can't tell which folder is the mod. It then
+  installs the mod without its manifest: you get single-choice options named after the folders and a new ID,
+  so adding a newer version lists the mod twice. Extract the archive and add the folder that contains
+  `manifest.json` with Add Folder.
 - **An archive of archives** (one zip per variant inside the download) installs with a warning that names the
   inner archives. Extract the one you want and add that instead.
 

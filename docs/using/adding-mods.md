@@ -68,7 +68,10 @@ Every install goes through the same steps:
 1. A folder for the mod is created under `mods/`, named after the archive's filename (without its extension) or
    the source folder's name.
 2. If the archive/folder contains a `manifest.json`, that becomes the mod's manifest (see
-   [Manifest reference](../authors/manifest.md) for the formats DDMM understands).
+   [Manifest reference](../authors/manifest.md) for the formats DDMM understands). The `manifest.json` is
+   also found when the mod's folder was zipped instead of its contents (`My Mod/manifest.json`): that folder is
+   then installed as the mod. See
+   [Zipping the folder or its contents](../authors/packaging.md#zipping-the-folder-or-its-contents).
 3. If there's no `manifest.json`, DDMM generates a minimal one automatically: a random ID, the archive/folder name
    as the mod's name, an empty description — and, for this auto-generated manifest only, DDMM also scans the mod's
    files to fill in `Options` if needed; see [Archives without a manifest.json](#archives-without-a-manifestjson)
