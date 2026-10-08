@@ -13,14 +13,16 @@ name. DDMM's Deploy and Purge buttons manage exactly those files; nothing else i
 Clicking **Deploy** (tip: "Install the current selection of mods."):
 
 1. Validates your [Game Path](settings.md#game-path) — deploy refuses to run against an invalid path.
-2. **Purges first** (see below), so every deploy starts from a clean `data` folder rather than layering on top of
-   a previous one.
-3. Walks your active profile's mod list, skipping any mod whose toggle is switched off.
-4. For each enabled mod, collects its patch files — from the mod's root, from the selected legacy option's
+2. Walks your active profile's mod list, skipping any mod whose toggle is switched off.
+3. For each enabled mod, collects its patch files — from the mod's root, from the selected legacy option's
    subfolder, or from each toggled `V1`/`V2` option's (and selected sub-option's) `Include` folders, depending on
    its [manifest](../authors/packaging.md#folder-layout-by-manifest-type) — grouped by their 16-character patch
    name. `V1` and `V2` collect identically; `V2`'s `Categories`/`CategoryRef` only affect how options are grouped
-   in the options editor, not what gets deployed.
+   in the options editor, not what gets deployed. If a mod can't be collected (for example, an option folder its
+   manifest names is missing), deploy stops here with an error, before your `data` folder is touched, so the
+   mods you deployed last time stay in place.
+4. **Purges** (see below), so every deploy starts from a clean `data` folder rather than layering on top of a
+   previous one.
 5. Copies each group's patch/`.gpu_resources`/`.stream` files into `<Game Path>/data/`, numbering them
    `.patch_0`, `.patch_1`, and so on in your profile's mod order. If a triplet is missing its `.gpu_resources` or
    `.stream` file, DDMM writes an empty placeholder for it instead of skipping it, so the numbering for later
@@ -43,7 +45,19 @@ Clicking **Purge** (tip: "Uninstall all mods from the game.") asks for confirmat
 uninstall all mods from the game?"), then deletes **every** file in `<Game Path>/data/` that matches the
 `<16 hex chars>.patch_N[.gpu_resources|.stream]` naming pattern — not just files DDMM itself deployed. This is
 what "clean" means for deploy, and it's also available on its own if you just want your install back to a vanilla
-state without deploying a new selection.
+state without deploying a new selection. The one exception is slot `0` of a patch name in your
+[Skip List](settings.md#skip-list): that `.patch_0` (and its `.gpu_resources`/`.stream`) belongs to the game, so
+purge leaves it in place — unless DDMM put it there itself (deployed before you added the name to the Skip List),
+in which case it is purged like any other mod file.
 
-Purge only removes files matching that pattern; the rest of your `data` folder (and your game install as a whole)
-is left alone.
+To tell the two apart, each deploy writes a small record of the files it wrote, with each one's size and
+modification time, `.ddmm-deployed.json`, into the same `data` folder; purge removes it again. A skip-listed slot
+`0` file is purged only if it is still exactly the file DDMM wrote: if something replaced it since (a Steam
+"Verify integrity of game files" restoring the game's own file, for example), or there is no record (for example
+after a deploy by an older version), it is kept.
+
+!!! warning "Upgrading from rc.14 or earlier"
+    If you used rc.14 or earlier with Skip List entries, verify game files in Steam once, because older versions could delete the game's own files for those names.
+
+Purge only removes files matching that pattern (and its own `.ddmm-deployed.json` record); the rest of your `data`
+folder (and your game install as a whole) is left alone.

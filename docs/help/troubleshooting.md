@@ -145,12 +145,23 @@ Both refuse to run against an invalid [Game Path](../using/settings.md#game-path
 If the path is valid but deploy still fails partway through, check the log for which file operation failed (for
 example, a patch file the mod claims to include that doesn't actually exist in its folder).
 
+## Game files missing after using the Skip List
+
+If you used rc.14 or earlier with Skip List entries, verify game files in Steam once, because older versions could
+delete the game's own files for those names. Current versions leave them alone (see
+[Deploy & purge](../using/deploy-purge.md#purge)).
+
 ## A specific mod won't deploy, or deploying it errors out
 
 `V1` and `V2` manifests deploy the same way. If an enabled option (or the selected sub-option) doesn't actually
 contribute any files, check the [log file](logs.md) for a warning naming the mod and an out-of-range option/
-sub-option index, or an `Include` folder that doesn't exist in the mod's own directory — deploy skips that
-option rather than failing the whole deploy, but it also means nothing gets installed for it.
+sub-option index — deploy skips that option rather than failing the whole deploy, but it also means nothing gets
+installed for it.
+
+An option folder (a Legacy `Options` entry, or an `Include` path) that doesn't exist in the mod's own folder is
+different: deploy stops with an error naming that folder, before anything in your game's `data` folder is changed,
+so the mods you deployed last time stay as they were. Reinstall the mod, or let its author know the manifest names a
+folder the archive doesn't contain.
 
 ## Browser handoff fails immediately with a Downloads-folder error
 

@@ -148,6 +148,12 @@ impl Settings {
         self.bridge_allowed_sites().iter().any(|s| s == registrable_domain)
     }
 
+    pub fn set_bridge_allowed_sites(&mut self, sites: Vec<String>) {
+        match self {
+            Settings::V1 { bridge_allowed_sites, .. } => *bridge_allowed_sites = sites,
+        }
+    }
+
     pub fn allow_bridge_site(&mut self, registrable_domain: String) {
         match self {
             Settings::V1 { bridge_allowed_sites, .. } => {

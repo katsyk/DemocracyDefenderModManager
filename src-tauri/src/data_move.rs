@@ -643,7 +643,7 @@ fn rewrite_stored_paths(old_base: &Path, new_base: &Path) -> anyhow::Result<()> 
         }
     }
     if changed {
-        std::fs::write(&file, serde_json::to_vec_pretty(&json)?)
+        crate::fs_util::replace_file_durably_blocking(&file, &serde_json::to_vec_pretty(&json)?)
             .with_context(|| format!("couldn't update {}", file.display()))?;
     }
     Ok(())

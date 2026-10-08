@@ -54,12 +54,39 @@ pub async fn do_load_settings(base_path: &Path) -> anyhow::Result<Settings> {
     Ok(settings)
 }
 
-/// Write `settings` to settings.json (backend-side changes: the Nexus
-/// account name, "Always allow" sites, ...).
+/// Write `settings` to settings.json. Every save goes through here: the
+/// file is replaced atomically, because it is read all the time (the
+/// auto-import watcher, browser-extension requests, the update scheduler,
+/// deploy) and a reader must never see it half written, nor a crash leave
+/// it so.
 pub async fn write_settings(base_path: &Path, settings: &Settings) -> anyhow::Result<()> {
     let data = serde_json::to_vec_pretty(settings)?;
-    tokio::fs::write(base_path.join(SETTINGS_FILE), data).await?;
-    Ok(())
+    crate::fs_util::replace_file(&base_path.join(SETTINGS_FILE), &data).await
+}
+
+/// Serializes every read-modify-write of settings.json. `data_op` is a
+/// shared lock, so without this two writers (a Settings save and an
+/// "Always allow" from the browser extension, say) could each load the
+/// file, change their own field and write it back, and the second write
+/// would silently undo the first.
+static SETTINGS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Hold this while reading, changing and writing settings.json.
+pub async fn lock_settings() -> tokio::sync::MutexGuard<'static, ()> {
+    SETTINGS_LOCK.lock().await
+}
+
+/// Load settings.json, let `change` modify it, and write it back, all
+/// under [`lock_settings`]. Returns the settings as written.
+pub async fn update_settings(
+    base_path: &Path,
+    change: impl FnOnce(&mut Settings) -> anyhow::Result<()>,
+) -> anyhow::Result<Settings> {
+    let _lock = lock_settings().await;
+    let mut settings = do_load_settings(base_path).await?;
+    change(&mut settings)?;
+    write_settings(base_path, &settings).await?;
+    Ok(settings)
 }
 
 pub async fn do_check_settings(base_path: &Path) -> anyhow::Result<bool> {
@@ -134,16 +161,18 @@ pub async fn load_settings(state: State<'_, AppState>) -> TAResult<Settings> {
 pub async fn save_settings(state: State<'_, AppState>, settings: Settings) -> TAResult<()> {
     let _data_op = state.data_op().into_ta_result()?;
     log::info!("Saving settings...");
+    do_save_settings(&state.base_path, settings).await.into_ta_result()?;
+    log::info!("Settings saved.");
+    Ok(())
+}
 
-    let mut settings = settings;
-    // The Nexus account name is owned by the backend (set when a key is
-    // saved/removed); a page that loaded settings earlier mustn't clobber it.
-    let on_disk_username = do_load_settings(&state.base_path)
-        .await
-        .ok()
-        .and_then(|s| s.nexus_username().map(str::to_string));
-    settings.set_nexus_username(on_disk_username);
-
+/// Save the Settings page's `settings`. Fields the backend owns are taken
+/// from disk, not from the page, which may have loaded them long ago: the
+/// Nexus account name (set when a key is saved or removed) and the
+/// browser sites allowed with "Always allow" (changed only by allowing
+/// from the extension's prompt or revoking in Settings, each of which
+/// writes settings.json itself).
+async fn do_save_settings(base_path: &Path, mut settings: Settings) -> anyhow::Result<()> {
     // Store the real game root if the user picked a folder above/below it
     // (e.g. `.../Helldivers 2/data` or `.../steamapps/common`).
     if let Ok(root) = crate::game_path::resolve(settings.game_path()).await {
@@ -153,16 +182,26 @@ pub async fn save_settings(state: State<'_, AppState>, settings: Settings) -> TA
         }
     }
 
-    check_downloads_path(&state.base_path, settings.downloads_path()).into_ta_result()?;
+    check_downloads_path(base_path, settings.downloads_path())?;
     if !settings.game_path().as_os_str().is_empty() {
-        check_game_data_dir(&state.base_path, &settings.game_path().join("data")).into_ta_result()?;
+        check_game_data_dir(base_path, &settings.game_path().join("data"))?;
     }
 
-    let data = serde_json::to_vec_pretty(&settings).into_ta_result()?;
-    tokio::fs::write(state.base_path.join(SETTINGS_FILE), data).await.into_ta_result()?;
-
-    log::info!("Settings saved.");
-    Ok(())
+    let _lock = lock_settings().await;
+    match do_load_settings(base_path).await {
+        Ok(on_disk) => {
+            settings.set_nexus_username(on_disk.nexus_username().map(str::to_string));
+            settings.set_bridge_allowed_sites(on_disk.bridge_allowed_sites().to_vec());
+        }
+        // An unreadable settings.json: nothing to carry over. The account
+        // name is shown again once the key is checked; the page's list of
+        // allowed sites is the best one left.
+        Err(e) => {
+            log::warn!("Couldn't read the current settings before saving: {e:#}");
+            settings.set_nexus_username(None);
+        }
+    }
+    write_settings(base_path, &settings).await
 }
 
 #[tauri::command]
@@ -216,11 +255,12 @@ pub async fn auto_detect_and_save_game_path(state: State<'_, AppState>) -> TARes
         return Ok(None);
     };
 
-    let mut settings = do_load_settings(&state.base_path).await.into_ta_result()?;
-    settings.set_game_path(path.clone());
-
-    let data = serde_json::to_vec_pretty(&settings).into_ta_result()?;
-    tokio::fs::write(state.base_path.join(SETTINGS_FILE), data).await.into_ta_result()?;
+    update_settings(&state.base_path, |settings| {
+        settings.set_game_path(path.clone());
+        Ok(())
+    })
+    .await
+    .into_ta_result()?;
 
     Ok(Some(path.to_string_lossy().into_owned()))
 }
@@ -228,6 +268,90 @@ pub async fn auto_detect_and_save_game_path(state: State<'_, AppState>) -> TARes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// settings.json is read all the time (the auto-import watcher, every
+    /// browser-extension request, the update scheduler, deploy). A save
+    /// must never let one of those reads see a half-written file -- nor
+    /// leave one behind if DDMM dies mid-write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readers_never_see_a_half_written_settings_file() {
+        let base = tempfile::tempdir().unwrap();
+        let mut settings = do_load_settings(base.path()).await.unwrap();
+        // Big enough that a write isn't a single syscall's worth.
+        settings.set_game_path(PathBuf::from("x".repeat(256 * 1024)));
+        write_settings(base.path(), &settings).await.unwrap();
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (base, stop) = (base.path().to_path_buf(), stop.clone());
+            tokio::spawn(async move {
+                let mut failures = 0;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    if do_load_settings(&base).await.is_err() {
+                        failures += 1;
+                    }
+                }
+                failures
+            })
+        };
+        for _ in 0..200 {
+            write_settings(base.path(), &settings).await.unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(reader.await.unwrap(), 0, "a read saw a half-written settings.json");
+    }
+
+    /// The Settings page is open with settings it loaded earlier; meanwhile
+    /// the browser extension's "Always allow" (and a Nexus key) are saved.
+    /// Saving the page must not undo them.
+    #[tokio::test]
+    async fn saving_the_settings_page_keeps_backend_owned_fields() {
+        let base = tempfile::tempdir().unwrap();
+        let mut page = do_load_settings(base.path()).await.unwrap();
+        write_settings(base.path(), &page).await.unwrap();
+
+        update_settings(base.path(), |s| {
+            s.allow_bridge_site("example.com".into());
+            s.set_nexus_username(Some("Diver".into()));
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // The page's stale copy, with one change the user did make.
+        page.set_downloads_path(base.path().to_path_buf());
+        do_save_settings(base.path(), page).await.unwrap();
+
+        let saved = do_load_settings(base.path()).await.unwrap();
+        assert_eq!(saved.bridge_allowed_sites(), ["example.com".to_string()]);
+        assert_eq!(saved.nexus_username(), Some("Diver"));
+        assert_eq!(saved.downloads_path(), base.path());
+    }
+
+    /// Concurrent read-modify-write updates must all land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_settings_updates_are_not_lost() {
+        let base = tempfile::tempdir().unwrap();
+        write_settings(base.path(), &do_load_settings(base.path()).await.unwrap()).await.unwrap();
+        let tasks: Vec<_> = (0..20)
+            .map(|i| {
+                let base = base.path().to_path_buf();
+                tokio::spawn(async move {
+                    update_settings(&base, |s| {
+                        s.allow_bridge_site(format!("site{i}.example"));
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let saved = do_load_settings(base.path()).await.unwrap();
+        assert_eq!(saved.bridge_allowed_sites().len(), 20, "{:?}", saved.bridge_allowed_sites());
+    }
 
     #[test]
     fn downloads_folder_may_contain_the_data_folder_but_not_be_inside_the_mod_storage() {

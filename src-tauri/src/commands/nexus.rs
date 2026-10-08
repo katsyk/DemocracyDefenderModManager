@@ -17,7 +17,7 @@ use tauri::{AppHandle, State};
 use tauri_plugin_opener::OpenerExt;
 
 use crate::{
-    commands::settings::{do_load_settings, write_settings},
+    commands::settings::{do_load_settings, update_settings},
     nexus_oauth::{self, SignInConfig, SignInError},
     providers::nexus::{NexusClient, NexusError},
     secrets::{self, KeyStorage, NexusApiKey},
@@ -88,9 +88,11 @@ pub async fn validate_and_store(state: &AppState, key: NexusApiKey) -> anyhow::R
         .await
         .map_err(|e| anyhow::anyhow!(secrets::redact(&e.to_string(), &key)))?;
 
-    let mut settings = do_load_settings(&state.base_path).await?;
-    settings.set_nexus_username(Some(user.name.clone()));
-    write_settings(&state.base_path, &settings).await?;
+    update_settings(&state.base_path, |settings| {
+        settings.set_nexus_username(Some(user.name.clone()));
+        Ok(())
+    })
+    .await?;
 
     // Cached Nexus decisions belong to whatever key/account made them;
     // start fresh.
@@ -111,9 +113,12 @@ pub async fn remove_nexus_api_key(state: State<'_, AppState>) -> TAResult<NexusK
     let _data_op = state.data_op().into_ta_result()?;
     secrets::remove(&state.base_path).await;
     let _ = tokio::fs::remove_file(state.base_path.join("update-cache.json")).await;
-    let mut settings = do_load_settings(&state.base_path).await.into_ta_result()?;
-    settings.set_nexus_username(None);
-    write_settings(&state.base_path, &settings).await.into_ta_result()?;
+    update_settings(&state.base_path, |settings| {
+        settings.set_nexus_username(None);
+        Ok(())
+    })
+    .await
+    .into_ta_result()?;
     log::info!("Nexus Mods API key removed.");
     Ok(NexusKeyStatus { present: false, storage: None, username: None, is_premium: None })
 }

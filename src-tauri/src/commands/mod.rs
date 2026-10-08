@@ -4,7 +4,7 @@ use anyhow_tauri::{IntoTAResult, TAResult};
 use regex::Regex;
 use tauri::State;
 
-use crate::{AppState, commands::settings::do_load_settings, models::{manifest::Manifest, profile::Config, Mod}, utils::is_patch_filename};
+use crate::{AppState, commands::settings::do_load_settings, models::{manifest::Manifest, profile::Config, settings::Settings, Mod}, utils::is_patch_filename};
 
 pub mod mods;
 pub mod profiles;
@@ -141,19 +141,143 @@ async fn create_empty_patch_file(dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn do_purge(data_dir: &Path) -> anyhow::Result<()> {
+/// The record of which patch files the last deploy wrote, kept next to
+/// them in the game's `data` folder (so it always describes that folder,
+/// whichever DDMM data folder or game path is in use). Purge removes it.
+const DEPLOY_RECORD: &str = ".ddmm-deployed.json";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DeployRecord {
+    files: Vec<RecordedFile>,
+}
+
+/// One file a deploy wrote, with its length and modification time
+/// (nanoseconds since the Unix epoch) right after it was written. If either
+/// has changed since, something else (a Steam "verify files", the user)
+/// replaced it, and it is no longer DDMM's.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RecordedFile {
+    name: String,
+    len: u64,
+    modified: u64,
+}
+
+/// A file's length and modification time, as recorded in [`RecordedFile`].
+async fn file_stamp(file: &Path) -> Option<(u64, u64)> {
+    let meta = tokio::fs::symlink_metadata(file).await.ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some((meta.len(), u64::try_from(modified.as_nanos()).ok()?))
+}
+
+/// The files the last deploy recorded writing, by name, or `None` when
+/// there is no usable record (none yet -- including a game folder last
+/// deployed by a version without records -- or an unreadable or damaged
+/// one).
+async fn read_deploy_record(data_dir: &Path) -> Option<HashMap<String, RecordedFile>> {
+    let file = data_dir.join(DEPLOY_RECORD);
+    let data = match tokio::fs::read(&file).await {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            log::warn!("Couldn't read the deploy record {:?}: {}", file, e);
+            return None;
+        }
+    };
+    match serde_json::from_slice::<DeployRecord>(&data) {
+        Ok(record) => Some(
+            record
+                .files
+                .into_iter()
+                .filter(|f| is_patch_filename(&f.name))
+                .map(|f| (f.name.clone(), f))
+                .collect(),
+        ),
+        Err(e) => {
+            log::warn!("Ignoring the damaged deploy record {:?}: {}", file, e);
+            None
+        }
+    }
+}
+
+/// Record which of `names` (in `data_dir`) are now there, as written by
+/// this deploy. Never fails the deploy: without a record, purge just keeps
+/// a skip-listed slot-0 file it can't prove is DDMM's.
+async fn record_deployed_files(data_dir: &Path, names: &[String]) {
+    let mut files = Vec::with_capacity(names.len());
+    for name in names {
+        if let Some((len, modified)) = file_stamp(&data_dir.join(name)).await {
+            files.push(RecordedFile { name: name.clone(), len, modified });
+        }
+    }
+    let file = data_dir.join(DEPLOY_RECORD);
+    let written = match serde_json::to_vec_pretty(&DeployRecord { files }) {
+        Ok(data) => crate::fs_util::replace_file(&file, &data).await,
+        Err(e) => Err(e.into()),
+    };
+    if let Err(e) = written {
+        log::warn!("Couldn't write the deploy record {:?} (the deploy itself is fine): {:#}", file, e);
+    }
+}
+
+/// Whether `file` (a patch file in the game's `data` folder) is slot 0 of a
+/// patch name in the Skip List: the base game's or a DLC's own file, which
+/// deploy numbers around (it starts that name at `.patch_1`) and purge
+/// leaves alone -- unless the deploy record says DDMM wrote it (deployed
+/// before the name was added to the Skip List).
+fn is_skip_listed_slot_zero(file: &Path, settings: &Settings) -> bool {
+    let Some(name) = file.file_name().and_then(|n| n.to_str()) else { return false };
+    let Some((prefix, rest)) = name.split_at_checked(16) else { return false };
+    matches!(rest, ".patch_0" | ".patch_0.gpu_resources" | ".patch_0.stream") && settings.has_skip_entry(prefix)
+}
+
+async fn do_purge(data_dir: &Path, settings: &Settings) -> anyhow::Result<()> {
+    use anyhow::Context;
     log::info!("Purging...");
 
-    let patch_files = get_patch_files_from_dir(data_dir).await?;
+    let deployed = read_deploy_record(data_dir).await;
+    let mut patch_files = Vec::new();
+    for f in get_patch_files_from_dir(data_dir).await? {
+        if is_skip_listed_slot_zero(&f, settings) {
+            // Only delete it if DDMM wrote it and it is still exactly what
+            // DDMM wrote; otherwise it is (again) the game's own file.
+            let recorded = f
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| deployed.as_ref()?.get(n));
+            let ours = match recorded {
+                Some(r) => file_stamp(&f).await == Some((r.len, r.modified)),
+                None => false,
+            };
+            if !ours {
+                log::info!("Keeping {:?}: its patch name is in the Skip List and it isn't a file DDMM deployed.", f);
+                continue;
+            }
+        }
+        patch_files.push(f);
+    }
 
     log::info!("Deleting files...");
     futures::future::try_join_all(patch_files.iter().map(|f| async move {
-        use anyhow::Context;
         tokio::fs::remove_file(f)
             .await
             .with_context(|| format!("failed to delete {:?}", f))
     }))
     .await?;
+
+    // Everything DDMM deployed is gone, so the record is too.
+    let record = data_dir.join(DEPLOY_RECORD);
+    // A record that can't be removed only ever keeps files: its entries
+    // no longer match any file once that file is rewritten.
+    match tokio::fs::remove_file(&record).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("Couldn't delete the deploy record {:?}: {}", record, e),
+    }
 
     log::info!("Purge complete.");
     Ok(())
@@ -325,15 +449,16 @@ pub async fn deploy(state: State<'_, AppState>, configs: Vec<Config>) -> TAResul
     let data_dir = game_root.join("data");
     crate::commands::settings::check_game_data_dir(&state.base_path, &data_dir).into_ta_result()?;
 
-    do_purge(&data_dir).await?;
+    do_deploy(&data_dir, &settings, mods).await.into_ta_result()
+}
 
-    log::info!("Deploying...");
-
-    if mods.is_empty() {
-        log::info!("Nothing to deploy.");
-        return Ok(());
-    }
-
+/// Deploy `mods` into the game's `data_dir`: collect every enabled mod's
+/// patch files first, then purge, then copy. Collecting first means a
+/// mod that can't be deployed (an option folder missing from it, an
+/// unreadable folder) stops the deploy before anything in the game folder
+/// is touched, so the previous deploy stays in place instead of the game
+/// being left with no mods at all.
+async fn do_deploy(data_dir: &Path, settings: &Settings, mods: Vec<(&Mod, &Config)>) -> anyhow::Result<()> {
     log::info!("Grouping files...");
     let mut groups: HashMap<String, Vec<PatchFileTriplet>> = HashMap::new();
     for (r#mod, config) in mods {
@@ -346,14 +471,49 @@ pub async fn deploy(state: State<'_, AppState>, configs: Vec<Config>) -> TAResul
             log::debug!(" - k: \"{}\"; v: [{}]", k, v.len());
         }
     }
+
+    do_purge(data_dir, settings).await?;
+
+    log::info!("Deploying...");
+
+    if groups.is_empty() {
+        log::info!("Nothing to deploy.");
+        return Ok(());
+    }
     
     // Load order: `configs` is the profile's mod list, top to bottom, and
     // each group's triplets were collected in that order. The first gets
     // `<name>.patch_0` (after an optional skip-list offset), the next
     // `.patch_1`, and so on. Helldivers 2 applies higher patch numbers over
     // lower ones, so the mod LOWEST in the list wins a conflict.
-    log::info!("Copying files...");
+    let mut written = Vec::new();
     for (name, triplets) in &groups {
+        let offset = if settings.has_skip_entry(name) { 1 } else { 0 };
+        for index in offset..triplets.len() + offset {
+            for suffix in ["", ".gpu_resources", ".stream"] {
+                written.push(format!("{}.patch_{}{}", name, index, suffix));
+            }
+        }
+    }
+    written.sort();
+
+    log::info!("Copying files...");
+    let copied = copy_groups(data_dir, settings, &groups).await;
+    // Recorded even when copying stopped partway, so the files that did
+    // land are known to be DDMM's.
+    record_deployed_files(data_dir, &written).await;
+    copied?;
+
+    log::info!("Deployment complete.");
+    Ok(())
+}
+
+async fn copy_groups(
+    data_dir: &Path,
+    settings: &Settings,
+    groups: &HashMap<String, Vec<PatchFileTriplet>>,
+) -> anyhow::Result<()> {
+    for (name, triplets) in groups {
         let offset = if settings.has_skip_entry(name) { 1 } else { 0 };
 
         for (i, triplet) in triplets.iter().enumerate() {
@@ -361,25 +521,24 @@ pub async fn deploy(state: State<'_, AppState>, configs: Vec<Config>) -> TAResul
 
             let patch_dest = data_dir.join(format!("{}.patch_{}", name, index));
             match &triplet.patch {
-                Some(src) => { copy_patch_file(src, &patch_dest).await.into_ta_result()?; }
-                None => { create_empty_patch_file(&patch_dest).await.into_ta_result()?; }
+                Some(src) => { copy_patch_file(src, &patch_dest).await?; }
+                None => { create_empty_patch_file(&patch_dest).await?; }
             }
             
             let gpu_dest = data_dir.join(format!("{}.patch_{}.gpu_resources", name, index));
             match &triplet.gpu_resources {
-                Some(src) => { copy_patch_file(src, &gpu_dest).await.into_ta_result()?; }
-                None => { create_empty_patch_file(&gpu_dest).await.into_ta_result()?; }
+                Some(src) => { copy_patch_file(src, &gpu_dest).await?; }
+                None => { create_empty_patch_file(&gpu_dest).await?; }
             }
             
             let stream_dest = data_dir.join(format!("{}.patch_{}.stream", name, index));
             match &triplet.stream {
-                Some(src) => { copy_patch_file(src, &stream_dest).await.into_ta_result()?; }
-                None => { create_empty_patch_file(&stream_dest).await.into_ta_result()?; }
+                Some(src) => { copy_patch_file(src, &stream_dest).await?; }
+                None => { create_empty_patch_file(&stream_dest).await?; }
             }
         }
     }
 
-    log::info!("Deployment complete.");
     Ok(())
 }
 
@@ -394,7 +553,7 @@ pub async fn purge(state: State<'_, AppState>) -> TAResult<()> {
 
     let data_dir = game_root.join("data");
     crate::commands::settings::check_game_data_dir(&state.base_path, &data_dir).into_ta_result()?;
-    do_purge(&data_dir).await.into_ta_result()
+    do_purge(&data_dir, &settings).await.into_ta_result()
 }
 
 /// Last-resort way to close the app from the frontend.
@@ -702,6 +861,44 @@ mod tests {
         assert!(groups.is_empty());
     }
 
+    /// The Skip List marks patch names whose `.patch_0` is the game's own
+    /// file (deploy starts those names at `.patch_1`). Purge, and so the
+    /// purge every deploy starts with, must leave that slot 0 alone; every
+    /// other patch file, including the skip-listed name's higher slots, goes.
+    #[tokio::test]
+    async fn purge_keeps_skip_listed_slot_zero_files() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"Version":"V1","GamePath":"","SkipList":["0123456789abcdef"]}"#,
+        )
+        .unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let kept = [
+            "0123456789abcdef.patch_0",
+            "0123456789abcdef.patch_0.gpu_resources",
+            "0123456789abcdef.patch_0.stream",
+            "game.bin",
+        ];
+        let purged = [
+            "0123456789abcdef.patch_1",
+            "0123456789abcdef.patch_1.stream",
+            "0123456789abcdef.patch_10",
+            "fedcba9876543210.patch_0",
+            "fedcba9876543210.patch_0.gpu_resources",
+        ];
+        for name in kept.iter().chain(purged.iter()) {
+            tokio::fs::write(data.path().join(name), b"x").await.unwrap();
+        }
+
+        do_purge(data.path(), &settings).await.unwrap();
+
+        for name in kept {
+            assert!(data.path().join(name).exists(), "{name} must be kept");
+        }
+        for name in purged {
+            assert!(!data.path().join(name).exists(), "{name} must be purged");
+        }
+    }
+
     fn legacy_mod(guid: &str, dir: &std::path::Path) -> (Mod, Config) {
         let guid = Uuid::parse_str(guid).unwrap();
         let r#mod = Mod {
@@ -716,6 +913,163 @@ mod tests {
             sources: Vec::new(),
         };
         (r#mod, Config::Legacy { guid, enabled: true, selected: 0 })
+    }
+
+    fn skip_list(name: &str) -> Settings {
+        serde_json::from_str(&format!(r#"{{"Version":"V1","GamePath":"","SkipList":["{name}"]}}"#)).unwrap()
+    }
+
+    /// A mod deployed into slot 0 of a name that was added to the Skip List
+    /// only afterwards is DDMM's file, not the game's: the next purge must
+    /// still remove it.
+    #[tokio::test]
+    async fn purge_removes_ddmm_slot_zero_files_of_a_name_skip_listed_later() {
+        let data = tempfile::tempdir().unwrap();
+        let m = tempfile::tempdir().unwrap();
+        write_patch_file(m.path(), 0).await;
+        let (r#mod, cfg) = legacy_mod("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", m.path());
+        let mods = vec![r#mod];
+        let configs = vec![cfg];
+
+        do_deploy(data.path(), &no_skip_list(), pair_mods_with_configs(&mods, &configs)).await.unwrap();
+        let slot0 = data.path().join(patch_file_name(0));
+        assert!(slot0.exists());
+
+        do_purge(data.path(), &skip_list("0123456789abcdef")).await.unwrap();
+        assert!(!slot0.exists(), "DDMM's own slot-0 file must be purged");
+        assert!(!data.path().join(format!("{}.stream", patch_file_name(0))).exists());
+        assert!(!data.path().join(DEPLOY_RECORD).exists(), "purge removes the record");
+
+        // A deploy with the name skip-listed starts at slot 1 and leaves a
+        // game file in slot 0 alone, through the purge of the next deploy.
+        tokio::fs::write(&slot0, b"game").await.unwrap();
+        do_deploy(data.path(), &skip_list("0123456789abcdef"), pair_mods_with_configs(&mods, &configs)).await.unwrap();
+        do_deploy(data.path(), &skip_list("0123456789abcdef"), pair_mods_with_configs(&mods, &configs)).await.unwrap();
+        assert_eq!(tokio::fs::read(&slot0).await.unwrap(), b"game");
+        assert_eq!(tokio::fs::read(data.path().join(patch_file_name(1))).await.unwrap(), b"data");
+    }
+
+    /// DDMM deployed into slot 0, the name was skip-listed afterwards, and
+    /// then something else (a Steam "verify files") put the game's own
+    /// file back. The record no longer matches it, so purge keeps it --
+    /// whether its length or only its modification time changed.
+    #[tokio::test]
+    async fn purge_keeps_a_recorded_slot_zero_file_that_was_replaced_since() {
+        for same_length in [false, true] {
+            let data = tempfile::tempdir().unwrap();
+            let m = tempfile::tempdir().unwrap();
+            write_patch_file(m.path(), 0).await;
+            let (r#mod, cfg) = legacy_mod("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", m.path());
+            let mods = vec![r#mod];
+            let configs = vec![cfg];
+            do_deploy(data.path(), &no_skip_list(), pair_mods_with_configs(&mods, &configs)).await.unwrap();
+
+            let slot0 = data.path().join(patch_file_name(0));
+            let restored: &[u8] = if same_length { b"game" } else { b"the game's own file" };
+            tokio::fs::write(&slot0, restored).await.unwrap();
+            let file = std::fs::OpenOptions::new().write(true).open(&slot0).unwrap();
+            file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000)).unwrap();
+            drop(file);
+
+            do_purge(data.path(), &skip_list("0123456789abcdef")).await.unwrap();
+            assert_eq!(tokio::fs::read(&slot0).await.unwrap(), restored, "same length: {same_length}");
+            // The untouched companions DDMM wrote still match: purged.
+            assert!(!data.path().join(format!("{}.stream", patch_file_name(0))).exists());
+        }
+    }
+
+    /// The record can't be written (here a folder is in its way): the
+    /// deploy still goes through, and purge still works without it.
+    #[tokio::test]
+    async fn a_deploy_record_that_cant_be_written_doesnt_fail_the_deploy() {
+        let data = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(data.path().join(DEPLOY_RECORD)).await.unwrap();
+        let m = tempfile::tempdir().unwrap();
+        write_patch_file(m.path(), 0).await;
+        let (r#mod, cfg) = legacy_mod("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", m.path());
+        let mods = vec![r#mod];
+        let configs = vec![cfg];
+
+        do_deploy(data.path(), &no_skip_list(), pair_mods_with_configs(&mods, &configs)).await.unwrap();
+        let slot0 = data.path().join(patch_file_name(0));
+        assert_eq!(tokio::fs::read(&slot0).await.unwrap(), b"data");
+
+        // No usable record: a skip-listed slot 0 is kept, the rest purged.
+        tokio::fs::write(data.path().join(patch_file_name(1)), b"x").await.unwrap();
+        do_purge(data.path(), &skip_list("0123456789abcdef")).await.unwrap();
+        assert!(slot0.exists());
+        assert!(!data.path().join(patch_file_name(1)).exists());
+    }
+
+    /// No record (a game folder last deployed by an older version) or a
+    /// damaged one: a skip-listed slot-0 file can't be shown to be DDMM's,
+    /// so it is kept. Everything else is still purged.
+    #[tokio::test]
+    async fn without_a_usable_record_skip_listed_slot_zero_is_kept() {
+        for record in [None, Some(&b"{not json"[..]), Some(&b"{\"Files\": 7}"[..])] {
+            let data = tempfile::tempdir().unwrap();
+            let slot0 = data.path().join(patch_file_name(0));
+            let slot1 = data.path().join(patch_file_name(1));
+            tokio::fs::write(&slot0, b"x").await.unwrap();
+            tokio::fs::write(&slot1, b"x").await.unwrap();
+            if let Some(record) = record {
+                tokio::fs::write(data.path().join(DEPLOY_RECORD), record).await.unwrap();
+            }
+
+            do_purge(data.path(), &skip_list("0123456789abcdef")).await.unwrap();
+            assert!(slot0.exists(), "record {record:?}: slot 0 must be kept");
+            assert!(!slot1.exists(), "record {record:?}: slot 1 must be purged");
+            assert!(!data.path().join(DEPLOY_RECORD).exists());
+        }
+    }
+
+    fn no_skip_list() -> Settings {
+        serde_json::from_str(r#"{"Version":"V1","GamePath":"","SkipList":[]}"#).unwrap()
+    }
+
+    /// A mod that can't be deployed (here: its selected option's folder is
+    /// missing) must fail the deploy before the game folder is purged, so
+    /// the mods deployed last time stay in the game.
+    #[tokio::test]
+    async fn a_failing_deploy_leaves_the_previous_deploy_in_place() {
+        let data = tempfile::tempdir().unwrap();
+        let previous = data.path().join("fedcba9876543210.patch_0");
+        tokio::fs::write(&previous, b"deployed last time").await.unwrap();
+
+        let good = tempfile::tempdir().unwrap();
+        write_patch_file(good.path(), 0).await;
+        let (good_mod, good_cfg) = legacy_mod("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", good.path());
+        let broken = tempfile::tempdir().unwrap();
+        let guid = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+        let broken_mod = Mod {
+            manifest: Manifest::Legacy(legacy::Manifest {
+                guid,
+                name: "broken".into(),
+                description: String::new(),
+                icon_path: None,
+                options: Some(vec!["NotThere".into()]),
+            }),
+            directory: broken.path().to_path_buf(),
+            sources: Vec::new(),
+        };
+        let broken_cfg = Config::Legacy { guid, enabled: true, selected: 0 };
+
+        let mods = vec![good_mod, broken_mod];
+        let configs = vec![good_cfg, broken_cfg];
+        let err = do_deploy(data.path(), &no_skip_list(), pair_mods_with_configs(&mods, &configs))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("NotThere"), "{err:#}");
+        assert!(previous.exists(), "the previous deploy must not be purged by a deploy that fails");
+        assert!(!data.path().join(patch_file_name(0)).exists());
+
+        // Without the broken mod the deploy goes through, replacing the old files.
+        let ok = do_deploy(data.path(), &no_skip_list(), pair_mods_with_configs(&mods, &configs[..1])).await;
+        ok.unwrap();
+        assert!(!previous.exists());
+        assert_eq!(tokio::fs::read(data.path().join(patch_file_name(0))).await.unwrap(), b"data");
+        assert!(data.path().join(format!("{}.gpu_resources", patch_file_name(0))).exists());
+        assert!(data.path().join(format!("{}.stream", patch_file_name(0))).exists());
     }
 
     /// The deploy index of a file is its position in its group, so this pins
