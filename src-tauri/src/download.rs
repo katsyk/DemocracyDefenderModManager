@@ -91,13 +91,13 @@ pub async fn download_archive_with_progress(
 const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The slowest a download may be: at least [`MIN_BYTES_PER_WINDOW`] in
-/// every [`THROUGHPUT_WINDOW`] (64 KiB in 5 minutes, about 220 bytes/s).
+/// every [`THROUGHPUT_WINDOW`] (1 MiB in 5 minutes, about 3.4 KiB/s).
 /// Together with [`STALL_TIMEOUT`] this bounds a download that trickles a
 /// byte at a time and so never stalls outright -- which otherwise holds its
 /// data operation (and blocks a data folder move) indefinitely -- without
 /// a fixed deadline that would cut off a large mod on a slow connection.
 const THROUGHPUT_WINDOW: Duration = Duration::from_secs(5 * 60);
-const MIN_BYTES_PER_WINDOW: u64 = 64 * 1024;
+const MIN_BYTES_PER_WINDOW: u64 = 1024 * 1024;
 
 /// Enforces a minimum download rate: at least `min_bytes` per `window`,
 /// checked as each chunk arrives (a connection that sends nothing at all
@@ -543,17 +543,19 @@ mod tests {
     fn min_throughput_judges_each_window() {
         let start = std::time::Instant::now();
         let at = |s: u64| start + Duration::from_secs(s);
-        let mut rate = MinThroughput::new(Duration::from_secs(300), 64 * 1024, start);
+        let window = THROUGHPUT_WINDOW.as_secs();
+        let mut rate = MinThroughput::new(THROUGHPUT_WINDOW, MIN_BYTES_PER_WINDOW, start);
         // Within the first window nothing is judged yet.
         rate.record(1, at(59)).unwrap();
-        rate.record(64 * 1024, at(299)).unwrap();
-        // Window over with enough bytes: a new window starts.
-        rate.record(0, at(300)).unwrap();
-        // One byte a minute for the next window: too slow.
+        rate.record(MIN_BYTES_PER_WINDOW - 1, at(window - 1)).unwrap();
+        // Window over with exactly the minimum: a new window starts.
+        rate.record(0, at(window)).unwrap();
+        // 64 KiB a minute (about 1 KiB/s) for the next window: too slow.
         for minute in 1..5 {
-            rate.record(1, at(300 + minute * 60)).unwrap();
+            rate.record(64 * 1024, at(window + minute * 60)).unwrap();
         }
-        assert!(rate.record(1, at(600)).is_err());
+        let err = rate.record(64 * 1024, at(2 * window)).unwrap_err();
+        assert!(format!("{err}").contains("too slow"), "{err}");
     }
 
     /// Real network smoke test for the whole pipeline. Intentionally

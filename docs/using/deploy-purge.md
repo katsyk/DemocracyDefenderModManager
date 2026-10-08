@@ -50,9 +50,11 @@ state without deploying a new selection. The one exception is slot `0` of a patc
 purge leaves it in place — unless DDMM put it there itself (deployed before you added the name to the Skip List),
 in which case it is purged like any other mod file.
 
-To tell the two apart, each deploy writes a small record of the files it wrote, `.ddmm-deployed.json`, into the
-same `data` folder; purge removes it again. Without that record (for example after a deploy by an older version)
-a skip-listed slot `0` file is always kept.
+To tell the two apart, each deploy writes a small record of the files it wrote, with each one's size and
+modification time, `.ddmm-deployed.json`, into the same `data` folder; purge removes it again. A skip-listed slot
+`0` file is purged only if it is still exactly the file DDMM wrote: if something replaced it since (a Steam
+"Verify integrity of game files" restoring the game's own file, for example), or there is no record (for example
+after a deploy by an older version), it is kept.
 
 !!! warning "Upgrading from rc.14 or earlier"
     If you used rc.14 or earlier with Skip List entries, verify game files in Steam once, because older versions could delete the game's own files for those names.

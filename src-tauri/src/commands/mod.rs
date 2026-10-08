@@ -149,13 +149,36 @@ const DEPLOY_RECORD: &str = ".ddmm-deployed.json";
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct DeployRecord {
-    files: Vec<String>,
+    files: Vec<RecordedFile>,
 }
 
-/// The file names the last deploy recorded writing, or `None` when there
-/// is no usable record (none yet -- including a game folder last deployed
-/// by a version without records -- or an unreadable or damaged one).
-async fn read_deploy_record(data_dir: &Path) -> Option<HashSet<String>> {
+/// One file a deploy wrote, with its length and modification time
+/// (nanoseconds since the Unix epoch) right after it was written. If either
+/// has changed since, something else (a Steam "verify files", the user)
+/// replaced it, and it is no longer DDMM's.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RecordedFile {
+    name: String,
+    len: u64,
+    modified: u64,
+}
+
+/// A file's length and modification time, as recorded in [`RecordedFile`].
+async fn file_stamp(file: &Path) -> Option<(u64, u64)> {
+    let meta = tokio::fs::symlink_metadata(file).await.ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some((meta.len(), u64::try_from(modified.as_nanos()).ok()?))
+}
+
+/// The files the last deploy recorded writing, by name, or `None` when
+/// there is no usable record (none yet -- including a game folder last
+/// deployed by a version without records -- or an unreadable or damaged
+/// one).
+async fn read_deploy_record(data_dir: &Path) -> Option<HashMap<String, RecordedFile>> {
     let file = data_dir.join(DEPLOY_RECORD);
     let data = match tokio::fs::read(&file).await {
         Ok(data) => data,
@@ -166,7 +189,14 @@ async fn read_deploy_record(data_dir: &Path) -> Option<HashSet<String>> {
         }
     };
     match serde_json::from_slice::<DeployRecord>(&data) {
-        Ok(record) => Some(record.files.into_iter().filter(|f| is_patch_filename(f)).collect()),
+        Ok(record) => Some(
+            record
+                .files
+                .into_iter()
+                .filter(|f| is_patch_filename(&f.name))
+                .map(|f| (f.name.clone(), f))
+                .collect(),
+        ),
         Err(e) => {
             log::warn!("Ignoring the damaged deploy record {:?}: {}", file, e);
             None
@@ -174,11 +204,24 @@ async fn read_deploy_record(data_dir: &Path) -> Option<HashSet<String>> {
     }
 }
 
-/// Record `files` (names in `data_dir`) as written by DDMM, before writing
-/// them, so a deploy that is interrupted is still on record.
-async fn write_deploy_record(data_dir: &Path, files: Vec<String>) -> anyhow::Result<()> {
-    let data = serde_json::to_vec_pretty(&DeployRecord { files })?;
-    crate::fs_util::replace_file(&data_dir.join(DEPLOY_RECORD), &data).await
+/// Record which of `names` (in `data_dir`) are now there, as written by
+/// this deploy. Never fails the deploy: without a record, purge just keeps
+/// a skip-listed slot-0 file it can't prove is DDMM's.
+async fn record_deployed_files(data_dir: &Path, names: &[String]) {
+    let mut files = Vec::with_capacity(names.len());
+    for name in names {
+        if let Some((len, modified)) = file_stamp(&data_dir.join(name)).await {
+            files.push(RecordedFile { name: name.clone(), len, modified });
+        }
+    }
+    let file = data_dir.join(DEPLOY_RECORD);
+    let written = match serde_json::to_vec_pretty(&DeployRecord { files }) {
+        Ok(data) => crate::fs_util::replace_file(&file, &data).await,
+        Err(e) => Err(e.into()),
+    };
+    if let Err(e) = written {
+        log::warn!("Couldn't write the deploy record {:?} (the deploy itself is fine): {:#}", file, e);
+    }
 }
 
 /// Whether `file` (a patch file in the game's `data` folder) is slot 0 of a
@@ -197,20 +240,26 @@ async fn do_purge(data_dir: &Path, settings: &Settings) -> anyhow::Result<()> {
     log::info!("Purging...");
 
     let deployed = read_deploy_record(data_dir).await;
-    let mut patch_files = get_patch_files_from_dir(data_dir).await?;
-    patch_files.retain(|f| {
-        if !is_skip_listed_slot_zero(f, settings) {
-            return true;
+    let mut patch_files = Vec::new();
+    for f in get_patch_files_from_dir(data_dir).await? {
+        if is_skip_listed_slot_zero(&f, settings) {
+            // Only delete it if DDMM wrote it and it is still exactly what
+            // DDMM wrote; otherwise it is (again) the game's own file.
+            let recorded = f
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| deployed.as_ref()?.get(n));
+            let ours = match recorded {
+                Some(r) => file_stamp(&f).await == Some((r.len, r.modified)),
+                None => false,
+            };
+            if !ours {
+                log::info!("Keeping {:?}: its patch name is in the Skip List and it isn't a file DDMM deployed.", f);
+                continue;
+            }
         }
-        let ours = f
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| deployed.as_ref().is_some_and(|d| d.contains(n)));
-        if !ours {
-            log::info!("Keeping {:?}: its patch name is in the Skip List and DDMM didn't deploy it.", f);
-        }
-        ours
-    });
+        patch_files.push(f);
+    }
 
     log::info!("Deleting files...");
     futures::future::try_join_all(patch_files.iter().map(|f| async move {
@@ -222,10 +271,12 @@ async fn do_purge(data_dir: &Path, settings: &Settings) -> anyhow::Result<()> {
 
     // Everything DDMM deployed is gone, so the record is too.
     let record = data_dir.join(DEPLOY_RECORD);
+    // A record that can't be removed only ever keeps files: its entries
+    // no longer match any file once that file is rewritten.
     match tokio::fs::remove_file(&record).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("failed to delete {:?}", record)),
+        Err(e) => log::warn!("Couldn't delete the deploy record {:?}: {}", record, e),
     }
 
     log::info!("Purge complete.");
@@ -445,10 +496,24 @@ async fn do_deploy(data_dir: &Path, settings: &Settings, mods: Vec<(&Mod, &Confi
         }
     }
     written.sort();
-    write_deploy_record(data_dir, written).await?;
 
     log::info!("Copying files...");
-    for (name, triplets) in &groups {
+    let copied = copy_groups(data_dir, settings, &groups).await;
+    // Recorded even when copying stopped partway, so the files that did
+    // land are known to be DDMM's.
+    record_deployed_files(data_dir, &written).await;
+    copied?;
+
+    log::info!("Deployment complete.");
+    Ok(())
+}
+
+async fn copy_groups(
+    data_dir: &Path,
+    settings: &Settings,
+    groups: &HashMap<String, Vec<PatchFileTriplet>>,
+) -> anyhow::Result<()> {
+    for (name, triplets) in groups {
         let offset = if settings.has_skip_entry(name) { 1 } else { 0 };
 
         for (i, triplet) in triplets.iter().enumerate() {
@@ -474,7 +539,6 @@ async fn do_deploy(data_dir: &Path, settings: &Settings, mods: Vec<(&Mod, &Confi
         }
     }
 
-    log::info!("Deployment complete.");
     Ok(())
 }
 
@@ -883,6 +947,58 @@ mod tests {
         do_deploy(data.path(), &skip_list("0123456789abcdef"), pair_mods_with_configs(&mods, &configs)).await.unwrap();
         assert_eq!(tokio::fs::read(&slot0).await.unwrap(), b"game");
         assert_eq!(tokio::fs::read(data.path().join(patch_file_name(1))).await.unwrap(), b"data");
+    }
+
+    /// DDMM deployed into slot 0, the name was skip-listed afterwards, and
+    /// then something else (a Steam "verify files") put the game's own
+    /// file back. The record no longer matches it, so purge keeps it --
+    /// whether its length or only its modification time changed.
+    #[tokio::test]
+    async fn purge_keeps_a_recorded_slot_zero_file_that_was_replaced_since() {
+        for same_length in [false, true] {
+            let data = tempfile::tempdir().unwrap();
+            let m = tempfile::tempdir().unwrap();
+            write_patch_file(m.path(), 0).await;
+            let (r#mod, cfg) = legacy_mod("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", m.path());
+            let mods = vec![r#mod];
+            let configs = vec![cfg];
+            do_deploy(data.path(), &no_skip_list(), pair_mods_with_configs(&mods, &configs)).await.unwrap();
+
+            let slot0 = data.path().join(patch_file_name(0));
+            let restored: &[u8] = if same_length { b"game" } else { b"the game's own file" };
+            tokio::fs::write(&slot0, restored).await.unwrap();
+            let file = std::fs::OpenOptions::new().write(true).open(&slot0).unwrap();
+            file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000)).unwrap();
+            drop(file);
+
+            do_purge(data.path(), &skip_list("0123456789abcdef")).await.unwrap();
+            assert_eq!(tokio::fs::read(&slot0).await.unwrap(), restored, "same length: {same_length}");
+            // The untouched companions DDMM wrote still match: purged.
+            assert!(!data.path().join(format!("{}.stream", patch_file_name(0))).exists());
+        }
+    }
+
+    /// The record can't be written (here a folder is in its way): the
+    /// deploy still goes through, and purge still works without it.
+    #[tokio::test]
+    async fn a_deploy_record_that_cant_be_written_doesnt_fail_the_deploy() {
+        let data = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(data.path().join(DEPLOY_RECORD)).await.unwrap();
+        let m = tempfile::tempdir().unwrap();
+        write_patch_file(m.path(), 0).await;
+        let (r#mod, cfg) = legacy_mod("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", m.path());
+        let mods = vec![r#mod];
+        let configs = vec![cfg];
+
+        do_deploy(data.path(), &no_skip_list(), pair_mods_with_configs(&mods, &configs)).await.unwrap();
+        let slot0 = data.path().join(patch_file_name(0));
+        assert_eq!(tokio::fs::read(&slot0).await.unwrap(), b"data");
+
+        // No usable record: a skip-listed slot 0 is kept, the rest purged.
+        tokio::fs::write(data.path().join(patch_file_name(1)), b"x").await.unwrap();
+        do_purge(data.path(), &skip_list("0123456789abcdef")).await.unwrap();
+        assert!(slot0.exists());
+        assert!(!data.path().join(patch_file_name(1)).exists());
     }
 
     /// No record (a game folder last deployed by an older version) or a
