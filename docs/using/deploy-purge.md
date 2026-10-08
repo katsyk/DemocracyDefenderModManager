@@ -13,14 +13,16 @@ name. DDMM's Deploy and Purge buttons manage exactly those files; nothing else i
 Clicking **Deploy** (tip: "Install the current selection of mods."):
 
 1. Validates your [Game Path](settings.md#game-path) — deploy refuses to run against an invalid path.
-2. **Purges first** (see below), so every deploy starts from a clean `data` folder rather than layering on top of
-   a previous one.
-3. Walks your active profile's mod list, skipping any mod whose toggle is switched off.
-4. For each enabled mod, collects its patch files — from the mod's root, from the selected legacy option's
+2. Walks your active profile's mod list, skipping any mod whose toggle is switched off.
+3. For each enabled mod, collects its patch files — from the mod's root, from the selected legacy option's
    subfolder, or from each toggled `V1`/`V2` option's (and selected sub-option's) `Include` folders, depending on
    its [manifest](../authors/packaging.md#folder-layout-by-manifest-type) — grouped by their 16-character patch
    name. `V1` and `V2` collect identically; `V2`'s `Categories`/`CategoryRef` only affect how options are grouped
-   in the options editor, not what gets deployed.
+   in the options editor, not what gets deployed. If a mod can't be collected (for example, an option folder its
+   manifest names is missing), deploy stops here with an error, before your `data` folder is touched, so the
+   mods you deployed last time stay in place.
+4. **Purges** (see below), so every deploy starts from a clean `data` folder rather than layering on top of a
+   previous one.
 5. Copies each group's patch/`.gpu_resources`/`.stream` files into `<Game Path>/data/`, numbering them
    `.patch_0`, `.patch_1`, and so on in your profile's mod order. If a triplet is missing its `.gpu_resources` or
    `.stream` file, DDMM writes an empty placeholder for it instead of skipping it, so the numbering for later

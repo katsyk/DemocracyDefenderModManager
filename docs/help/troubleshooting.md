@@ -153,8 +153,9 @@ sub-option index — deploy skips that option rather than failing the whole depl
 installed for it.
 
 An option folder (a Legacy `Options` entry, or an `Include` path) that doesn't exist in the mod's own folder is
-different: deploy stops with an error naming that folder, so a broken mod is never deployed half-installed without
-you knowing. Reinstall the mod, or let its author know the manifest names a folder the archive doesn't contain.
+different: deploy stops with an error naming that folder, before anything in your game's `data` folder is changed,
+so the mods you deployed last time stay as they were. Reinstall the mod, or let its author know the manifest names a
+folder the archive doesn't contain.
 
 ## Browser handoff fails immediately with a Downloads-folder error
 

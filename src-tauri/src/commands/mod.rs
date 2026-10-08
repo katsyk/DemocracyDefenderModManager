@@ -342,15 +342,16 @@ pub async fn deploy(state: State<'_, AppState>, configs: Vec<Config>) -> TAResul
     let data_dir = game_root.join("data");
     crate::commands::settings::check_game_data_dir(&state.base_path, &data_dir).into_ta_result()?;
 
-    do_purge(&data_dir, &settings).await?;
+    do_deploy(&data_dir, &settings, mods).await.into_ta_result()
+}
 
-    log::info!("Deploying...");
-
-    if mods.is_empty() {
-        log::info!("Nothing to deploy.");
-        return Ok(());
-    }
-
+/// Deploy `mods` into the game's `data_dir`: collect every enabled mod's
+/// patch files first, then purge, then copy. Collecting first means a
+/// mod that can't be deployed (an option folder missing from it, an
+/// unreadable folder) stops the deploy before anything in the game folder
+/// is touched, so the previous deploy stays in place instead of the game
+/// being left with no mods at all.
+async fn do_deploy(data_dir: &Path, settings: &Settings, mods: Vec<(&Mod, &Config)>) -> anyhow::Result<()> {
     log::info!("Grouping files...");
     let mut groups: HashMap<String, Vec<PatchFileTriplet>> = HashMap::new();
     for (r#mod, config) in mods {
@@ -362,6 +363,15 @@ pub async fn deploy(state: State<'_, AppState>, configs: Vec<Config>) -> TAResul
         for (k, v) in &groups {
             log::debug!(" - k: \"{}\"; v: [{}]", k, v.len());
         }
+    }
+
+    do_purge(data_dir, settings).await?;
+
+    log::info!("Deploying...");
+
+    if groups.is_empty() {
+        log::info!("Nothing to deploy.");
+        return Ok(());
     }
     
     // Load order: `configs` is the profile's mod list, top to bottom, and
@@ -378,20 +388,20 @@ pub async fn deploy(state: State<'_, AppState>, configs: Vec<Config>) -> TAResul
 
             let patch_dest = data_dir.join(format!("{}.patch_{}", name, index));
             match &triplet.patch {
-                Some(src) => { copy_patch_file(src, &patch_dest).await.into_ta_result()?; }
-                None => { create_empty_patch_file(&patch_dest).await.into_ta_result()?; }
+                Some(src) => { copy_patch_file(src, &patch_dest).await?; }
+                None => { create_empty_patch_file(&patch_dest).await?; }
             }
             
             let gpu_dest = data_dir.join(format!("{}.patch_{}.gpu_resources", name, index));
             match &triplet.gpu_resources {
-                Some(src) => { copy_patch_file(src, &gpu_dest).await.into_ta_result()?; }
-                None => { create_empty_patch_file(&gpu_dest).await.into_ta_result()?; }
+                Some(src) => { copy_patch_file(src, &gpu_dest).await?; }
+                None => { create_empty_patch_file(&gpu_dest).await?; }
             }
             
             let stream_dest = data_dir.join(format!("{}.patch_{}.stream", name, index));
             match &triplet.stream {
-                Some(src) => { copy_patch_file(src, &stream_dest).await.into_ta_result()?; }
-                None => { create_empty_patch_file(&stream_dest).await.into_ta_result()?; }
+                Some(src) => { copy_patch_file(src, &stream_dest).await?; }
+                None => { create_empty_patch_file(&stream_dest).await?; }
             }
         }
     }
@@ -771,6 +781,55 @@ mod tests {
             sources: Vec::new(),
         };
         (r#mod, Config::Legacy { guid, enabled: true, selected: 0 })
+    }
+
+    fn no_skip_list() -> Settings {
+        serde_json::from_str(r#"{"Version":"V1","GamePath":"","SkipList":[]}"#).unwrap()
+    }
+
+    /// A mod that can't be deployed (here: its selected option's folder is
+    /// missing) must fail the deploy before the game folder is purged, so
+    /// the mods deployed last time stay in the game.
+    #[tokio::test]
+    async fn a_failing_deploy_leaves_the_previous_deploy_in_place() {
+        let data = tempfile::tempdir().unwrap();
+        let previous = data.path().join("fedcba9876543210.patch_0");
+        tokio::fs::write(&previous, b"deployed last time").await.unwrap();
+
+        let good = tempfile::tempdir().unwrap();
+        write_patch_file(good.path(), 0).await;
+        let (good_mod, good_cfg) = legacy_mod("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", good.path());
+        let broken = tempfile::tempdir().unwrap();
+        let guid = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+        let broken_mod = Mod {
+            manifest: Manifest::Legacy(legacy::Manifest {
+                guid,
+                name: "broken".into(),
+                description: String::new(),
+                icon_path: None,
+                options: Some(vec!["NotThere".into()]),
+            }),
+            directory: broken.path().to_path_buf(),
+            sources: Vec::new(),
+        };
+        let broken_cfg = Config::Legacy { guid, enabled: true, selected: 0 };
+
+        let mods = vec![good_mod, broken_mod];
+        let configs = vec![good_cfg, broken_cfg];
+        let err = do_deploy(data.path(), &no_skip_list(), pair_mods_with_configs(&mods, &configs))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("NotThere"), "{err:#}");
+        assert!(previous.exists(), "the previous deploy must not be purged by a deploy that fails");
+        assert!(!data.path().join(patch_file_name(0)).exists());
+
+        // Without the broken mod the deploy goes through, replacing the old files.
+        let ok = do_deploy(data.path(), &no_skip_list(), pair_mods_with_configs(&mods, &configs[..1])).await;
+        ok.unwrap();
+        assert!(!previous.exists());
+        assert_eq!(tokio::fs::read(data.path().join(patch_file_name(0))).await.unwrap(), b"data");
+        assert!(data.path().join(format!("{}.gpu_resources", patch_file_name(0))).exists());
+        assert!(data.path().join(format!("{}.stream", patch_file_name(0))).exists());
     }
 
     /// The deploy index of a file is its position in its group, so this pins
