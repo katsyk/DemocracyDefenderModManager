@@ -260,10 +260,33 @@
             },
             "skip_version": "Skip version {version}",
             "unskip_version": "Stop skipping {version}",
-            "needs_nexus_key": "Optional: add a Nexus Mods API key in Settings to check for updates"
+            "needs_nexus_key": "Optional: add a Nexus Mods API key in Settings to check for updates",
+            "entry_menu": {
+                "remove": "Remove",
+                "move_up": "Move Up",
+                "move_down": "Move Down",
+                "to_top": "To Top",
+                "to_bottom": "To Bottom"
+            }
         },
         "settings": {
             "popup": {
+                "error": {
+                    "save": {
+                        "message": "Couldn't save the settings!"
+                    }
+                },
+                "confirm": {
+                    "close_invalid": {
+                        "title": "Settings Not Saved",
+                        "question": "Your settings have a problem (see the game path) and won't be saved. Close anyway?"
+                    },
+                    "close_save_failed": {
+                        "title": "Couldn't Save Settings",
+                        "question": "Couldn't save your settings: {error}. Close anyway? Unsaved changes will be lost.",
+                        "timeout_error": "Saving is taking too long"
+                    }
+                },
                 "notification": {
                     "validation_error": {
                         "message": "Invalid settings values!"

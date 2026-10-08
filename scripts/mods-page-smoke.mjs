@@ -52,6 +52,12 @@ function fixture() {
         resolve_mod_image: null,
         take_pending_deep_links: [],
         detect_import_sources: [],
+        // Settings
+        get_data_dir: "/data",
+        validate_game_path: { valid: true, resolvedPath: null, code: null, detail: null, message: null },
+        get_nexus_key_status: { Present: false },
+        get_nexus_sign_in_status: { Available: false, SignedIn: false, Port: 28647 },
+        repair_browser_integration: [],
     };
 }
 
@@ -130,6 +136,219 @@ const scenarios = {
             r.expect((await rows(page)).includes("V1 mod"), "the Mods page is still there");
         },
     },
+    // Enter or Space while a popup is shown: never presses the page's
+    // button that opened it again (a second deploy behind the first).
+    async keysbehind(page, r) {
+        await page.locator("button.hd2mm-success-button", { hasText: "Deploy" }).click({ timeout: 2000 });
+        await page.waitForTimeout(400);
+        await page.keyboard.press("Enter");
+        await page.waitForTimeout(400);
+        await page.keyboard.press("Space");
+        await page.waitForTimeout(400);
+        r.expect(r.calls.filter(c => c.cmd === "deploy").length === 1, "Deploy ran once");
+    },
+    // Delete in the library, and a browser install lands while "Are you
+    // sure?" is shown: the mod clicked is deleted, not the one now in its
+    // place.
+    deleterace: {
+        data: (d) => d.load_profiles.Profiles[0].Configs.splice(1, 1),
+        async check(page, r) {
+            await page.locator("main button[title='Library']").click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            await page.locator("main li button[title='Delete']").first().click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            await page.evaluate((g) => {
+                const r = window.__smokeResponses;
+                r.get_mods.unshift({ Manifest: { Version: 1, Guid: g, Name: "Browser mod", Description: "", Options: [] }, Directory: "/data/mods/b" });
+                window.__smokeEmit("bridge://mod-installed", { requestId: "1", mod: { guid: g, name: "Browser mod" }, afterInstall: "library" });
+            }, G(5));
+            await page.waitForTimeout(500);
+            await page.getByText("Yes", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            const deleted = r.calls.filter(c => c.cmd === "delete_mod").map(c => c.args.guid);
+            r.expect(deleted.length === 1 && deleted[0] === G(2), `the mod clicked is deleted (deleted ${deleted.join(", ")})`);
+        },
+    },
+    // Leaving Settings when the backend refuses to save them: the reason
+    // is shown, not swallowed.
+    settingssavefail: {
+        data: (d) => { d.__fails = { save_settings: "The downloads folder is DDMM's own mod storage." }; },
+        async check(page, r) {
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            await page.locator("a[href='/']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            r.expect(r.calls.some(c => c.cmd === "save_settings"), "Settings tried to save");
+            r.expect(await page.getByText("DDMM's own mod storage").count() === 1, "the reason is shown");
+            r.expect(!r.errors.some(e => e.includes("mod storage")), "no unhandled rejection");
+        },
+    },
+    // Settings that can't be loaded (a broken settings.json): the page says
+    // so, and doesn't keep the user from leaving or save over the file.
+    settingsloadfail: {
+        data: (d) => { d.__fails = { load_settings: "settings.json isn't valid settings JSON" }; },
+        async check(page, r) {
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            await page.locator("a[href='/help']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            r.expect(page.url().endsWith("/help"), "the user can leave Settings");
+            r.expect(!r.calls.some(c => c.cmd === "save_settings"), "nothing is saved over the file");
+        },
+    },
+    // Closing DDMM from Settings saves them first.
+    settingsclose: {
+        async check(page, r) {
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            const saves = r.calls.filter(c => c.cmd === "save_settings").length;
+            await page.evaluate(() => window.__smokeEmit("tauri://close-requested", null));
+            await page.waitForTimeout(800);
+            r.expect(r.calls.filter(c => c.cmd === "save_settings").length === saves + 1, "the settings are saved on close");
+            r.expect(r.calls.some(c => c.cmd === "ack_close_requested"), "the close is acknowledged");
+            r.expect(r.windowCalls.some(c => c.includes("destroy")), "the window is closed");
+        },
+    },
+    // A browser handoff with another popup shown on top of it for a while
+    // (here the extension asking to install): the page is opened and the
+    // handoff started once, not again when the handoff shows again.
+    handoffcover: {
+        data: (d) => { d.classify_download_url = { Provider: "nexus", DisplayName: "Nexus Mods", RequiresHandoff: true }; },
+        async check(page, r) {
+            await page.locator("button", { hasText: "Add URL" }).click({ timeout: 2000 });
+            await page.locator("#input").fill("https://www.nexusmods.com/helldivers2/mods/1");
+            await page.getByText("Confirm", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            await page.evaluate(() => window.__smokeEmit("bridge://consent-request", { requestId: "1", site: "example.com" }));
+            await page.waitForTimeout(300);
+            await page.getByText("Deny", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(r.calls.filter(c => c.cmd === "start_handoff").length === 1, "the handoff is started once");
+            r.expect(r.pluginCalls.filter(c => c === "plugin:opener|open_url").length === 1, "the page is opened once");
+            // The download lands while another popup covers the handoff.
+            await page.evaluate(() => window.__smokeEmit("bridge://consent-request", { requestId: "2", site: "example.com" }));
+            await page.waitForTimeout(300);
+            await page.evaluate((g) => window.__smokeEmit("handoff", { Status: "Done", Mod: { Manifest: { Version: 1, Guid: g, Name: "Handed-off mod", Description: "", Options: [] }, Directory: "/data/mods/h" } }), G(6));
+            await page.waitForTimeout(300);
+            await page.getByText("Deny", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(await page.getByText("Waiting for the download", { exact: false }).count() === 0
+                && await page.locator("button", { hasText: "Choose File" }).count() === 0, "the handoff popup is closed");
+        },
+    },
+    movingclose: {
+        data: (d) => {
+            d["plugin:dialog|open"] = "/newdata";
+            d.plan_data_folder_move = { Source: "/data", Picked: "/newdata", Target: "/newdata", IsReset: false, UsedSubfolder: false, ExistingData: false, TotalBytes: 1000, TotalFiles: 3, FreeBytes: null };
+            d.__hang = ["move_data_folder"];
+        },
+        async check(page, r) {
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            await page.getByText("Change...", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            await page.getByText("Move", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(r.calls.some(c => c.cmd === "move_data_folder"), "the move is running");
+            await page.evaluate(() => window.__smokeEmit("tauri://close-requested", null));
+            await page.waitForTimeout(800);
+            r.expect(!r.windowCalls.some(c => c.includes("destroy")), "the window is NOT destroyed mid-move (got " + r.windowCalls.join(",") + ")");
+        },
+    },
+    handofferrcover: {
+        data: (d) => { d.classify_download_url = { Provider: "nexus", DisplayName: "Nexus Mods", RequiresHandoff: true }; d.__fails = { start_handoff: "Downloads folder missing" }; },
+        async check(page, r) {
+            await page.locator("button", { hasText: "Add URL" }).click({ timeout: 2000 });
+            await page.locator("#input").fill("https://www.nexusmods.com/helldivers2/mods/1");
+            await page.getByText("Confirm", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(await page.getByText("Downloads folder missing").count() === 1, "error shown first");
+            await page.evaluate(() => window.__smokeEmit("bridge://consent-request", { requestId: "1", site: "example.com" }));
+            await page.waitForTimeout(300);
+            await page.getByText("Deny", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(await page.getByText("Downloads folder missing").count() === 1, "error still shown after cover");
+        },
+    },
+    // Closing from Settings with an invalid game path: asks first, and
+    // closes without saving only when told to.
+    invalidclose: {
+        data: (d) => { d.validate_game_path = { valid: false, resolvedPath: null, code: "not_found", detail: null, message: null }; },
+        async check(page, r) {
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            await page.evaluate(() => window.__smokeEmit("tauri://close-requested", null));
+            await page.waitForTimeout(500);
+            r.expect(!r.windowCalls.some(c => c.includes("destroy")), "not closed without asking");
+            await page.getByText("Yes", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(r.windowCalls.some(c => c.includes("destroy")), "closed once confirmed");
+            r.expect(!r.calls.some(c => c.cmd === "save_settings"), "the invalid settings aren't saved");
+        },
+    },
+    // "Choose File" in the browser handoff cancels the handoff, whose
+    // "Cancelled" mustn't close the popup while the chosen file installs.
+    handoffchoose: {
+        data: (d) => {
+            d.classify_download_url = { Provider: "nexus", DisplayName: "Nexus Mods", RequiresHandoff: true };
+            d["plugin:dialog|open"] = "/dl/mod.zip";
+            d.__hang = ["install_handoff_file"];
+        },
+        async check(page, r) {
+            await page.locator("button", { hasText: "Add URL" }).click({ timeout: 2000 });
+            await page.locator("#input").fill("https://www.nexusmods.com/helldivers2/mods/1");
+            await page.getByText("Confirm", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            await page.locator("button", { hasText: "Choose File" }).click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            await page.evaluate(() => window.__smokeEmit("handoff", { Status: "Cancelled" }));
+            await page.waitForTimeout(300);
+            r.expect(r.calls.some(c => c.cmd === "install_handoff_file"), "the chosen file is installing");
+            r.expect(await page.locator("button", { hasText: "Choose File" }).count() === 1, "the popup stays open while it installs");
+        },
+    },
+    // A settings save that never returns doesn't hold up the later ones
+    // (here: the save before moving the data folder).
+    savehang: {
+        data: (d) => {
+            d.__hangFirst = ["save_settings"];
+            d["plugin:dialog|open"] = "/newdata";
+            d.plan_data_folder_move = { Source: "/data", Picked: "/newdata", Target: "/newdata", IsReset: false, UsedSubfolder: false, ExistingData: false, TotalBytes: 1000, TotalFiles: 3, FreeBytes: null };
+        },
+        async check(page, r) {
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            await page.evaluate(() => window.__smokeEmit("tauri://close-requested", null));
+            await page.waitForTimeout(5500);
+            await page.getByText("Yes", { exact: true }).click({ timeout: 2000 }).catch(() => {});
+            await page.waitForTimeout(300);
+            const before = r.calls.filter(c => c.cmd === "save_settings").length;
+            await page.getByText("Change...", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(6000);
+            r.expect(r.calls.filter(c => c.cmd === "save_settings").length === before + 1, "the next save runs");
+            r.expect(r.calls.some(c => c.cmd === "plan_data_folder_move"), "the move goes on to its plan");
+        },
+    },
+    // "Use existing data": closing waits while the folder is switched.
+    adoptclose: {
+        data: (d) => {
+            d["plugin:dialog|open"] = "/newdata";
+            d.plan_data_folder_move = { Source: "/data", Picked: "/newdata", Target: "/newdata", IsReset: false, UsedSubfolder: false, ExistingData: true, TotalBytes: 1000, TotalFiles: 3, FreeBytes: null };
+            d.__hang = ["adopt_data_folder"];
+        },
+        async check(page, r) {
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            await page.getByText("Change...", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            await page.getByText("Use the Existing Data", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(r.calls.some(c => c.cmd === "adopt_data_folder"), "the switch is running");
+            await page.evaluate(() => window.__smokeEmit("tauri://close-requested", null));
+            await page.waitForTimeout(800);
+            r.expect(!r.windowCalls.some(c => c.includes("destroy")), "the window is not closed meanwhile");
+        },
+    },
     // Init itself fails.
     initfail: {
         data: (d) => { d.load_profiles.Profiles = null; },
@@ -158,11 +377,13 @@ for (const name of process.argv.length > 2 ? process.argv.slice(2) : Object.keys
     const data = fixture();
     s.data?.(data);
     const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
-    const r = { logs: [], saves: [], calls: [], errors: [], results: [], expect(ok, what) { this.results.push([!!ok, what]); } };
+    const r = { logs: [], saves: [], calls: [], windowCalls: [], pluginCalls: [], errors: [], results: [], expect(ok, what) { this.results.push([!!ok, what]); } };
     page.on("pageerror", e => r.errors.push(e.message));
     await page.exposeFunction("__smokeLog", (level, message) => r.logs.push({ level, message }));
     await page.exposeFunction("__smokeSave", (config) => r.saves.push(config));
     await page.exposeFunction("__smokeCall", (cmd, args) => r.calls.push({ cmd, args }));
+    await page.exposeFunction("__smokeWindowCall", (cmd) => r.windowCalls.push(cmd));
+    await page.exposeFunction("__smokePluginCall", (cmd) => r.pluginCalls.push(cmd));
     await page.addInitScript((responses) => {
         let next = 1;
         window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
@@ -173,8 +394,24 @@ for (const name of process.argv.length > 2 ? process.argv.slice(2) : Object.keys
             convertFileSrc: (p, proto = "asset") => `${proto}://localhost/${encodeURIComponent(p)}`,
             async invoke(cmd, args) {
                 if (cmd === "plugin:log|log") return void window.__smokeLog(args.level, args.message);
-                if (cmd.startsWith("plugin:event|listen")) return next++;
+                if (cmd.startsWith("plugin:event|listen")) {
+                    const id = next++;
+                    (window.__smokeListeners ??= []).push({ id, event: args.event, handler: args.handler });
+                    return id;
+                }
+                if (cmd === "plugin:event|unlisten") {
+                    window.__smokeListeners = (window.__smokeListeners ?? []).filter(l => l.id !== args.eventId);
+                    return;
+                }
                 if (!cmd.startsWith("plugin:")) window.__smokeCall(cmd, args ?? null);
+                if (cmd.startsWith("plugin:window|")) window.__smokeWindowCall(cmd);
+                if (cmd.startsWith("plugin:") && !cmd.startsWith("plugin:log|")) window.__smokePluginCall(cmd);
+                if (cmd in (responses.__fails ?? {})) throw responses.__fails[cmd];
+                if ((responses.__hang ?? []).includes(cmd)) return new Promise(() => {});
+                if ((responses.__hangFirst ?? []).includes(cmd)) {
+                    responses.__hangFirst = responses.__hangFirst.filter(c => c !== cmd);
+                    return new Promise(() => {});
+                }
                 if (cmd === "save_profiles") return void window.__smokeSave(JSON.parse(JSON.stringify(args.config)));
                 if (!(cmd in responses)) return null;
                 const result = structuredClone(responses[cmd]);
@@ -184,6 +421,11 @@ for (const name of process.argv.length > 2 ? process.argv.slice(2) : Object.keys
                 }
                 return result;
             },
+        };
+        window.__smokeResponses = responses;
+        // Doesn't wait for the handler (it may be waiting for a popup).
+        window.__smokeEmit = (event, payload) => {
+            for (const l of (window.__smokeListeners ?? []).filter(l => l.event === event)) window[`_${l.handler}`]({ event, id: l.id, payload });
         };
     }, data);
     await page.goto(`http://127.0.0.1:${server.address().port}/`);

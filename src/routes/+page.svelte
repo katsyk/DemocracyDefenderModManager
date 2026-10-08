@@ -1148,12 +1148,16 @@
     }
 
     async function onDelete(i: number) {
+        // The mod clicked, taken before asking: the library can change
+        // while the question is shown (a browser install, an import), and
+        // `i` may then be another mod's place.
+        const mod = libraryMods[i];
+        if (!mod) return;
         const confirm = new ConfirmPopup(
             t("pages.mods.popup.confirm.delete.title"),
             t("pages.mods.popup.confirm.delete.question"),
         );
         if (!await showPopup(confirm)) return;
-        const mod = libraryMods[i];
         await doDeleteMod(mod.guid);
     }
 
@@ -1690,16 +1694,16 @@
                                 <PopupMenuButton insertTarget="main">
                                     <button onclick={() => onRemoveMissing(ci)}>
                                         <Eraser />
-                                        <span>Remove</span>
+                                        <span>{t("pages.mods.entry_menu.remove")}</span>
                                     </button>
                                     <hr>
                                     <button disabled={ci === 0} onclick={() => onMoveUp(ci)}>
                                         <CaretUp />
-                                        <span>Move Up</span>
+                                        <span>{t("pages.mods.entry_menu.move_up")}</span>
                                     </button>
                                     <button disabled={ci === profileConfigs.length - 1} onclick={() => onMoveDown(ci)}>
                                         <CaretDown />
-                                        <span>Move Down</span>
+                                        <span>{t("pages.mods.entry_menu.move_down")}</span>
                                     </button>
                                 </PopupMenuButton>
                             </div>
@@ -1765,7 +1769,7 @@
                                 <PopupMenuButton insertTarget="main">
                                     <button onclick={() => onRemove(ci)}>
                                         <Eraser />
-                                        <span>Remove</span>
+                                        <span>{t("pages.mods.entry_menu.remove")}</span>
                                     </button>
                                     <hr>
                                     <button
@@ -1773,28 +1777,28 @@
                                         onclick={() => onMoveUp(ci)}
                                     >
                                         <CaretUp />
-                                        <span>Move Up</span>
+                                        <span>{t("pages.mods.entry_menu.move_up")}</span>
                                     </button>
                                     <button
                                         disabled={ci === profileConfigs.length - 1}
                                         onclick={() => onMoveDown(ci)}
                                     >
                                         <CaretDown />
-                                        <span>Move Down</span>
+                                        <span>{t("pages.mods.entry_menu.move_down")}</span>
                                     </button>
                                     <button
                                         disabled={ci === 0}
                                         onclick={() => onToTop(ci)}
                                     >
                                         <ArrowBarUp />
-                                        <span>To Top</span>
+                                        <span>{t("pages.mods.entry_menu.to_top")}</span>
                                     </button>
                                     <button
                                         disabled={ci === profileConfigs.length - 1}
                                         onclick={() => onToBottom(ci)}
                                     >
                                         <ArrowBarDown />
-                                        <span>To Bottom</span>
+                                        <span>{t("pages.mods.entry_menu.to_bottom")}</span>
                                     </button>
                                     {#if mod.Sources.some((s) => s.PageUrl)}
                                         <hr>

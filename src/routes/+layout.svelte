@@ -11,6 +11,7 @@
     import { checkSettings, getDataFolderInfo, type DataFolderInfo } from "$lib/utils/commands";
     import { goto } from "$app/navigation";
     import type { Snippet } from "svelte";
+    import { usePopup } from "$lib/state/popup.svelte";
 
     let { children }: { children?: Snippet } = $props();
 
@@ -19,6 +20,11 @@
     // user picks what to do. See `commands::data_folder` on the Rust side.
     let recovery = $state<DataFolderInfo | null>(null);
     let ready = $state(false);
+
+    // While a popup is shown, the page under it is inert: the button that
+    // opened it keeps the focus otherwise, and Enter or Space would press it
+    // again behind the popup (a second deploy, a second "Add URL" popup).
+    const popups = usePopup();
 
     onMount(async () => {
         try {
@@ -51,12 +57,14 @@
     <Titlebar />
     <div class="relative flex-1 flex flex-row min-h-0">
         {#if recovery}
-            <main class="flex-1 p-2 overflow-auto min-w-0 min-h-0 h-full">
+            <main class="flex-1 p-2 overflow-auto min-w-0 min-h-0 h-full" inert={popups.isShown}>
                 <DataFolderRecovery info={recovery} />
             </main>
         {:else if ready}
-            <Sidebar />
-            <main class="flex-1 p-2 overflow-hidden min-w-0 min-h-0 h-full">
+            <div class="contents" inert={popups.isShown}>
+                <Sidebar />
+            </div>
+            <main class="flex-1 p-2 overflow-hidden min-w-0 min-h-0 h-full" inert={popups.isShown}>
                 {@render children?.()}
             </main>
         {/if}

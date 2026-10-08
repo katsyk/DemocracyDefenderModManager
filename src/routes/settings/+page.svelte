@@ -3,7 +3,9 @@
     import { open } from "@tauri-apps/plugin-dialog";
     import { openPath, openUrl } from "@tauri-apps/plugin-opener";
     import { beforeNavigate, onNavigate } from "$app/navigation";
-    import { tick } from "svelte";
+    import { onMount, tick } from "svelte";
+    import { getCurrentWindow } from "@tauri-apps/api/window";
+    import * as log from "@tauri-apps/plugin-log";
     import { toSkipEntry, type SkipEntry } from "$lib/models/settings";
     import type { AfterBrowserInstall } from "$lib/models/settings";
     import { useLocalization } from "$lib/state/localization.svelte";
@@ -13,7 +15,7 @@
         repairBrowserIntegrationOne, removeBrowserIntegrationOne,
         getNexusKeyStatus, setNexusApiKey, removeNexusApiKey,
         getNexusSignInStatus, nexusSignIn, nexusCancelSignIn, nexusSignOut,
-        getDataFolderInfo, planDataFolderMove, adoptDataFolder,
+        getDataFolderInfo, planDataFolderMove, adoptDataFolder, ackCloseRequested, forceExit,
         type BrowserIntegrationStatus, type NexusKeyStatus, type NexusSignInStatus, type DataFolderInfo
     } from "$lib/utils/commands";
     import type { Settings } from "$lib/models/settings";
@@ -22,7 +24,8 @@
     } from "svelte-bootstrap-icons";
     import { usePopup } from "$lib/state/popup.svelte";
     import {
-        InputPopup, NotificationPopup, WaitPopup, DataFolderMovePopup, DataFolderProgressPopup
+        InputPopup, NotificationPopup, WaitPopup, DataFolderMovePopup, DataFolderProgressPopup,
+        ErrorPopup, ConfirmPopup
     } from "$lib/types/popup";
     import Select from "$lib/components/Select.svelte";
     import ToggleSwitch from "$lib/components/ToggleSwitch.svelte";
@@ -80,6 +83,35 @@
     let dataFolderInfo = $state<DataFolderInfo | null>(null);
     let dataDirBusy = $state(false);
     let dataFolderMoving = false;
+    /** The data folder move being copied, if any (see `onCloseRequested`). */
+    let moveInProgress: DataFolderProgressPopup | null = null;
+    /** The settings save in progress, if any: saves run one after the
+     * other, so a close never starts a second one alongside a running one. */
+    let saveInFlight: Promise<void> | null = null;
+    /** How long a save waits for the one before it: a save that never
+     * returns mustn't hold up every later one for the rest of the session. */
+    const PREVIOUS_SAVE_WAIT_MS = 5000;
+    /** "Use existing data" is switching folders (the app restarts after):
+     * closing waits, like during a move. */
+    let adopting = false;
+
+    function save(): Promise<void> {
+        const settings = currentSettings();
+        const previous = saveInFlight
+            ? new Promise<void>(resolve => {
+                const timer = setTimeout(resolve, PREVIOUS_SAVE_WAIT_MS);
+                saveInFlight!.catch(() => {}).finally(() => { clearTimeout(timer); resolve(); });
+            })
+            : Promise.resolve();
+        const run = previous.then(() => saveSettings(settings));
+        saveInFlight = run;
+        run.finally(() => { if (saveInFlight === run) saveInFlight = null; }).catch(() => {});
+        return run;
+    }
+    /** Set once the settings are loaded into this page. Until then (still
+     * loading, or loading failed) there's nothing to save, and leaving
+     * mustn't be blocked by the empty game path. */
+    let settingsLoaded = false;
     let initPromise = $state<Promise<void>>(init());
     // Linked from the Mods page ("add a Nexus API key"): scroll there once
     // the page has actually rendered (it only renders after init).
@@ -125,7 +157,7 @@
     });
 
     beforeNavigate(({ cancel }) => {
-        if (gamePathErrors.length === 0) return;
+        if (!settingsLoaded || gamePathErrors.length === 0) return;
         cancel();
         showPopup(new NotificationPopup(
             "error",
@@ -147,12 +179,81 @@
         };
     }
 
+    /** Whether the settings can be saved now: loaded, not moving the data
+     * folder (the old folder is read-only until the restart), and a valid
+     * game path (leaving is blocked until then). */
+    function canSave(): boolean {
+        return settingsLoaded && !dataFolderMoving && gamePathErrors.length === 0;
+    }
+
     onNavigate(async () => {
-        // After a data folder move the old folder is read-only until the
-        // restart; nothing to save then.
-        if (dataFolderMoving) return;
-        await saveSettings(currentSettings());
+        if (!canSave()) return;
+        try {
+            await save();
+        } catch (ex: unknown) {
+            // The backend says why (e.g. the downloads folder is DDMM's own
+            // mod storage); never lose the changes without a word.
+            showPopup(new ErrorPopup(t("pages.settings.popup.error.save.message"), errorText(ex)));
+        }
     })
+
+    // Closing DDMM from this page saves too (the Mods page's close handler
+    // isn't there to): the changes were lost otherwise.
+    let closeRequestInFlight = false;
+    onMount(() => {
+        const appWindow = getCurrentWindow();
+        const unlisten = appWindow.onCloseRequested(async (event) => {
+            event.preventDefault();
+            await ackCloseRequested().catch((ex: unknown) =>
+                log.error(`Failed to acknowledge close request: ${errorText(ex)}`).catch(() => {}));
+            // Copying the data folder: the backend refuses the close (the copy
+            // would go on with no window, and DDMM would come back by
+            // itself); the progress popup asks to wait.
+            if (adopting || (moveInProgress && !moveInProgress.finished)) {
+                log.info("Close requested while switching the data folder; not closing.").catch(() => {});
+                return;
+            }
+            if (closeRequestInFlight) return;
+            closeRequestInFlight = true;
+            try {
+                if (settingsLoaded && !dataFolderMoving && gamePathErrors.length > 0) {
+                    const closeAnyway = await showPopup(new ConfirmPopup(
+                        t("pages.settings.popup.confirm.close_invalid.title"),
+                        t("pages.settings.popup.confirm.close_invalid.question"),
+                    ));
+                    if (!closeAnyway) return;
+                } else if (canSave()) {
+                    let timer: ReturnType<typeof setTimeout> | undefined;
+                    const timeout = new Promise<never>((_, reject) => {
+                        timer = setTimeout(() => reject(new Error(t("pages.settings.popup.confirm.close_save_failed.timeout_error"))), 5000);
+                    });
+                    try {
+                        // Waits for a save already running first (leaving
+                        // the page just before closing), within the same
+                        // time limit.
+                        await Promise.race([save(), timeout]);
+                    } catch (ex: unknown) {
+                        const closeAnyway = await showPopup(new ConfirmPopup(
+                            t("pages.settings.popup.confirm.close_save_failed.title"),
+                            t("pages.settings.popup.confirm.close_save_failed.question", { error: errorText(ex) }),
+                        ));
+                        if (!closeAnyway) return;
+                    } finally {
+                        clearTimeout(timer);
+                    }
+                }
+                try {
+                    await appWindow.destroy();
+                } catch (ex: unknown) {
+                    log.error(`Window destroy() failed, falling back to force_exit: ${errorText(ex)}`).catch(() => {});
+                    await forceExit().catch(() => {});
+                }
+            } finally {
+                closeRequestInFlight = false;
+            }
+        });
+        return () => { unlisten.then(f => f()); };
+    });
 
     async function init() {
         const [settings, resolvedDataDir, folderInfo] = await Promise.all([
@@ -172,6 +273,7 @@
                 autoCheckIntervalHours = autoCheckIntervalEnabled
                     ? clampInterval(settings.AutoCheckIntervalHours)
                     : DEFAULT_AUTO_CHECK_INTERVAL_HOURS;
+                settingsLoaded = true;
                 break;
         }
         dataDir = resolvedDataDir;
@@ -360,7 +462,7 @@
         dataDirBusy = true;
         let plan;
         try {
-            await saveSettings(currentSettings());
+            await save();
             plan = await planDataFolderMove(destination, reset);
         } catch (ex: unknown) {
             showPopup(new NotificationPopup("error", t("pages.settings.data_dir.popup.refused", { detail: errorText(ex) })));
@@ -375,16 +477,22 @@
             showPopup(wait);
             try {
                 dataFolderMoving = true;
+                adopting = true;
                 await adoptDataFolder(destination, reset);
+                adopting = false;
             } catch (ex: unknown) {
+                adopting = false;
                 dataFolderMoving = false;
                 wait.close();
                 showPopup(new NotificationPopup("error", t("pages.settings.data_dir.popup.adopt_failed", { detail: errorText(ex) })));
             }
         } else if (decision === "move") {
             dataFolderMoving = true;
-            const result = await showPopup(new DataFolderProgressPopup(destination, reset, plan.TotalBytes));
+            const progress = new DataFolderProgressPopup(destination, reset, plan.TotalBytes);
+            moveInProgress = progress;
+            const result = await showPopup(progress);
             if (!result.ok) {
+                moveInProgress = null;
                 dataFolderMoving = false;
                 showPopup(new NotificationPopup("error", t("pages.settings.data_dir.popup.move_failed", { detail: result.message })));
             }

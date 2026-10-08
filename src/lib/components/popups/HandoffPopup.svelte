@@ -1,10 +1,10 @@
 <script lang="ts">
-    import { onMount, onDestroy } from "svelte";
+    import { onMount } from "svelte";
     import { openUrl } from "@tauri-apps/plugin-opener";
     import { open } from "@tauri-apps/plugin-dialog";
-    import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+    import { listen } from "@tauri-apps/api/event";
     import PopupBase from "./PopupBase.svelte";
-    import { HandoffPopup } from "$lib/types/popup";
+    import { HandoffPopup, type HandoffView } from "$lib/types/popup";
     import { useLocalization } from "$lib/state/localization.svelte";
     import { startHandoff, cancelHandoff, installHandoffFile, rawModToMod } from "$lib/utils/commands";
     import type { Manifest } from "$lib/models/manifest";
@@ -14,9 +14,8 @@
 
     let { popup }: { popup: HandoffPopup } = $props();
 
-    type Status = "Waiting" | "Installing" | "Done" | "Cancelled" | "TimedOut" | "Error";
     type HandoffEventPayload = {
-        Status: Status;
+        Status: HandoffView["status"] | "Done" | "Cancelled" | "TimedOut";
         Mod?: { Manifest: Manifest, Directory: string, Sources?: ResolvedSource[] };
         Warning?: string;
         Message?: string;
@@ -24,73 +23,78 @@
         Ignored?: { FileName: string; ModId: string };
     };
 
-    let status = $state<Status>("Waiting");
-    let errorMessage = $state<string | undefined>();
-    let ignored = $state<{ FileName: string; ModId: string } | undefined>();
-    let unlisten: UnlistenFn | undefined;
-    let closed = false;
+    // What's shown lives on the popup object (`popup.view`), not in this
+    // component: the component is unmounted while another popup covers it,
+    // and must show the same thing (an error, an ignored file) when it's
+    // shown again.
+    let view = $state<HandoffView>({ status: "Waiting" });
 
-    function closeOnce(result: Parameters<typeof popup.close>[0]) {
-        if (closed) return;
-        closed = true;
-        popup.close(result);
+    function update(change: Partial<HandoffView>) {
+        Object.assign(popup.view, change);
+        view = { ...popup.view };
     }
 
     onMount(() => {
-        (async () => {
-            unlisten = await listen<HandoffEventPayload>("handoff", (event) => {
-                const payload = event.payload;
-                status = payload.Status;
-
-                switch (payload.Status) {
-                    case "Waiting":
-                        if (payload.Ignored) ignored = payload.Ignored;
-                        break;
-                    case "Done":
-                        if (payload.Mod) {
-                            closeOnce({ status: "Done", mod: rawModToMod(payload.Mod), warning: payload.Warning });
-                        }
-                        break;
-                    case "Cancelled":
-                        closeOnce({ status: "Cancelled" });
-                        break;
-                    case "TimedOut":
-                        closeOnce({ status: "TimedOut" });
-                        break;
-                    case "Error":
-                        errorMessage = payload.Message;
-                        break;
-                }
-            });
-
-            try {
-                await openUrl(popup.pageUrl);
-            } catch {
-                // Non-fatal: the user can still open the link manually.
-            }
-
-            try {
-                await startHandoff(popup.pageUrl, popup.existingGuid);
-            } catch (ex: unknown) {
-                status = "Error";
-                errorMessage = ex instanceof Error ? ex.message : String(ex);
-            }
-        })();
-
+        view = { ...popup.view };
+        popup.onViewChange = () => (view = { ...popup.view });
+        if (!popup.started) {
+            popup.started = true;
+            begin();
+        }
         return () => {
-            unlisten?.();
+            popup.onViewChange = undefined;
         };
     });
 
-    onDestroy(() => {
-        unlisten?.();
-    });
+    /** Once per popup: listen for the handoff's progress for as long as the
+     * popup is open (covered or not), open the page and start the handoff. */
+    async function begin() {
+        const unlisten = await listen<HandoffEventPayload>("handoff", (event) => {
+            const payload = event.payload;
+            switch (payload.Status) {
+                case "Waiting":
+                case "Installing":
+                    update({ status: payload.Status, ...(payload.Ignored ? { ignored: payload.Ignored } : {}) });
+                    break;
+                case "Error":
+                    update({ status: "Error", errorMessage: payload.Message });
+                    break;
+                case "Done":
+                    if (payload.Mod) popup.close({ status: "Done", mod: rawModToMod(payload.Mod), warning: payload.Warning });
+                    break;
+                case "Cancelled":
+                    // "Choose File" cancels the handoff itself; its own
+                    // install decides how this popup closes.
+                    if (!popup.installingChosenFile) popup.close({ status: "Cancelled" });
+                    break;
+                case "TimedOut":
+                    if (!popup.installingChosenFile) popup.close({ status: "TimedOut" });
+                    break;
+            }
+            popup.onViewChange?.();
+        });
+        // Runs at once if the popup was closed meanwhile.
+        popup.promise.finally(unlisten);
+
+        try {
+            await openUrl(popup.pageUrl);
+        } catch {
+            // Non-fatal: the user can still open the link manually.
+        }
+
+        try {
+            await startHandoff(popup.pageUrl, popup.existingGuid);
+        } catch (ex: unknown) {
+            update({ status: "Error", errorMessage: ex instanceof Error ? ex.message : String(ex) });
+            popup.onViewChange?.();
+        }
+    }
 
     async function onCancel() {
         try {
             await cancelHandoff();
         } finally {
-            closeOnce({ status: "Cancelled" });
+            popup.close({ status: "Cancelled" });
         }
     }
 
@@ -102,6 +106,7 @@
         });
         if (!files) return;
 
+        popup.installingChosenFile = true;
         try {
             await cancelHandoff();
         } catch {
@@ -110,34 +115,34 @@
 
         try {
             const { mod, warning } = await installHandoffFile(files, popup.pageUrl, popup.existingGuid);
-            closeOnce({ status: "Done", mod, warning });
+            popup.close({ status: "Done", mod, warning });
         } catch (ex: unknown) {
             const message = ex instanceof Error ? ex.message : String(ex);
-            closeOnce({ status: "Error", message });
+            popup.close({ status: "Error", message });
         }
     }
 </script>
 
 <PopupBase>
     <span class="text-yellow-300 text-xl font-blockletter self-center">{t("popup.handoff.title")}</span>
-    {#if status === "Error"}
+    {#if view.status === "Error"}
         <p class="min-w-60 max-w-80 text-sm text-red-500">{t("popup.handoff.error_message", { site: popup.siteName })}</p>
-        {#if errorMessage}
-            <pre class="min-w-40 px-2 py-1 bg-zinc-800 rounded text-sm self-start whitespace-pre-wrap font-mono">{errorMessage}</pre>
+        {#if view.errorMessage}
+            <pre class="min-w-40 px-2 py-1 bg-zinc-800 rounded text-sm self-start whitespace-pre-wrap font-mono">{view.errorMessage}</pre>
         {/if}
     {:else}
         <p class="min-w-60 max-w-80 text-sm">
             {t("popup.handoff.message", { site: popup.siteName, downloadsPath: popup.downloadsPath })}
         </p>
-        {#if ignored}
+        {#if view.ignored}
             <p class="min-w-60 max-w-80 text-sm text-yellow-300">
-                {t("popup.handoff.ignored_other_mod", { file: ignored.FileName, modId: ignored.ModId })}
+                {t("popup.handoff.ignored_other_mod", { file: view.ignored.FileName, modId: view.ignored.ModId })}
             </p>
         {/if}
         <div class="flex flex-row gap-1 items-center self-center">
             <div class="w-4 h-4 rounded-full border-2 border-transparent border-b-yellow-300 animate-spin"></div>
             <span class="text-sm text-zinc-400">
-                {status === "Installing" ? t("popup.handoff.status.installing") : t("popup.handoff.status.waiting")}
+                {view.status === "Installing" ? t("popup.handoff.status.installing") : t("popup.handoff.status.waiting")}
             </span>
         </div>
     {/if}
