@@ -136,3 +136,6 @@ to move it. See [Data folder](data-folder.md) for everything about moving it.
 
 Settings are saved to `settings.json` in DDMM's data folder (see **Data Folder** above), in a versioned format
 (currently `V1`). You generally shouldn't need to hand-edit this file — use the Settings page instead.
+
+There's no separate "save" button: your changes are saved when you leave the Settings page or close DDMM. If
+they can't be saved (for example, the downloads folder is DDMM's own mod storage), DDMM tells you why.
