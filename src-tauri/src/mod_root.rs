@@ -24,9 +24,13 @@ pub(crate) const MAX_WRAPPER_DEPTH: usize = 3;
 
 /// Files and folders operating systems and archivers drop next to a mod
 /// (`__MACOSX` holds a Mac's resource forks, `._name` its AppleDouble
-/// files). They never count as a second top-level item.
+/// files), and DDMM's own working folders. They never count as a second
+/// top-level item.
 pub(crate) fn is_os_clutter(name: &str) -> bool {
+    use crate::mod_folder::{PENDING_DELETE_PREFIX, UNWRAP_PREFIX, UPDATE_STAGING_PREFIX};
     name.starts_with("._")
+        // DDMM's own working folders (`.update-backup-` included).
+        || [UNWRAP_PREFIX, UPDATE_STAGING_PREFIX, PENDING_DELETE_PREFIX].iter().any(|p| name.starts_with(p))
         || ["__MACOSX", ".DS_Store", "Thumbs.db", "desktop.ini", ".Spotlight-V100", ".Trashes"]
             .iter()
             .any(|c| c.eq_ignore_ascii_case(name))
@@ -134,11 +138,29 @@ pub(crate) fn folder_mod_root(folder: &Path) -> PathBuf {
     match find_root(list) {
         Some(root) if !root.is_empty() => {
             let root = folder.join(join(&root));
+            // A broken one is ignored, as in an archive: the folder is
+            // added the way it always was.
+            if manifest_in(&root).is_none_or(|data| crate::models::manifest::Manifest::parse(&data, "manifest.json").is_err()) {
+                log::warn!("Ignoring the manifest.json in {:?}: it can't be read.", root);
+                return folder.to_path_buf();
+            }
             log::info!("{:?} has no manifest.json of its own; using the one in {:?}", folder, root);
             root
         }
         _ => folder.to_path_buf(),
     }
+}
+
+/// The contents of `dir`'s manifest.json (or a case variant of its name).
+fn manifest_in(dir: &Path) -> Option<Vec<u8>> {
+    let exact = dir.join(MANIFEST_FILE);
+    if exact.is_file() {
+        return std::fs::read(exact).ok();
+    }
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+        let is_file = e.file_type().map(|t| t.is_file()).unwrap_or(false);
+        (is_file && e.file_name().to_string_lossy().eq_ignore_ascii_case(MANIFEST_FILE)).then(|| std::fs::read(e.path()).ok()).flatten()
+    })
 }
 
 #[cfg(test)]
@@ -172,6 +194,7 @@ mod tests {
     }
 
     const PATCH: &str = "0123456789abcdef.patch_0";
+    const MANIFEST: &[u8] = br#"{"Guid":"dddddddd-1111-4111-8111-dddddddddddd","Name":"M","Description":""}"#;
 
     #[test]
     fn root_manifest_wins() {
@@ -244,11 +267,14 @@ mod tests {
         let inner = top.join("Outer").join("ModName");
         std::fs::create_dir_all(&inner).unwrap();
         std::fs::create_dir_all(top.join("__MACOSX")).unwrap();
+        std::fs::create_dir_all(top.join(".update-0b7c0f3e-0000-4000-8000-000000000000")).unwrap();
         std::fs::write(top.join(".DS_Store"), b"").unwrap();
         assert_eq!(folder_mod_root(&top), top, "no manifest anywhere: unchanged");
-        std::fs::write(inner.join("manifest.json"), b"{}").unwrap();
+        std::fs::write(inner.join("manifest.json"), b"{ broken").unwrap();
+        assert_eq!(folder_mod_root(&top), top, "a broken manifest is ignored");
+        std::fs::write(inner.join("manifest.json"), MANIFEST).unwrap();
         assert_eq!(folder_mod_root(&top), inner);
-        std::fs::write(top.join("manifest.json"), b"{}").unwrap();
+        std::fs::write(top.join("manifest.json"), MANIFEST).unwrap();
         assert_eq!(folder_mod_root(&top), top, "a manifest at the top wins");
         std::fs::remove_file(top.join("manifest.json")).unwrap();
         std::fs::create_dir(top.join("Second")).unwrap();

@@ -12,13 +12,13 @@
     import { useLocalization } from "$lib/state/localization.svelte";
     import { Mod } from "$lib/models/mod";
     import type {Config, Profile, ProfilesConfig} from "$lib/models/profile";
-    import { defaultConfigFor, deployableEntries, fitConfig, removeDuplicateEntries, removeEntriesOf } from "$lib/utils/profileEntries";
+    import { defaultConfigFor, deployableEntries, fitConfig, removeDuplicateEntries, removeEntriesOf, renameEntries } from "$lib/utils/profileEntries";
     import {
         addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles,
         loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath,
         resolveBridgeConsent, resolveBridgeInstallCompletion, isGameRunning, forceExit, ackCloseRequested,
         setBridgeFrontendReady, getLastUpdateReport, skipUpdateVersion, browserExtensionActive,
-        detectImportSources, takePendingDeepLinks, type ImportSource,
+        detectImportSources, takePendingDeepLinks, getGuidRenames, type ImportSource,
         type UpdateStatusEntry, type UpdateCheckReport, type BridgeConsentDecision, type BridgeSoftError
     } from "$lib/utils/commands";
     import type { UUID } from "$lib/types/uuid";
@@ -390,6 +390,38 @@
         removeEntriesOf(profileConfigs, guid);
     }
 
+    /** After an update: a mod installed without its manifest.json (so with
+     * an ID of DDMM's own) and updated with its author's has the author's
+     * ID now. The backend moved its entries in profiles.json; move them
+     * here too (keeping on/off and position, resetting option choices that
+     * no longer fit), or the next save would list it as missing. */
+    async function applyGuidRenames() {
+        let renames: [UUID, UUID][];
+        try {
+            renames = await getGuidRenames();
+        } catch (ex: unknown) {
+            log.warn(`Couldn't get the mods whose ID changed: ${errorMessage(ex)}`);
+            return;
+        }
+        if (renames.length === 0 || !profilesLoaded) return;
+        if (currentProfile) applyCurrentConfigChanges();
+        let moved = 0;
+        for (const [oldGuid, newGuid] of renames) {
+            for (const profile of profiles) {
+                switch (profile.Version) {
+                    case "V1":
+                        moved += renameEntries(profile.Configs, oldGuid, newGuid);
+                        break;
+                }
+            }
+        }
+        if (moved === 0) return;
+        log.info(`Moved ${moved} profile entr(ies) to the new ID of an updated mod.`);
+        fitProfilesToMods(profiles, mods);
+        if (currentProfile) profileConfigs = currentProfile.Configs;
+        await refreshUpdateStatuses();
+    }
+
     function updatesFor(guid: UUID): UpdateStatusEntry[] {
         return updateStatuses.filter(u => u.Guid === guid);
     }
@@ -678,6 +710,7 @@
                         mods[i] = result.mod;
                     }
                 }
+                await applyGuidRenames();
                 if (result.warning) showPopup(new NotificationPopup("warning", result.warning));
                 break;
             case "TimedOut":
@@ -730,6 +763,7 @@
         // before touching it.
         mods = await getMods();
         await refreshUpdateStatuses();
+        await applyGuidRenames();
         const mod = mods.find(m => m.guid === payload.mod.guid);
 
         let addedToProfile: string | undefined;
@@ -1220,6 +1254,7 @@
                 return "failed";
             }
             replaceMod(entry.Guid, result.mod);
+            await applyGuidRenames();
             if (result.warning) {
                 if (failures) failures.push(`${mod.name}: ${result.warning}`);
                 else showToast("warning", result.warning);
@@ -1244,6 +1279,7 @@
             switch (decision) {
                 case "Done":
                     mods = await getMods();
+                    await applyGuidRenames();
                     return "updatedByExtension";
                 case "Skip":
                     return "skipped";

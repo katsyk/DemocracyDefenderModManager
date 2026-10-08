@@ -3,6 +3,7 @@
 // plain Node.
 import type { Config } from "../models/profile";
 import type { Manifest } from "../models/manifest";
+import type { UUID } from "../types/uuid";
 
 /** A new entry for a mod: on, every option on, first choice everywhere. */
 export function defaultConfigFor(manifest: Manifest): Config {
@@ -57,6 +58,23 @@ export function deployableEntries(configs: Config[], loadedGuids: Iterable<strin
     const known = new Set(loadedGuids);
     const loaded = configs.filter(c => known.has(c.Guid));
     return { loaded, missing: configs.length - loaded.length };
+}
+
+/** Move the entries of a mod that changed its ID from `oldGuid` to
+ * `newGuid`, in place, keeping on/off and position (a list that then has
+ * the mod twice keeps the first entry); returns how many moved. Option
+ * choices are left as they are: `fitConfig` resets the ones that no longer
+ * fit. */
+export function renameEntries(configs: Config[], oldGuid: UUID, newGuid: UUID): number {
+    let moved = 0;
+    for (const config of configs) {
+        if (config.Guid.toLowerCase() === oldGuid.toLowerCase()) {
+            config.Guid = newGuid;
+            moved++;
+        }
+    }
+    if (moved > 0) removeDuplicateEntries(configs);
+    return moved;
 }
 
 /** Take every entry of the mod `guid` out of `configs`, in place (so a

@@ -1,7 +1,7 @@
 // Run with `pnpm run test:unit` (plain Node; it strips the TypeScript types).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { configFits, deployableEntries, fitConfig, defaultConfigFor, removeDuplicateEntries, removeEntriesOf } from "../../src/lib/utils/profileEntries.ts";
+import { configFits, deployableEntries, fitConfig, defaultConfigFor, removeDuplicateEntries, removeEntriesOf, renameEntries } from "../../src/lib/utils/profileEntries.ts";
 
 const v1 = (options) => ({ Version: 1, Guid: "g1", Name: "M", Description: "", Options: options });
 const opt = (subs = 0) => ({ Name: "o", Description: "", SubOptions: subs ? Array.from({ length: subs }, () => ({ Name: "s", Description: "", Include: [] })) : undefined });
@@ -60,4 +60,28 @@ test("repeated entries of a mod are removed, keeping the first (issue #71)", () 
     assert.equal(configs[0], first);
     assert.deepEqual(removeDuplicateEntries(configs), []);
     assert.deepEqual(removeDuplicateEntries([]), []);
+});
+
+test("a mod's entries follow it to a new ID, keeping on/off and position", () => {
+    const configs = [
+        { For: "V1", Guid: "a", Enabled: true, Toggled: [], Selected: [] },
+        { For: "Legacy", Guid: "LOCAL-old", Enabled: false, Selected: 1 },
+        { For: "V1", Guid: "b", Enabled: true, Toggled: [], Selected: [] },
+    ];
+    assert.equal(renameEntries(configs, "local-OLD", "g1"), 1);
+    assert.deepEqual(configs.map(c => c.Guid), ["a", "g1", "b"]);
+    assert.equal(configs[1].Enabled, false);
+    const fitted = fitConfig(configs[1], v1([opt(2), opt()]));
+    assert.ok(fitted.reset);
+    assert.deepEqual(fitted.config, { For: "V1", Guid: "g1", Enabled: false, Toggled: [true, true], Selected: [0, 0] });
+    assert.equal(renameEntries(configs, "LOCAL-old", "g1"), 0, "nothing left to move");
+});
+
+test("a list that already has the new ID keeps the first entry", () => {
+    const configs = [
+        { For: "V1", Guid: "g1", Enabled: true, Toggled: [], Selected: [] },
+        { For: "Legacy", Guid: "old", Enabled: false, Selected: 0 },
+    ];
+    assert.equal(renameEntries(configs, "old", "g1"), 1);
+    assert.deepEqual(configs.map(c => [c.Guid, c.Enabled]), [["g1", true]]);
 });

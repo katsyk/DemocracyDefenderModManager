@@ -305,6 +305,12 @@ pub fn pending_delete_record_path(dir: &Path) -> PathBuf {
     dir.with_file_name(name)
 }
 
+/// Prefix of the throwaway folder an archive whose mod sits in a wrapper
+/// folder (`ModName/manifest.json`) is extracted into; the wrapped folder
+/// is then renamed into place. Always safe to delete: it only ever holds
+/// a copy of an archive's contents.
+pub const UNWRAP_PREFIX: &str = ".unwrap-";
+
 /// Prefix of the throwaway folder an update is extracted into.
 pub const UPDATE_STAGING_PREFIX: &str = ".update-";
 /// Prefix of the folder the old version of a mod is set aside in while an

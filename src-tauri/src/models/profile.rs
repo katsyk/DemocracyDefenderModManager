@@ -35,6 +35,12 @@ impl Config {
         }
     }
 
+    pub fn set_uuid(&mut self, new: Uuid) {
+        match self {
+            Config::Legacy { guid, .. } | Config::V1 { guid, .. } | Config::V2 { guid, .. } => *guid = new,
+        }
+    }
+
     pub fn enabled(&self) -> bool {
         match self {
             Config::Legacy { enabled, .. } => *enabled,
