@@ -141,10 +141,51 @@ async fn create_empty_patch_file(dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The record of which patch files the last deploy wrote, kept next to
+/// them in the game's `data` folder (so it always describes that folder,
+/// whichever DDMM data folder or game path is in use). Purge removes it.
+const DEPLOY_RECORD: &str = ".ddmm-deployed.json";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DeployRecord {
+    files: Vec<String>,
+}
+
+/// The file names the last deploy recorded writing, or `None` when there
+/// is no usable record (none yet -- including a game folder last deployed
+/// by a version without records -- or an unreadable or damaged one).
+async fn read_deploy_record(data_dir: &Path) -> Option<HashSet<String>> {
+    let file = data_dir.join(DEPLOY_RECORD);
+    let data = match tokio::fs::read(&file).await {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            log::warn!("Couldn't read the deploy record {:?}: {}", file, e);
+            return None;
+        }
+    };
+    match serde_json::from_slice::<DeployRecord>(&data) {
+        Ok(record) => Some(record.files.into_iter().filter(|f| is_patch_filename(f)).collect()),
+        Err(e) => {
+            log::warn!("Ignoring the damaged deploy record {:?}: {}", file, e);
+            None
+        }
+    }
+}
+
+/// Record `files` (names in `data_dir`) as written by DDMM, before writing
+/// them, so a deploy that is interrupted is still on record.
+async fn write_deploy_record(data_dir: &Path, files: Vec<String>) -> anyhow::Result<()> {
+    let data = serde_json::to_vec_pretty(&DeployRecord { files })?;
+    crate::fs_util::replace_file(&data_dir.join(DEPLOY_RECORD), &data).await
+}
+
 /// Whether `file` (a patch file in the game's `data` folder) is slot 0 of a
 /// patch name in the Skip List: the base game's or a DLC's own file, which
 /// deploy numbers around (it starts that name at `.patch_1`) and purge
-/// must leave alone.
+/// leaves alone -- unless the deploy record says DDMM wrote it (deployed
+/// before the name was added to the Skip List).
 fn is_skip_listed_slot_zero(file: &Path, settings: &Settings) -> bool {
     let Some(name) = file.file_name().and_then(|n| n.to_str()) else { return false };
     let Some((prefix, rest)) = name.split_at_checked(16) else { return false };
@@ -152,25 +193,40 @@ fn is_skip_listed_slot_zero(file: &Path, settings: &Settings) -> bool {
 }
 
 async fn do_purge(data_dir: &Path, settings: &Settings) -> anyhow::Result<()> {
+    use anyhow::Context;
     log::info!("Purging...");
 
+    let deployed = read_deploy_record(data_dir).await;
     let mut patch_files = get_patch_files_from_dir(data_dir).await?;
     patch_files.retain(|f| {
-        let keep = is_skip_listed_slot_zero(f, settings);
-        if keep {
-            log::info!("Keeping {:?}: its patch name is in the Skip List.", f);
+        if !is_skip_listed_slot_zero(f, settings) {
+            return true;
         }
-        !keep
+        let ours = f
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| deployed.as_ref().is_some_and(|d| d.contains(n)));
+        if !ours {
+            log::info!("Keeping {:?}: its patch name is in the Skip List and DDMM didn't deploy it.", f);
+        }
+        ours
     });
 
     log::info!("Deleting files...");
     futures::future::try_join_all(patch_files.iter().map(|f| async move {
-        use anyhow::Context;
         tokio::fs::remove_file(f)
             .await
             .with_context(|| format!("failed to delete {:?}", f))
     }))
     .await?;
+
+    // Everything DDMM deployed is gone, so the record is too.
+    let record = data_dir.join(DEPLOY_RECORD);
+    match tokio::fs::remove_file(&record).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("failed to delete {:?}", record)),
+    }
 
     log::info!("Purge complete.");
     Ok(())
@@ -379,6 +435,18 @@ async fn do_deploy(data_dir: &Path, settings: &Settings, mods: Vec<(&Mod, &Confi
     // `<name>.patch_0` (after an optional skip-list offset), the next
     // `.patch_1`, and so on. Helldivers 2 applies higher patch numbers over
     // lower ones, so the mod LOWEST in the list wins a conflict.
+    let mut written = Vec::new();
+    for (name, triplets) in &groups {
+        let offset = if settings.has_skip_entry(name) { 1 } else { 0 };
+        for index in offset..triplets.len() + offset {
+            for suffix in ["", ".gpu_resources", ".stream"] {
+                written.push(format!("{}.patch_{}{}", name, index, suffix));
+            }
+        }
+    }
+    written.sort();
+    write_deploy_record(data_dir, written).await?;
+
     log::info!("Copying files...");
     for (name, triplets) in &groups {
         let offset = if settings.has_skip_entry(name) { 1 } else { 0 };
@@ -781,6 +849,62 @@ mod tests {
             sources: Vec::new(),
         };
         (r#mod, Config::Legacy { guid, enabled: true, selected: 0 })
+    }
+
+    fn skip_list(name: &str) -> Settings {
+        serde_json::from_str(&format!(r#"{{"Version":"V1","GamePath":"","SkipList":["{name}"]}}"#)).unwrap()
+    }
+
+    /// A mod deployed into slot 0 of a name that was added to the Skip List
+    /// only afterwards is DDMM's file, not the game's: the next purge must
+    /// still remove it.
+    #[tokio::test]
+    async fn purge_removes_ddmm_slot_zero_files_of_a_name_skip_listed_later() {
+        let data = tempfile::tempdir().unwrap();
+        let m = tempfile::tempdir().unwrap();
+        write_patch_file(m.path(), 0).await;
+        let (r#mod, cfg) = legacy_mod("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", m.path());
+        let mods = vec![r#mod];
+        let configs = vec![cfg];
+
+        do_deploy(data.path(), &no_skip_list(), pair_mods_with_configs(&mods, &configs)).await.unwrap();
+        let slot0 = data.path().join(patch_file_name(0));
+        assert!(slot0.exists());
+
+        do_purge(data.path(), &skip_list("0123456789abcdef")).await.unwrap();
+        assert!(!slot0.exists(), "DDMM's own slot-0 file must be purged");
+        assert!(!data.path().join(format!("{}.stream", patch_file_name(0))).exists());
+        assert!(!data.path().join(DEPLOY_RECORD).exists(), "purge removes the record");
+
+        // A deploy with the name skip-listed starts at slot 1 and leaves a
+        // game file in slot 0 alone, through the purge of the next deploy.
+        tokio::fs::write(&slot0, b"game").await.unwrap();
+        do_deploy(data.path(), &skip_list("0123456789abcdef"), pair_mods_with_configs(&mods, &configs)).await.unwrap();
+        do_deploy(data.path(), &skip_list("0123456789abcdef"), pair_mods_with_configs(&mods, &configs)).await.unwrap();
+        assert_eq!(tokio::fs::read(&slot0).await.unwrap(), b"game");
+        assert_eq!(tokio::fs::read(data.path().join(patch_file_name(1))).await.unwrap(), b"data");
+    }
+
+    /// No record (a game folder last deployed by an older version) or a
+    /// damaged one: a skip-listed slot-0 file can't be shown to be DDMM's,
+    /// so it is kept. Everything else is still purged.
+    #[tokio::test]
+    async fn without_a_usable_record_skip_listed_slot_zero_is_kept() {
+        for record in [None, Some(&b"{not json"[..]), Some(&b"{\"Files\": 7}"[..])] {
+            let data = tempfile::tempdir().unwrap();
+            let slot0 = data.path().join(patch_file_name(0));
+            let slot1 = data.path().join(patch_file_name(1));
+            tokio::fs::write(&slot0, b"x").await.unwrap();
+            tokio::fs::write(&slot1, b"x").await.unwrap();
+            if let Some(record) = record {
+                tokio::fs::write(data.path().join(DEPLOY_RECORD), record).await.unwrap();
+            }
+
+            do_purge(data.path(), &skip_list("0123456789abcdef")).await.unwrap();
+            assert!(slot0.exists(), "record {record:?}: slot 0 must be kept");
+            assert!(!slot1.exists(), "record {record:?}: slot 1 must be purged");
+            assert!(!data.path().join(DEPLOY_RECORD).exists());
+        }
     }
 
     fn no_skip_list() -> Settings {

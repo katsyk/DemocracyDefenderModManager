@@ -53,6 +53,9 @@ doesn't collide with — or overwrite the slot used by — that DLC content. See
 - Select an entry in the list and use the **-** button to remove it.
 
 You won't normally need to touch this unless a specific mod's documentation tells you to add an entry for it.
+Purge leaves a skip-listed name's `.patch_0` alone unless DDMM deployed it itself (see
+[Deploy & purge](deploy-purge.md#purge)). If you used rc.14 or earlier with Skip List entries, verify game files in
+Steam once, because older versions could delete the game's own files for those names.
 
 ## Mod updates
 

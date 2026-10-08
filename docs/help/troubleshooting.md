@@ -145,6 +145,12 @@ Both refuse to run against an invalid [Game Path](../using/settings.md#game-path
 If the path is valid but deploy still fails partway through, check the log for which file operation failed (for
 example, a patch file the mod claims to include that doesn't actually exist in its folder).
 
+## Game files missing after using the Skip List
+
+If you used rc.14 or earlier with Skip List entries, verify game files in Steam once, because older versions could
+delete the game's own files for those names. Current versions leave them alone (see
+[Deploy & purge](../using/deploy-purge.md#purge)).
+
 ## A specific mod won't deploy, or deploying it errors out
 
 `V1` and `V2` manifests deploy the same way. If an enabled option (or the selected sub-option) doesn't actually

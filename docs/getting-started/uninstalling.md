@@ -45,4 +45,4 @@ executable (portable) or in `%APPDATA%\io.github.katsyk.ddmm.location` / `~/.con
 completely clean removal.
 
 In every case, your Helldivers 2 installation itself is never touched beyond the `data` folder changes
-Deploy/Purge make.
+Deploy/Purge make (the deployed patch files and DDMM's `.ddmm-deployed.json` record of them, both removed by Purge).

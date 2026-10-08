@@ -47,7 +47,15 @@ uninstall all mods from the game?"), then deletes **every** file in `<Game Path>
 what "clean" means for deploy, and it's also available on its own if you just want your install back to a vanilla
 state without deploying a new selection. The one exception is slot `0` of a patch name in your
 [Skip List](settings.md#skip-list): that `.patch_0` (and its `.gpu_resources`/`.stream`) belongs to the game, so
-purge leaves it in place.
+purge leaves it in place — unless DDMM put it there itself (deployed before you added the name to the Skip List),
+in which case it is purged like any other mod file.
 
-Purge only removes files matching that pattern; the rest of your `data` folder (and your game install as a whole)
-is left alone.
+To tell the two apart, each deploy writes a small record of the files it wrote, `.ddmm-deployed.json`, into the
+same `data` folder; purge removes it again. Without that record (for example after a deploy by an older version)
+a skip-listed slot `0` file is always kept.
+
+!!! warning "Upgrading from rc.14 or earlier"
+    If you used rc.14 or earlier with Skip List entries, verify game files in Steam once, because older versions could delete the game's own files for those names.
+
+Purge only removes files matching that pattern (and its own `.ddmm-deployed.json` record); the rest of your `data`
+folder (and your game install as a whole) is left alone.
