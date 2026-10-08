@@ -112,6 +112,13 @@ manifest with its own `Guid`, that GUID is used instead, and profile entries tha
 match it (DDMM doesn't migrate them): the old entry shows as *Mod not found* in your profile and the updated mod is
 in the Library. Add it to the profile again, then remove the old entry.
 
+The exception is a mod that was installed **without** a `manifest.json` of its own and so got an ID from DDMM. This
+happens, for example, with an archive that zips the mod's folder (`My Mod/manifest.json`) and was added with
+DDMM 2.0.0-rc.14 or earlier. When an update brings the author's manifest and its `Guid`, the mod's profile entries
+move to the new ID in every profile. They keep their position and whether they're on. Option choices that don't
+fit the author's options are reset to the defaults. If another mod in your list already has that `Guid`, the
+updated mod keeps the ID it had.
+
 ## Nexus Mods: optional API key (sign-in coming soon) { #nexus-mods-and-the-optional-api-key }
 
 Nexus Mods only answers these questions ("is there a newer file?") for people who have an API key or are signed
