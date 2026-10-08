@@ -260,7 +260,14 @@
             },
             "skip_version": "Skip version {version}",
             "unskip_version": "Stop skipping {version}",
-            "needs_nexus_key": "Optional: add a Nexus Mods API key in Settings to check for updates"
+            "needs_nexus_key": "Optional: add a Nexus Mods API key in Settings to check for updates",
+            "entry_menu": {
+                "remove": "Remove",
+                "move_up": "Move Up",
+                "move_down": "Move Down",
+                "to_top": "To Top",
+                "to_bottom": "To Bottom"
+            }
         },
         "settings": {
             "popup": {
