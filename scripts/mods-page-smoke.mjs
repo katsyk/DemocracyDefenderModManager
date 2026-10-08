@@ -377,6 +377,44 @@ const scenarios = {
             r.expect(configs[0].Guid === G(1), "an old ID that's still loaded isn't renamed");
         },
     },
+    // An update changed a mod's options under its profile entry: Deploy
+    // resets its choices to fit, and that's what is saved afterwards.
+    deployfit: {
+        async check(page, r) {
+            await page.evaluate((guid) => {
+                const res = window.__smokeResponses;
+                const mod = res.get_mods.find(m => m.Manifest.Guid === guid);
+                mod.Manifest.Options = mod.Manifest.Options.slice(0, 2);
+                window.__smokeEmit("bridge://mod-installed", { requestId: "r1", mod: { guid, name: "V1 mod" }, afterInstall: "library" });
+            }, G(1));
+            await page.waitForTimeout(800);
+            // Waits for the "installed" toast over the button to go.
+            await page.locator("button.hd2mm-success-button", { hasText: "Deploy" }).click({ timeout: 10000 });
+            await page.waitForTimeout(800);
+            r.expect(r.calls.some(c => c.cmd === "deploy"), "Deploy ran");
+            // "Deployed, but 1 missing mod(s) were skipped".
+            await page.getByText("OK", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(400);
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            const entry = r.saves.at(-1)?.Profiles[0].Configs.find(c => c.Guid === G(1));
+            r.expect(JSON.stringify(entry?.Toggled) === "[true,true]", `the fitted options are saved (${JSON.stringify(entry)})`);
+        },
+    },
+    // Choices that don't fit the mod any more are reset when the page
+    // loads, and the reset ones are what's saved.
+    loadfit: {
+        data: (d) => { d.load_profiles.Profiles[0].Configs[0] = { For: "V1", Guid: G(1), Enabled: false, Toggled: [true, false], Selected: [0, 0] }; },
+        async check(page, r) {
+            r.expect(r.logs.some(l => l.message.includes("Options reset to defaults")), "the reset is logged");
+            await page.getByText("OK", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(400);
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            const entry = r.saves.at(-1)?.Profiles[0].Configs.find(c => c.Guid === G(1));
+            r.expect(JSON.stringify(entry?.Toggled) === "[true,true,true]" && entry?.Enabled === false, `the fitted options are saved (${JSON.stringify(entry)})`);
+        },
+    },
     // Init itself fails.
     initfail: {
         data: (d) => { d.load_profiles.Profiles = null; },

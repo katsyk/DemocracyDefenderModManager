@@ -396,14 +396,14 @@
      * here too (keeping on/off and position, resetting option choices that
      * no longer fit), or the next save would list it as missing. */
     async function applyGuidRenames() {
-        let renames: [UUID, UUID][];
+        let renames: [UUID, UUID][] | null | undefined;
         try {
             renames = await getGuidRenames();
         } catch (ex: unknown) {
             log.warn(`Couldn't get the mods whose ID changed: ${errorMessage(ex)}`);
             return;
         }
-        if (renames.length === 0 || !profilesLoaded) return;
+        if (!renames?.length || !profilesLoaded) return;
         if (currentProfile) applyCurrentConfigChanges();
         const moved: UUID[] = [];
         for (const [oldGuid, newGuid] of renames) {
@@ -473,13 +473,16 @@
      * on/off and position; returns the names of the mods that were reset. */
     function fitProfilesToMods(allProfiles: Profile[], loaded: Mod[]): string[] {
         const reset: string[] = [];
+        // In place: the active profile's array is the list shown (and
+        // saved); replacing it would leave the list on the stale entries.
         for (const profile of allProfiles) {
-            profile.Configs = profile.Configs.map(config => {
+            profile.Configs.forEach((config, i) => {
                 const mod = loaded.find(m => m.guid === config.Guid);
-                if (!mod) return config;
+                if (!mod) return;
                 const fitted = fitConfig(config, mod.Manifest);
-                if (fitted.reset && !reset.includes(mod.name)) reset.push(mod.name);
-                return fitted.config;
+                if (!fitted.reset) return;
+                if (!reset.includes(mod.name)) reset.push(mod.name);
+                profile.Configs[i] = fitted.config;
             });
         }
         return reset;
