@@ -19,6 +19,7 @@ pub mod nexus_oauth;
 pub mod mod_import;
 pub mod install_error;
 pub mod mod_folder;
+pub(crate) mod mod_root;
 
 use std::{
     path::PathBuf,

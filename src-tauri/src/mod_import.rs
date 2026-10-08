@@ -665,7 +665,8 @@ fn inspect_archive(item: &mut ScanItem) -> anyhow::Result<()> {
         }
     }
     item.size = unpacked;
-    let manifest_entry = archive.find_root_file_ci(crate::commands::mods::MANIFEST_FILE)?;
+    // At the root or inside wrapper folders, exactly as installing finds it.
+    let manifest_entry = crate::mod_root::find_archive_manifest(&mut archive)?.map(|(_, entry)| entry);
     if let Some(entry) = &manifest_entry {
         let data = archive.read_path(entry)?;
         let manifest = Manifest::parse(&data, "manifest.json")?;
@@ -682,7 +683,7 @@ fn inspect_archive(item: &mut ScanItem) -> anyhow::Result<()> {
 fn inspect_folder(item: &mut ScanItem) -> anyhow::Result<()> {
     item.size = tree_size(&item.path);
     item.file_size = item.size;
-    if let Some(manifest_file) = find_manifest_sync(&item.path) {
+    if let Some(manifest_file) = find_manifest_sync(&crate::mod_root::folder_mod_root(&item.path)) {
         let data = std::fs::read(&manifest_file)?;
         let manifest = Manifest::parse(&data, "manifest.json")?;
         apply_manifest(item, &manifest);

@@ -1257,3 +1257,27 @@ fn import_keeps_a_carried_install_time() {
     let item = inspect(1, &Candidate { kind: ItemKind::Folder, path: plain });
     assert!(sidecar_for(&item, &installed, None).installed_at > 1_700_000_000);
 }
+
+/// An archive that zips the mod's folder instead of its contents is read
+/// like installing reads it: the wrapped manifest's GUID and name count,
+/// so it's recognized as the installed mod it is.
+#[test]
+fn a_wrapped_manifest_gives_the_scan_its_guid() {
+    let dir = tempfile::tempdir().unwrap();
+    let guid = "cccccccc-1111-4111-8111-cccccccccccc";
+    let m = author_manifest(guid, "Wrapped Helmets");
+    let zip = dir.path().join("helmets.zip");
+    let inner = format!("Wrapped Helmets/{PATCH}");
+    make_zip(&zip, &[("__MACOSX/._x", b""), ("Wrapped Helmets/manifest.json", &m), (inner.as_str(), b"x")]);
+    let item = inspect(0, &Candidate { kind: ItemKind::Archive, path: zip });
+    assert_eq!(item.guid, Some(Uuid::parse_str(guid).unwrap()));
+    assert_eq!(item.name, "Wrapped Helmets");
+    assert!(!item.local_guid);
+
+    let folder = dir.path().join("download");
+    std::fs::create_dir_all(folder.join("Wrapped Helmets")).unwrap();
+    std::fs::write(folder.join("Wrapped Helmets").join("manifest.json"), &m).unwrap();
+    std::fs::write(folder.join("Wrapped Helmets").join(PATCH), b"x").unwrap();
+    let item = inspect(1, &Candidate { kind: ItemKind::Folder, path: folder });
+    assert_eq!(item.guid, Some(Uuid::parse_str(guid).unwrap()));
+}
