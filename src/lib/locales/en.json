@@ -271,6 +271,18 @@
         },
         "settings": {
             "popup": {
+                "error": {
+                    "save": {
+                        "message": "Couldn't save the settings!"
+                    }
+                },
+                "confirm": {
+                    "close_save_failed": {
+                        "title": "Couldn't Save Settings",
+                        "question": "Couldn't save your settings: {error}. Close anyway? Unsaved changes will be lost.",
+                        "timeout_error": "Saving is taking too long"
+                    }
+                },
                 "notification": {
                     "validation_error": {
                         "message": "Invalid settings values!"

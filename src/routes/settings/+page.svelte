@@ -3,7 +3,9 @@
     import { open } from "@tauri-apps/plugin-dialog";
     import { openPath, openUrl } from "@tauri-apps/plugin-opener";
     import { beforeNavigate, onNavigate } from "$app/navigation";
-    import { tick } from "svelte";
+    import { onMount, tick } from "svelte";
+    import { getCurrentWindow } from "@tauri-apps/api/window";
+    import * as log from "@tauri-apps/plugin-log";
     import { toSkipEntry, type SkipEntry } from "$lib/models/settings";
     import type { AfterBrowserInstall } from "$lib/models/settings";
     import { useLocalization } from "$lib/state/localization.svelte";
@@ -13,7 +15,7 @@
         repairBrowserIntegrationOne, removeBrowserIntegrationOne,
         getNexusKeyStatus, setNexusApiKey, removeNexusApiKey,
         getNexusSignInStatus, nexusSignIn, nexusCancelSignIn, nexusSignOut,
-        getDataFolderInfo, planDataFolderMove, adoptDataFolder,
+        getDataFolderInfo, planDataFolderMove, adoptDataFolder, ackCloseRequested, forceExit,
         type BrowserIntegrationStatus, type NexusKeyStatus, type NexusSignInStatus, type DataFolderInfo
     } from "$lib/utils/commands";
     import type { Settings } from "$lib/models/settings";
@@ -22,7 +24,8 @@
     } from "svelte-bootstrap-icons";
     import { usePopup } from "$lib/state/popup.svelte";
     import {
-        InputPopup, NotificationPopup, WaitPopup, DataFolderMovePopup, DataFolderProgressPopup
+        InputPopup, NotificationPopup, WaitPopup, DataFolderMovePopup, DataFolderProgressPopup,
+        ErrorPopup, ConfirmPopup
     } from "$lib/types/popup";
     import Select from "$lib/components/Select.svelte";
     import ToggleSwitch from "$lib/components/ToggleSwitch.svelte";
@@ -80,6 +83,10 @@
     let dataFolderInfo = $state<DataFolderInfo | null>(null);
     let dataDirBusy = $state(false);
     let dataFolderMoving = false;
+    /** Set once the settings are loaded into this page. Until then (still
+     * loading, or loading failed) there's nothing to save, and leaving
+     * mustn't be blocked by the empty game path. */
+    let settingsLoaded = false;
     let initPromise = $state<Promise<void>>(init());
     // Linked from the Mods page ("add a Nexus API key"): scroll there once
     // the page has actually rendered (it only renders after init).
@@ -125,7 +132,7 @@
     });
 
     beforeNavigate(({ cancel }) => {
-        if (gamePathErrors.length === 0) return;
+        if (!settingsLoaded || gamePathErrors.length === 0) return;
         cancel();
         showPopup(new NotificationPopup(
             "error",
@@ -147,12 +154,65 @@
         };
     }
 
+    /** Whether the settings can be saved now: loaded, not moving the data
+     * folder (the old folder is read-only until the restart), and a valid
+     * game path (leaving is blocked until then). */
+    function canSave(): boolean {
+        return settingsLoaded && !dataFolderMoving && gamePathErrors.length === 0;
+    }
+
     onNavigate(async () => {
-        // After a data folder move the old folder is read-only until the
-        // restart; nothing to save then.
-        if (dataFolderMoving) return;
-        await saveSettings(currentSettings());
+        if (!canSave()) return;
+        try {
+            await saveSettings(currentSettings());
+        } catch (ex: unknown) {
+            // The backend says why (e.g. the downloads folder is DDMM's own
+            // mod storage); never lose the changes without a word.
+            showPopup(new ErrorPopup(t("pages.settings.popup.error.save.message"), errorText(ex)));
+        }
     })
+
+    // Closing DDMM from this page saves too (the Mods page's close handler
+    // isn't there to): the changes were lost otherwise.
+    let closeRequestInFlight = false;
+    onMount(() => {
+        const appWindow = getCurrentWindow();
+        const unlisten = appWindow.onCloseRequested(async (event) => {
+            event.preventDefault();
+            await ackCloseRequested().catch((ex: unknown) =>
+                log.error(`Failed to acknowledge close request: ${errorText(ex)}`).catch(() => {}));
+            if (closeRequestInFlight) return;
+            closeRequestInFlight = true;
+            try {
+                if (canSave()) {
+                    let timer: ReturnType<typeof setTimeout> | undefined;
+                    const timeout = new Promise<never>((_, reject) => {
+                        timer = setTimeout(() => reject(new Error(t("pages.settings.popup.confirm.close_save_failed.timeout_error"))), 5000);
+                    });
+                    try {
+                        await Promise.race([saveSettings(currentSettings()), timeout]);
+                    } catch (ex: unknown) {
+                        const closeAnyway = await showPopup(new ConfirmPopup(
+                            t("pages.settings.popup.confirm.close_save_failed.title"),
+                            t("pages.settings.popup.confirm.close_save_failed.question", { error: errorText(ex) }),
+                        ));
+                        if (!closeAnyway) return;
+                    } finally {
+                        clearTimeout(timer);
+                    }
+                }
+                try {
+                    await appWindow.destroy();
+                } catch (ex: unknown) {
+                    log.error(`Window destroy() failed, falling back to force_exit: ${errorText(ex)}`).catch(() => {});
+                    await forceExit().catch(() => {});
+                }
+            } finally {
+                closeRequestInFlight = false;
+            }
+        });
+        return () => { unlisten.then(f => f()); };
+    });
 
     async function init() {
         const [settings, resolvedDataDir, folderInfo] = await Promise.all([
@@ -172,6 +232,7 @@
                 autoCheckIntervalHours = autoCheckIntervalEnabled
                     ? clampInterval(settings.AutoCheckIntervalHours)
                     : DEFAULT_AUTO_CHECK_INTERVAL_HOURS;
+                settingsLoaded = true;
                 break;
         }
         dataDir = resolvedDataDir;

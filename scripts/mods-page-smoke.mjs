@@ -52,6 +52,12 @@ function fixture() {
         resolve_mod_image: null,
         take_pending_deep_links: [],
         detect_import_sources: [],
+        // Settings
+        get_data_dir: "/data",
+        validate_game_path: { valid: true, resolvedPath: null, code: null, detail: null, message: null },
+        get_nexus_key_status: { Present: false },
+        get_nexus_sign_in_status: { Available: false, SignedIn: false, Port: 28647 },
+        repair_browser_integration: [],
     };
 }
 
@@ -163,6 +169,46 @@ const scenarios = {
             r.expect(deleted.length === 1 && deleted[0] === G(2), `the mod clicked is deleted (deleted ${deleted.join(", ")})`);
         },
     },
+    // Leaving Settings when the backend refuses to save them: the reason
+    // is shown, not swallowed.
+    settingssavefail: {
+        data: (d) => { d.__fails = { save_settings: "The downloads folder is DDMM's own mod storage." }; },
+        async check(page, r) {
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            await page.locator("a[href='/']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            r.expect(r.calls.some(c => c.cmd === "save_settings"), "Settings tried to save");
+            r.expect(await page.getByText("DDMM's own mod storage").count() === 1, "the reason is shown");
+            r.expect(!r.errors.some(e => e.includes("mod storage")), "no unhandled rejection");
+        },
+    },
+    // Settings that can't be loaded (a broken settings.json): the page says
+    // so, and doesn't keep the user from leaving or save over the file.
+    settingsloadfail: {
+        data: (d) => { d.__fails = { load_settings: "settings.json isn't valid settings JSON" }; },
+        async check(page, r) {
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            await page.locator("a[href='/help']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            r.expect(page.url().endsWith("/help"), "the user can leave Settings");
+            r.expect(!r.calls.some(c => c.cmd === "save_settings"), "nothing is saved over the file");
+        },
+    },
+    // Closing DDMM from Settings saves them first.
+    settingsclose: {
+        async check(page, r) {
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            const saves = r.calls.filter(c => c.cmd === "save_settings").length;
+            await page.evaluate(() => window.__smokeEmit("tauri://close-requested", null));
+            await page.waitForTimeout(800);
+            r.expect(r.calls.filter(c => c.cmd === "save_settings").length === saves + 1, "the settings are saved on close");
+            r.expect(r.calls.some(c => c.cmd === "ack_close_requested"), "the close is acknowledged");
+            r.expect(r.windowCalls.some(c => c.includes("destroy")), "the window is closed");
+        },
+    },
     // Init itself fails.
     initfail: {
         data: (d) => { d.load_profiles.Profiles = null; },
@@ -191,11 +237,12 @@ for (const name of process.argv.length > 2 ? process.argv.slice(2) : Object.keys
     const data = fixture();
     s.data?.(data);
     const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
-    const r = { logs: [], saves: [], calls: [], errors: [], results: [], expect(ok, what) { this.results.push([!!ok, what]); } };
+    const r = { logs: [], saves: [], calls: [], windowCalls: [], errors: [], results: [], expect(ok, what) { this.results.push([!!ok, what]); } };
     page.on("pageerror", e => r.errors.push(e.message));
     await page.exposeFunction("__smokeLog", (level, message) => r.logs.push({ level, message }));
     await page.exposeFunction("__smokeSave", (config) => r.saves.push(config));
     await page.exposeFunction("__smokeCall", (cmd, args) => r.calls.push({ cmd, args }));
+    await page.exposeFunction("__smokeWindowCall", (cmd) => r.windowCalls.push(cmd));
     await page.addInitScript((responses) => {
         let next = 1;
         window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
@@ -211,6 +258,8 @@ for (const name of process.argv.length > 2 ? process.argv.slice(2) : Object.keys
                     return next++;
                 }
                 if (!cmd.startsWith("plugin:")) window.__smokeCall(cmd, args ?? null);
+                if (cmd.startsWith("plugin:window|")) window.__smokeWindowCall(cmd);
+                if (cmd in (responses.__fails ?? {})) throw responses.__fails[cmd];
                 if (cmd === "save_profiles") return void window.__smokeSave(JSON.parse(JSON.stringify(args.config)));
                 if (!(cmd in responses)) return null;
                 const result = structuredClone(responses[cmd]);
