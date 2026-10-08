@@ -1,6 +1,6 @@
 {
   "name": "ddmm-extension",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Browser extension half of one-click Helldivers 2 mod installs for DDMM.",
   "private": true,
   "type": "module",
