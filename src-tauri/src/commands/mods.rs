@@ -538,7 +538,7 @@ async fn install_archive_steps(
     let mods_root = base_path.join(MODS_DIRECTORY);
     // An unreadable archive counts as "has one": resolving the manifest
     // below then reports the real problem.
-    let has_manifest = !matches!(archive.find_root_file_ci(MANIFEST_FILE), Ok(None));
+    let has_manifest = archive_has_manifest(&mut archive);
     if !has_manifest {
         refuse_if_listed(mods, &mods_root, dir_name, subject)?;
     }
@@ -553,7 +553,7 @@ async fn install_archive_steps(
     // already exists" (e.g. after an archive was rejected as unsafe).
     let prepared: Result<(Mod, Option<String>), InstallError> = async {
         log::info!("Resolving manifest...");
-        let (archive, manifest) = resolve_manifest(archive, manifest_name.to_string(), manifest_file.clone())
+        let (archive, manifest, root) = resolve_manifest(archive, manifest_name.to_string(), manifest_file.clone())
             .await
             .map_err(|e| manifest_failure(subject, e))?;
 
@@ -567,7 +567,7 @@ async fn install_archive_steps(
         check_not_installed(mods, &r#mod, subject)?;
 
         log::info!("Extracting archive...");
-        extract_archive(archive, mod_dir.clone()).await.install_step(subject, InstallStep::Extract)?;
+        extract_archive(archive, mod_dir.clone(), root).await.install_step(subject, InstallStep::Extract)?;
 
         log::debug!("Detecting patch file layout...");
         let warning = apply_patch_layout(&mod_dir, &mut r#mod.manifest)
@@ -596,6 +596,21 @@ async fn install_archive_steps(
     mods.push(r#mod.clone());
     log::info!("Mod successfully added.");
     Ok((r#mod, warning))
+}
+
+/// Whether installing `archive` will use a manifest.json from it: one at
+/// its root, or a readable one inside a wrapper folder (a broken one there
+/// is ignored, see [`resolve_manifest`]). An unreadable archive counts as
+/// "has one": resolving the manifest then reports the real problem.
+fn archive_has_manifest(archive: &mut Archive) -> bool {
+    match crate::mod_root::find_archive_manifest(archive) {
+        Ok(None) => false,
+        Ok(Some((root, entry))) if !root.as_os_str().is_empty() => match archive.read_path(&entry) {
+            Ok(data) => Manifest::parse(&data, "manifest.json").is_ok(),
+            Err(_) => true,
+        },
+        _ => true,
+    }
 }
 
 /// Reading the manifest out of an archive fails either because the
@@ -771,21 +786,31 @@ fn generate_local_manifest(name: String) -> anyhow::Result<Manifest> {
     }))
 }
 
-async fn resolve_manifest(mut archive: Archive, name: String, manifest_file: PathBuf) -> anyhow::Result<(Archive, Manifest)> {
-    if let Some(entry) = archive.find_root_file_ci(MANIFEST_FILE)? {
+/// Also returns the mod's root inside the archive: empty, or the wrapper
+/// folder(s) holding the manifest.json (see [`crate::mod_root`]).
+async fn resolve_manifest(mut archive: Archive, name: String, manifest_file: PathBuf) -> anyhow::Result<(Archive, Manifest, PathBuf)> {
+    let found = crate::mod_root::find_archive_manifest(&mut archive)?;
+    if let Some((root, entry)) = found {
         let manifest_data = archive.read_path(&entry)?;
-        let manifest = Manifest::parse(&manifest_data, &entry.to_string_lossy())?;
-        Ok((archive, manifest))
-    } else {
-        let manifest = generate_local_manifest(name)?;
-
-        let manifest_data = serde_json::to_vec_pretty(&manifest)?;
-        tokio::fs::write(&manifest_file, manifest_data)
-            .await
-            .with_context(|| format!("couldn't write {:?}", manifest_file))?;
-
-        Ok((archive, manifest))
+        match Manifest::parse(&manifest_data, &entry.to_string_lossy()) {
+            Ok(manifest) => return Ok((archive, manifest, root)),
+            // A broken manifest.json inside a wrapper folder: install the
+            // archive the way DDMM always did (it was never read before),
+            // rather than fail. One at the root is still an error.
+            Err(e) if !root.as_os_str().is_empty() => {
+                log::warn!("Ignoring {:?}, which can't be read ({:#}); installing without it.", entry, e);
+            }
+            Err(e) => return Err(e),
+        }
     }
+    let manifest = generate_local_manifest(name)?;
+
+    let manifest_data = serde_json::to_vec_pretty(&manifest)?;
+    tokio::fs::write(&manifest_file, manifest_data)
+        .await
+        .with_context(|| format!("couldn't write {:?}", manifest_file))?;
+
+    Ok((archive, manifest, PathBuf::new()))
 }
 
 /// Same idea as [`resolve_manifest`], but for a plain folder install: read
@@ -812,9 +837,37 @@ async fn resolve_manifest_for_dir(source_dir: &Path, name: String, manifest_file
     }
 }
 
-async fn extract_archive(mut archive: Archive, mod_dir: PathBuf) -> anyhow::Result<()> {
-    let dir = mod_dir.clone();
-    tokio::task::spawn_blocking(move || archive.extract_to(dir)).await??;
+/// Extract `archive` into `mod_dir`. When the mod's `root` is a wrapper
+/// folder inside the archive, only that folder's contents end up in
+/// `mod_dir` (the rest -- the wrapper itself, OS clutter, a loose readme
+/// beside it -- is dropped).
+async fn extract_archive(mut archive: Archive, mod_dir: PathBuf, root: PathBuf) -> anyhow::Result<()> {
+    if root.as_os_str().is_empty() {
+        let dir = mod_dir.clone();
+        tokio::task::spawn_blocking(move || archive.extract_to(dir)).await??;
+    } else {
+        log::info!("The archive's manifest.json is in {:?}; installing that folder's contents.", root);
+        // Unpacked next to the mod folder (a dot-name, never loaded as a
+        // mod; swept on the next start if DDMM stops halfway), then the
+        // wrapped folder takes the reserved, still empty, mod folder's
+        // place in one rename.
+        let mods_root = mod_dir.parent().ok_or_else(|| anyhow::anyhow!("{:?} has no parent folder", mod_dir))?.to_path_buf();
+        let unpacked = mods_root.join(format!("{}{}", mod_folder::UNWRAP_PREFIX, Uuid::new_v4()));
+        tokio::fs::create_dir(&unpacked).await?;
+        let moved: anyhow::Result<()> = async {
+            let dir = unpacked.clone();
+            tokio::task::spawn_blocking(move || archive.extract_to(dir)).await??;
+            tokio::fs::remove_dir(&mod_dir).await.with_context(|| format!("couldn't replace {:?}", mod_dir))?;
+            crate::fs_util::move_path(&unpacked.join(&root), &mod_dir).await
+        }
+        .await;
+        // Only what was left around the wrapped folder (or, on a failure,
+        // the unpacked copy): a cleanup that fails never undoes the install.
+        if let Err(e) = mod_folder::remove_mod_folder(&mods_root, &unpacked).await {
+            log::warn!("Couldn't remove the working folder {:?} yet (removed on the next start): {:#}", unpacked, e);
+        }
+        moved?;
+    }
     normalize_manifest_file_name(&mod_dir).await
 }
 
@@ -967,6 +1020,9 @@ async fn install_folder_steps(
         .map(str::to_string)
         .unwrap_or_else(|| crate::mod_import::display_name_from_file(&name, false));
     let name = name_override.map(str::to_string).unwrap_or(name);
+    // A folder that only wraps the mod's folder (`Download/ModName/manifest.json`):
+    // install the inner folder, so the author's manifest is used.
+    let folder = &crate::mod_root::folder_mod_root(folder);
     log::info!("Preparing mod directory...");
     if find_manifest_file(folder).await.is_none() {
         refuse_if_listed(mods, &mods_root, &name, subject)?;
@@ -1326,7 +1382,23 @@ async fn install_update_steps(
             Manifest::V1(m) => m.guid,
             Manifest::V2(m) => m.guid,
         };
-        if new_guid != existing_guid {
+        let taken_by = mods.iter().find(|m| m.guid() == new_guid && new_guid != existing_guid);
+        if let (true, Some(other)) = (is_local_generated(&old_mod.manifest), taken_by) {
+            // Installed without its manifest.json (so with an ID of DDMM's
+            // own), now updated with its author's -- whose ID another mod
+            // in the list already has. The mod keeps the ID it has, so
+            // nothing changes for its profile entries.
+            log::warn!(
+                "Update for mod {{{}}} ships the ID {{{}}}, which \"{}\" already has; keeping {{{}}}.",
+                existing_guid, new_guid, other.name(), existing_guid
+            );
+            match &mut manifest {
+                Manifest::Legacy(m) => m.guid = existing_guid,
+                Manifest::V1(m) => m.guid = existing_guid,
+                Manifest::V2(m) => m.guid = existing_guid,
+            }
+            existing_guid
+        } else if new_guid != existing_guid {
             // Keeping a new ID that another installed mod already has would
             // leave two mods with one ID (and deleting one of them by ID
             // could then hit the other's files): refuse before touching
@@ -1352,11 +1424,19 @@ async fn install_update_steps(
                 return Err(err);
             }
             log::info!(
-                "Update for mod {{{}}} ships its own GUID {{{}}}; keeping the new one (profile entries referencing the old GUID will no longer match).",
-                existing_guid, new_guid
+                "Update for mod {{{}}} ships its own GUID {{{}}}; keeping the new one{}.",
+                existing_guid,
+                new_guid,
+                if is_local_generated(&old_mod.manifest) {
+                    " (the old one was DDMM's own; profile entries are moved over to it)"
+                } else {
+                    " (profile entries referencing the old GUID will no longer match)"
+                }
             );
+            new_guid
+        } else {
+            new_guid
         }
-        new_guid
     };
 
     // Persist the (possibly GUID-rewritten) manifest into staging before the swap.
@@ -1430,6 +1510,17 @@ async fn install_update_steps(
     mods.retain(|m| m.guid() != existing_guid);
     mods.push(new_mod.clone());
 
+    // An ID DDMM generated, replaced by the author's (the mod was installed
+    // before DDMM found manifest.json inside a zipped folder): its profile
+    // entries follow it, keeping on/off and their place.
+    if final_guid != existing_guid && is_local_generated(&old_mod.manifest) {
+        state.record_guid_rename(existing_guid, final_guid);
+        match crate::commands::profiles::migrate_saved_profiles(&state.base_path, existing_guid, final_guid, &new_mod.manifest).await {
+            Ok(n) => log::info!("Moved {n} profile entr(ies) from {{{existing_guid}}} to {{{final_guid}}}."),
+            Err(e) => log::error!("Couldn't move the profile entries of {{{existing_guid}}} to {{{final_guid}}}: {e:#}"),
+        }
+    }
+
     log::info!("Mod {{{}}} updated successfully.", new_mod.guid());
     Ok((new_mod, warning))
 }
@@ -1498,6 +1589,15 @@ pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Vec<PathBuf> {
         } else if let Some(rest) = name.strip_prefix(mod_folder::UPDATE_STAGING_PREFIX) {
             if is_dir && Uuid::parse_str(rest).is_ok() {
                 staging.push(path);
+            }
+        } else if let Some(rest) = name.strip_prefix(mod_folder::UNWRAP_PREFIX) {
+            // An archive unpacked for an install that didn't finish: only
+            // a copy of the archive, never anything else.
+            if is_dir && Uuid::parse_str(rest).is_ok() {
+                match mod_folder::remove_mod_folder(mods_root, &path).await {
+                    Ok(()) => log::info!("Removed {:?}, left by an install that didn't finish.", path),
+                    Err(e) => log::warn!("Couldn't remove {:?} yet: {:#}", path, e),
+                }
             }
         } else if is_dir && path.join(MANIFEST_FILE).is_file() {
             hidden_mods.push((path, name));
@@ -1848,11 +1948,11 @@ async fn stage_update(
         .map(|n| crate::mod_import::display_name_from_file(n, true))
         .unwrap_or_else(|| "update".to_string());
 
-    let (archive, mut manifest) = resolve_manifest(archive, name, manifest_file)
+    let (archive, mut manifest, root) = resolve_manifest(archive, name, manifest_file)
         .await
         .map_err(|e| manifest_failure(subject, e))?;
 
-    extract_archive(archive, staging_dir.to_path_buf()).await.install_step(subject, InstallStep::Extract)?;
+    extract_archive(archive, staging_dir.to_path_buf(), root).await.install_step(subject, InstallStep::Extract)?;
 
     let warning = apply_patch_layout(staging_dir, &mut manifest)
         .await
@@ -2845,6 +2945,364 @@ mod tests {
         let (visible, hidden) = visible_and_hidden(&base.path().join(MODS_DIRECTORY));
         assert_eq!(visible, vec!["B".to_string()]);
         assert!(hidden.is_empty(), "{hidden:?}");
+    }
+
+    // --- an archive or folder that wraps the mod's folder (`ModName/manifest.json`) ---
+
+    const WRAPPED_GUID: &str = "dddddddd-1111-4111-8111-dddddddddddd";
+
+    /// A V1 manifest with two options whose `Include`s and images are
+    /// relative to the mod's own folder.
+    fn wrapped_manifest(name: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "Version": 1,
+            "Guid": WRAPPED_GUID,
+            "Name": name,
+            "Description": "by its author",
+            "IconPath": "icon.png",
+            "Options": [
+                { "Name": "Red", "Description": "red one", "Include": ["Red"], "Image": "Red/preview.png" },
+                { "Name": "Blue", "Description": "blue one", "Include": ["Blue"],
+                  "SubOptions": [{ "Name": "Dark", "Description": "", "Include": ["Blue/Dark"] }] }
+            ]
+        }))
+        .unwrap()
+    }
+
+    /// The mod's files, under `prefix` (`"Cool Mod/"`, or `""` at the root).
+    fn wrapped_entries(prefix: &str, name: &str, content: &[u8]) -> Vec<(String, Vec<u8>)> {
+        let patch = patch_file_name();
+        vec![
+            (format!("{prefix}manifest.json"), wrapped_manifest(name)),
+            (format!("{prefix}icon.png"), b"png".to_vec()),
+            (format!("{prefix}Red/preview.png"), b"png".to_vec()),
+            (format!("{prefix}Red/{patch}"), content.to_vec()),
+            (format!("{prefix}Blue/{patch}"), content.to_vec()),
+            (format!("{prefix}Blue/Dark/{patch}"), content.to_vec()),
+        ]
+    }
+
+    fn write_zip(path: &Path, entries: &[(String, Vec<u8>)]) {
+        let entries: Vec<(&str, &[u8])> = entries.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+        make_zip(path, &entries);
+    }
+
+    /// The author's manifest is in use and every path in it resolves
+    /// inside the installed mod's folder.
+    fn assert_authors_manifest(m: &Mod, name: &str) {
+        assert_eq!(m.guid(), Uuid::parse_str(WRAPPED_GUID).unwrap());
+        assert_eq!(m.name(), name);
+        let Manifest::V1(v1) = &m.manifest else { panic!("not the author's V1 manifest: {:?}", m.manifest) };
+        assert_eq!(v1.icon_path.as_deref(), Some(Path::new("icon.png")));
+        assert!(m.directory.join("icon.png").is_file());
+        let options = v1.options.as_ref().unwrap();
+        assert_eq!(options.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), ["Red", "Blue"]);
+        for option in options {
+            for include in option.include.iter().flatten() {
+                assert!(m.directory.join(include).join(patch_file_name()).is_file(), "{include:?}");
+            }
+            for sub in option.sub_options.iter().flatten() {
+                for include in &sub.include {
+                    assert!(m.directory.join(include).join(patch_file_name()).is_file(), "{include:?}");
+                }
+            }
+            if let Some(image) = &option.image {
+                assert!(m.directory.join(image).is_file(), "{image:?}");
+            }
+        }
+        assert!(m.directory.join(MANIFEST_FILE).is_file());
+        let names: Vec<String> = std::fs::read_dir(&m.directory)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != sources::ORIGIN_SIDECAR_FILE)
+            .collect();
+        let mut names = names;
+        names.sort();
+        assert_eq!(names, ["Blue", "Red", "icon.png", "manifest.json"], "only the wrapped folder's contents");
+    }
+
+    #[tokio::test]
+    async fn a_zipped_mod_folder_installs_with_its_authors_manifest() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let mut entries = wrapped_entries("Cool Mod/", "Cool Mod", b"v1");
+        // What a Mac, Windows Explorer and a readme add around it.
+        entries.push(("__MACOSX/Cool Mod/._manifest.json".into(), b"".to_vec()));
+        entries.push((".DS_Store".into(), b"".to_vec()));
+        entries.push(("Thumbs.db".into(), b"".to_vec()));
+        entries.push(("Cool Mod/desktop.ini".into(), b"".to_vec()));
+        entries.push(("readme.txt".into(), b"read me".to_vec()));
+        let zip = src.path().join("Cool Mod.zip");
+        write_zip(&zip, &entries);
+
+        let (m, warning) = install(&state, &zip).await.unwrap();
+        assert_eq!(warning, None);
+        std::fs::remove_file(m.directory.join("desktop.ini")).unwrap();
+        assert_authors_manifest(&m, "Cool Mod");
+        let (_, hidden) = visible_and_hidden(&base.path().join(MODS_DIRECTORY));
+        assert!(hidden.is_empty(), "no working folder left behind: {hidden:?}");
+
+        // It loads the same way on the next start.
+        let reloaded = load(base.path()).await;
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].guid(), m.guid());
+        assert!(matches!(reloaded[0].manifest, Manifest::V1(_)));
+    }
+
+    #[tokio::test]
+    async fn a_mod_folder_inside_wrapper_folders_installs_with_its_manifest() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let zip = src.path().join("Cool Mod.zip");
+        write_zip(&zip, &wrapped_entries("Cool Mod v1/Cool Mod/", "Cool Mod", b"v1"));
+        let (m, _) = install(&state, &zip).await.unwrap();
+        assert_authors_manifest(&m, "Cool Mod");
+    }
+
+    /// Re-adding the wrapped archive is caught by its GUID, and updating
+    /// with a wrapped archive replaces the mod in place, keeping its ID.
+    #[tokio::test]
+    async fn a_wrapped_mod_reinstalls_as_itself_not_a_duplicate() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let zip = src.path().join("Cool Mod.zip");
+        write_zip(&zip, &wrapped_entries("Cool Mod/", "Cool Mod", b"v1"));
+        let (first, _) = install(&state, &zip).await.unwrap();
+
+        let msg = message(install(&state, &zip).await);
+        assert!(msg.contains("already has that ID"), "{msg}");
+
+        let update = src.path().join("Cool Mod 1.1.zip");
+        write_zip(&update, &wrapped_entries("Cool Mod 1.1/", "Cool Mod", b"v2"));
+        let mut guard = state.mods.lock().await;
+        let mods = guard.as_mut().unwrap();
+        let (updated, _) = install_update_from_archive(&state, mods, &update, first.guid()).await.unwrap();
+        assert_eq!(mods.len(), 1);
+        assert_eq!(updated.directory, first.directory);
+        assert_authors_manifest(&updated, "Cool Mod");
+        assert_eq!(std::fs::read(updated.directory.join("Red").join(patch_file_name())).unwrap(), b"v2");
+        let (visible, hidden) = visible_and_hidden(&base.path().join(MODS_DIRECTORY));
+        assert_eq!(visible, ["Cool Mod"]);
+        assert!(hidden.is_empty(), "{hidden:?}");
+    }
+
+    #[tokio::test]
+    async fn a_folder_wrapping_the_mod_folder_installs_the_mod_folder() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let outer = src.path().join("Cool Mod-1234-1-0-1712345678");
+        for (name, data) in wrapped_entries("Cool Mod/", "Cool Mod", b"v1") {
+            let path = outer.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, data).unwrap();
+        }
+        std::fs::write(outer.join(".DS_Store"), b"").unwrap();
+        let mut guard = state.mods.lock().await;
+        let mods = guard.as_mut().unwrap();
+        let (m, _) = install_from_folder(base.path(), mods, &outer).await.unwrap();
+        assert_authors_manifest(&m, "Cool Mod");
+        assert!(outer.join("Cool Mod").join(MANIFEST_FILE).is_file(), "source untouched");
+
+        let msg = message(install_from_folder(base.path(), mods, &outer).await);
+        assert!(msg.contains("already has that ID"), "{msg}");
+        assert_eq!(mods.len(), 1);
+    }
+
+    /// Two top-level folders aren't a wrapper, even if one has a
+    /// manifest.json: the archive installs as before (a generated
+    /// manifest, the folders as options), and nothing is moved.
+    #[tokio::test]
+    async fn two_top_level_folders_are_not_unwrapped() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let mut entries = wrapped_entries("Cool Mod/", "Cool Mod", b"v1");
+        entries.push((format!("Other/{}", patch_file_name()), b"other".to_vec()));
+        let zip = src.path().join("Two.zip");
+        write_zip(&zip, &entries);
+        let (m, _) = install(&state, &zip).await.unwrap();
+        assert!(is_local_generated(&m.manifest), "{:?}", m.manifest);
+        assert!(m.directory.join("Cool Mod").join(MANIFEST_FILE).is_file());
+        assert!(m.directory.join("Other").join(patch_file_name()).is_file());
+    }
+
+    /// A manifest.json at the root is the mod's, even next to a single
+    /// folder that has one too.
+    #[tokio::test]
+    async fn a_root_manifest_wins_over_a_wrapped_one() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let mut entries = wrapped_entries("", "Cool Mod", b"v1");
+        entries.push(("Extras/manifest.json".into(), v1_manifest(GUID_A, "Not this one").into_bytes()));
+        let zip = src.path().join("Cool Mod.zip");
+        write_zip(&zip, &entries);
+        let (m, _) = install(&state, &zip).await.unwrap();
+        assert_eq!(m.guid(), Uuid::parse_str(WRAPPED_GUID).unwrap());
+        assert!(m.directory.join("Extras").join(MANIFEST_FILE).is_file());
+        assert!(m.directory.join("Red").join(patch_file_name()).is_file());
+    }
+
+    /// A mod installed from a zipped folder before DDMM looked inside it:
+    /// the archive's manifest.json was never read, so it got an ID of
+    /// DDMM's own and its folders as single-choice options.
+    async fn install_as_before_unwrapping(state: &AppState, src: &Path) -> Mod {
+        let patch = patch_file_name();
+        let zip = src.join("Cool Mod.zip");
+        let red = format!("Cool Mod/Red/{patch}");
+        let blue = format!("Cool Mod/Blue/{patch}");
+        make_zip(&zip, &[(red.as_str(), b"v1"), (blue.as_str(), b"v1")]);
+        let (m, _) = install(state, &zip).await.unwrap();
+        assert!(is_local_generated(&m.manifest));
+        m
+    }
+
+    fn profile_entries(base: &Path) -> Vec<serde_json::Value> {
+        let data: serde_json::Value = serde_json::from_slice(&std::fs::read(base.join("profiles.json")).unwrap()).unwrap();
+        data["Profiles"][0]["Configs"].as_array().unwrap().clone()
+    }
+
+    /// Updating such a mod with its zipped folder now reads the author's
+    /// manifest and so its ID: the mod's profile entries move to the new
+    /// ID, keeping on/off and their place, with option choices that no
+    /// longer fit reset to the defaults.
+    #[tokio::test]
+    async fn updating_a_mod_installed_without_its_wrapped_manifest_moves_its_profile_entries() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let old = install_as_before_unwrapping(&state, src.path()).await;
+        let other = install_v1(&state, src.path(), "A.zip", GUID_A, "Alpha").await;
+        let data = serde_json::json!({ "Profiles": [
+            { "Version": "V1", "Name": "Default", "Configs": [
+                { "For": "V1", "Guid": other.guid(), "Enabled": true, "Toggled": [], "Selected": [] },
+                { "For": "Legacy", "Guid": old.guid(), "Enabled": false, "Selected": 1 },
+            ] },
+            { "Version": "V1", "Name": "Other", "Configs": [
+                { "For": "Legacy", "Guid": old.guid(), "Enabled": true, "Selected": 0 },
+            ] },
+        ], "Active": 0 });
+        std::fs::write(base.path().join("profiles.json"), data.to_string()).unwrap();
+
+        let update = src.path().join("Cool Mod 1.1.zip");
+        write_zip(&update, &wrapped_entries("Cool Mod/", "Cool Mod", b"v2"));
+        let updated = {
+            let mut guard = state.mods.lock().await;
+            let mods = guard.as_mut().unwrap();
+            let (updated, _) = install_update_from_archive(&state, mods, &update, old.guid()).await.unwrap();
+            assert_eq!(mods.len(), 2);
+            updated
+        };
+        let new = Uuid::parse_str(WRAPPED_GUID).unwrap();
+        assert_eq!(updated.guid(), new);
+        assert_eq!(updated.directory, old.directory);
+        assert_authors_manifest(&updated, "Cool Mod");
+
+        let entries = profile_entries(base.path());
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["Guid"], other.guid().to_string());
+        assert_eq!(entries[1]["Guid"], WRAPPED_GUID, "same place, new ID");
+        assert_eq!(entries[1]["Enabled"], false, "still off");
+        assert_eq!(entries[1]["For"], "V1");
+        assert_eq!(entries[1]["Toggled"], serde_json::json!([true, true]));
+        assert_eq!(entries[1]["Selected"], serde_json::json!([0, 0]));
+        assert_eq!(saved_profile_guids(base.path())[1], [WRAPPED_GUID]);
+        assert_eq!(state.guid_renames(), [(old.guid(), new)]);
+
+        // A page that hadn't caught up yet saves the old ID: it's mapped.
+        let stale: crate::models::profile::ProfilesConfig = serde_json::from_value(data).unwrap();
+        let mut stale = stale;
+        crate::commands::profiles::apply_guid_renames(&mut stale, &state.guid_renames());
+        assert_eq!(stale.profiles[0].configs()[1].uuid(), &new);
+
+        // It loads under the new ID on the next start.
+        let reloaded = load(base.path()).await;
+        assert!(reloaded.iter().any(|m| m.guid() == new));
+    }
+
+    /// When the author's ID is already another installed mod's, the
+    /// updated mod keeps its own and its profile entries stay as they are.
+    #[tokio::test]
+    async fn an_authors_id_taken_by_another_mod_keeps_the_old_id() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let old = install_as_before_unwrapping(&state, src.path()).await;
+        let taken = install_v1(&state, src.path(), "Taken.zip", WRAPPED_GUID, "Taken").await;
+        write_profiles(base.path(), &[("Default", &[&old.guid().to_string(), &taken.guid().to_string()])]);
+
+        let update = src.path().join("Cool Mod 1.1.zip");
+        write_zip(&update, &wrapped_entries("Cool Mod/", "Cool Mod", b"v2"));
+        let mut guard = state.mods.lock().await;
+        let mods = guard.as_mut().unwrap();
+        let (updated, _) = install_update_from_archive(&state, mods, &update, old.guid()).await.unwrap();
+        assert_eq!(updated.guid(), old.guid());
+        assert_eq!(mods.len(), 2);
+        assert_eq!(mods.iter().filter(|m| m.guid().to_string() == WRAPPED_GUID).count(), 1);
+        assert_eq!(saved_profile_guids(base.path()), [[old.guid().to_string(), WRAPPED_GUID.to_string()]]);
+        assert!(state.guid_renames().is_empty());
+        let on_disk = Manifest::parse(&std::fs::read(updated.directory.join(MANIFEST_FILE)).unwrap(), "m").unwrap();
+        assert!(matches!(on_disk, Manifest::V1(m) if m.guid == old.guid()));
+    }
+
+    /// A manifest.json inside a wrapper folder that can't be read: the
+    /// archive installs as it always did instead of failing.
+    #[tokio::test]
+    async fn a_broken_wrapped_manifest_installs_as_before() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let patch = format!("Cool Mod/{}", patch_file_name());
+        let zip = src.path().join("Cool Mod.zip");
+        make_zip(&zip, &[("Cool Mod/manifest.json", b"{ broken"), (patch.as_str(), b"x")]);
+        let (m, _) = install(&state, &zip).await.unwrap();
+        assert!(is_local_generated(&m.manifest), "{:?}", m.manifest);
+        assert!(m.directory.join("Cool Mod").join(patch_file_name()).is_file());
+
+        let folder = src.path().join("Download");
+        std::fs::create_dir_all(folder.join("Cool Mod")).unwrap();
+        std::fs::write(folder.join("Cool Mod").join(MANIFEST_FILE), b"{ broken").unwrap();
+        std::fs::write(folder.join("Cool Mod").join(patch_file_name()), b"x").unwrap();
+        let mut guard = state.mods.lock().await;
+        let (m, _) = install_from_folder(base.path(), guard.as_mut().unwrap(), &folder).await.unwrap();
+        assert!(is_local_generated(&m.manifest), "{:?}", m.manifest);
+        assert!(m.directory.join("Cool Mod").join(patch_file_name()).is_file());
+    }
+
+    /// Adding the same archive with a broken wrapped manifest twice is
+    /// refused like any archive without a manifest, not listed twice.
+    #[tokio::test]
+    async fn a_broken_wrapped_manifest_archive_added_twice_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let patch = format!("Cool Mod/{}", patch_file_name());
+        let zip = src.path().join("Cool Mod.zip");
+        make_zip(&zip, &[("Cool Mod/manifest.json", b"{ broken"), (patch.as_str(), b"x")]);
+        install(&state, &zip).await.unwrap();
+        let msg = message(install(&state, &zip).await);
+        assert!(msg.contains("is already installed"), "{msg}");
+        assert_eq!(state.mods.lock().await.as_ref().unwrap().len(), 1);
+    }
+
+    /// An archive unpacked for an install that didn't finish is removed on
+    /// the next start; a folder that merely looks similar is not.
+    #[tokio::test]
+    async fn an_unfinished_unwrap_is_swept_at_startup() {
+        let base = tempfile::tempdir().unwrap();
+        let mods_root = base.path().join(MODS_DIRECTORY);
+        let leftover = mods_root.join(format!("{}{}", mod_folder::UNWRAP_PREFIX, Uuid::new_v4()));
+        write_v1_mod(&leftover.join("Cool Mod"), GUID_A, "Alpha");
+        let lookalike = mods_root.join(format!("{}mine", mod_folder::UNWRAP_PREFIX));
+        std::fs::create_dir_all(&lookalike).unwrap();
+        recover_leftover_folders(&mods_root).await;
+        assert!(!leftover.exists());
+        assert!(lookalike.is_dir());
+        assert!(load(base.path()).await.is_empty());
     }
 
     fn write_v1_mod(dir: &Path, guid: &str, name: &str) {

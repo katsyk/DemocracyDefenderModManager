@@ -349,6 +349,72 @@ const scenarios = {
             r.expect(!r.windowCalls.some(c => c.includes("destroy")), "the window is not closed meanwhile");
         },
     },
+    // An update gave the legacy mod (installed without its manifest.json)
+    // its author's ID: its entry moves to the new ID, keeping its place and
+    // on/off, with the options reset to fit; an old ID that's still a
+    // loaded mod's is left alone.
+    rename: {
+        async check(page, r) {
+            await page.evaluate(([oldGuid, newGuid, inUse]) => {
+                const res = window.__smokeResponses;
+                const i = res.get_mods.findIndex(m => m.Manifest.Guid === oldGuid);
+                res.get_mods[i] = { Manifest: { Version: 1, Guid: newGuid, Name: "Legacy mod", Description: "author's",
+                    Options: [{ Name: "Red", Description: "", Include: ["Red"] }, { Name: "Blue", Description: "", Include: ["Blue"] }] },
+                    Directory: "/data/mods/legacy", Sources: [] };
+                res.get_guid_renames = [[oldGuid, newGuid], [inUse, newGuid]];
+                window.__smokeEmit("bridge://mod-installed", { requestId: "r1", mod: { guid: newGuid, name: "Legacy mod" }, afterInstall: "library" });
+            }, [G(3), G(50), G(1)]);
+            await page.waitForTimeout(800);
+            r.expect(r.calls.some(c => c.cmd === "get_guid_renames"), "the page asks for the renames");
+            r.expect(await page.getByTestId("missing-mod-entry").count() === 1, "only the entry that was missing before is missing");
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            const configs = r.saves.at(-1)?.Profiles[0].Configs ?? [];
+            const moved = configs[2];
+            r.expect(configs.length === 5 && !configs.some(c => c.Guid === G(3)), `no entry keeps the old ID (${configs.map(c => c.Guid).join(", ")})`);
+            r.expect(moved?.Guid === G(50) && moved.Enabled === false, "the entry keeps its place and stays off");
+            r.expect(moved?.For === "V1" && JSON.stringify(moved.Toggled) === "[true,true]" && JSON.stringify(moved.Selected) === "[0,0]", `its options fit the author's (${JSON.stringify(moved)}; ${r.logs.filter(l => /new ID/.test(l.message)).map(l => l.message).join(" / ")})`);
+            r.expect(configs[0].Guid === G(1), "an old ID that's still loaded isn't renamed");
+        },
+    },
+    // An update changed a mod's options under its profile entry: Deploy
+    // resets its choices to fit, and that's what is saved afterwards.
+    deployfit: {
+        async check(page, r) {
+            await page.evaluate((guid) => {
+                const res = window.__smokeResponses;
+                const mod = res.get_mods.find(m => m.Manifest.Guid === guid);
+                mod.Manifest.Options = mod.Manifest.Options.slice(0, 2);
+                window.__smokeEmit("bridge://mod-installed", { requestId: "r1", mod: { guid, name: "V1 mod" }, afterInstall: "library" });
+            }, G(1));
+            await page.waitForTimeout(800);
+            // Waits for the "installed" toast over the button to go.
+            await page.locator("button.hd2mm-success-button", { hasText: "Deploy" }).click({ timeout: 10000 });
+            await page.waitForTimeout(800);
+            r.expect(r.calls.some(c => c.cmd === "deploy"), "Deploy ran");
+            // "Deployed, but 1 missing mod(s) were skipped".
+            await page.getByText("OK", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(400);
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            const entry = r.saves.at(-1)?.Profiles[0].Configs.find(c => c.Guid === G(1));
+            r.expect(JSON.stringify(entry?.Toggled) === "[true,true]", `the fitted options are saved (${JSON.stringify(entry)})`);
+        },
+    },
+    // Choices that don't fit the mod any more are reset when the page
+    // loads, and the reset ones are what's saved.
+    loadfit: {
+        data: (d) => { d.load_profiles.Profiles[0].Configs[0] = { For: "V1", Guid: G(1), Enabled: false, Toggled: [true, false], Selected: [0, 0] }; },
+        async check(page, r) {
+            r.expect(r.logs.some(l => l.message.includes("Options reset to defaults")), "the reset is logged");
+            await page.getByText("OK", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(400);
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            const entry = r.saves.at(-1)?.Profiles[0].Configs.find(c => c.Guid === G(1));
+            r.expect(JSON.stringify(entry?.Toggled) === "[true,true,true]" && entry?.Enabled === false, `the fitted options are saved (${JSON.stringify(entry)})`);
+        },
+    },
     // Init itself fails.
     initfail: {
         data: (d) => { d.load_profiles.Profiles = null; },

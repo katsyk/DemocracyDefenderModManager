@@ -268,6 +268,13 @@ export async function saveProfiles(config: ProfilesConfig): Promise<void> {
     await invoke<void>("save_profiles", { config });
 }
 
+/** Mods whose ID changed in an update this session, as [old, new] pairs
+ * (a mod installed without its manifest.json, updated with its author's). */
+export async function getGuidRenames(): Promise<[UUID, UUID][]> {
+    log.debug("Invoking `get_guid_renames`.");
+    return await invoke<[UUID, UUID][]>("get_guid_renames");
+}
+
 export async function loadSettings(): Promise<Settings> {
     log.debug("Invoking `load_settings`.");
     return await invoke<Settings>("load_settings");

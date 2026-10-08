@@ -12,13 +12,13 @@
     import { useLocalization } from "$lib/state/localization.svelte";
     import { Mod } from "$lib/models/mod";
     import type {Config, Profile, ProfilesConfig} from "$lib/models/profile";
-    import { defaultConfigFor, deployableEntries, fitConfig, removeDuplicateEntries, removeEntriesOf } from "$lib/utils/profileEntries";
+    import { defaultConfigFor, deployableEntries, fitConfig, removeDuplicateEntries, removeEntriesOf, renameEntries } from "$lib/utils/profileEntries";
     import {
         addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles,
         loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath,
         resolveBridgeConsent, resolveBridgeInstallCompletion, isGameRunning, forceExit, ackCloseRequested,
         setBridgeFrontendReady, getLastUpdateReport, skipUpdateVersion, browserExtensionActive,
-        detectImportSources, takePendingDeepLinks, type ImportSource,
+        detectImportSources, takePendingDeepLinks, getGuidRenames, type ImportSource,
         type UpdateStatusEntry, type UpdateCheckReport, type BridgeConsentDecision, type BridgeSoftError
     } from "$lib/utils/commands";
     import type { UUID } from "$lib/types/uuid";
@@ -390,6 +390,45 @@
         removeEntriesOf(profileConfigs, guid);
     }
 
+    /** After an update: a mod installed without its manifest.json (so with
+     * an ID of DDMM's own) and updated with its author's has the author's
+     * ID now. The backend moved its entries in profiles.json; move them
+     * here too (keeping on/off and position, resetting option choices that
+     * no longer fit), or the next save would list it as missing. */
+    async function applyGuidRenames() {
+        let renames: [UUID, UUID][] | null | undefined;
+        try {
+            renames = await getGuidRenames();
+        } catch (ex: unknown) {
+            log.warn(`Couldn't get the mods whose ID changed: ${errorMessage(ex)}`);
+            return;
+        }
+        if (!renames?.length || !profilesLoaded) return;
+        if (currentProfile) applyCurrentConfigChanges();
+        const moved: UUID[] = [];
+        for (const [oldGuid, newGuid] of renames) {
+            // An old ID that's a loaded mod's again stays its own.
+            if (mods.some(m => m.guid.toLowerCase() === oldGuid.toLowerCase())) continue;
+            for (const profile of profiles) {
+                switch (profile.Version) {
+                    case "V1":
+                        if (renameEntries(profile.Configs, oldGuid, newGuid) > 0 && !moved.includes(newGuid)) moved.push(newGuid);
+                        break;
+                }
+            }
+        }
+        if (moved.length === 0) return;
+        // Fitted in place: the shown list is the active profile's array.
+        for (const profile of profiles) {
+            profile.Configs.forEach((config, i) => {
+                const mod = moved.includes(config.Guid) ? mods.find(m => m.guid === config.Guid) : undefined;
+                if (mod) profile.Configs[i] = fitConfig(config, mod.Manifest).config;
+            });
+        }
+        log.info(`Moved the profile entries of ${moved.length} updated mod(s) to their new ID.`);
+        await refreshUpdateStatuses();
+    }
+
     function updatesFor(guid: UUID): UpdateStatusEntry[] {
         return updateStatuses.filter(u => u.Guid === guid);
     }
@@ -434,13 +473,16 @@
      * on/off and position; returns the names of the mods that were reset. */
     function fitProfilesToMods(allProfiles: Profile[], loaded: Mod[]): string[] {
         const reset: string[] = [];
+        // In place: the active profile's array is the list shown (and
+        // saved); replacing it would leave the list on the stale entries.
         for (const profile of allProfiles) {
-            profile.Configs = profile.Configs.map(config => {
+            profile.Configs.forEach((config, i) => {
                 const mod = loaded.find(m => m.guid === config.Guid);
-                if (!mod) return config;
+                if (!mod) return;
                 const fitted = fitConfig(config, mod.Manifest);
-                if (fitted.reset && !reset.includes(mod.name)) reset.push(mod.name);
-                return fitted.config;
+                if (!fitted.reset) return;
+                if (!reset.includes(mod.name)) reset.push(mod.name);
+                profile.Configs[i] = fitted.config;
             });
         }
         return reset;
@@ -678,6 +720,7 @@
                         mods[i] = result.mod;
                     }
                 }
+                await applyGuidRenames();
                 if (result.warning) showPopup(new NotificationPopup("warning", result.warning));
                 break;
             case "TimedOut":
@@ -730,6 +773,7 @@
         // before touching it.
         mods = await getMods();
         await refreshUpdateStatuses();
+        await applyGuidRenames();
         const mod = mods.find(m => m.guid === payload.mod.guid);
 
         let addedToProfile: string | undefined;
@@ -1220,6 +1264,7 @@
                 return "failed";
             }
             replaceMod(entry.Guid, result.mod);
+            await applyGuidRenames();
             if (result.warning) {
                 if (failures) failures.push(`${mod.name}: ${result.warning}`);
                 else showToast("warning", result.warning);
@@ -1244,6 +1289,7 @@
             switch (decision) {
                 case "Done":
                     mods = await getMods();
+                    await applyGuidRenames();
                     return "updatedByExtension";
                 case "Skip":
                     return "skipped";

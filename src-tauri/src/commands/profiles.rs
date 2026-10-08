@@ -1,7 +1,7 @@
 use anyhow_tauri::{IntoTAResult, TAResult};
 use tauri::State;
 
-use crate::{AppState, models::profile::{Profile, ProfilesConfig}};
+use crate::{AppState, models::{manifest::Manifest, profile::{Config, Profile, ProfilesConfig}}};
 
 const PROFILES_FILE: &'static str = "profiles.json";
 
@@ -79,12 +79,64 @@ pub async fn save_profiles(state: State<'_, AppState>, config: ProfilesConfig) -
         }
     }
 
-    let _saving = PROFILES_WRITE.lock().await;
-    write_profiles(&state.base_path, &config).await.into_ta_result()?;
+    save_profiles_mapped(&state, config).await.into_ta_result()?;
 
     log::info!("Profiles saved.");
 
     Ok(())
+}
+
+/// Write `config`, with entries still listing a mod by an ID it had before
+/// an update this session moved over to its new one. The renames are read
+/// only once the write lock is held: an update records its rename before
+/// it rewrites profiles.json under the same lock, so a save either runs
+/// first (and the update then moves what it wrote) or sees the rename.
+pub(crate) async fn save_profiles_mapped(state: &AppState, mut config: ProfilesConfig) -> anyhow::Result<()> {
+    let _saving = PROFILES_WRITE.lock().await;
+    let mut renames = state.guid_renames();
+    // An old ID that's a loaded mod's again isn't renamed. The mod list is
+    // only looked at when it's free: an install or update holding it may
+    // be waiting for this lock, and a rename it records is always applied.
+    if let Ok(mods) = state.mods.try_lock() {
+        if let Some(mods) = mods.as_ref() {
+            renames.retain(|(old, _)| !mods.iter().any(|m| m.guid() == *old));
+        }
+    }
+    apply_guid_renames(&mut config, &renames);
+    write_profiles(&state.base_path, &config).await
+}
+
+/// The mods whose ID changed in an update this session, as (old, new) in
+/// the order they happened. The Mods page moves its entries over with it.
+#[tauri::command]
+pub async fn get_guid_renames(state: State<'_, AppState>) -> TAResult<Vec<(uuid::Uuid, uuid::Uuid)>> {
+    Ok(state.guid_renames())
+}
+
+/// Move entries still listing a mod by an ID it had before an update this
+/// session (a page that hadn't caught up yet) over to its new ID.
+pub(crate) fn apply_guid_renames(config: &mut ProfilesConfig, renames: &[(uuid::Uuid, uuid::Uuid)]) {
+    if renames.is_empty() {
+        return;
+    }
+    let mut renamed = false;
+    for profile in &mut config.profiles {
+        match profile {
+            Profile::V1 { configs, .. } => {
+                for c in configs.iter_mut() {
+                    for (old, new) in renames {
+                        if c.uuid() == old {
+                            c.set_uuid(*new);
+                            renamed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if renamed {
+        remove_repeated_entries(config);
+    }
 }
 
 /// Take every entry of the mod `guid` out of every profile in the saved
@@ -112,6 +164,86 @@ pub async fn remove_from_saved_profiles(base_path: &std::path::Path, guid: uuid:
         write_profiles(base_path, &config).await?;
     }
     Ok(removed)
+}
+
+/// Move every entry of the mod `old` in the saved profiles.json over to
+/// `new` (the ID the mod has after an update), and return how many there
+/// were. On/off and position are kept; option choices that no longer fit
+/// `manifest` are reset to the defaults (see [`fit_config`]). A profile
+/// that already lists `new` keeps whichever entry comes first. Nothing is
+/// written when no profile has `old` (or there's no file yet).
+pub async fn migrate_saved_profiles(
+    base_path: &std::path::Path,
+    old: uuid::Uuid,
+    new: uuid::Uuid,
+    manifest: &Manifest,
+) -> anyhow::Result<usize> {
+    let _saving = PROFILES_WRITE.lock().await;
+    if !tokio::fs::try_exists(base_path.join(PROFILES_FILE)).await? {
+        return Ok(0);
+    }
+    let mut config = do_load_profiles(base_path).await?;
+    let mut moved = 0;
+    for profile in &mut config.profiles {
+        match profile {
+            Profile::V1 { configs, .. } => {
+                for c in configs.iter_mut().filter(|c| *c.uuid() == old) {
+                    *c = fit_config(c, new, manifest);
+                    moved += 1;
+                }
+            }
+        }
+    }
+    if moved > 0 {
+        remove_repeated_entries(&mut config);
+        write_profiles(base_path, &config).await?;
+    }
+    Ok(moved)
+}
+
+/// `config` for the mod `guid` whose manifest is `manifest`: its option
+/// choices when they still fit (same manifest version, same number of
+/// options, sub-option choices in range), else every option on and the
+/// first choice everywhere -- like a new entry, but keeping on/off.
+pub(crate) fn fit_config(config: &Config, guid: uuid::Uuid, manifest: &Manifest) -> Config {
+    let enabled = config.enabled();
+    let in_range = |i: usize, count: usize| i < count.max(1);
+    // Sub-option counts per option.
+    let subs: Option<Vec<usize>> = match manifest {
+        Manifest::Legacy(_) => None,
+        Manifest::V1(m) => Some(m.options.iter().flatten().map(|o| o.sub_options.as_ref().map_or(0, Vec::len)).collect()),
+        Manifest::V2(m) => Some(m.options.iter().flatten().map(|o| o.sub_options.as_ref().map_or(0, Vec::len)).collect()),
+    };
+    match (manifest, config) {
+        (Manifest::Legacy(m), Config::Legacy { selected, .. }) if in_range(*selected, m.options.as_ref().map_or(0, Vec::len)) => {
+            Config::Legacy { guid, enabled, selected: *selected }
+        }
+        (Manifest::Legacy(_), _) => Config::Legacy { guid, enabled, selected: 0 },
+        (_, Config::V1 { toggled, selected, .. }) | (_, Config::V2 { toggled, selected, .. }) => {
+            let subs = subs.unwrap_or_default();
+            let same_version = matches!((manifest, config), (Manifest::V1(_), Config::V1 { .. }) | (Manifest::V2(_), Config::V2 { .. }));
+            let fits = same_version
+                && toggled.len() == subs.len()
+                && selected.len() == subs.len()
+                && selected.iter().zip(&subs).all(|(s, n)| in_range(*s, *n));
+            if fits {
+                with_version(manifest, guid, enabled, toggled.clone(), selected.clone())
+            } else {
+                with_version(manifest, guid, enabled, vec![true; subs.len()], vec![0; subs.len()])
+            }
+        }
+        (_, Config::Legacy { .. }) => {
+            let n = subs.map_or(0, |s| s.len());
+            with_version(manifest, guid, enabled, vec![true; n], vec![0; n])
+        }
+    }
+}
+
+fn with_version(manifest: &Manifest, guid: uuid::Uuid, enabled: bool, toggled: Vec<bool>, selected: Vec<usize>) -> Config {
+    match manifest {
+        Manifest::V2(_) => Config::V2 { guid, enabled, toggled, selected },
+        _ => Config::V1 { guid, enabled, toggled, selected },
+    }
 }
 
 /// Held while profiles.json is written (or read to be rewritten), so a
@@ -158,6 +290,49 @@ mod tests {
         let guids: Vec<String> = configs.iter().map(|c| c.uuid().to_string()).collect();
         assert_eq!(guids, [A, B]);
         assert!(!configs[0].enabled());
+    }
+
+    /// A save that started before an update recorded its rename, but got
+    /// the write lock after it, still writes the new ID.
+    #[tokio::test]
+    async fn a_save_reads_the_renames_once_it_holds_the_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = std::sync::Arc::new(crate::AppState::new(dir.path().to_path_buf()));
+        let (a, b) = (uuid::Uuid::parse_str(A).unwrap(), uuid::Uuid::parse_str(B).unwrap());
+        let held = PROFILES_WRITE.lock().await;
+        let save = {
+            let state = state.clone();
+            tokio::spawn(async move { save_profiles_mapped(&state, profiles_with(&[A])).await })
+        };
+        tokio::task::yield_now().await;
+        state.record_guid_rename(a, b);
+        drop(held);
+        save.await.unwrap().unwrap();
+        let loaded = do_load_profiles(dir.path()).await.unwrap();
+        assert_eq!(loaded.profiles[0].configs()[0].uuid(), &b);
+    }
+
+    /// An old ID that is a loaded mod's again is left alone.
+    #[tokio::test]
+    async fn a_rename_whose_old_id_is_back_in_use_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::AppState::new(dir.path().to_path_buf());
+        let (a, b) = (uuid::Uuid::parse_str(A).unwrap(), uuid::Uuid::parse_str(B).unwrap());
+        state.record_guid_rename(a, b);
+        *state.mods.lock().await = Some(vec![crate::models::Mod {
+            manifest: Manifest::Legacy(crate::models::manifest::legacy::Manifest {
+                guid: a,
+                name: "A".into(),
+                description: String::new(),
+                icon_path: None,
+                options: None,
+            }),
+            directory: dir.path().join("A"),
+            sources: Vec::new(),
+        }]);
+        save_profiles_mapped(&state, profiles_with(&[A])).await.unwrap();
+        let loaded = do_load_profiles(dir.path()).await.unwrap();
+        assert_eq!(loaded.profiles[0].configs()[0].uuid(), &a);
     }
 
     /// Saves and a delete's removal running at once (all without the

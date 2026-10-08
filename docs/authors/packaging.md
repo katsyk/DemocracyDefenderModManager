@@ -82,6 +82,34 @@ my-mod/
     `Categories` and `Tags` for organizing options in the editor and on the mod's card. See
     [Manifest reference](manifest.md#v2).
 
+## Zipping the folder or its contents
+
+Zip your mod's contents so `manifest.json` sits at the archive's root. Zipping the mod's folder itself also works:
+when an archive (or a folder added with Add Folder) has no `manifest.json` at its root, DDMM looks inside, and if
+the root holds just one folder, it uses the `manifest.json` in that folder. It looks up to 3 folders deep, so
+`My Mod v1.2/My Mod/manifest.json` works too.
+
+```text
+my-mod.zip
+├── __MACOSX/              (ignored)
+├── readme.txt             (not installed)
+└── My Mod/                (becomes the mod's root)
+    ├── manifest.json
+    └── hud/
+        └── ...
+```
+
+That folder then becomes the mod's root: only its contents are installed, and every path in your manifest
+(`Include`, `Image`, `IconPath`) is relative to it, exactly as you wrote them. Files that operating systems add
+(`__MACOSX`, `.DS_Store`, `Thumbs.db`, `desktop.ini`) don't count as a second folder. Anything else next to the
+folder, such as a readme, isn't installed.
+
+DDMM doesn't look inside the folder when the archive's root has:
+
+- a `manifest.json` (that one is used),
+- two or more folders,
+- patch files.
+
 ## Icons and option images
 
 `IconPath` (on the manifest) and `Image` (on an option or sub-option) are paths relative to the mod root, pointing

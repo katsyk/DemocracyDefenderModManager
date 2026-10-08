@@ -19,6 +19,7 @@ pub mod nexus_oauth;
 pub mod mod_import;
 pub mod install_error;
 pub mod mod_folder;
+pub(crate) mod mod_root;
 
 use std::{
     path::PathBuf,
@@ -96,6 +97,12 @@ pub struct AppState {
     last_update_report: Mutex<Option<commands::updates::UpdateCheckReport>>,
     /// When the latest update check ran (for the opt-in re-check interval).
     last_update_check: Mutex<Option<tokio::time::Instant>>,
+    /// Mods whose ID changed in an update this session, as (old, new): a
+    /// mod installed without its manifest.json (a generated ID) updated
+    /// with its author's. profiles.json is moved over at once; the Mods
+    /// page moves its own copy (`get_guid_renames`), and saving maps any
+    /// old ID it still sends.
+    guid_renames: std::sync::Mutex<Vec<(uuid::Uuid, uuid::Uuid)>>,
     /// When the browser extension last talked to this session (any bridge
     /// request) -- decides whether a browser update can finish with the
     /// extension's "Update with DDMM" button.
@@ -154,11 +161,23 @@ impl AppState {
             update_check_lock: Mutex::new(()),
             last_update_report: Mutex::default(),
             last_update_check: Mutex::default(),
+            guid_renames: std::sync::Mutex::default(),
             bridge_last_seen: Mutex::default(),
             nexus_sign_in_cancel: Mutex::default(),
             import_cancel: std::sync::Mutex::default(),
             import_scan: Mutex::default(),
             deep_links: std::sync::Mutex::default(),
+        }
+    }
+
+    /// See [`AppState::guid_renames`] (the field).
+    pub(crate) fn guid_renames(&self) -> Vec<(uuid::Uuid, uuid::Uuid)> {
+        self.guid_renames.lock().map(|r| r.clone()).unwrap_or_default()
+    }
+
+    pub(crate) fn record_guid_rename(&self, old: uuid::Uuid, new: uuid::Uuid) {
+        if let Ok(mut renames) = self.guid_renames.lock() {
+            renames.push((old, new));
         }
     }
 
@@ -484,6 +503,7 @@ pub fn run() {
             commands::nexus::nexus_sign_out,
             commands::profiles::load_profiles,
             commands::profiles::save_profiles,
+            commands::profiles::get_guid_renames,
             commands::settings::load_settings,
             commands::settings::save_settings,
             commands::settings::check_settings,
