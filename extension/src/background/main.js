@@ -198,6 +198,10 @@
 
   api.downloads.onChanged.addListener((delta) => {
     const changed = DDMM.downloadsAdapter.normalizeChangedDelta(delta);
+    if (changed.state === 'interrupted') {
+      reportInterruptedDirectDownload(changed.id);
+      return;
+    }
     if (changed.state !== 'complete') return;
 
     handleCompletedDownload(changed.id).catch(() => {
@@ -206,6 +210,25 @@
       // in an event listener.
     });
   });
+
+  /** The reply a tab gets when the download it started never finished. */
+  function downloadFailedReply(message) {
+    return { ok: false, error: { code: 'DOWNLOAD_FAILED', message: message || '' } };
+  }
+
+  /**
+   * A download we started for a tab's "Install with DDMM" click was
+   * cancelled or failed: tell the tab, so its button doesn't stay on
+   * "Installing…" for good. The context is kept, so a download the user
+   * resumes from the browser's downloads list still installs.
+   * @param {number} downloadId
+   */
+  function reportInterruptedDirectDownload(downloadId) {
+    const context = directDownloads.get(downloadId);
+    if (context && context.tabId != null) {
+      sendToTab(context.tabId, { type: 'ddmm:installResult', reply: downloadFailedReply() });
+    }
+  }
 
   /** @param {number} downloadId */
   async function handleCompletedDownload(downloadId) {
@@ -422,12 +445,21 @@
 
       case 'ddmm:installDirect': {
         const tabId = sender.tab ? sender.tab.id : null;
-        const downloadId = await startDirectDownload(message.url, {
-          pageUrl: message.pageUrl ?? null,
-          pageVersion: message.pageVersion ?? null,
-          tabId,
-        });
-        return { ok: true, downloadId };
+        try {
+          const downloadId = await startDirectDownload(message.url, {
+            pageUrl: message.pageUrl ?? null,
+            pageVersion: message.pageVersion ?? null,
+            tabId,
+          });
+          return { ok: true, downloadId };
+        } catch (e) {
+          // The browser refused or the user cancelled the save dialog
+          // (Firefox rejects then): no download will ever complete, so the
+          // tab hears it now instead of waiting on "Installing…".
+          const reply = downloadFailedReply(e && e.message);
+          if (tabId != null) sendToTab(tabId, { type: 'ddmm:installResult', reply });
+          return reply;
+        }
       }
 
       case 'ddmm:armCapture': {
