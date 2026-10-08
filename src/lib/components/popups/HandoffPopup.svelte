@@ -63,6 +63,25 @@
                 }
             });
 
+            // Shown again after another popup covered it: the handoff is
+            // still running (a second start would fail with "a handoff is
+            // already in progress"), and the page is already open.
+            if (popup.started) return;
+            popup.started = true;
+
+            // How the handoff ends is heard even while this popup is covered
+            // (unmounted), for as long as the popup is open: otherwise a
+            // download finished meanwhile left it "Waiting..." for good.
+            const unlistenEnd = await listen<HandoffEventPayload>("handoff", (event) => {
+                const payload = event.payload;
+                if (payload.Status === "Done" && payload.Mod) {
+                    popup.close({ status: "Done", mod: rawModToMod(payload.Mod), warning: payload.Warning });
+                } else if (payload.Status === "Cancelled" || payload.Status === "TimedOut") {
+                    popup.close({ status: payload.Status });
+                }
+            });
+            popup.promise.finally(unlistenEnd);
+
             try {
                 await openUrl(popup.pageUrl);
             } catch {

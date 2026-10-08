@@ -141,6 +141,10 @@ export type HandoffResult =
  */
 export class HandoffPopup extends Popup<HandoffResult> {
     component = HandoffPopupComponent;
+    /** Set once the page has been opened and the handoff started, so
+     * re-mounting the popup (another popup shown on top and closed again)
+     * never does either twice. */
+    started = false;
 
     constructor(
         public readonly pageUrl: string,

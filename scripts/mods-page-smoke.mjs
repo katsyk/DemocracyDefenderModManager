@@ -209,6 +209,33 @@ const scenarios = {
             r.expect(r.windowCalls.some(c => c.includes("destroy")), "the window is closed");
         },
     },
+    // A browser handoff with another popup shown on top of it for a while
+    // (here the extension asking to install): the page is opened and the
+    // handoff started once, not again when the handoff shows again.
+    handoffcover: {
+        data: (d) => { d.classify_download_url = { Provider: "nexus", DisplayName: "Nexus Mods", RequiresHandoff: true }; },
+        async check(page, r) {
+            await page.locator("button", { hasText: "Add URL" }).click({ timeout: 2000 });
+            await page.locator("#input").fill("https://www.nexusmods.com/helldivers2/mods/1");
+            await page.getByText("Confirm", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            await page.evaluate(() => window.__smokeEmit("bridge://consent-request", { requestId: "1", site: "example.com" }));
+            await page.waitForTimeout(300);
+            await page.getByText("Deny", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(r.calls.filter(c => c.cmd === "start_handoff").length === 1, "the handoff is started once");
+            r.expect(r.pluginCalls.filter(c => c === "plugin:opener|open_url").length === 1, "the page is opened once");
+            // The download lands while another popup covers the handoff.
+            await page.evaluate(() => window.__smokeEmit("bridge://consent-request", { requestId: "2", site: "example.com" }));
+            await page.waitForTimeout(300);
+            await page.evaluate((g) => window.__smokeEmit("handoff", { Status: "Done", Mod: { Manifest: { Version: 1, Guid: g, Name: "Handed-off mod", Description: "", Options: [] }, Directory: "/data/mods/h" } }), G(6));
+            await page.waitForTimeout(300);
+            await page.getByText("Deny", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(await page.getByText("Waiting for the download", { exact: false }).count() === 0
+                && await page.locator("button", { hasText: "Choose File" }).count() === 0, "the handoff popup is closed");
+        },
+    },
     // Init itself fails.
     initfail: {
         data: (d) => { d.load_profiles.Profiles = null; },
@@ -237,12 +264,13 @@ for (const name of process.argv.length > 2 ? process.argv.slice(2) : Object.keys
     const data = fixture();
     s.data?.(data);
     const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
-    const r = { logs: [], saves: [], calls: [], windowCalls: [], errors: [], results: [], expect(ok, what) { this.results.push([!!ok, what]); } };
+    const r = { logs: [], saves: [], calls: [], windowCalls: [], pluginCalls: [], errors: [], results: [], expect(ok, what) { this.results.push([!!ok, what]); } };
     page.on("pageerror", e => r.errors.push(e.message));
     await page.exposeFunction("__smokeLog", (level, message) => r.logs.push({ level, message }));
     await page.exposeFunction("__smokeSave", (config) => r.saves.push(config));
     await page.exposeFunction("__smokeCall", (cmd, args) => r.calls.push({ cmd, args }));
     await page.exposeFunction("__smokeWindowCall", (cmd) => r.windowCalls.push(cmd));
+    await page.exposeFunction("__smokePluginCall", (cmd) => r.pluginCalls.push(cmd));
     await page.addInitScript((responses) => {
         let next = 1;
         window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
@@ -254,11 +282,17 @@ for (const name of process.argv.length > 2 ? process.argv.slice(2) : Object.keys
             async invoke(cmd, args) {
                 if (cmd === "plugin:log|log") return void window.__smokeLog(args.level, args.message);
                 if (cmd.startsWith("plugin:event|listen")) {
-                    (window.__smokeListeners ??= {})[args.event] = args.handler;
-                    return next++;
+                    const id = next++;
+                    (window.__smokeListeners ??= []).push({ id, event: args.event, handler: args.handler });
+                    return id;
+                }
+                if (cmd === "plugin:event|unlisten") {
+                    window.__smokeListeners = (window.__smokeListeners ?? []).filter(l => l.id !== args.eventId);
+                    return;
                 }
                 if (!cmd.startsWith("plugin:")) window.__smokeCall(cmd, args ?? null);
                 if (cmd.startsWith("plugin:window|")) window.__smokeWindowCall(cmd);
+                if (cmd.startsWith("plugin:") && !cmd.startsWith("plugin:log|")) window.__smokePluginCall(cmd);
                 if (cmd in (responses.__fails ?? {})) throw responses.__fails[cmd];
                 if (cmd === "save_profiles") return void window.__smokeSave(JSON.parse(JSON.stringify(args.config)));
                 if (!(cmd in responses)) return null;
@@ -271,7 +305,10 @@ for (const name of process.argv.length > 2 ? process.argv.slice(2) : Object.keys
             },
         };
         window.__smokeResponses = responses;
-        window.__smokeEmit = (event, payload) => window[`_${window.__smokeListeners[event]}`]({ event, id: 0, payload });
+        // Doesn't wait for the handler (it may be waiting for a popup).
+        window.__smokeEmit = (event, payload) => {
+            for (const l of (window.__smokeListeners ?? []).filter(l => l.event === event)) window[`_${l.handler}`]({ event, id: l.id, payload });
+        };
     }, data);
     await page.goto(`http://127.0.0.1:${server.address().port}/`);
     await page.waitForTimeout(1500);
