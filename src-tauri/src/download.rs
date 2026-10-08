@@ -76,7 +76,8 @@ pub async fn download_archive_with_progress(
         .with_context(|| format!("failed to create download staging directory {:?}", temp_dir))?;
 
     let client = download_client(STALL_TIMEOUT)?;
-    match download_archive_into(&client, &parsed, &temp_dir, &mut progress).await {
+    let min_rate = MinThroughput::new(THROUGHPUT_WINDOW, MIN_BYTES_PER_WINDOW, std::time::Instant::now());
+    match download_archive_into(&client, &parsed, &temp_dir, &mut progress, min_rate).await {
         Ok(path) => Ok(DownloadedArchive { path, temp_dir }),
         Err(e) => {
             let _ = tokio::fs::remove_dir_all(&temp_dir).await;
@@ -89,11 +90,55 @@ pub async fn download_archive_with_progress(
 /// given up as stalled.
 const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The HTTP client for archive downloads. There is deliberately no deadline
-/// for the whole download: a large mod on a slow connection can take far
-/// longer than any fixed limit and still be making progress. Only a
-/// connection that can't be made, or that stops sending for
-/// `stall_timeout`, fails.
+/// The slowest a download may be: at least [`MIN_BYTES_PER_WINDOW`] in
+/// every [`THROUGHPUT_WINDOW`] (64 KiB in 5 minutes, about 220 bytes/s).
+/// Together with [`STALL_TIMEOUT`] this bounds a download that trickles a
+/// byte at a time and so never stalls outright -- which otherwise holds its
+/// data operation (and blocks a data folder move) indefinitely -- without
+/// a fixed deadline that would cut off a large mod on a slow connection.
+const THROUGHPUT_WINDOW: Duration = Duration::from_secs(5 * 60);
+const MIN_BYTES_PER_WINDOW: u64 = 64 * 1024;
+
+/// Enforces a minimum download rate: at least `min_bytes` per `window`,
+/// checked as each chunk arrives (a connection that sends nothing at all
+/// is the client's read timeout's job).
+#[derive(Debug, Clone, Copy)]
+struct MinThroughput {
+    window: Duration,
+    min_bytes: u64,
+    window_start: std::time::Instant,
+    bytes: u64,
+}
+
+impl MinThroughput {
+    fn new(window: Duration, min_bytes: u64, now: std::time::Instant) -> Self {
+        MinThroughput { window, min_bytes, window_start: now, bytes: 0 }
+    }
+
+    /// Count `n` bytes received at `now`; an error once a whole window
+    /// went by with fewer than `min_bytes`.
+    fn record(&mut self, n: u64, now: std::time::Instant) -> anyhow::Result<()> {
+        self.bytes = self.bytes.saturating_add(n);
+        if now.duration_since(self.window_start) >= self.window {
+            if self.bytes < self.min_bytes {
+                anyhow::bail!(
+                    "the download is too slow: only {} bytes arrived in {} seconds",
+                    self.bytes,
+                    self.window.as_secs()
+                );
+            }
+            self.window_start = now;
+            self.bytes = 0;
+        }
+        Ok(())
+    }
+}
+
+/// The HTTP client for archive downloads. There is deliberately no fixed
+/// deadline for the whole download: a large mod on a slow connection can
+/// take far longer than any fixed limit and still be making progress. A
+/// connection that can't be made, that stops sending for `stall_timeout`,
+/// or that falls below the minimum rate ([`MinThroughput`]) fails.
 fn download_client(stall_timeout: Duration) -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .user_agent(crate::providers::user_agent())
@@ -108,6 +153,7 @@ async fn download_archive_into(
     url: &reqwest::Url,
     temp_dir: &Path,
     progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+    mut min_rate: MinThroughput,
 ) -> anyhow::Result<PathBuf> {
 
     // `without_url()`: reqwest errors embed the full URL, and direct CDN
@@ -115,10 +161,10 @@ async fn download_archive_into(
     // string. Errors are now shown to the user and written to the log, so
     // name the host instead.
     let host = url.host_str().unwrap_or("the server").to_string();
-    let response = client
-        .get(url.clone())
-        .send()
+    // The response headers must arrive within one throughput window too.
+    let response = tokio::time::timeout(min_rate.window, client.get(url.clone()).send())
         .await
+        .map_err(|_| anyhow::anyhow!("couldn't reach {}: it didn't answer in {} seconds", host, min_rate.window.as_secs()))?
         .map_err(|e| anyhow::anyhow!("couldn't reach {}: {}", host, e.without_url()))?;
     let response = response
         .error_for_status()
@@ -152,6 +198,9 @@ async fn download_archive_into(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| anyhow::anyhow!("download from {} failed: {}", host, e.without_url()))?;
         total += chunk.len() as u64;
+        min_rate
+            .record(chunk.len() as u64, std::time::Instant::now())
+            .map_err(|e| anyhow::anyhow!("download from {host} failed: {e}"))?;
         if total > MAX_DOWNLOAD_SIZE {
             anyhow::bail!(
                 "download exceeded the {} byte limit while streaming",
@@ -452,7 +501,7 @@ mod tests {
         // Each gap (300 ms) is well inside the stall timeout, the whole
         // download (about 1.8 s) is well past it.
         let client = download_client(Duration::from_secs(1)).unwrap();
-        let path = download_archive_into(&client, &url, staging.path(), &mut |_, _| {})
+        let path = download_archive_into(&client, &url, staging.path(), &mut |_, _| {}, generous_rate())
             .await
             .expect("a download that keeps moving must finish");
         assert_eq!(path.file_name().unwrap(), "mod.zip");
@@ -464,8 +513,47 @@ mod tests {
         let url = slow_zip_server(2, Duration::from_secs(3)).await;
         let staging = tempfile::tempdir().unwrap();
         let client = download_client(Duration::from_millis(500)).unwrap();
-        let result = download_archive_into(&client, &url, staging.path(), &mut |_, _| {}).await;
+        let result = download_archive_into(&client, &url, staging.path(), &mut |_, _| {}, generous_rate()).await;
         assert!(result.is_err(), "a download that stops sending must fail");
+    }
+
+    /// A rate floor no test download comes near.
+    fn generous_rate() -> MinThroughput {
+        MinThroughput::new(Duration::from_secs(60), 1, std::time::Instant::now())
+    }
+
+    /// A server that keeps sending a little, often enough never to trip
+    /// the read timeout, must still be given up on once it falls below the
+    /// minimum rate.
+    #[tokio::test]
+    async fn a_trickling_download_fails_on_the_rate_floor() {
+        // ~4.2 KB zip in 40 pieces, one every 100 ms: about 4 s in all.
+        let url = slow_zip_server(40, Duration::from_millis(100)).await;
+        let staging = tempfile::tempdir().unwrap();
+        let client = download_client(Duration::from_secs(2)).unwrap();
+        // At least 1 MiB per 500 ms: far more than the trickle delivers.
+        let floor = MinThroughput::new(Duration::from_millis(500), 1024 * 1024, std::time::Instant::now());
+        let err = download_archive_into(&client, &url, staging.path(), &mut |_, _| {}, floor)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("too slow"), "{err:#}");
+    }
+
+    #[test]
+    fn min_throughput_judges_each_window() {
+        let start = std::time::Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        let mut rate = MinThroughput::new(Duration::from_secs(300), 64 * 1024, start);
+        // Within the first window nothing is judged yet.
+        rate.record(1, at(59)).unwrap();
+        rate.record(64 * 1024, at(299)).unwrap();
+        // Window over with enough bytes: a new window starts.
+        rate.record(0, at(300)).unwrap();
+        // One byte a minute for the next window: too slow.
+        for minute in 1..5 {
+            rate.record(1, at(300 + minute * 60)).unwrap();
+        }
+        assert!(rate.record(1, at(600)).is_err());
     }
 
     /// Real network smoke test for the whole pipeline. Intentionally
