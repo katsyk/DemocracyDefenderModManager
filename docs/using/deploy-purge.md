@@ -43,7 +43,9 @@ Clicking **Purge** (tip: "Uninstall all mods from the game.") asks for confirmat
 uninstall all mods from the game?"), then deletes **every** file in `<Game Path>/data/` that matches the
 `<16 hex chars>.patch_N[.gpu_resources|.stream]` naming pattern — not just files DDMM itself deployed. This is
 what "clean" means for deploy, and it's also available on its own if you just want your install back to a vanilla
-state without deploying a new selection.
+state without deploying a new selection. The one exception is slot `0` of a patch name in your
+[Skip List](settings.md#skip-list): that `.patch_0` (and its `.gpu_resources`/`.stream`) belongs to the game, so
+purge leaves it in place.
 
 Purge only removes files matching that pattern; the rest of your `data` folder (and your game install as a whole)
 is left alone.

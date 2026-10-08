@@ -4,7 +4,7 @@ use anyhow_tauri::{IntoTAResult, TAResult};
 use regex::Regex;
 use tauri::State;
 
-use crate::{AppState, commands::settings::do_load_settings, models::{manifest::Manifest, profile::Config, Mod}, utils::is_patch_filename};
+use crate::{AppState, commands::settings::do_load_settings, models::{manifest::Manifest, profile::Config, settings::Settings, Mod}, utils::is_patch_filename};
 
 pub mod mods;
 pub mod profiles;
@@ -141,10 +141,27 @@ async fn create_empty_patch_file(dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn do_purge(data_dir: &Path) -> anyhow::Result<()> {
+/// Whether `file` (a patch file in the game's `data` folder) is slot 0 of a
+/// patch name in the Skip List: the base game's or a DLC's own file, which
+/// deploy numbers around (it starts that name at `.patch_1`) and purge
+/// must leave alone.
+fn is_skip_listed_slot_zero(file: &Path, settings: &Settings) -> bool {
+    let Some(name) = file.file_name().and_then(|n| n.to_str()) else { return false };
+    let Some((prefix, rest)) = name.split_at_checked(16) else { return false };
+    matches!(rest, ".patch_0" | ".patch_0.gpu_resources" | ".patch_0.stream") && settings.has_skip_entry(prefix)
+}
+
+async fn do_purge(data_dir: &Path, settings: &Settings) -> anyhow::Result<()> {
     log::info!("Purging...");
 
-    let patch_files = get_patch_files_from_dir(data_dir).await?;
+    let mut patch_files = get_patch_files_from_dir(data_dir).await?;
+    patch_files.retain(|f| {
+        let keep = is_skip_listed_slot_zero(f, settings);
+        if keep {
+            log::info!("Keeping {:?}: its patch name is in the Skip List.", f);
+        }
+        !keep
+    });
 
     log::info!("Deleting files...");
     futures::future::try_join_all(patch_files.iter().map(|f| async move {
@@ -325,7 +342,7 @@ pub async fn deploy(state: State<'_, AppState>, configs: Vec<Config>) -> TAResul
     let data_dir = game_root.join("data");
     crate::commands::settings::check_game_data_dir(&state.base_path, &data_dir).into_ta_result()?;
 
-    do_purge(&data_dir).await?;
+    do_purge(&data_dir, &settings).await?;
 
     log::info!("Deploying...");
 
@@ -394,7 +411,7 @@ pub async fn purge(state: State<'_, AppState>) -> TAResult<()> {
 
     let data_dir = game_root.join("data");
     crate::commands::settings::check_game_data_dir(&state.base_path, &data_dir).into_ta_result()?;
-    do_purge(&data_dir).await.into_ta_result()
+    do_purge(&data_dir, &settings).await.into_ta_result()
 }
 
 /// Last-resort way to close the app from the frontend.
@@ -700,6 +717,44 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(groups.is_empty());
+    }
+
+    /// The Skip List marks patch names whose `.patch_0` is the game's own
+    /// file (deploy starts those names at `.patch_1`). Purge, and so the
+    /// purge every deploy starts with, must leave that slot 0 alone; every
+    /// other patch file, including the skip-listed name's higher slots, goes.
+    #[tokio::test]
+    async fn purge_keeps_skip_listed_slot_zero_files() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"Version":"V1","GamePath":"","SkipList":["0123456789abcdef"]}"#,
+        )
+        .unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let kept = [
+            "0123456789abcdef.patch_0",
+            "0123456789abcdef.patch_0.gpu_resources",
+            "0123456789abcdef.patch_0.stream",
+            "game.bin",
+        ];
+        let purged = [
+            "0123456789abcdef.patch_1",
+            "0123456789abcdef.patch_1.stream",
+            "0123456789abcdef.patch_10",
+            "fedcba9876543210.patch_0",
+            "fedcba9876543210.patch_0.gpu_resources",
+        ];
+        for name in kept.iter().chain(purged.iter()) {
+            tokio::fs::write(data.path().join(name), b"x").await.unwrap();
+        }
+
+        do_purge(data.path(), &settings).await.unwrap();
+
+        for name in kept {
+            assert!(data.path().join(name).exists(), "{name} must be kept");
+        }
+        for name in purged {
+            assert!(!data.path().join(name).exists(), "{name} must be purged");
+        }
     }
 
     fn legacy_mod(guid: &str, dir: &std::path::Path) -> (Mod, Config) {
