@@ -88,6 +88,18 @@ only recognizes archive files (`.zip`, `.7z`, `.rar`) from that site (including 
 domains). If your download is a different format, use the right-click **Install with DDMM** on the
 link, or add the file manually in DDMM.
 
+**"The download didn't finish, so nothing was installed":** The browser download was cancelled
+(for example by closing the "Save as" dialog), failed, or was blocked by the browser, so DDMM never
+got a file. Click the button again to retry. If you resume the download from your browser's
+downloads list instead, DDMM still installs it once it finishes. For a right-clicked link to a
+different mod than the page you're on, this message appears as a notification instead of on the
+page's button.
+
+**Auto-capture results:** An auto-captured install shows its result on the button of that mod's own
+page, when DDMM can tell which page it came from. Otherwise, for example when the file came from a
+CDN with no link back to a mod page, the result appears only as a notification, and other open
+pages of the site just re-check their own status.
+
 ## How it works
 
 1. You click **Install with DDMM** (or **Update with DDMM**, if a newer version is available) on a supported mod

@@ -192,7 +192,25 @@
    */
   async function startDirectDownload(url, context) {
     const downloadId = await api.downloads.download({ url });
+    // A new click for the same file from the same tab supersedes the old
+    // download, and one for the same mod supersedes a failed one: only the
+    // newest is installed and reported.
+    if (context.tabId != null) {
+      for (const [id, old] of directDownloads) {
+        if (old.tabId === context.tabId && old.pageUrl === context.pageUrl && (old.downloadUrl === url || old.interrupted)) {
+          directDownloads.delete(id);
+        }
+      }
+    }
     directDownloads.set(downloadId, { ...context, downloadUrl: url });
+    // It may already have failed before it was registered here (the
+    // onChanged event then found no context): check once.
+    try {
+      const [item] = await api.downloads.search({ id: downloadId });
+      if (item && item.state === 'interrupted') reportInterruptedDirectDownload(downloadId);
+    } catch {
+      // Best effort; onChanged still covers anything later.
+    }
     return downloadId;
   }
 
@@ -220,13 +238,19 @@
    * A download we started for a tab's "Install with DDMM" click was
    * cancelled or failed: tell the tab, so its button doesn't stay on
    * "Installing…" for good. The context is kept, so a download the user
-   * resumes from the browser's downloads list still installs.
+   * resumes from the browser's downloads list still installs. Reported
+   * once per download.
    * @param {number} downloadId
    */
   function reportInterruptedDirectDownload(downloadId) {
     const context = directDownloads.get(downloadId);
-    if (context && context.tabId != null) {
+    if (!context || context.interrupted) return;
+    context.interrupted = true;
+    if (context.tabId != null) {
       sendToTab(context.tabId, { type: 'ddmm:installResult', reply: downloadFailedReply() });
+    } else {
+      // No button is waiting on it (a right-clicked link to another mod).
+      notify('DDMM install failed', DDMM.errors.describeError('DOWNLOAD_FAILED'));
     }
   }
 
@@ -385,7 +409,9 @@
     return {
       pageUrl: attribution.pageUrl,
       pageVersion: sendableVersion(attribution, tabUrl),
-      tabId: tab && tab.id != null ? tab.id : null,
+      // Only the page's own mod reports back to the page: its button is
+      // about that mod, and another mod's result there would mislabel it.
+      tabId: attribution.sameModAsPage && tab && tab.id != null ? tab.id : null,
     };
   }
 

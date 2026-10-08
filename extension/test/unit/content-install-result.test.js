@@ -10,6 +10,8 @@ import { beforeAll, describe, expect, it } from 'vitest';
 
 const onMessage = [];
 const sent = [];
+/** The button's click listener: jsdom can't make a trusted click, so tests call it directly. */
+let clickListener;
 let installed = false;
 
 beforeAll(async () => {
@@ -19,11 +21,17 @@ beforeAll(async () => {
         sent.push(msg.type);
         if (msg.type === 'ddmm:hello') return { ok: true };
         if (msg.type === 'ddmm:query') return { ok: true, installed };
+        if (msg.type === 'ddmm:armCapture') return { ok: true, claimed: false };
         return { ok: true };
       },
       onMessage: { addListener: (fn) => onMessage.push(fn) },
     },
     storage: { local: {} },
+  };
+  const addEventListener = EventTarget.prototype.addEventListener;
+  EventTarget.prototype.addEventListener = function patched(type, fn, opts) {
+    if (type === 'click' && this.classList && this.classList.contains('ddmm-btn')) clickListener = fn;
+    return addEventListener.call(this, type, fn, opts);
   };
   for (const lib of ['browser-shim.js', 'sources.js', 'errors.js', 'button-state.js', 'capture.js']) {
     await import(`../../src/lib/${lib}`);
@@ -71,5 +79,29 @@ describe('install results sent to every tab of a site', () => {
     deliver({ type: 'ddmm:installResult', reply: { ok: false, error: { code: 'DECLINED' } } });
     await flush();
     expect(label()).toBe('You chose not to install this mod.');
+  });
+});
+
+describe('while this tab waits on its own install', () => {
+  const OTHER = 'https://www.nexusmods.com/helldivers2/mods/999';
+
+  it("another mod's broadcast neither re-checks nor changes the button", async () => {
+    await clickListener({ isTrusted: true });
+    await flush();
+    expect(label()).toBe('Click Download on this page…');
+    const before = sent.length;
+    deliver({ type: 'ddmm:installResult', broadcast: true, pageUrl: OTHER, reply: { ok: true, type: 'installed' } });
+    await flush();
+    expect(label()).toBe('Click Download on this page…');
+    expect(sent.length).toBe(before);
+  });
+
+  it("another mod's broadcast capture doesn't move it to Installing, its own does", async () => {
+    deliver({ type: 'ddmm:captureStarted', site: 'nexus', broadcast: true, pageUrl: OTHER });
+    await flush();
+    expect(label()).toBe('Click Download on this page…');
+    deliver({ type: 'ddmm:captureStarted', site: 'nexus', broadcast: true, pageUrl: 'https://www.nexusmods.com/helldivers2/mods/123' });
+    await flush();
+    expect(label()).toBe('Installing…');
   });
 });

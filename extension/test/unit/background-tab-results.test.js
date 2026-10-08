@@ -6,7 +6,7 @@ import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 // A download that never completes (cancelled, failed, refused) must still
 // be reported, or the button stays stuck until the page is reloaded.
 
-const listeners = { onMessage: [], onChanged: [] };
+const listeners = { onMessage: [], onChanged: [], onClicked: [] };
 const evt = (name) => ({ addListener: (fn) => name && listeners[name].push(fn) });
 
 /** What the fake `downloads.download` does next: an id, or an Error to reject with. */
@@ -14,6 +14,7 @@ let nextDownload = 1;
 const tabMessages = [];
 const installs = [];
 let localStore = {};
+const notifications = [];
 /** id -> DownloadItem for `downloads.search`, when not the default GitHub file. */
 const searchResults = new Map();
 
@@ -54,8 +55,8 @@ beforeAll(async () => {
     },
     // Two open Nexus tabs (a broadcast reaches both).
     tabs: { query: (_q, cb) => cb([{ id: 8 }, { id: 9 }]), sendMessage: (tabId, msg, cb) => { tabMessages.push({ tabId, msg }); if (cb) cb(); } },
-    contextMenus: { create() {}, onClicked: evt() },
-    notifications: { create: (_o, cb) => cb && cb() },
+    contextMenus: { create() {}, onClicked: evt('onClicked') },
+    notifications: { create: (o, cb) => { notifications.push(o); if (cb) cb(); } },
   };
   for (const lib of [
     'browser-shim.js', 'sources.js', 'errors.js', 'protocol-client.js',
@@ -69,6 +70,7 @@ beforeAll(async () => {
 beforeEach(() => {
   tabMessages.length = 0;
   installs.length = 0;
+  notifications.length = 0;
 });
 
 const flush = () => new Promise((r) => setTimeout(r, 20));
@@ -138,5 +140,72 @@ describe('auto-captured installs', () => {
     for (const { msg } of results) {
       expect(msg).toMatchObject({ broadcast: true, pageUrl: 'https://www.nexusmods.com/helldivers2/mods/123?tab=files' });
     }
+  });
+});
+
+describe('right-click installs', () => {
+  const OTHER_FILE = 'https://github.com/someone/else/releases/download/v2/other.zip';
+  const rightClick = (linkUrl) =>
+    listeners.onClicked.forEach((fn) => fn({ menuItemId: 'ddmm-install-link', linkUrl }, { id: 5, url: PAGE }));
+
+  it("never report another mod's download to the page's button", async () => {
+    nextDownload = 50;
+    rightClick(OTHER_FILE);
+    await flush();
+    changeState(50, 'interrupted');
+    await flush();
+    expect(resultsFor(5)).toHaveLength(0);
+    // Nobody's button is waiting on it, so the failure is a notification.
+    expect(notifications.map((n) => n.title)).toEqual(['DDMM install failed']);
+
+    nextDownload = 51;
+    rightClick(OTHER_FILE);
+    await flush();
+    changeState(51, 'complete');
+    await flush();
+    expect(installs).toHaveLength(1);
+    expect(resultsFor(5)).toHaveLength(0);
+  });
+
+  it("still report the page's own mod to its button", async () => {
+    nextDownload = 52;
+    rightClick(FILE);
+    await flush();
+    changeState(52, 'interrupted');
+    await flush();
+    expect(resultsFor(5).map((m) => m.msg.reply.error.code)).toEqual(['DOWNLOAD_FAILED']);
+  });
+});
+
+describe('direct-download bookkeeping', () => {
+  const bg = () => globalThis.DDMM.background;
+
+  it('reports a download that failed before it was even registered, once', async () => {
+    nextDownload = 60;
+    // The interruption came before downloads.download() answered, so its
+    // onChanged event found nothing to report to.
+    searchResults.set(60, { id: 60, state: 'interrupted' });
+    changeState(60, 'interrupted');
+    await clickInstall();
+    await flush();
+    expect(resultsFor(5).map((m) => m.msg.reply.error.code)).toEqual(['DOWNLOAD_FAILED']);
+    // A later event for the same failure isn't reported again.
+    changeState(60, 'interrupted');
+    await flush();
+    expect(resultsFor(5)).toHaveLength(1);
+    searchResults.delete(60);
+  });
+
+  it('forgets a download once it completes, or when a new click for it supersedes it', async () => {
+    nextDownload = 70;
+    await clickInstall();
+    nextDownload = 71;
+    await clickInstall();
+    expect(bg().directDownloads.has(70)).toBe(false);
+    expect(bg().directDownloads.has(71)).toBe(true);
+    changeState(71, 'complete');
+    await flush();
+    expect(bg().directDownloads.has(71)).toBe(false);
+    expect(installs).toHaveLength(1);
   });
 });
