@@ -75,7 +75,8 @@ pub async fn download_archive_with_progress(
         .await
         .with_context(|| format!("failed to create download staging directory {:?}", temp_dir))?;
 
-    match download_archive_into(&parsed, &temp_dir, &mut progress).await {
+    let client = download_client(STALL_TIMEOUT)?;
+    match download_archive_into(&client, &parsed, &temp_dir, &mut progress).await {
         Ok(path) => Ok(DownloadedArchive { path, temp_dir }),
         Err(e) => {
             let _ = tokio::fs::remove_dir_all(&temp_dir).await;
@@ -84,17 +85,30 @@ pub async fn download_archive_with_progress(
     }
 }
 
+/// How long a download may go without receiving a single byte before it is
+/// given up as stalled.
+const STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The HTTP client for archive downloads. There is deliberately no deadline
+/// for the whole download: a large mod on a slow connection can take far
+/// longer than any fixed limit and still be making progress. Only a
+/// connection that can't be made, or that stops sending for
+/// `stall_timeout`, fails.
+fn download_client(stall_timeout: Duration) -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent(crate::providers::user_agent())
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .read_timeout(stall_timeout)
+        .connect_timeout(Duration::from_secs(20))
+        .build()?)
+}
+
 async fn download_archive_into(
+    client: &reqwest::Client,
     url: &reqwest::Url,
     temp_dir: &Path,
     progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
 ) -> anyhow::Result<PathBuf> {
-    let client = reqwest::Client::builder()
-        .user_agent(crate::providers::user_agent())
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .timeout(Duration::from_secs(10 * 60))
-        .connect_timeout(Duration::from_secs(20))
-        .build()?;
 
     // `without_url()`: reqwest errors embed the full URL, and direct CDN
     // links (e.g. Nexus) carry short-lived access tokens in the query
@@ -392,6 +406,66 @@ mod tests {
     fn last_path_segment_decodes_percent_encoding() {
         let url = reqwest::Url::parse("https://example.com/files/cool%20mod.zip").unwrap();
         assert_eq!(last_path_segment(&url), Some("cool mod.zip".to_string()));
+    }
+
+    /// A plain-HTTP server on localhost that answers one request with a
+    /// zip, sent in `chunks` pieces `gap` apart.
+    async fn slow_zip_server(chunks: usize, gap: Duration) -> reqwest::Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut zip = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut zip));
+            writer.start_file("a.txt", zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut writer, &[7u8; 4096]).unwrap();
+            writer.finish().unwrap();
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/zip\r\nConnection: close\r\n\r\n",
+                zip.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            let size = zip.len().div_ceil(chunks);
+            for piece in zip.chunks(size) {
+                tokio::time::sleep(gap).await;
+                if socket.write_all(piece).await.is_err() {
+                    return;
+                }
+            }
+            let _ = socket.shutdown().await;
+        });
+        reqwest::Url::parse(&format!("http://{addr}/mod.zip")).unwrap()
+    }
+
+    /// A download that keeps receiving data must not be cut off just
+    /// because it takes a long time in total: before, every download was
+    /// aborted 10 minutes in, however much it was still moving.
+    #[tokio::test]
+    async fn a_slow_but_steady_download_is_not_cut_off() {
+        let url = slow_zip_server(6, Duration::from_millis(300)).await;
+        let staging = tempfile::tempdir().unwrap();
+        // Each gap (300 ms) is well inside the stall timeout, the whole
+        // download (about 1.8 s) is well past it.
+        let client = download_client(Duration::from_secs(1)).unwrap();
+        let path = download_archive_into(&client, &url, staging.path(), &mut |_, _| {})
+            .await
+            .expect("a download that keeps moving must finish");
+        assert_eq!(path.file_name().unwrap(), "mod.zip");
+        assert!(crate::archive::Archive::open(&path).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_stalled_download_fails() {
+        let url = slow_zip_server(2, Duration::from_secs(3)).await;
+        let staging = tempfile::tempdir().unwrap();
+        let client = download_client(Duration::from_millis(500)).unwrap();
+        let result = download_archive_into(&client, &url, staging.path(), &mut |_, _| {}).await;
+        assert!(result.is_err(), "a download that stops sending must fail");
     }
 
     /// Real network smoke test for the whole pipeline. Intentionally
