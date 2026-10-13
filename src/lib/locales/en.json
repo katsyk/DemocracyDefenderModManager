@@ -518,7 +518,9 @@
             "title": "Add Result",
             "ok_button": {
                 "text": "OK"
-            }
+            },
+            "replaced": "Replaced the installed mod with the same ID.",
+            "kept": "Not installed: you kept the installed mod with the same ID."
         },
         "config": {
             "ok_button": {
@@ -753,6 +755,22 @@
             "done_warnings": "{count} have no Helldivers 2 patch files and won't change anything when deployed.",
             "done_warnings_one": "1 has no Helldivers 2 patch files and won't change anything when deployed.",
             "finish_button": "Done"
+        },
+        "replace": {
+            "title": "Replace Installed Mod?",
+            "title_different": "Replace a Different Mod?",
+            "question": "\"{installed}\"{installedVersion} is already installed. Replace it with this file (\"{new}\"{newVersion})?",
+            "question_different": "\"{installed}\"{installedVersion} is installed and has the same ID as this file (\"{new}\"{newVersion}). These may be two different mods: the author of one probably copied the other's manifest.json.",
+            "warning_different": "Replacing removes \"{installed}\" and puts \"{new}\" in its place. Two mods with the same ID can't both be installed.",
+            "keeps": "The mod keeps its place in your profiles, whether it's on, and the option choices that still fit. Cancel leaves everything as it is.",
+            "version": " (version {version})",
+            "file": "File: {file}",
+            "replace_button": {
+                "text": "Replace"
+            },
+            "cancel_button": {
+                "text": "Cancel"
+            }
         }
     },
     "toast": {
@@ -762,7 +780,8 @@
             "deployed": "{name} installed and deployed.",
             "installed_with_issue": "{name} installed, but {message}",
             "profile_save_failed": "couldn't save profiles.json",
-            "game_running": "Helldivers 2 is currently running; deploy manually once you've closed it."
+            "game_running": "Helldivers 2 is currently running; deploy manually once you've closed it.",
+            "replaced": "{name} replaced with the file from your browser."
         },
         "auto_import": {
             "deployed": "{name} installed and deployed.",
@@ -779,6 +798,9 @@
         "import": {
             "added_to_profile": "Imported mods were added to \"{profile}\". Deploy to use them.",
             "profile_save_failed": "The mods were imported, but the profile couldn't be saved: {error}"
+        },
+        "replace": {
+            "replaced": "{name} replaced with the new file."
         }
     },
     "recovery": {

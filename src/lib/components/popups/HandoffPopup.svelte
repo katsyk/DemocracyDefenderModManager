@@ -21,6 +21,8 @@
         Message?: string;
         /** A download left alone because it's another Nexus mod's file. */
         Ignored?: { FileName: string; ModId: string };
+        /** With "Done": it replaced the installed mod with its ID. */
+        Replaced?: boolean;
     };
 
     // What's shown lives on the popup object (`popup.view`), not in this
@@ -60,7 +62,7 @@
                     update({ status: "Error", errorMessage: payload.Message });
                     break;
                 case "Done":
-                    if (payload.Mod) popup.close({ status: "Done", mod: rawModToMod(payload.Mod), warning: payload.Warning });
+                    if (payload.Mod) popup.close({ status: "Done", mod: rawModToMod(payload.Mod), warning: payload.Warning, replaced: payload.Replaced === true });
                     break;
                 case "Cancelled":
                     // "Choose File" cancels the handoff itself; its own
@@ -114,8 +116,10 @@
         }
 
         try {
-            const { mod, warning } = await installHandoffFile(files, popup.pageUrl, popup.existingGuid);
-            popup.close({ status: "Done", mod, warning });
+            const { mod, warning, replaced, kept } = await installHandoffFile(files, popup.pageUrl, popup.existingGuid);
+            // Kept: the user chose to keep the installed mod with this
+            // file's ID; nothing was installed.
+            popup.close(kept ? { status: "Cancelled" } : { status: "Done", mod, warning, replaced });
         } catch (ex: unknown) {
             const message = ex instanceof Error ? ex.message : String(ex);
             popup.close({ status: "Error", message });

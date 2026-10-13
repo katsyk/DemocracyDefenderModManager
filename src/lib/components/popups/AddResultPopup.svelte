@@ -3,7 +3,7 @@
     import PopupBase from "./PopupBase.svelte";
     import { AddResultPopup } from "$lib/types/popup";
     import { useLocalization } from "$lib/state/localization.svelte";
-    import { CheckSquare, XSquare } from "svelte-bootstrap-icons";
+    import { CheckSquare, DashSquare, XSquare } from "svelte-bootstrap-icons";
     
     const { t } = useLocalization();
 
@@ -16,7 +16,9 @@
         {#each popup.results as result}
             <li class="flex flex-col gap-0.5">
                 <div class="flex flex-row items-center gap-2">
-                    {#if result.success}
+                    {#if result.success && result.kept}
+                        <DashSquare class="text-zinc-400" />
+                    {:else if result.success}
                         <CheckSquare class="text-green-500" />
                     {:else}
                         <XSquare class="text-red-500" />
@@ -27,7 +29,12 @@
                 </div>
                 {#if !result.success}
                     <pre class="font-mono ml-6 bg-zinc-700 rounded px-1 whitespace-pre-wrap break-normal">{result.errorMessage}</pre>
-                {:else if result.warning}
+                {:else if result.kept}
+                    <span class="ml-6 text-sm text-zinc-400">{t("popup.add_result.kept")}</span>
+                {:else if result.replaced}
+                    <span class="ml-6 text-sm text-zinc-300">{t("popup.add_result.replaced")}</span>
+                {/if}
+                {#if result.success && result.warning}
                     <pre class="font-mono ml-6 bg-yellow-900/40 text-yellow-300 rounded px-1 whitespace-pre-wrap break-normal">{result.warning}</pre>
                 {/if}
             </li>

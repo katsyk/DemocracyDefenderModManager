@@ -3,5 +3,7 @@ export type RustResult<T, E = string> =
     | { Err: E };
 
 export type ModAddResult =
-    | { success: true; archiveFile: string; warning?: string }
+    /** `replaced`: it replaced the installed mod with its ID; `kept`: the
+     * user kept that mod instead, and nothing was installed. */
+    | { success: true; archiveFile: string; warning?: string; replaced?: boolean; kept?: boolean }
     | { success: false; archiveFile: string; errorMessage: string };

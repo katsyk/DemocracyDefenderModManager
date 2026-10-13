@@ -18,8 +18,9 @@
         loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath,
         resolveBridgeConsent, resolveBridgeInstallCompletion, isGameRunning, forceExit, ackCloseRequested,
         setBridgeFrontendReady, getLastUpdateReport, skipUpdateVersion, browserExtensionActive,
-        detectImportSources, takePendingDeepLinks, getGuidRenames, type ImportSource,
-        type UpdateStatusEntry, type UpdateCheckReport, type BridgeConsentDecision, type BridgeSoftError
+        detectImportSources, takePendingDeepLinks, getGuidRenames, resolveReplaceRequest, type ImportSource,
+        type UpdateStatusEntry, type UpdateCheckReport, type BridgeConsentDecision, type BridgeSoftError,
+        type ReplaceOffer, type InstalledMod
     } from "$lib/utils/commands";
     import type { UUID } from "$lib/types/uuid";
     import { usePopup } from "$lib/state/popup.svelte";
@@ -39,7 +40,8 @@
         UpdateFilePickPopup,
         UpdateDownloadPopup,
         BrowserUpdatePopup,
-        ImportPopup
+        ImportPopup,
+        ReplacePopup
     } from "$lib/types/popup";
     import type { HandoffResult } from "$lib/types/popup";
     import type { AfterBrowserInstall } from "$lib/models/settings";
@@ -229,6 +231,16 @@
             "bridge://mod-installed",
             (e) => onBridgeModInstalled(e.payload),
         );
+        // "Replace the installed mod with this file?" -- asked by the
+        // backend for every way a file is added (see replace_prompt.rs).
+        const unlistenReplaceRequest = listen<{ requestId: string; offer: ReplaceOffer }>(
+            "install://replace-request",
+            (e) => onReplaceRequest(e.payload),
+        );
+        const unlistenReplaceClosed = listen<{ requestId: string }>(
+            "install://replace-request-closed",
+            (e) => replaceQuestions.get(e.payload.requestId)?.close(false),
+        );
         // ddmm:// deep links (see deep_link.rs on the Rust side): the
         // backend queues them and says so; this page takes them once it's
         // ready (below) and whenever a new one is queued.
@@ -252,7 +264,7 @@
         // Only now can a browser install's consent prompt / afterInstall
         // step actually be handled; the backend holds them until then (on a
         // cold start the install arrives before this page has loaded).
-        Promise.all([initPromise, unlistenBridgeConsent, unlistenBridgeInstalled])
+        Promise.all([initPromise, unlistenBridgeConsent, unlistenBridgeInstalled, unlistenReplaceRequest, unlistenReplaceClosed])
             .then(() => {
                 if (profilesLoaded) return setBridgeFrontendReady(true);
             })
@@ -272,6 +284,8 @@
             unlistenDragDrop.then(f => f());
             unlistenBridgeConsent.then(f => f());
             unlistenBridgeInstalled.then(f => f());
+            unlistenReplaceRequest.then(f => f());
+            unlistenReplaceClosed.then(f => f());
             unlistenDeepLinkPending.then(f => f());
             unlistenAutoImport.then(f => f());
             unlistenUpdatesChecked.then(f => f());
@@ -536,14 +550,21 @@
         }
     }
 
-    async function doAddMod(filename: string): Promise<Mod | undefined> {
+    /** Add one archive. `askRedeploy`: after it replaced an installed mod
+     * that's on in the active profile, offer to redeploy (as an update
+     * does). Returns the mod added or replaced; `undefined` when it failed,
+     * or the user kept the installed mod. */
+    async function doAddMod(filename: string, askRedeploy = true): Promise<Mod | undefined> {
         const wait = new WaitPopup(t("pages.mods.popup.wait.add.message"));
         showPopup(wait);
+        let replaced: Mod | undefined;
         try {
-            const { mod, warning } = await addMod(filename);
-            mods.push(mod);
-            if (warning) showPopup(new NotificationPopup("warning", warning));
-            return mod;
+            const installed = await addMod(filename);
+            if (installed.kept) return undefined;
+            const placed = await placeInstalledMod(installed);
+            if (installed.replaced) replaced = placed;
+            if (installed.warning) showPopup(new NotificationPopup("warning", installed.warning));
+            return placed;
         } catch(ex: unknown) {
             let message: string;
             if (ex instanceof Error) {
@@ -557,36 +578,76 @@
             return undefined;
         } finally {
             wait.close();
+            if (replaced && askRedeploy) await afterUpdates([replaced.guid]);
         }
+    }
+
+    /** Put a just-installed mod into the list: a new one at the end; one
+     * that replaced an installed mod (same ID) in that mod's place, with
+     * its profile entries fitted to it. */
+    async function placeInstalledMod(installed: InstalledMod): Promise<Mod> {
+        if (installed.replaced) {
+            await onModReplaced(installed.mod);
+            showToast("info", t("toast.replace.replaced", { name: installed.mod.name }));
+        } else {
+            mods.push(installed.mod);
+        }
+        return installed.mod;
+    }
+
+    /** A mod was replaced in place by a file with its ID: show the new
+     * one, fit the option choices of its entries in every profile to its
+     * manifest (keeping their place and on/off; the backend did the same
+     * in profiles.json), forget what the last update check said about the
+     * old one, and save. */
+    async function onModReplaced(mod: Mod) {
+        replaceMod(mod.guid, mod);
+        if (profilesLoaded && currentProfile) applyCurrentConfigChanges();
+        const reset = fitProfilesToMods(profiles, [mod]);
+        if (reset.length > 0) log.info(`Options of the replaced mod reset to fit it: ${reset.join(", ")}`);
+        updateStatuses = updateStatuses.filter(u => u.Guid !== mod.guid);
+        await refreshUpdateStatuses();
+        if (!profilesLoaded) return;
+        const saved = await doSaveProfiles();
+        if (!saved.ok) log.warn(`Failed to save profiles after replacing a mod: ${saved.error}`);
+    }
+
+    /** Results of several adds: the mods added go into the list, replaced
+     * ones in their place. Returns the IDs of the replaced ones. */
+    async function placeAddResults(results: { Ok: InstalledMod }[]): Promise<UUID[]> {
+        const replaced: UUID[] = [];
+        for (const { Ok: installed } of results) {
+            if (installed.kept) continue;
+            if (installed.replaced) {
+                await onModReplaced(installed.mod);
+                replaced.push(installed.mod.guid);
+            } else {
+                mods.push(installed.mod);
+            }
+        }
+        return replaced;
+    }
+
+    function toAddResult(r: { Ok: InstalledMod } | { Err: string }, file: string): ModAddResult {
+        if ("Ok" in r) {
+            return { success: true, archiveFile: file, warning: r.Ok.warning, replaced: r.Ok.replaced, kept: r.Ok.kept };
+        }
+        return { success: false, archiveFile: file, errorMessage: r.Err };
     }
 
     async function doAddMods(...filenames: string[]) {
         const wait = new WaitPopup(t("pages.mods.popup.wait.add_multiple.message"));
         showPopup(wait);
 
+        let resultsShown: Promise<void> | undefined;
+        let replaced: UUID[] = [];
         try {
             const results = await addMods(filenames);
 
-            const addResults = results.map<ModAddResult>((r, i) => {
-                if ("Ok" in r) {
-                    return {
-                        success: true,
-                        archiveFile: filenames[i],
-                        warning: r.Ok.warning
-                    };
-                } else {
-                    return {
-                        success: false,
-                        archiveFile: filenames[i],
-                        errorMessage: r.Err
-                    }
-                }
-            });
-            const popup = new AddResultPopup(addResults);
-            showPopup(popup);
+            const addResults = results.map<ModAddResult>((r, i) => toAddResult(r, filenames[i]));
+            resultsShown = showPopup(new AddResultPopup(addResults));
 
-            const modsToAdd = results.filter(r => "Ok" in r).map(r => r.Ok.mod);
-            mods.push(...modsToAdd);
+            replaced = await placeAddResults(results.filter(r => "Ok" in r));
         } catch(ex: unknown) {
             let message: string;
             if (ex instanceof Error) {
@@ -599,6 +660,10 @@
             showPopup(new ErrorPopup(t("pages.mods.popup.error.add.message"), message));
         } finally {
             wait.close();
+        }
+        if (replaced.length > 0) {
+            await resultsShown;
+            await afterUpdates(replaced);
         }
     }
 
@@ -628,29 +693,15 @@
         const wait = new WaitPopup(t("pages.mods.popup.wait.add_multiple.message"));
         showPopup(wait);
 
+        let resultsShown: Promise<void> | undefined;
+        let replaced: UUID[] = [];
         try {
             const results = await addPaths(paths);
 
-            const addResults = results.map<ModAddResult>((r, i) => {
-                if ("Ok" in r) {
-                    return {
-                        success: true,
-                        archiveFile: paths[i],
-                        warning: r.Ok.warning
-                    };
-                } else {
-                    return {
-                        success: false,
-                        archiveFile: paths[i],
-                        errorMessage: r.Err
-                    }
-                }
-            });
-            const popup = new AddResultPopup(addResults);
-            showPopup(popup);
+            const addResults = results.map<ModAddResult>((r, i) => toAddResult(r, paths[i]));
+            resultsShown = showPopup(new AddResultPopup(addResults));
 
-            const modsToAdd = results.filter(r => "Ok" in r).map(r => r.Ok.mod);
-            mods.push(...modsToAdd);
+            replaced = await placeAddResults(results.filter(r => "Ok" in r));
         } catch(ex: unknown) {
             let message: string;
             if (ex instanceof Error) {
@@ -664,15 +715,23 @@
         } finally {
             wait.close();
         }
+        if (replaced.length > 0) {
+            await resultsShown;
+            await afterUpdates(replaced);
+        }
     }
 
     async function doAddModFromUrl(url: string) {
         const wait = new WaitPopup(t("pages.mods.popup.wait.add_url.message"));
         showPopup(wait);
+        let replaced: Mod | undefined;
         try {
-            const { mod, warning } = await addModFromUrl(url);
-            mods.push(mod);
-            if (warning) showPopup(new NotificationPopup("warning", warning));
+            const installed = await addModFromUrl(url);
+            if (!installed.kept) {
+                const placed = await placeInstalledMod(installed);
+                if (installed.replaced) replaced = placed;
+                if (installed.warning) showPopup(new NotificationPopup("warning", installed.warning));
+            }
         } catch(ex: unknown) {
             let message: string;
             if (ex instanceof Error) {
@@ -704,13 +763,17 @@
             return;
         }
         wait.close();
+        if (replaced) await afterUpdates([replaced.guid]);
     }
 
     async function doStartHandoff(pageUrl: string, siteName: string, existingGuid?: UUID): Promise<HandoffResult["status"]> {
         const result = await showPopup(new HandoffPopup(pageUrl, siteName, downloadsPath, existingGuid));
         switch (result.status) {
             case "Done":
-                if (!existingGuid) {
+                if (!existingGuid && result.replaced) {
+                    await onModReplaced(result.mod);
+                    showToast("info", t("toast.replace.replaced", { name: result.mod.name }));
+                } else if (!existingGuid) {
                     mods.push(result.mod);
                 } else {
                     const i = mods.findIndex(m => m.guid === existingGuid || m.guid === result.mod.guid);
@@ -722,6 +785,9 @@
                 }
                 await applyGuidRenames();
                 if (result.warning) showPopup(new NotificationPopup("warning", result.warning));
+                // A new install that replaced a mod is redeployed (or not)
+                // like an update; an update's caller does that itself.
+                if (!existingGuid && result.replaced) await afterUpdates([result.mod.guid]);
                 break;
             case "TimedOut":
                 showPopup(new NotificationPopup("warning", t("popup.handoff.timed_out_message")));
@@ -761,7 +827,32 @@
         requestId: string;
         mod: { guid: UUID; name: string };
         afterInstall: "library" | "profile" | "deploy";
+        /** It replaced the installed mod with its ID (the user said so). */
+        replaced?: boolean;
     };
+
+    /** Open "Replace the installed mod?" questions, by request ID, so a
+     * question the backend stopped waiting for can be closed. */
+    const replaceQuestions = new Map<string, ReplacePopup>();
+
+    /** `install://replace-request` -- a file being added (by any route,
+     * the browser extension included) has, in its manifest.json, the ID
+     * of an installed mod: ask whether to replace that mod with it. */
+    async function onReplaceRequest(payload: { requestId: string; offer: ReplaceOffer }) {
+        const popup = new ReplacePopup(payload.offer);
+        replaceQuestions.set(payload.requestId, popup);
+        let replace = false;
+        try {
+            replace = await showPopup(popup);
+        } finally {
+            replaceQuestions.delete(payload.requestId);
+        }
+        try {
+            await resolveReplaceRequest(payload.requestId, replace);
+        } catch (ex: unknown) {
+            log.error(`Failed to answer whether to replace a mod: ${errorMessage(ex)}`);
+        }
+    }
 
     /** `bridge://mod-installed` -- the backend already installed the mod
      * (it doesn't touch profiles.json itself); this does the
@@ -775,6 +866,10 @@
         await refreshUpdateStatuses();
         await applyGuidRenames();
         const mod = mods.find(m => m.guid === payload.mod.guid);
+        if (mod && payload.replaced) {
+            if (currentProfile) applyCurrentConfigChanges();
+            fitProfilesToMods(profiles, [mod]);
+        }
 
         let addedToProfile: string | undefined;
         let deployed = false;
@@ -819,6 +914,8 @@
             showToast("warning", t("toast.bridge_install.installed_with_issue", { name, message: softError.message }));
         } else if (deployed) {
             showToast("info", t("toast.bridge_install.deployed", { name }));
+        } else if (payload.replaced) {
+            showToast("info", t("toast.bridge_install.replaced", { name }));
         } else if (addedToProfile) {
             showToast("info", t("toast.bridge_install.added_to_profile", { name, profile: addedToProfile }));
         } else {
@@ -894,7 +991,7 @@
         const decision = await showPopup(new AutoImportPopup(payload.file));
         if (decision === "Ignore") return;
 
-        const mod = await doAddMod(payload.file);
+        const mod = await doAddMod(payload.file, decision !== "InstallAndDeploy");
         if (!mod) return;
 
         if (decision === "InstallAndDeploy" && currentProfile) {

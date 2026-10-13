@@ -21,16 +21,40 @@ async function invoke<T>(cmd: string, args?: InvokeArgs): Promise<T> {
 }
 
 type RawMod = { Manifest: Manifest, Directory: string, Sources?: ResolvedSource[] };
-type RawInstalledMod = RawMod & { Warning?: string };
+type RawInstalledMod = RawMod & { Warning?: string, Replaced?: boolean, Kept?: boolean };
 
-export type InstalledMod = { mod: Mod, warning?: string };
+/** What an install did. When the file had the ID of an installed mod and
+ * the user was asked (see `ReplacePopup`): `replaced` -- `mod` is that mod,
+ * replaced in place by the file; `kept` -- the user kept the installed mod
+ * (`mod`, unchanged) and nothing was installed. */
+export type InstalledMod = { mod: Mod, warning?: string, replaced?: boolean, kept?: boolean };
 
 export function rawModToMod(raw: RawMod): Mod {
     return new Mod(raw.Manifest, raw.Directory, raw.Sources ?? []);
 }
 
 function toInstalledMod(raw: RawInstalledMod): InstalledMod {
-    return { mod: rawModToMod(raw), warning: raw.Warning };
+    return { mod: rawModToMod(raw), warning: raw.Warning, replaced: raw.Replaced === true, kept: raw.Kept === true };
+}
+
+/** `install://replace-request`: a file being added has, in its
+ * manifest.json, the ID of an installed mod (see `replace_prompt` on the
+ * Rust side). */
+export type ReplaceOffer = {
+    guid: UUID,
+    fileName: string,
+    installedName: string,
+    installedVersion?: string,
+    newName: string,
+    newVersion?: string,
+    /** Same name: most likely another version of the same mod. */
+    sameName: boolean
+};
+
+/** Answers an `install://replace-request`: Replace (`true`) or Cancel. */
+export async function resolveReplaceRequest(requestId: string, replace: boolean): Promise<void> {
+    log.debug("Invoking `resolve_replace_request`.");
+    await invoke<void>("resolve_replace_request", { requestId, replace });
 }
 
 export async function getMods(): Promise<Mod[]> {

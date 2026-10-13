@@ -415,6 +415,82 @@ const scenarios = {
             r.expect(JSON.stringify(entry?.Toggled) === "[true,true,true]" && entry?.Enabled === false, `the fitted options are saved (${JSON.stringify(entry)})`);
         },
     },
+    // A file with the ID of an installed mod: "Replace?" names both, says
+    // when they may be two different mods, and Cancel is the default;
+    // the answer goes back to the backend, and a question it stopped
+    // waiting for closes.
+    replaceask: {
+        async check(page, r) {
+            const offer = (sameName) => ({ guid: G(1), fileName: "Other mod-1234-2-0-1718000000.zip", installedName: "V1 mod",
+                installedVersion: "1.0", newName: sameName ? "V1 mod" : "Other mod", newVersion: "2.0", sameName });
+            const answers = () => r.calls.filter(c => c.cmd === "resolve_replace_request").map(c => `${c.args.requestId}:${c.args.replace}`);
+            await page.evaluate((o) => window.__smokeEmit("install://replace-request", { requestId: "q1", offer: o }), offer(false));
+            await page.waitForTimeout(400);
+            const question = await page.getByTestId("replace-question").textContent();
+            r.expect(question.includes("\"V1 mod\" (version 1.0)") && question.includes("\"Other mod\" (version 2.0)"), `both are named (${question})`);
+            r.expect(question.includes("two different mods"), "it says they may be different mods");
+            r.expect(await page.getByTestId("replace-warning").count() === 1, "it says Replace removes the installed one");
+            r.expect(await page.evaluate(() => document.activeElement?.textContent?.trim()) === "Cancel", "Cancel has the focus");
+            await page.keyboard.press("Enter");
+            await page.waitForTimeout(400);
+            r.expect(await page.getByTestId("replace-question").count() === 0, "Enter closes it");
+            r.expect(answers().join() === "q1:false", `Enter answers Cancel (${answers().join()})`);
+
+            await page.evaluate((o) => window.__smokeEmit("install://replace-request", { requestId: "q2", offer: o }), offer(true));
+            await page.waitForTimeout(400);
+            r.expect(await page.getByTestId("replace-warning").count() === 0, "no different-mod warning for the same name");
+            r.expect((await page.getByTestId("replace-question").textContent()).includes("already installed"), "the same mod is asked about as such");
+            await page.getByText("Replace", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(400);
+            r.expect(answers().join() === "q1:false,q2:true", `Replace answers yes (${answers().join()})`);
+
+            await page.evaluate((o) => window.__smokeEmit("install://replace-request", { requestId: "q3", offer: o }), offer(true));
+            await page.waitForTimeout(300);
+            await page.evaluate(() => window.__smokeEmit("install://replace-request-closed", { requestId: "q3" }));
+            await page.waitForTimeout(400);
+            r.expect(await page.getByTestId("replace-question").count() === 0, "a question no longer waited for closes");
+            r.expect(r.calls.some(c => c.cmd === "set_bridge_frontend_ready" && c.args?.ready === true), "the page says it can be asked");
+        },
+    },
+    // Add a file that replaced an installed mod: the mod stays one entry
+    // in its place, its options are fitted to the new manifest and saved,
+    // and it's redeployed like an update.
+    replaceadd: {
+        data: (d) => {
+            d["plugin:dialog|open"] = ["/dl/V1 mod 2.zip"];
+            d.add_mod = { Manifest: { Version: 1, Guid: G(1), Name: "V1 mod", Description: "v2", Options: [{ Name: "A", Description: "" }, { Name: "B", Description: "" }] },
+                Directory: "/data/mods/V1 mod 1.0.0 2026-09-27T03-15Z", Sources: [], Replaced: true };
+        },
+        async check(page, r) {
+            await page.locator("button[title='Add a mod to the library.']").click({ timeout: 2000 });
+            await page.waitForTimeout(1200);
+            r.expect(r.calls.some(c => c.cmd === "add_mod"), "the file is added");
+            r.expect((await rows(page)).filter(n => n === "V1 mod").length === 1, "the replaced mod is listed once");
+            const entry = r.saves.at(-1)?.Profiles[0].Configs.find(c => c.Guid === G(1));
+            r.expect(entry && JSON.stringify(entry.Toggled) === "[true,true]" && JSON.stringify(entry.Selected) === "[0,0]" && entry.Enabled === true,
+                `its options are fitted and saved (${JSON.stringify(entry)})`);
+            r.expect(r.saves.at(-1)?.Profiles[0].Configs[0].Guid === G(1), "it keeps its place");
+            r.expect(r.calls.some(c => c.cmd === "deploy"), "it's redeployed like an update");
+            r.expect(r.errors.length === 0, "no page error");
+        },
+    },
+    // Add a file, then keep the installed mod with its ID: nothing
+    // changes, and no error is shown.
+    replacekeep: {
+        data: (d) => {
+            d["plugin:dialog|open"] = ["/dl/Other mod.zip"];
+            d.add_mod = { ...d.get_mods[0], Kept: true };
+        },
+        async check(page, r) {
+            const before = await rows(page);
+            await page.locator("button[title='Add a mod to the library.']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            r.expect(r.calls.some(c => c.cmd === "add_mod"), "the file is added");
+            r.expect(JSON.stringify(await rows(page)) === JSON.stringify(before), "the list is unchanged");
+            r.expect(await page.getByText("Mod adding failed!").count() === 0, "no error is shown");
+            r.expect(!r.calls.some(c => c.cmd === "deploy"), "nothing is deployed");
+        },
+    },
     // Init itself fails.
     initfail: {
         data: (d) => { d.load_profiles.Profiles = null; },

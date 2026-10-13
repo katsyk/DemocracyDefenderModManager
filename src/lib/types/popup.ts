@@ -16,12 +16,13 @@ import BrowserUpdatePopupComponent from "$lib/components/popups/BrowserUpdatePop
 import DataFolderMovePopupComponent from "$lib/components/popups/DataFolderMovePopup.svelte";
 import DataFolderProgressPopupComponent from "$lib/components/popups/DataFolderProgressPopup.svelte";
 import ImportPopupComponent from "$lib/components/popups/ImportPopup.svelte";
+import ReplacePopupComponent from "$lib/components/popups/ReplacePopup.svelte";
 import { ImportWizard } from "$lib/state/importWizard.svelte";
 import type { ModAddResult } from "./results";
 import type { Config } from "$lib/models/profile";
 import type { Mod } from "$lib/models/mod";
 import type { UUID } from "./uuid";
-import type { BridgeConsentDecision, UpdateCheckReport, UpdateFile, UpdateStatusEntry, DataFolderMovePlan, DataFolderMoveResult, ImportReport } from "$lib/utils/commands";
+import type { BridgeConsentDecision, UpdateCheckReport, UpdateFile, UpdateStatusEntry, DataFolderMovePlan, DataFolderMoveResult, ImportReport, ReplaceOffer } from "$lib/utils/commands";
 
 export abstract class Popup<T = void> {
     abstract component: Component<any, any, any>;
@@ -129,7 +130,9 @@ export class ModConfigPopup extends Popup<Config | null> {
 }
 
 export type HandoffResult =
-    | { status: "Done"; mod: Mod; warning?: string }
+    /** `replaced`: the file had the ID of an installed mod, which the user
+     * chose to replace with it (`mod` is that mod now). */
+    | { status: "Done"; mod: Mod; warning?: string; replaced?: boolean }
     | { status: "Cancelled" }
     | { status: "TimedOut" }
     | { status: "Error"; message: string };
@@ -194,6 +197,24 @@ export class BridgeConsentPopup extends Popup<BridgeConsentDecision> {
 
     protected override resultOnError(): BridgeConsentDecision {
         return "Deny";
+    }
+}
+
+/**
+ * "Replace the installed mod with this file?" -- a file being added has,
+ * in its manifest.json, the ID of an installed mod (asked by the backend,
+ * see `replace_prompt` on the Rust side). `true` is Replace; Cancel (the
+ * default) keeps the installed mod and installs nothing.
+ */
+export class ReplacePopup extends Popup<boolean> {
+    component = ReplacePopupComponent;
+
+    constructor(public readonly offer: ReplaceOffer) {
+        super();
+    }
+
+    protected override resultOnError(): boolean {
+        return false;
     }
 }
 
