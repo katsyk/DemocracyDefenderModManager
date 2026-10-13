@@ -237,6 +237,7 @@ mod tests {
         assert!(rx_a.await.is_err(), "a forgotten question gets no answer");
     }
 
+    #[cfg(not(windows))]
     fn offer() -> ReplaceOffer {
         ReplaceOffer {
             guid: Uuid::nil(),
@@ -249,72 +250,81 @@ mod tests {
         }
     }
 
-    /// A mock app (no webview) with DDMM's state, the Mods page ready, and
-    /// the request IDs of the questions it was asked / told were closed.
-    fn mock_page() -> (
-        tauri::App<tauri::test::MockRuntime>,
-        tempfile::TempDir,
-        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    ) {
-        use tauri::Listener;
-        let app = tauri::test::mock_app();
-        let dir = tempfile::tempdir().unwrap();
-        app.manage(AppState::new(dir.path().to_path_buf()));
-        app.state::<AppState>().bridge_frontend_ready.send_replace(true);
-        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let closed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        for (event, list) in [(REQUEST_EVENT, asked.clone()), (CLOSED_EVENT, closed.clone())] {
-            app.listen_any(event, move |e| {
-                let v: serde_json::Value = serde_json::from_str(e.payload()).unwrap();
-                list.lock().unwrap().push(v["requestId"].as_str().unwrap().to_string());
-            });
-        }
-        (app, dir, asked, closed)
-    }
+    /// The real ask path, on Tauri's mock runtime. Not on Windows: the
+    /// mock runtime isn't available there (see the `tauri` dev-dependency
+    /// in Cargo.toml).
+    #[cfg(not(windows))]
+    mod ask_path {
+        use super::*;
 
-    async fn wait_for_question(asked: &std::sync::Mutex<Vec<String>>) -> String {
-        for _ in 0..200 {
-            if let Some(id) = asked.lock().unwrap().first().cloned() {
-                return id;
+        /// A mock app (no webview) with DDMM's state, the Mods page ready, and
+        /// the request IDs of the questions it was asked / told were closed.
+        fn mock_page() -> (
+            tauri::App<tauri::test::MockRuntime>,
+            tempfile::TempDir,
+            std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+            std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        ) {
+            use tauri::Listener;
+            let app = tauri::test::mock_app();
+            let dir = tempfile::tempdir().unwrap();
+            app.manage(AppState::new(dir.path().to_path_buf()));
+            app.state::<AppState>().bridge_frontend_ready.send_replace(true);
+            let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let closed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            for (event, list) in [(REQUEST_EVENT, asked.clone()), (CLOSED_EVENT, closed.clone())] {
+                app.listen_any(event, move |e| {
+                    let v: serde_json::Value = serde_json::from_str(e.payload()).unwrap();
+                    list.lock().unwrap().push(v["requestId"].as_str().unwrap().to_string());
+                });
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            (app, dir, asked, closed)
         }
-        panic!("the question was never asked");
-    }
 
-    #[tokio::test]
-    async fn the_page_answers_through_resolve() {
-        let (app, _dir, asked, _) = mock_page();
-        let handle = app.handle().clone();
-        let question = tokio::spawn(async move { Asker::in_app(&handle).ask(&offer()).await });
-        let id = wait_for_question(&asked).await;
-        assert!(app.state::<AppState>().replace_pending.lock().await.answer(&id, true));
-        assert_eq!(question.await.unwrap(), Some(true));
-    }
+        async fn wait_for_question(asked: &std::sync::Mutex<Vec<String>>) -> String {
+            for _ in 0..200 {
+                if let Some(id) = asked.lock().unwrap().first().cloned() {
+                    return id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the question was never asked");
+        }
 
-    /// No answer in time: keep, and the page is told to close the question.
-    #[tokio::test]
-    async fn no_answer_in_time_keeps_and_closes_the_question() {
-        let (app, _dir, asked, closed) = mock_page();
-        let handle = app.handle().clone();
-        let answer = Asker::User { app: &handle, timeout: Duration::from_millis(50) }.ask(&offer()).await;
-        assert_eq!(answer, Some(false));
-        assert_eq!(*closed.lock().unwrap(), *asked.lock().unwrap());
-        assert_eq!(closed.lock().unwrap().len(), 1);
-        assert_eq!(app.state::<AppState>().replace_pending.lock().await.0.len(), 0, "nothing left waiting");
-    }
+        #[tokio::test]
+        async fn the_page_answers_through_resolve() {
+            let (app, _dir, asked, _) = mock_page();
+            let handle = app.handle().clone();
+            let question = tokio::spawn(async move { Asker::in_app(&handle).ask(&offer()).await });
+            let id = wait_for_question(&asked).await;
+            assert!(app.state::<AppState>().replace_pending.lock().await.answer(&id, true));
+            assert_eq!(question.await.unwrap(), Some(true));
+        }
 
-    /// The page went away while asking: keep, at once.
-    #[tokio::test]
-    async fn the_page_going_away_keeps_at_once() {
-        let (app, _dir, asked, _) = mock_page();
-        let handle = app.handle().clone();
-        let question = tokio::spawn(async move { Asker::in_app(&handle).ask(&offer()).await });
-        wait_for_question(&asked).await;
-        assert_eq!(app.state::<AppState>().replace_pending.lock().await.keep_all(), 1);
-        let answer = tokio::time::timeout(Duration::from_secs(5), question).await.unwrap().unwrap();
-        assert_eq!(answer, Some(false));
+        /// No answer in time: keep, and the page is told to close the question.
+        #[tokio::test]
+        async fn no_answer_in_time_keeps_and_closes_the_question() {
+            let (app, _dir, asked, closed) = mock_page();
+            let handle = app.handle().clone();
+            let answer = Asker::User { app: &handle, timeout: Duration::from_millis(50) }.ask(&offer()).await;
+            assert_eq!(answer, Some(false));
+            assert_eq!(*closed.lock().unwrap(), *asked.lock().unwrap());
+            assert_eq!(closed.lock().unwrap().len(), 1);
+            assert_eq!(app.state::<AppState>().replace_pending.lock().await.0.len(), 0, "nothing left waiting");
+        }
+
+        /// The page went away while asking: keep, at once.
+        #[tokio::test]
+        async fn the_page_going_away_keeps_at_once() {
+            let (app, _dir, asked, _) = mock_page();
+            let handle = app.handle().clone();
+            let question = tokio::spawn(async move { Asker::in_app(&handle).ask(&offer()).await });
+            wait_for_question(&asked).await;
+            assert_eq!(app.state::<AppState>().replace_pending.lock().await.keep_all(), 1);
+            let answer = tokio::time::timeout(Duration::from_secs(5), question).await.unwrap().unwrap();
+            assert_eq!(answer, Some(false));
+        }
+
     }
 
     #[test]
