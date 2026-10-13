@@ -48,7 +48,7 @@ url = "2.5"
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 # PKCE (S256 code challenge) for the optional "Sign in to Nexus Mods". See
 # `nexus_oauth.rs`.
-sha2 = "0.10"
+sha2 = "0.11"
 base64 = "0.22"
 # File identity (dev+inode / volume+file index) for "is this folder the
 # same as, inside, or containing that one" checks. See `fs_util::path_overlap`.
