@@ -41,7 +41,7 @@ percent-encoding = "2.3.2"
 dirs = "7"
 tauri-plugin-deep-link = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
-sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 url = "2.5"
 # OS keychain for the optional Nexus Mods API key (Windows Credential
 # Manager, macOS Keychain, Linux Secret Service). See `secrets.rs`.
