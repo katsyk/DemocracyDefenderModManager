@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@humanspeak/svelte-markdown':
-        specifier: ^1.4.1
-        version: 1.9.1(svelte@5.57.1)
+        specifier: ^1.9.5
+        version: 1.9.5(svelte@5.57.1)
       '@rodrigodagostino/svelte-sortable-list':
         specifier: ^2.1.15
         version: 2.2.6(svelte@5.57.1)
@@ -229,15 +229,18 @@ packages:
     resolution: {integrity: sha512-im7GIIpgjdD6Fx68xCeiXw3XiDv30/WMRAaodMm+ep0ptYfEUd0cdNeTAylHGIRTJIeByKFHdTmPjAktyDM/JQ==}
     engines: {node: '>=20.19.0'}
 
-  '@humanspeak/svelte-markdown@1.9.1':
-    resolution: {integrity: sha512-2JjpATdZfhGQurV38LtkUkPkyQzM7eXku6LoDBeK6i69qqOe0OLmMwpqtMnhwG3ItdxXOt/3miPbSaNTFqMl5Q==}
+  '@humanspeak/svelte-markdown@1.9.5':
+    resolution: {integrity: sha512-RqWrhE+tkqE1i7JQWpgTIzciSWbhAYSyfeCahh+doxOKzm9kkPXxtr+Vb6PEmZWktXXtBIgE7KAUZuso8hFs0A==}
     engines: {node: '>=22'}
     peerDependencies:
+      '@tanstack/highlight': '>=0.1.0'
       katex: '>=0.16.0'
       mermaid: '>=10.0.0'
       shiki: '>=4.0.0'
       svelte: ^5.0.0
     peerDependenciesMeta:
+      '@tanstack/highlight':
+        optional: true
       katex:
         optional: true
       mermaid:
@@ -1072,7 +1075,7 @@ snapshots:
 
   '@humanspeak/memory-cache@1.2.0': {}
 
-  '@humanspeak/svelte-markdown@1.9.1(svelte@5.57.1)':
+  '@humanspeak/svelte-markdown@1.9.5(svelte@5.57.1)':
     dependencies:
       '@humanspeak/memory-cache': 1.2.0
       github-slugger: 2.0.0
