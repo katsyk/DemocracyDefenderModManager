@@ -96,6 +96,14 @@ learns this time at the next check, so only updates after that one show up again
 **Stop skipping** in the same places undoes it. The skip is stored with the mod (in its `.hd2mm-origin.json`) and
 is cleared when the mod is updated.
 
+### With a file you already have
+
+You don't need an update check to put a newer (or older) version of a mod in place: **Add** the file (or drop it
+on DDMM, or use Add URL). If its `manifest.json` has the installed mod's ID, DDMM asks whether to **replace** the
+installed mod with it. Replace works like an update: the mod keeps its ID, its place and on/off in every profile,
+and the option choices that still fit. See
+[A mod with the same ID is already installed](adding-mods.md#replacing-an-installed-mod).
+
 ### After updating: redeploy
 
 The game only sees updated files after a deploy. If an updated mod is enabled in your active profile:

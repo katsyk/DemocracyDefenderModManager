@@ -86,8 +86,45 @@ Every install goes through the same steps:
    any Helldivers 2 patch files anywhere in it, you'll see a non-fatal warning: "no Helldivers 2 patch files found
    in this archive" — the mod is still added, it just won't do anything when deployed.
 
-If a mod with the same ID (`Guid`) is already installed, adding it again fails with a "mod with GUID ... already
-exists" error rather than silently overwriting it.
+## A mod with the same ID is already installed { #replacing-an-installed-mod }
+
+Every mod has an ID (the `Guid` in its `manifest.json`), and two installed mods can't share one. When a file you
+add has the ID of a mod that's already installed, DDMM never overwrites it silently. It asks first:
+
+- **Same name** (most likely another version of the same mod): *"Cool Mod" (version 1.0) is already installed.
+  Replace it with this file ("Cool Mod", version 1.2)?* The versions are shown when DDMM knows them (from where the
+  mod was installed from, or from a Nexus Mods download name).
+- **Different names**: DDMM says that these may be **two different mods**: some authors copy one mod's
+  `manifest.json` into their next mod, so both claim the same ID. **Replace** then removes the installed mod and
+  puts the new one in its place.
+
+**Cancel** is the default (Enter cancels) and leaves everything as it is: nothing is installed, and the installed
+mod isn't touched. If you don't answer within 10 minutes (2 minutes for an install from the browser extension), DDMM
+cancels by itself.
+
+**Replace** swaps the new file in the same way an [update](updating-mods.md) does:
+
+- the file is unpacked and checked completely first; if anything goes wrong, the installed mod stays as it was;
+- the mod keeps its ID, so it keeps its **place in every profile** and whether it's **on**. Its **option choices**
+  stay as they were if they still fit the new `manifest.json`, otherwise they're reset to the defaults;
+- where the mod came from is recorded for the new file, as for a new install: from a Nexus Mods download name, or
+  from the link you installed it from (Add URL, the browser extension). What the last update check said about the
+  replaced mod is cleared;
+- if the mod is on in your active profile, DDMM redeploys it (or asks to) just like after an update; see
+  [After updating: redeploy](updating-mods.md#after-updating-redeploy).
+
+The question is asked for Add (one file or several), drag and drop, Add URL, `ddmm://` links, the browser handoff
+and the browser extension. Some cases don't ask:
+
+- **Many files at once** (10 or more added or dropped) go through the [import checklist](importing-mods.md), which
+  marks a file whose mod is already installed (*Already in DDMM*, *Another version is in DDMM*) and leaves it
+  unticked; it doesn't offer to replace. To replace that mod, add the file on its own.
+- **Folders** (Add Folder) and **archives without a `manifest.json`** have no ID to compare. A folder with a
+  `manifest.json` whose ID is already installed is refused; an archive or folder without one is refused when it
+  would get the folder of a mod already in the list. Remove the installed mod first, or use **Update** on it.
+
+If the question can't be shown (for example, the browser extension sends an install while DDMM's Mods page isn't
+open), the file is refused as already installed, and the message says how to replace the mod.
 
 ## Archives without a manifest.json
 

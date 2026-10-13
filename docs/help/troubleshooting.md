@@ -73,9 +73,18 @@ causes:
 - **Password-protected archives**, **archives split into parts** (`.7z.001`, `.z01`, `.part2.rar` missing) and
   7z archives packed with **Deflate64** can't be installed directly. Extract them yourself (for example with
   7-Zip), then add the extracted folder with [Add Folder](../using/adding-mods.md).
-- **Two mods with the same ID.** Some authors copy one mod's `manifest.json` into their next mod, so both claim
-  the same GUID. DDMM names the mod already using it. Tell the author; to install it anyway, extract the
-  archive, delete its `manifest.json`, and add the folder with Add Folder (DDMM then gives it an ID of its own).
+- **"… is already installed" / two mods with the same ID.** Every mod has an ID (the GUID in its
+  `manifest.json`), and two installed mods can't share one. When you add a file with the ID of an installed mod,
+  DDMM asks whether to **replace** the installed mod with it (see
+  [A mod with the same ID is already installed](../using/adding-mods.md#replacing-an-installed-mod)); you only
+  get this error when the question couldn't be asked (for example, the browser extension sent the file while
+  DDMM's Mods page wasn't open), or for a folder added with Add Folder. Then:
+    - **The same mod again** (a newer or older download of it): add the file again with the Mods page open and
+      choose **Replace**, use **Update** on the mod, or remove it first.
+    - **A different mod** with the same ID: some authors copy one mod's `manifest.json` into their next mod, so
+      both claim the same GUID. DDMM names the mod already using it; tell the author. You can't have both
+      installed: **Replace** removes the installed one. To keep both, extract the archive, delete its
+      `manifest.json`, and add the folder with Add Folder (DDMM then gives it an ID of its own).
 - **The mod's options are missing, or it shows up twice.** DDMM looks for `manifest.json` at the archive's
   root and, when the root holds only one folder, inside that folder (up to 3 levels deep). If the archive holds
   two or more folders with the manifest in one of them, DDMM can't tell which folder is the mod. It then

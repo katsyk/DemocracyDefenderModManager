@@ -171,6 +171,13 @@ old GUID no longer match (they are not migrated; the Mods page shows them as mis
 installed mod's files, the app only does it when the id came from a recognized mod-page `pageUrl`. A source derived
 from `downloadUrl` host detection never has an id and always installs as a new mod.
 
+When the file isn't such an update but its `manifest.json` has the GUID of an installed mod, the app asks the user on
+the Mods page whether to **replace** that mod with it (the same question as for Add; see
+[adding mods](../using/adding-mods.md#replacing-an-installed-mod)), waiting up to 2 minutes. Replace swaps the file in
+place of that mod, keeping its GUID and so its profile entries; the reply is then `"updated": true`. Cancel (or no
+answer) installs nothing and replies `DECLINED`. If the Mods page can't show the question, the install fails as
+already installed (`INTERNAL`), as before.
+
 One mod page can offer several files that are installed side by side (GameBanana variants, a Nexus Mods main file and
 its optional files), so sharing a source isn't enough: the app records which file each mod was installed from
 (`InstalledFiles` in its origin sidecar) and updates a mod only with **the same file**:
@@ -280,7 +287,7 @@ Reply: `{ "id": "5", "ok": true, "type": "opened" }`
 | `BAD_REQUEST` | Malformed message / missing field / message too large |
 | `UNSUPPORTED` | Unknown message type or protocol version |
 | `FORBIDDEN_ORIGIN` | Caller isn't an allowed extension |
-| `DECLINED` | The user answered Deny / closed the prompt |
+| `DECLINED` | The user answered Deny / closed the prompt, or kept the installed mod when asked whether to replace it |
 | `NOT_ARCHIVE` | File isn't a zip/7z/rar |
 | `UNSAFE_ARCHIVE` | Archive failed path-traversal / symlink validation |
 | `FILE_NOT_FOUND` | `file` doesn't exist or isn't a regular file |
