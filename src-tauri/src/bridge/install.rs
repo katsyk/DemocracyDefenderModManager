@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use crate::{
-    commands::mods::{install_from_archive, install_update_from_archive},
+    commands::mods::{install_or_replace, install_update_from_archive},
     download,
     models::{manifest::Source, Mod},
     sources, AppState,
@@ -19,7 +19,10 @@ use super::protocol::ErrorCode;
 #[derive(Debug)]
 pub struct InstallOutcome {
     pub r#mod: Mod,
+    /// Installed over an installed mod: an update of it, or (`replaced`) a
+    /// file with its ID the user chose to replace it with.
     pub updated: bool,
+    pub replaced: bool,
     pub warning: Option<String>,
     /// The source recorded for this install (provider + id when `pageUrl`
     /// was a recognized mod page), echoed back in the `installed` reply.
@@ -181,11 +184,27 @@ pub async fn install_file(
     download_url: Option<&str>,
     page_version: Option<&str>,
 ) -> Result<InstallOutcome, InstallError> {
-    install_file_with(state, mods, file, page_url, download_url, page_version, Vec::new()).await
+    install_file_with(state, mods, file, page_url, download_url, page_version, Vec::new(), None).await
+}
+
+/// The installed mod an install of `file` from this request would update
+/// in place (see [`find_update_target`]), if any. A file with the ID of an
+/// installed mod that isn't such an update is what the user is asked to
+/// replace (see `server::handle_install`).
+pub async fn update_target(mods: &[Mod], file: &Path, page_url: Option<&str>, download_url: Option<&str>) -> Option<uuid::Uuid> {
+    let source = resolve_source(page_url, download_url, None)?;
+    if !source_is_from_mod_page(page_url) {
+        return None;
+    }
+    let incoming_name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    find_update_target(mods, &source, incoming_name).await
 }
 
 /// [`install_file`], also recording which exact file was installed (see
-/// `sources::InstalledFile`).
+/// `sources::InstalledFile`), and -- when it isn't an update -- replacing
+/// the installed mod `replace` in place (the user said so) when the file
+/// has its ID.
+#[allow(clippy::too_many_arguments)]
 pub async fn install_file_with(
     state: &AppState,
     mods: &mut Vec<Mod>,
@@ -194,7 +213,14 @@ pub async fn install_file_with(
     download_url: Option<&str>,
     page_version: Option<&str>,
     installed_files: Vec<sources::InstalledFile>,
+    replace: Option<uuid::Uuid>,
 ) -> Result<InstallOutcome, InstallError> {
+    check_file(file).await?;
+    install_checked_file(state, mods, file, page_url, download_url, page_version, installed_files, replace).await
+}
+
+/// The protocol's checks of a file to install (see [`install_file`]).
+pub async fn check_file(file: &Path) -> Result<(), InstallError> {
     let meta = tokio::fs::symlink_metadata(file)
         .await
         .map_err(|_| InstallError::new(ErrorCode::FileNotFound, "file does not exist"))?;
@@ -224,7 +250,20 @@ pub async fn install_file_with(
             format!("the downloaded file can't be installed: {e:#}"),
         ));
     }
+    Ok(())
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn install_checked_file(
+    state: &AppState,
+    mods: &mut Vec<Mod>,
+    file: &Path,
+    page_url: Option<&str>,
+    download_url: Option<&str>,
+    page_version: Option<&str>,
+    installed_files: Vec<sources::InstalledFile>,
+    replace: Option<uuid::Uuid>,
+) -> Result<InstallOutcome, InstallError> {
     let mut source = resolve_source(page_url, download_url, page_version);
 
     // Safety net: an in-place update replaces an installed mod's files, so
@@ -275,11 +314,12 @@ pub async fn install_file_with(
         }
     }
 
-    let (r#mod, warning) = match existing_guid {
+    let (r#mod, warning, replaced) = match existing_guid {
         Some(guid) => install_update_from_archive(state, mods, file, guid)
             .await
+            .map(|(m, w)| (m, w, false))
             .map_err(|e| InstallError::from_install_failure(e.to_string()))?,
-        None => install_from_archive(state, mods, file)
+        None => install_or_replace(state, mods, file, replace)
             .await
             .map_err(|e| InstallError::from_install_failure(e.to_string()))?,
     };
@@ -310,7 +350,8 @@ pub async fn install_file_with(
 
     Ok(InstallOutcome {
         r#mod,
-        updated: existing_guid.is_some(),
+        updated: existing_guid.is_some() || replaced,
+        replaced,
         warning,
         source,
     })
@@ -755,6 +796,39 @@ mod tests {
             assert_ne!(out.r#mod.guid(), a_guid);
         }
         assert_eq!(mods.len(), 4);
+    }
+
+    /// A browser install of a file with an installed mod's ID, after the
+    /// user chose Replace: replaces that mod in place (reported as an
+    /// update), and records the page it came from. Without Replace it's
+    /// refused as already installed, as before.
+    #[tokio::test]
+    async fn a_file_with_an_installed_mods_id_replaces_it_when_told_to() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("mods")).await.unwrap();
+        let state = AppState::new(dir.path().to_path_buf());
+        let mut mods = Vec::new();
+        let manifest = br#"{ "Version": 1, "Guid": "dddddddd-4444-4444-8444-dddddddddddd", "Name": "Shared", "Description": "" }"#;
+        let first = dir.path().join("first.zip");
+        make_zip(&first, &[("manifest.json", manifest), ("0123456789abcdef.patch_0", b"1")]);
+        let installed = install_file(&state, &mut mods, &first, None, None, None).await.unwrap();
+
+        let second = dir.path().join("second.zip");
+        make_zip(&second, &[("manifest.json", manifest), ("0123456789abcdef.patch_0", b"2")]);
+        assert_eq!(update_target(&mods, &second, Some(PAGE_URL), None).await, None, "not an update of it");
+        let err = install_file(&state, &mut mods, &second, Some(PAGE_URL), None, None).await.unwrap_err();
+        assert!(err.message.contains("already installed"), "{}", err.message);
+
+        let guid = installed.r#mod.guid();
+        let out = install_file_with(&state, &mut mods, &second, Some(PAGE_URL), None, None, Vec::new(), Some(guid))
+            .await
+            .unwrap();
+        assert!(out.updated && out.replaced);
+        assert_eq!(out.r#mod.guid(), guid);
+        assert_eq!(out.r#mod.directory, installed.r#mod.directory);
+        assert_eq!(patch_bytes(&out.r#mod.directory), b"2");
+        assert_eq!(mods.len(), 1);
+        assert_eq!(out.source.as_ref().and_then(|s| s.id.as_deref()), Some("4084"));
     }
 
     #[tokio::test]

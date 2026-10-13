@@ -1229,7 +1229,7 @@ pub async fn update_mod_direct(
 
     mark_mod_updated(&state, guid, r#mod.guid(), Some(&provider), version.as_deref()).await;
     log::info!("Mod {{{}}} updated from {provider} to {:?}.", r#mod.guid(), version);
-    Ok(InstalledMod { r#mod, warning })
+    Ok(InstalledMod::added(r#mod, warning))
 }
 
 /// The install half of [`update_mod_direct`]: replace mod `guid` with

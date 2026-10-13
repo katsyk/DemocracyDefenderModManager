@@ -19,6 +19,7 @@ pub mod nexus_oauth;
 pub mod mod_import;
 pub mod install_error;
 pub mod mod_folder;
+pub mod replace_prompt;
 pub(crate) mod mod_root;
 
 use std::{
@@ -120,6 +121,9 @@ pub struct AppState {
     /// `ddmm://install` links waiting for the Mods page's confirmation
     /// (`deep_link` only).
     deep_links: std::sync::Mutex<deep_link::DeepLinkQueue>,
+    /// "Replace the installed mod?" questions waiting for the Mods page's
+    /// answer (`replace_prompt` only).
+    replace_pending: Mutex<replace_prompt::PendingReplaces>,
 }
 
 /// Shown when something that writes to the data folder is attempted while
@@ -167,6 +171,7 @@ impl AppState {
             import_cancel: std::sync::Mutex::default(),
             import_scan: Mutex::default(),
             deep_links: std::sync::Mutex::default(),
+            replace_pending: Mutex::default(),
         }
     }
 
@@ -480,6 +485,7 @@ pub fn run() {
             commands::mods::add_mod_folder,
             commands::mods::add_paths,
             commands::mods::add_mod_from_url,
+            commands::mods::resolve_replace_request,
             commands::import::detect_import_sources,
             commands::import::scan_import_folder,
             commands::import::scan_import_paths,

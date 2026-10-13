@@ -15,7 +15,12 @@ use tokio::{
 };
 
 use crate::{
-    commands::{mods::ensure_mods_loaded, profiles::do_load_profiles, settings::do_load_settings},
+    commands::{
+        mods::{ensure_mods_loaded, ReplaceChoice},
+        profiles::do_load_profiles,
+        settings::do_load_settings,
+    },
+    replace_prompt::Asker,
     AppState,
 };
 
@@ -38,7 +43,7 @@ const FRONTEND_READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// bridge events. Emitting before that loses the event: nothing is
 /// listening yet, so a consent prompt would never appear (and time out as
 /// Deny) and the afterInstall step would silently not happen.
-async fn wait_for_frontend(app: &AppHandle) -> bool {
+pub(crate) async fn wait_for_frontend(app: &AppHandle) -> bool {
     let rx = app.state::<AppState>().bridge_frontend_ready.subscribe();
     wait_until_ready(rx, FRONTEND_READY_TIMEOUT).await
 }
@@ -480,6 +485,44 @@ async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String) -> 
     let state = app.state::<AppState>();
     let file = std::path::PathBuf::from(&req.file);
 
+    if let Err(e) = install::check_file(&file).await {
+        return ErrorReply::new(id, e.code, e.message).to_line();
+    }
+
+    // A file with the ID (manifest.json GUID) of an installed mod that this
+    // isn't an update of: ask the user whether to replace that mod, on the
+    // Mods page -- without holding the mod list meanwhile.
+    let is_update = {
+        let mut mods_guard = state.mods.lock().await;
+        match ensure_mods_loaded(&mut mods_guard, &state.base_path).await {
+            Ok(mods) => install::update_target(mods, &file, req.page_url.as_deref(), req.download_url.as_deref())
+                .await
+                .is_some(),
+            Err(e) => {
+                return ErrorReply::new(id, ErrorCode::Internal, format!("couldn't read installed mods: {e}")).to_line()
+            }
+        }
+    };
+    let replace = if is_update {
+        None
+    } else {
+        match crate::commands::mods::decide_replace(&state, &file, &Asker::browser(app)).await {
+            Ok(ReplaceChoice::Keep(existing)) => {
+                return ErrorReply::new(
+                    id,
+                    ErrorCode::Declined,
+                    format!("You kept the installed \"{}\"; nothing was installed.", existing.name()),
+                )
+                .to_line();
+            }
+            Ok(ReplaceChoice::Replace(guid)) => Some(guid),
+            Ok(ReplaceChoice::Install) => None,
+            Err(e) => {
+                return ErrorReply::new(id, ErrorCode::Internal, format!("couldn't read installed mods: {e:#}")).to_line()
+            }
+        }
+    };
+
     // Record what's being installed (version, which file) so update checks
     // work for it: from the page, or -- before taking the mods lock, since
     // it may ask the site -- from the archive name / the site itself.
@@ -512,6 +555,7 @@ async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String) -> 
             req.download_url.as_deref(),
             page_version.as_deref(),
             installed_files,
+            replace,
         )
         .await
     };
@@ -672,6 +716,7 @@ async fn request_install_completion(
         },
         "afterInstall": after_install,
         "updated": outcome.updated,
+        "replaced": outcome.replaced,
     });
     let _ = app.emit("bridge://mod-installed", payload);
 

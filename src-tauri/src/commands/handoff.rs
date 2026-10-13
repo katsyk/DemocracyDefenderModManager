@@ -25,10 +25,11 @@ use uuid::Uuid;
 use crate::{
     install_error::{InstallError, InstallStep},
     commands::{
-        mods::{install_from_archive, install_update_from_archive},
+        mods::{decide_replace, install_or_replace, install_update_from_archive, InstalledMod, ReplaceChoice},
         settings::do_load_settings,
     },
     models::{manifest::Source, Mod},
+    replace_prompt::Asker,
     sources, AppState,
 };
 
@@ -199,6 +200,10 @@ pub struct HandoffEvent {
     /// sent with `Waiting`, since the handoff keeps waiting.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ignored: Option<IgnoredDownload>,
+    /// Sent with `Done`: the file had the ID of an installed mod, and the
+    /// user chose to replace that mod with it (`r#mod` is that mod now).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub replaced: bool,
 }
 
 /// A new archive in the Downloads folder that is plainly *another* mod's
@@ -221,7 +226,8 @@ pub enum HandoffStatus {
     Installing,
     /// Installed successfully -- `r#mod` (and maybe `warning`) are set.
     Done,
-    /// The user cancelled via `cancel_handoff`.
+    /// The user cancelled via `cancel_handoff` -- or kept the installed
+    /// mod that has the downloaded file's ID, so nothing was installed.
     Cancelled,
     /// 15 minutes passed with no matching file appearing.
     TimedOut,
@@ -368,6 +374,7 @@ pub async fn cancel_handoff(state: State<'_, AppState>) -> TAResult<()> {
 /// recording the same origin `Source`.
 #[tauri::command]
 pub async fn install_handoff_file(
+    app: AppHandle,
     state: State<'_, AppState>,
     file: PathBuf,
     page_url: String,
@@ -381,11 +388,9 @@ pub async fn install_handoff_file(
         version: None,
     });
 
-    let (r#mod, warning) = install_found_file(&state, &file, &source, existing_guid)
+    install_found_file(&state, &file, &source, existing_guid, &Asker::in_app(&app))
         .await
-        .into_ta_result()?;
-
-    Ok(crate::commands::mods::InstalledMod { r#mod, warning })
+        .into_ta_result()
 }
 
 async fn run_handoff(
@@ -408,19 +413,33 @@ async fn run_handoff(
                     warning: None,
                     message: None,
                     ignored: None,
+                    replaced: false,
                 },
             );
 
             let state = app.state::<AppState>();
-            match install_holding_data_op(&state, &path, &source, existing_guid).await {
-                Ok((r#mod, warning)) => emit(
+            match install_holding_data_op(&state, &path, &source, existing_guid, &Asker::in_app(&app)).await {
+                // The user kept the installed mod with this file's ID.
+                Ok(installed) if installed.kept => emit(
+                    &app,
+                    HandoffEvent {
+                        status: HandoffStatus::Cancelled,
+                        r#mod: None,
+                        warning: None,
+                        message: None,
+                        ignored: None,
+                        replaced: false,
+                    },
+                ),
+                Ok(installed) => emit(
                     &app,
                     HandoffEvent {
                         status: HandoffStatus::Done,
-                        r#mod: Some(r#mod),
-                        warning,
+                        r#mod: Some(installed.r#mod),
+                        warning: installed.warning,
                         message: None,
                         ignored: None,
+                        replaced: installed.replaced,
                     },
                 ),
                 Err(e) => emit(
@@ -431,6 +450,7 @@ async fn run_handoff(
                         warning: None,
                         message: Some(e.to_string()),
                         ignored: None,
+                        replaced: false,
                     },
                 ),
             }
@@ -443,6 +463,7 @@ async fn run_handoff(
                 warning: None,
                 message: None,
                 ignored: None,
+                replaced: false,
             },
         ),
         Ok(WaitOutcome::TimedOut) => emit(
@@ -453,6 +474,7 @@ async fn run_handoff(
                 warning: None,
                 message: None,
                 ignored: None,
+                replaced: false,
             },
         ),
         Err(e) => {
@@ -465,6 +487,7 @@ async fn run_handoff(
                     warning: None,
                     message: Some(e.to_string()),
                     ignored: None,
+                    replaced: false,
                 },
             )
         }
@@ -485,17 +508,23 @@ async fn install_holding_data_op(
     archive_path: &Path,
     source: &Source,
     existing_guid: Option<Uuid>,
-) -> anyhow::Result<(Mod, Option<String>)> {
+    asker: &Asker<'_>,
+) -> anyhow::Result<InstalledMod> {
     let _data_op = state.data_op()?;
-    install_found_file(state, archive_path, source, existing_guid).await
+    install_found_file(state, archive_path, source, existing_guid, asker).await
 }
 
+/// Install the file the handoff found (or the user chose): an update of
+/// `existing_guid` when set, else a new mod -- or, when the file has the
+/// ID of an installed mod, that mod replaced in place if `asker` says so
+/// (`kept` when not).
 async fn install_found_file(
     state: &AppState,
     archive_path: &Path,
     source: &Source,
     existing_guid: Option<Uuid>,
-) -> anyhow::Result<(Mod, Option<String>)> {
+    asker: &Asker<'_>,
+) -> anyhow::Result<InstalledMod> {
     // A file of another Nexus mod (its archive name says which) is never
     // installed as an update of this one. Chosen by hand as a new install,
     // it's installed -- as the mod it really is.
@@ -514,6 +543,21 @@ async fn install_found_file(
     }
     let source = &source;
 
+    // A new install of a file with an installed mod's ID: ask first
+    // (without the mods lock), before asking any site about it.
+    let replace = match existing_guid {
+        Some(_) => None,
+        None => match decide_replace(state, archive_path, asker).await? {
+            ReplaceChoice::Keep(existing) => {
+                let mut kept = InstalledMod::added(existing, None);
+                kept.kept = true;
+                return Ok(kept);
+            }
+            ReplaceChoice::Replace(guid) => Some(guid),
+            ReplaceChoice::Install => None,
+        },
+    };
+
     // Done before taking the mods lock so a slow/failed metadata fetch
     // never holds up anything else touching the mod list. Best-effort:
     // falls back to the plain source (no Version) on any failure.
@@ -528,17 +572,18 @@ async fn install_found_file(
         }
     }
 
-    let (r#mod, warning) = {
+    let (r#mod, warning, replaced) = {
         let mut mods_guard = state.mods.lock().await;
         let mods = mods_guard
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("mods not read"))?;
 
-        let (mut r#mod, warning) = match existing_guid {
+        let (mut r#mod, warning, replaced) = match existing_guid {
             Some(guid) => install_update_from_archive(state, mods, archive_path, guid)
                 .await
+                .map(|(m, w)| (m, w, false))
                 .map_err(|e| anyhow::anyhow!("{e}"))?,
-            None => install_from_archive(state, mods, archive_path)
+            None => install_or_replace(state, mods, archive_path, replace)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?,
         };
@@ -553,7 +598,7 @@ async fn install_found_file(
         if let Some(existing) = mods.iter_mut().find(|m| m.guid() == r#mod.guid()) {
             *existing = r#mod.clone();
         }
-        (r#mod, warning)
+        (r#mod, warning, replaced)
     };
 
     if let Some(guid) = existing_guid {
@@ -567,7 +612,9 @@ async fn install_found_file(
         .await;
     }
 
-    Ok((r#mod, warning))
+    let mut installed = InstalledMod::added(r#mod, warning);
+    installed.replaced = replaced;
+    Ok(installed)
 }
 
 enum WaitOutcome {
@@ -596,6 +643,7 @@ async fn wait_for_download(
             warning: None,
             message: None,
             ignored: None,
+            replaced: false,
         },
     );
 
@@ -632,6 +680,7 @@ async fn wait_for_download(
                         warning: None,
                         message: None,
                         ignored: Some(IgnoredDownload { file_name: name, mod_id }),
+                        replaced: false,
                     },
                 );
                 continue;
@@ -851,7 +900,7 @@ mod tests {
         *state.mods.lock().await = Some(Vec::new());
         let first = dir.join("Better Stims-1234-1-0-1718000000.zip");
         make_mod_zip(&first, b"1234 v1");
-        let (m, _) = install_found_file(&state, &first, &nexus_source("1234"), None).await.unwrap();
+        let m = install_found_file(&state, &first, &nexus_source("1234"), None, &Asker::Never).await.unwrap().r#mod;
         (state, m.guid(), m.directory.clone())
     }
 
@@ -862,13 +911,13 @@ mod tests {
 
         let req = dir.path().join("Req-5678-2-0-1718200000.zip");
         make_mod_zip(&req, b"5678");
-        let err = install_found_file(&state, &req, &nexus_source("1234"), Some(guid)).await.unwrap_err();
+        let err = install_found_file(&state, &req, &nexus_source("1234"), Some(guid), &Asker::Never).await.unwrap_err();
         assert!(format!("{err:#}").contains("another Nexus Mods mod (ID 5678)"), "{err:#}");
         assert_eq!(std::fs::read(mod_dir.join("0123456789abcdef.patch_0")).unwrap(), b"1234 v1");
         assert_eq!(state.mods.lock().await.as_ref().unwrap().len(), 1);
 
         // Chosen by hand as a *new* install, it's installed -- as mod 5678.
-        let (m, _) = install_found_file(&state, &req, &nexus_source("1234"), None).await.unwrap();
+        let m = install_found_file(&state, &req, &nexus_source("1234"), None, &Asker::Never).await.unwrap().r#mod;
         assert_ne!(m.guid(), guid);
         let sidecar = sources::load_origin_sidecar(&m.directory).await.unwrap();
         assert_eq!(sidecar.sources[0].id.as_deref(), Some("5678"));
@@ -884,12 +933,12 @@ mod tests {
         *state.mods.lock().await = Some(Vec::new());
         let first = dir.path().join("Cool Mod-456-2024-06-01-1718000000.zip");
         make_mod_zip(&first, b"v1");
-        let (m, _) = install_found_file(&state, &first, &nexus_source("456"), None).await.unwrap();
+        let m = install_found_file(&state, &first, &nexus_source("456"), None, &Asker::Never).await.unwrap().r#mod;
 
         let update = dir.path().join("Cool Mod-456-2024-07-15-1720000000.zip");
         make_mod_zip(&update, b"v2");
         assert_eq!(sources::other_nexus_mod(&nexus_source("456"), "Cool Mod-456-2024-07-15-1720000000.zip"), None);
-        let (updated, _) = install_found_file(&state, &update, &nexus_source("456"), Some(m.guid())).await.unwrap();
+        let updated = install_found_file(&state, &update, &nexus_source("456"), Some(m.guid()), &Asker::Never).await.unwrap().r#mod;
         assert_eq!(updated.guid(), m.guid());
         assert_eq!(std::fs::read(updated.directory.join("0123456789abcdef.patch_0")).unwrap(), b"v2");
         let sidecar = sources::load_origin_sidecar(&updated.directory).await.unwrap();
@@ -945,7 +994,7 @@ mod tests {
 
         let f = dir.path().join("Other-99-1-0-1718000000.zip");
         make_mod_zip(&f, b"x");
-        let err = install_holding_data_op(&state, &f, &nexus_source("99"), None).await.unwrap_err();
+        let err = install_holding_data_op(&state, &f, &nexus_source("99"), None, &Asker::Never).await.unwrap_err();
         assert_eq!(err.to_string(), crate::DATA_FOLDER_BUSY);
         assert_eq!(state.mods.lock().await.as_ref().unwrap().len(), 1, "nothing was installed");
     }

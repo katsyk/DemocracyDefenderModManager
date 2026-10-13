@@ -201,6 +201,14 @@ pub async fn migrate_saved_profiles(
     Ok(moved)
 }
 
+/// After the mod `guid` was replaced in place by another file with the
+/// same ID: fit its entries in the saved profiles.json to its new
+/// `manifest` (see [`fit_config`]), keeping their place and on/off.
+/// Returns how many entries it has.
+pub async fn fit_saved_profiles(base_path: &std::path::Path, guid: uuid::Uuid, manifest: &Manifest) -> anyhow::Result<usize> {
+    migrate_saved_profiles(base_path, guid, guid, manifest).await
+}
+
 /// `config` for the mod `guid` whose manifest is `manifest`: its option
 /// choices when they still fit (same manifest version, same number of
 /// options, sub-option choices in range), else every option on and the
