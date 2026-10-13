@@ -10,10 +10,10 @@
 //! mod in place (see `commands::mods::replace_from_archive`); Cancel, no
 //! answer, or a page that can't ask leave everything as it is.
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, future::Future, pin::Pin, time::Duration};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -61,18 +61,18 @@ pub enum Asker<'a> {
     /// installed (the bulk import, which has its own statuses).
     Never,
     /// The user, on the Mods page.
-    User { app: &'a AppHandle, timeout: Duration },
+    User { app: &'a dyn AskUser, timeout: Duration },
     /// A fixed answer (tests).
     #[cfg(test)]
     Answer(bool),
 }
 
 impl<'a> Asker<'a> {
-    pub fn in_app(app: &'a AppHandle) -> Self {
+    pub fn in_app<R: Runtime>(app: &'a AppHandle<R>) -> Self {
         Asker::User { app, timeout: IN_APP_TIMEOUT }
     }
 
-    pub fn browser(app: &'a AppHandle) -> Self {
+    pub fn browser<R: Runtime>(app: &'a AppHandle<R>) -> Self {
         Asker::User { app, timeout: BROWSER_TIMEOUT }
     }
 
@@ -87,10 +87,34 @@ impl<'a> Asker<'a> {
     pub async fn ask(&self, offer: &ReplaceOffer) -> Option<bool> {
         match self {
             Asker::Never => None,
-            Asker::User { app, timeout } => ask_user(app, offer, *timeout).await,
+            Asker::User { app, timeout } => app.ask_user(offer, *timeout).await,
             #[cfg(test)]
             Asker::Answer(answer) => Some(*answer),
         }
+    }
+}
+
+/// Asks the user on the Mods page. Behind a trait object so that only the
+/// commands (which build an [`Asker::User`] from their `AppHandle`) reach
+/// the real webview runtime: code the unit tests run (with
+/// [`Asker::Answer`]) never references it, and so the test binary doesn't
+/// link the window/webview code (on Windows it would then need the app's
+/// common-controls manifest just to start).
+pub trait AskUser: Sync {
+    fn ask_user<'a>(
+        &'a self,
+        offer: &'a ReplaceOffer,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Option<bool>> + Send + 'a>>;
+}
+
+impl<R: Runtime> AskUser for AppHandle<R> {
+    fn ask_user<'a>(
+        &'a self,
+        offer: &'a ReplaceOffer,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Option<bool>> + Send + 'a>> {
+        Box::pin(ask_user(self, offer, timeout))
     }
 }
 
@@ -122,7 +146,7 @@ impl PendingReplaces {
     }
 }
 
-async fn ask_user(app: &AppHandle, offer: &ReplaceOffer, timeout: Duration) -> Option<bool> {
+async fn ask_user<R: Runtime>(app: &AppHandle<R>, offer: &ReplaceOffer, timeout: Duration) -> Option<bool> {
     if !crate::bridge::server::wait_for_frontend(app).await {
         log::warn!("The Mods page isn't open to ask whether to replace \"{}\"; not replacing it.", offer.installed_name);
         return None;

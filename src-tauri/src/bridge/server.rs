@@ -43,7 +43,7 @@ const FRONTEND_READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// bridge events. Emitting before that loses the event: nothing is
 /// listening yet, so a consent prompt would never appear (and time out as
 /// Deny) and the afterInstall step would silently not happen.
-pub(crate) async fn wait_for_frontend(app: &AppHandle) -> bool {
+pub(crate) async fn wait_for_frontend<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
     let rx = app.state::<AppState>().bridge_frontend_ready.subscribe();
     wait_until_ready(rx, FRONTEND_READY_TIMEOUT).await
 }
@@ -733,7 +733,7 @@ async fn request_install_completion(
 
 /// Bring the main window to front -- reused by `deep_link` and by the
 /// frontend-facing `commands::bridge::focus_main_window` command.
-pub fn focus_main_window(app: &AppHandle) {
+pub fn focus_main_window<R: tauri::Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
