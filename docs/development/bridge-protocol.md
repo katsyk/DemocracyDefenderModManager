@@ -173,7 +173,9 @@ from `downloadUrl` host detection never has an id and always installs as a new m
 
 When the file isn't such an update but its `manifest.json` has the GUID of an installed mod, the app asks the user on
 the Mods page whether to **replace** that mod with it (the same question as for Add; see
-[adding mods](../using/adding-mods.md#replacing-an-installed-mod)), waiting up to 2 minutes. Replace swaps the file in
+[adding mods](../using/adding-mods.md#replacing-an-installed-mod)), waiting up to 2 minutes, and never past the point where
+the extension would have given up (its 5-minute install timeout, counted from when the request arrived, minus 2 minutes
+for the install and the `afterInstall` step); with too little time left it doesn't ask. Replace swaps the file in
 place of that mod, keeping its GUID and so its profile entries; the reply is then `"updated": true`. Cancel (or no
 answer) installs nothing and replies `DECLINED`. If the Mods page can't show the question, the install fails as
 already installed (`INTERNAL`), as before.

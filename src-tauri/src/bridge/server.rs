@@ -388,6 +388,9 @@ async fn handle_install_queued(app: &AppHandle, raw: serde_json::Value, id: Stri
     };
     let _recent = RecentFileGuard::new(&state, &raw);
 
+    // The extension's own timeout runs from now (see
+    // `replace_prompt::browser_question_timeout`).
+    let arrived = std::time::Instant::now();
     let _permit = state.bridge_install_lock.lock().await;
     let Ok(_data_op) = state.data_op() else {
         return ErrorReply::new(
@@ -397,7 +400,7 @@ async fn handle_install_queued(app: &AppHandle, raw: serde_json::Value, id: Stri
         )
         .to_line();
     };
-    handle_install(app, raw, id.clone()).await
+    handle_install(app, raw, id.clone(), arrived).await
 }
 
 /// One place in the install queue (`bridge_queue_depth`), given back when
@@ -444,7 +447,7 @@ impl Drop for RecentFileGuard<'_> {
     }
 }
 
-async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String) -> String {
+async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String, arrived: std::time::Instant) -> String {
     let req: InstallRequest = match serde_json::from_value(raw) {
         Ok(r) => r,
         Err(e) => return ErrorReply::new(id, ErrorCode::BadRequest, e.to_string()).to_line(),
@@ -506,7 +509,7 @@ async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String) -> 
     let replace = if is_update {
         None
     } else {
-        match crate::commands::mods::decide_replace(&state, &file, &Asker::browser(app)).await {
+        match crate::commands::mods::decide_replace(&state, &file, &Asker::browser(app, arrived)).await {
             Ok(ReplaceChoice::Keep(existing)) => {
                 return ErrorReply::new(
                     id,
@@ -515,7 +518,7 @@ async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String) -> 
                 )
                 .to_line();
             }
-            Ok(ReplaceChoice::Replace(guid)) => Some(guid),
+            Ok(ReplaceChoice::Replace(target)) => Some(target),
             Ok(ReplaceChoice::Install) => None,
             Err(e) => {
                 return ErrorReply::new(id, ErrorCode::Internal, format!("couldn't read installed mods: {e:#}")).to_line()

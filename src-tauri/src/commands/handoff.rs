@@ -553,7 +553,7 @@ async fn install_found_file(
                 kept.kept = true;
                 return Ok(kept);
             }
-            ReplaceChoice::Replace(guid) => Some(guid),
+            ReplaceChoice::Replace(target) => Some(target),
             ReplaceChoice::Install => None,
         },
     };

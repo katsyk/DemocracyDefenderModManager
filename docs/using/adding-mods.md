@@ -99,19 +99,24 @@ add has the ID of a mod that's already installed, DDMM never overwrites it silen
   puts the new one in its place.
 
 **Cancel** is the default (Enter cancels) and leaves everything as it is: nothing is installed, and the installed
-mod isn't touched. If you don't answer within 10 minutes (2 minutes for an install from the browser extension), DDMM
-cancels by itself.
+mod isn't touched. If you don't answer within 10 minutes, DDMM cancels by itself. For an install from the browser
+extension it waits at most 2 minutes, and less when the extension would otherwise stop waiting first (the extension
+gives up on an install after 5 minutes); with too little time left it doesn't ask, and the install fails as
+already installed. Closing or reloading the Mods page also cancels an open question.
 
 **Replace** swaps the new file in the same way an [update](updating-mods.md) does:
 
 - the file is unpacked and checked completely first; if anything goes wrong, the installed mod stays as it was;
-- the mod keeps its ID, so it keeps its **place in every profile** and whether it's **on**. Its **option choices**
+- the mod keeps its ID and its folder in DDMM's mod storage (the folder isn't renamed after the new file), so it
+  keeps its **place in every profile** and whether it's **on**. Its **option choices**
   stay as they were if they still fit the new `manifest.json`, otherwise they're reset to the defaults;
 - where the mod came from is recorded for the new file, as for a new install: from a Nexus Mods download name, or
   from the link you installed it from (Add URL, the browser extension). What the last update check said about the
   replaced mod is cleared;
 - if the mod is on in your active profile, DDMM redeploys it (or asks to) just like after an update; see
-  [After updating: redeploy](updating-mods.md#after-updating-redeploy).
+  [After updating: redeploy](updating-mods.md#after-updating-redeploy). An install from the browser extension
+  instead does what **After a Browser Install** says (library only, add to the active profile, or add and deploy),
+  as every extension install does.
 
 The question is asked for Add (one file or several), drag and drop, Add URL, `ddmm://` links, the browser handoff
 and the browser extension. Some cases don't ask:

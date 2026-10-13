@@ -27,9 +27,26 @@ pub const CLOSED_EVENT: &str = "install://replace-request-closed";
 
 /// How long a question about a file added in the app waits for an answer.
 pub const IN_APP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-/// How long a question about a browser install waits: the extension gives
-/// up on an install after five minutes, consent prompt included.
+/// The longest a question about a browser install waits.
 pub const BROWSER_TIMEOUT: Duration = Duration::from_secs(120);
+/// The extension gives up on an install five minutes after sending it
+/// (`INSTALL_TIMEOUT_MS` in its protocol client): waiting for the Mods page,
+/// the consent prompt and the install queue included.
+const EXTENSION_INSTALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Left for the install itself and the afterInstall step once the question
+/// is answered.
+const BROWSER_MARGIN: Duration = Duration::from_secs(120);
+/// Less time than this for the question: don't ask at all.
+const MIN_QUESTION_TIME: Duration = Duration::from_secs(20);
+
+/// How long the question about a browser install that arrived `elapsed`
+/// ago may wait, so that a Replace never happens after the extension has
+/// given up (and shown a failure); `None` when there's too little time left
+/// to ask.
+pub fn browser_question_timeout(elapsed: Duration) -> Option<Duration> {
+    let left = EXTENSION_INSTALL_TIMEOUT.saturating_sub(elapsed).saturating_sub(BROWSER_MARGIN);
+    (left >= MIN_QUESTION_TIME).then(|| left.min(BROWSER_TIMEOUT))
+}
 
 /// What the question shows: the installed mod and the file that has its ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -72,8 +89,18 @@ impl<'a> Asker<'a> {
         Asker::User { app, timeout: IN_APP_TIMEOUT }
     }
 
-    pub fn browser<R: Runtime>(app: &'a AppHandle<R>) -> Self {
-        Asker::User { app, timeout: BROWSER_TIMEOUT }
+    /// For a browser install that arrived at `arrived`: asks only while
+    /// the extension still waits for the answer (see
+    /// [`browser_question_timeout`]); otherwise nobody is asked and the
+    /// file is refused as already installed.
+    pub fn browser<R: Runtime>(app: &'a AppHandle<R>, arrived: std::time::Instant) -> Self {
+        match browser_question_timeout(arrived.elapsed()) {
+            Some(timeout) => Asker::User { app, timeout },
+            None => {
+                log::warn!("Too little time left before the browser extension gives up; not asking whether to replace.");
+                Asker::Never
+            }
+        }
     }
 
     pub fn asks(&self) -> bool {
@@ -144,6 +171,17 @@ impl PendingReplaces {
     fn forget(&mut self, key: &str) {
         self.0.remove(key);
     }
+
+    /// The Mods page went away (reloaded, left): nobody will answer the
+    /// open questions, so each is answered "keep" at once -- rather than
+    /// holding its install (and the data folder) until it times out.
+    pub fn keep_all(&mut self) -> usize {
+        let n = self.0.len();
+        for (_, tx) in self.0.drain() {
+            let _ = tx.send(false);
+        }
+        n
+    }
 }
 
 async fn ask_user<R: Runtime>(app: &AppHandle<R>, offer: &ReplaceOffer, timeout: Duration) -> Option<bool> {
@@ -197,6 +235,95 @@ mod tests {
         assert!(rx_b.await.unwrap());
         pending.forget(&a);
         assert!(rx_a.await.is_err(), "a forgotten question gets no answer");
+    }
+
+    fn offer() -> ReplaceOffer {
+        ReplaceOffer {
+            guid: Uuid::nil(),
+            file_name: "Cool Mod.zip".into(),
+            installed_name: "Cool Mod".into(),
+            installed_version: None,
+            new_name: "Cool Mod".into(),
+            new_version: None,
+            same_name: true,
+        }
+    }
+
+    /// A mock app (no webview) with DDMM's state, the Mods page ready, and
+    /// the request IDs of the questions it was asked / told were closed.
+    fn mock_page() -> (
+        tauri::App<tauri::test::MockRuntime>,
+        tempfile::TempDir,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use tauri::Listener;
+        let app = tauri::test::mock_app();
+        let dir = tempfile::tempdir().unwrap();
+        app.manage(AppState::new(dir.path().to_path_buf()));
+        app.state::<AppState>().bridge_frontend_ready.send_replace(true);
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let closed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        for (event, list) in [(REQUEST_EVENT, asked.clone()), (CLOSED_EVENT, closed.clone())] {
+            app.listen_any(event, move |e| {
+                let v: serde_json::Value = serde_json::from_str(e.payload()).unwrap();
+                list.lock().unwrap().push(v["requestId"].as_str().unwrap().to_string());
+            });
+        }
+        (app, dir, asked, closed)
+    }
+
+    async fn wait_for_question(asked: &std::sync::Mutex<Vec<String>>) -> String {
+        for _ in 0..200 {
+            if let Some(id) = asked.lock().unwrap().first().cloned() {
+                return id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the question was never asked");
+    }
+
+    #[tokio::test]
+    async fn the_page_answers_through_resolve() {
+        let (app, _dir, asked, _) = mock_page();
+        let handle = app.handle().clone();
+        let question = tokio::spawn(async move { Asker::in_app(&handle).ask(&offer()).await });
+        let id = wait_for_question(&asked).await;
+        assert!(app.state::<AppState>().replace_pending.lock().await.answer(&id, true));
+        assert_eq!(question.await.unwrap(), Some(true));
+    }
+
+    /// No answer in time: keep, and the page is told to close the question.
+    #[tokio::test]
+    async fn no_answer_in_time_keeps_and_closes_the_question() {
+        let (app, _dir, asked, closed) = mock_page();
+        let handle = app.handle().clone();
+        let answer = Asker::User { app: &handle, timeout: Duration::from_millis(50) }.ask(&offer()).await;
+        assert_eq!(answer, Some(false));
+        assert_eq!(*closed.lock().unwrap(), *asked.lock().unwrap());
+        assert_eq!(closed.lock().unwrap().len(), 1);
+        assert_eq!(app.state::<AppState>().replace_pending.lock().await.0.len(), 0, "nothing left waiting");
+    }
+
+    /// The page went away while asking: keep, at once.
+    #[tokio::test]
+    async fn the_page_going_away_keeps_at_once() {
+        let (app, _dir, asked, _) = mock_page();
+        let handle = app.handle().clone();
+        let question = tokio::spawn(async move { Asker::in_app(&handle).ask(&offer()).await });
+        wait_for_question(&asked).await;
+        assert_eq!(app.state::<AppState>().replace_pending.lock().await.keep_all(), 1);
+        let answer = tokio::time::timeout(Duration::from_secs(5), question).await.unwrap().unwrap();
+        assert_eq!(answer, Some(false));
+    }
+
+    #[test]
+    fn a_browser_question_never_outlasts_the_extensions_wait() {
+        assert_eq!(browser_question_timeout(Duration::ZERO), Some(BROWSER_TIMEOUT));
+        let late = browser_question_timeout(Duration::from_secs(150)).unwrap();
+        assert!(Duration::from_secs(150) + late + BROWSER_MARGIN <= EXTENSION_INSTALL_TIMEOUT);
+        assert_eq!(browser_question_timeout(Duration::from_secs(170)), None, "too little time left to ask");
+        assert_eq!(browser_question_timeout(Duration::from_secs(600)), None);
     }
 
     #[test]

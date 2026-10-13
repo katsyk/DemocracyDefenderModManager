@@ -459,7 +459,7 @@ pub async fn resolve_replace_request(state: State<'_, AppState>, request_id: Str
 pub(crate) async fn add_archive(state: &AppState, archive_file: &Path, asker: &Asker<'_>) -> TAResult<InstalledMod> {
     let replace = match decide_replace(state, archive_file, asker).await.into_ta_result()? {
         ReplaceChoice::Keep(existing) => return Ok(InstalledMod::kept(existing)),
-        ReplaceChoice::Replace(guid) => Some(guid),
+        ReplaceChoice::Replace(target) => Some(target),
         ReplaceChoice::Install => None,
     };
     let mut mods = state.mods.lock().await;
@@ -476,10 +476,19 @@ pub(crate) async fn add_archive(state: &AppState, archive_file: &Path, asker: &A
 pub(crate) enum ReplaceChoice {
     /// Add it (no installed mod has its ID, or nobody could be asked).
     Install,
-    /// Replace the installed mod with this ID by it.
-    Replace(Uuid),
+    /// Replace the installed mod the user was asked about by it.
+    Replace(ReplaceTarget),
     /// Keep the installed mod (returned as it is); add nothing.
     Keep(Mod),
+}
+
+/// The installed mod the user agreed to replace: its ID and its folder
+/// (so that a different mod that has the ID by the time it's installed is
+/// never replaced instead).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaceTarget {
+    pub guid: Uuid,
+    pub directory: PathBuf,
 }
 
 /// If the archive's own manifest.json has the ID of an installed mod, ask
@@ -502,7 +511,7 @@ pub(crate) async fn decide_replace(state: &AppState, archive_file: &Path, asker:
         }
     };
     Ok(match asker.ask(&offer).await {
-        Some(true) => ReplaceChoice::Replace(offer.guid),
+        Some(true) => ReplaceChoice::Replace(ReplaceTarget { guid: offer.guid, directory: existing.directory }),
         Some(false) => ReplaceChoice::Keep(existing),
         None => ReplaceChoice::Install,
     })
@@ -545,22 +554,42 @@ fn replace_offer(mods: &[Mod], manifest: &Manifest, archive_file: &Path) -> Opti
 }
 
 /// Install `archive_file`: in place of the installed mod `replace` when
-/// that's given and the mod is still installed (see
-/// [`replace_from_archive`]), else as a new mod ([`install_from_archive`],
-/// which refuses a file whose ID is installed). The `bool` says whether it
-/// replaced.
+/// that's given and still installed (see [`replace_from_archive`]), else as
+/// a new mod ([`install_from_archive`], which refuses a file whose ID is
+/// installed). The `bool` says whether it replaced. A mod in another folder
+/// that has the ID by now (the one asked about was removed and another
+/// added meanwhile) is never replaced: that's refused.
 pub(crate) async fn install_or_replace(
     state: &AppState,
     mods: &mut Vec<Mod>,
     archive_file: &Path,
-    replace: Option<Uuid>,
+    replace: Option<ReplaceTarget>,
 ) -> TAResult<(Mod, Option<String>, bool)> {
-    if let Some(guid) = replace {
-        if mods.iter().any(|m| m.guid() == guid) {
-            let (r#mod, warning) = replace_from_archive(state, mods, archive_file, guid).await?;
-            return Ok((r#mod, warning, true));
+    if let Some(target) = replace {
+        match mods.iter().find(|m| m.guid() == target.guid) {
+            Some(m) if m.directory == target.directory => {
+                let (r#mod, warning) = replace_from_archive(state, mods, archive_file, target.guid).await?;
+                return Ok((r#mod, warning, true));
+            }
+            Some(m) => {
+                return Err(report(
+                    InstallError::new(
+                        subject_of(archive_file),
+                        InstallStep::Replace,
+                        anyhow::anyhow!(
+                            "\"{}\" in your mod list has its ID now, not the mod you chose to replace (it was \
+                             removed meanwhile)",
+                            m.name()
+                        ),
+                    )
+                    .with_hint("Nothing was changed. Add the file again to be asked about the mod that has its ID now."),
+                ));
+            }
+            None => log::info!(
+                "The mod to replace ({{{}}}) is no longer installed; adding the file as a new mod.",
+                target.guid
+            ),
         }
-        log::info!("The mod to replace ({{{guid}}}) is no longer installed; adding the file as a new mod.");
     }
     let (r#mod, warning) = install_from_archive(state, mods, archive_file).await?;
     Ok((r#mod, warning, false))
@@ -638,7 +667,7 @@ pub(crate) async fn install_from_archive(state: &AppState, mods: &mut Vec<Mod>, 
     log::info!("Adding mod from {:?}...", archive_file);
     let subject = subject_of(archive_file);
     let (mut r#mod, warning) =
-        install_archive_steps(&state.base_path, mods, archive_file, &dir_name, &display_name, &subject)
+        install_archive_steps(&state.base_path, mods, archive_file, &dir_name, &display_name, &subject, AddRoute::Archive)
             .await
             .map_err(report)?;
     record_nexus_from_file_name(mods, &mut r#mod, &file_name, true).await;
@@ -697,7 +726,7 @@ pub(crate) async fn install_from_archive_as(
 ) -> TAResult<(Mod, Option<String>)> {
     log::info!("Adding mod from {:?}...", archive_file);
     let subject = subject_of(archive_file);
-    install_archive_steps(base_path, mods, archive_file, name, name, &subject).await.map_err(report)
+    install_archive_steps(base_path, mods, archive_file, name, name, &subject, AddRoute::Import).await.map_err(report)
 }
 
 /// Log a failed install (the whole message: which mod, which step, why)
@@ -714,6 +743,7 @@ async fn install_archive_steps(
     dir_name: &str,
     manifest_name: &str,
     subject: &str,
+    route: AddRoute,
 ) -> Result<(Mod, Option<String>), InstallError> {
     log::debug!("Opening archive...");
     let mut archive = Archive::open(archive_file).install_step(subject, InstallStep::OpenArchive)?;
@@ -748,7 +778,7 @@ async fn install_archive_steps(
         };
 
         log::info!("Checking for duplicate...");
-        check_not_installed(mods, &r#mod, subject, true)?;
+        check_not_installed(mods, &r#mod, subject, route)?;
 
         log::info!("Extracting archive...");
         extract_archive(archive, mod_dir.clone(), root).await.install_step(subject, InstallStep::Extract)?;
@@ -811,9 +841,19 @@ fn manifest_failure(subject: &str, e: anyhow::Error) -> InstallError {
 ///
 /// An archive added on the Mods page never gets here with such an ID: the
 /// user is asked whether to replace the installed mod instead (see
-/// [`decide_replace`]). It does when the question couldn't be asked, so
-/// for an archive (`from_archive`) the hint says how to get it.
-fn check_not_installed(mods: &[Mod], new: &Mod, subject: &str, from_archive: bool) -> Result<(), InstallError> {
+/// [`decide_replace`]). It does when the question couldn't be asked, or in
+/// the bulk import (which never asks), so the hint says how to get it.
+/// How a mod is being added, for [`check_not_installed`]'s hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddRoute {
+    /// An archive added one by one (Add, drop, Add URL, a browser install).
+    Archive,
+    /// An archive in the bulk import, which never asks to replace.
+    Import,
+    Folder,
+}
+
+fn check_not_installed(mods: &[Mod], new: &Mod, subject: &str, route: AddRoute) -> Result<(), InstallError> {
     let Some(existing) = mods.iter().find(|m| m.guid() == new.guid()) else {
         return Ok(());
     };
@@ -823,18 +863,25 @@ fn check_not_installed(mods: &[Mod], new: &Mod, subject: &str, from_archive: boo
         existing.name()
     );
     let same_name = existing.name().trim().eq_ignore_ascii_case(new.name().trim());
-    let hint = if same_name && from_archive {
+    let how = match route {
+        AddRoute::Archive => Some("add the file again with DDMM's Mods page open and choose Replace when asked"),
+        AddRoute::Import => {
+            Some("add the file on its own with Add (or drop it on the Mods page) and choose Replace when asked")
+        }
+        AddRoute::Folder => None,
+    };
+    let hint = if let (true, Some(how)) = (same_name, how) {
         format!(
-            "\"{}\" is already installed. To replace it with this file, add the file again with DDMM's Mods page \
-             open and choose Replace when asked (or use Update on it, or remove it first).",
+            "\"{}\" is already installed. To replace it with this file, {how} (or use Update on it, or remove it \
+             first).",
             existing.name()
         )
-    } else if from_archive {
+    } else if let Some(how) = how {
         format!(
             "Two different mods can't share an ID: the mod's author probably copied another mod's manifest.json, \
-             so let them know. To install it anyway, add it again with DDMM's Mods page open and choose Replace \
-             when asked (that removes \"{}\"), or extract this archive, delete its manifest.json, and add the \
-             extracted folder with Add Folder (DDMM then gives it an ID of its own).",
+             so let them know. To install it anyway, {how} (that removes \"{}\"), or extract this archive, \
+             delete its manifest.json, and add the extracted folder with Add Folder (DDMM then gives it an ID of \
+             its own).",
             existing.name()
         )
     } else if same_name {
@@ -1287,7 +1334,7 @@ async fn adopt_folder_in_place(
             sources: Vec::new(),
         };
 
-        check_not_installed(mods, &r#mod, subject, false)?;
+        check_not_installed(mods, &r#mod, subject, AddRoute::Folder)?;
 
         normalize_manifest_file_name(mod_dir).await.install_step(subject, InstallStep::ReadManifest)?;
         let warning = apply_patch_layout(mod_dir, &mut r#mod.manifest)
@@ -1337,7 +1384,7 @@ async fn install_from_folder_inner(
     };
 
     log::info!("Checking for duplicate...");
-    check_not_installed(mods, &r#mod, subject, false)?;
+    check_not_installed(mods, &r#mod, subject, AddRoute::Folder)?;
 
     log::info!("Copying folder contents...");
     copy_dir_recursive(folder, mod_dir, &[sources::ORIGIN_SIDECAR_FILE])
@@ -2427,7 +2474,7 @@ mod tests {
                  Cause: its manifest.json gives it the ID (GUID) {{{KOYUKI_GUID}}}, and \"koyuki launcher\" in your \
                  mod list already has that ID\n\
                  Hint: Two different mods can't share an ID: the mod's author probably copied another mod's \
-                 manifest.json, so let them know. To install it anyway, add it again with DDMM's Mods page open \
+                 manifest.json, so let them know. To install it anyway, add the file again with DDMM's Mods page open \
                  and choose Replace when asked (that removes \"koyuki launcher\"), or extract this archive, delete \
                  its manifest.json, and add the extracted folder with Add Folder (DDMM then gives it an ID of its \
                  own)."
@@ -4518,7 +4565,8 @@ mod tests {
 
         let mut guard = state.mods.lock().await;
         let mods = guard.as_mut().unwrap();
-        let msg = message(install_or_replace(&state, mods, &file, Some(old.guid())).await);
+        let target = ReplaceTarget { guid: old.guid(), directory: old.directory.clone() };
+        let msg = message(install_or_replace(&state, mods, &file, Some(target)).await);
         assert!(msg.contains("Step: replacing the installed version"), "{msg}");
         assert!(msg.contains("was left as it was"), "{msg}");
         assert_eq!(mods.len(), 1);
@@ -4539,9 +4587,44 @@ mod tests {
         options_mod_zip(&file, REPLACE_GUID, "Cool Mod", &["Red"], b"v2");
 
         let mut guard = state.mods.lock().await;
-        let (m, _, replaced) = install_or_replace(&state, guard.as_mut().unwrap(), &file, Some(old.guid())).await.unwrap();
+        let target = ReplaceTarget { guid: old.guid(), directory: old.directory.clone() };
+        let (m, _, replaced) = install_or_replace(&state, guard.as_mut().unwrap(), &file, Some(target)).await.unwrap();
         assert!(!replaced);
         assert_eq!(m.guid(), old.guid());
         assert_eq!(guard.as_ref().unwrap().len(), 1);
+    }
+
+
+    /// The bulk import never asks: its hint says to add the file on its own.
+    #[tokio::test]
+    async fn the_import_says_to_add_the_file_on_its_own_to_replace() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        installed_with_options(&state, src.path(), &["Red"]).await;
+        let file = src.path().join("Cool Mod 2.zip");
+        options_mod_zip(&file, REPLACE_GUID, "Cool Mod", &["Red"], b"v2");
+        let mut guard = state.mods.lock().await;
+        let msg = message(install_from_archive_as(base.path(), guard.as_mut().unwrap(), &file, "Cool Mod 2").await);
+        assert!(msg.contains("add the file on its own with Add (or drop it on the Mods page)"), "{msg}");
+    }
+
+    /// The mod asked about was removed and another one with the same ID
+    /// added meanwhile: that one is never replaced instead.
+    #[tokio::test]
+    async fn a_different_folder_with_the_id_is_never_replaced() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let old = installed_with_options(&state, src.path(), &["Red"]).await;
+        let folders_before = mods_folder_names(base.path());
+        let file = src.path().join("Cool Mod 2.zip");
+        options_mod_zip(&file, REPLACE_GUID, "Cool Mod", &["Red"], b"v2");
+        let mut guard = state.mods.lock().await;
+        let target = ReplaceTarget { guid: old.guid(), directory: old.directory.with_file_name("Elsewhere") };
+        let msg = message(install_or_replace(&state, guard.as_mut().unwrap(), &file, Some(target)).await);
+        assert!(msg.contains("Nothing was changed"), "{msg}");
+        assert_eq!(std::fs::read(old.directory.join("Red").join(patch_file_name())).unwrap(), b"v1");
+        assert_eq!(mods_folder_names(base.path()), folders_before);
     }
 }

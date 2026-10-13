@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use crate::{
-    commands::mods::{install_or_replace, install_update_from_archive},
+    commands::mods::{install_or_replace, install_update_from_archive, ReplaceTarget},
     download,
     models::{manifest::Source, Mod},
     sources, AppState,
@@ -213,7 +213,7 @@ pub async fn install_file_with(
     download_url: Option<&str>,
     page_version: Option<&str>,
     installed_files: Vec<sources::InstalledFile>,
-    replace: Option<uuid::Uuid>,
+    replace: Option<ReplaceTarget>,
 ) -> Result<InstallOutcome, InstallError> {
     check_file(file).await?;
     install_checked_file(state, mods, file, page_url, download_url, page_version, installed_files, replace).await
@@ -262,7 +262,7 @@ async fn install_checked_file(
     download_url: Option<&str>,
     page_version: Option<&str>,
     installed_files: Vec<sources::InstalledFile>,
-    replace: Option<uuid::Uuid>,
+    replace: Option<ReplaceTarget>,
 ) -> Result<InstallOutcome, InstallError> {
     let mut source = resolve_source(page_url, download_url, page_version);
 
@@ -820,7 +820,8 @@ mod tests {
         assert!(err.message.contains("already installed"), "{}", err.message);
 
         let guid = installed.r#mod.guid();
-        let out = install_file_with(&state, &mut mods, &second, Some(PAGE_URL), None, None, Vec::new(), Some(guid))
+        let target = ReplaceTarget { guid, directory: installed.r#mod.directory.clone() };
+        let out = install_file_with(&state, &mut mods, &second, Some(PAGE_URL), None, None, Vec::new(), Some(target))
             .await
             .unwrap();
         assert!(out.updated && out.replaced);

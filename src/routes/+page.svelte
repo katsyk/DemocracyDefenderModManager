@@ -279,6 +279,7 @@
 
         return () => {
             unmounted = true;
+            closeReplaceQuestions();
             setBridgeFrontendReady(false).catch(() => {});
             unlisten.then(f => f());
             unlistenDragDrop.then(f => f());
@@ -835,6 +836,12 @@
      * question the backend stopped waiting for can be closed. */
     const replaceQuestions = new Map<string, ReplacePopup>();
 
+    /** Answer every open "Replace?" question with Cancel (the page is
+     * going away). */
+    function closeReplaceQuestions() {
+        for (const popup of [...replaceQuestions.values()]) popup.close(false);
+    }
+
     /** `install://replace-request` -- a file being added (by any route,
      * the browser extension included) has, in its manifest.json, the ID
      * of an installed mod: ask whether to replace that mod with it. */
@@ -1037,6 +1044,9 @@
      * (best effort, never more than a few seconds), and tell the backend
      * this page is gone so browser installs wait for the reloaded one. */
     async function beforeReload() {
+        // Nobody can answer them once the page is gone: keep the installed
+        // mods (the backend does the same when told the page is gone).
+        closeReplaceQuestions();
         const saving = (async () => {
             if (!profilesLoaded || !currentProfile) return;
             applyCurrentConfigChanges();

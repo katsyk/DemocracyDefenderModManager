@@ -758,7 +758,7 @@
         },
         "replace": {
             "title": "Replace Installed Mod?",
-            "title_different": "Replace a Different Mod?",
+            "title_different": "Replace a Mod With a Different Name?",
             "question": "\"{installed}\"{installedVersion} is already installed. Replace it with this file (\"{new}\"{newVersion})?",
             "question_different": "\"{installed}\"{installedVersion} is installed and has the same ID as this file (\"{new}\"{newVersion}). These may be two different mods: the author of one probably copied the other's manifest.json.",
             "warning_different": "Replacing removes \"{installed}\" and puts \"{new}\" in its place. Two mods with the same ID can't both be installed.",

@@ -15,10 +15,21 @@ use crate::{
 
 /// The Mods page reports whether it can currently handle bridge events
 /// (listeners registered, profiles loaded). See `AppState::bridge_frontend_ready`.
+///
+/// When the page goes away, the "Replace the installed mod?" questions it
+/// was showing are answered "keep" (see `replace_prompt`): nobody is left
+/// to answer them.
 #[tauri::command]
-pub fn set_bridge_frontend_ready(state: State<'_, AppState>, ready: bool) {
+pub async fn set_bridge_frontend_ready(state: State<'_, AppState>, ready: bool) -> TAResult<()> {
     log::debug!("Bridge frontend ready: {ready}");
     state.bridge_frontend_ready.send_replace(ready);
+    if !ready {
+        let kept = state.replace_pending.lock().await.keep_all();
+        if kept > 0 {
+            log::info!("The Mods page went away; keeping the installed mod(s) for {kept} open replace question(s).");
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a pending `bridge://consent-request` -- the frontend calls this
