@@ -28,8 +28,8 @@ ignore = [
     # because zbus 6 absorbed them (as zbus::wire, zbus::names and zbus's own
     # derives); no vulnerability is reported. Two copies are in Cargo.lock:
     # - 5.15 / 4.3.4 via zbus 5.19, used on Linux by tauri-plugin-opener and
-    #   tauri-plugin-single-instance. Every stable 2.x of both requires
-    #   zbus ^5.9; zbus 6 only arrives with their 3.0 (Tauri 3) line.
+    #   tauri-plugin-single-instance. No published version of either, 3.0
+    #   alphas included, uses zbus 6 yet: all of them require zbus ^5.9.
     # - 4.2 / 3.0 via zbus 4.4, via secret-service 4, an optional dependency
     #   of keyring 3.6.3 behind its `async-secret-service` feature. DDMM uses
     #   `sync-secret-service` (dbus-secret-service, no zbus), so this copy is
