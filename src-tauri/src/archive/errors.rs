@@ -74,6 +74,34 @@ pub fn unsafe_path(detail: String) -> anyhow::Error {
     .into()
 }
 
+pub const HINT_TOO_LARGE: &str = "No real mod is anywhere near this big. If you trust the file, extract it \
+     yourself and check what's inside before adding anything from it.";
+
+/// Refused before or while unpacking: the archive would unpack to more
+/// than `limit` bytes.
+pub fn too_large(limit: u64) -> anyhow::Error {
+    ArchiveError::with_hint(
+        format!(
+            "the archive would unpack to more than {} GiB, far more than any mod, so DDMM refused to extract it",
+            limit / (1024 * 1024 * 1024)
+        ),
+        HINT_TOO_LARGE,
+    )
+    .into()
+}
+
+/// Refused before unpacking: more than `limit` files and folders.
+pub fn too_many_entries(limit: usize) -> anyhow::Error {
+    ArchiveError::with_hint(
+        format!(
+            "the archive has more than {limit} files and folders, far more than any mod, so DDMM refused to \
+             extract it"
+        ),
+        HINT_TOO_LARGE,
+    )
+    .into()
+}
+
 pub fn io_error(e: std::io::Error, what: &str) -> anyhow::Error {
     use std::io::ErrorKind;
     let (message, hint) = match (e.kind(), e.raw_os_error()) {

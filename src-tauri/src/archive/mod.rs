@@ -9,6 +9,19 @@ pub(crate) mod test_fixtures;
 pub use errors::{hint_of, io_error, is_archive_problem, ArchiveError};
 use errors::{rar_error, sevenz_error, zip_error};
 
+/// The most bytes one archive may unpack to, counted from the sizes its
+/// own index declares (checked before anything is written) and again from
+/// what is actually written. Real HD2 mods are tens to a few hundred MB;
+/// downloads are capped at 2 GiB (`download::MAX_DOWNLOAD_SIZE`), and this
+/// is 8x that, so even a large pack of very compressible patch files fits,
+/// while an "archive bomb" (a small file that expands to fill the drive) is
+/// refused.
+pub const MAX_UNPACKED_SIZE: u64 = 16 * 1024 * 1024 * 1024;
+
+/// The most entries (files and folders) one archive may have. Mods have a
+/// handful to a few hundred.
+pub const MAX_ENTRIES: usize = 100_000;
+
 /// The archive formats DDMM can open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -427,7 +440,14 @@ impl Archive {
     /// literal `..\..\` would otherwise slip past a `/`-only check on
     /// Linux). Also rejects symlink entries outright -- HD2 mods never
     /// need them, and this crate can only detect them cleanly for zip (see
-    /// [`ArchiveEntry::is_symlink`]).
+    /// [`ArchiveEntry::is_symlink`]). Names Windows can't create or treats
+    /// specially (see [`validate_entry_path`]) are refused on every
+    /// platform, so an archive installs the same everywhere.
+    ///
+    /// Also refuses an archive with more than [`MAX_ENTRIES`] entries, or
+    /// whose entries declare more than [`MAX_UNPACKED_SIZE`] bytes in total
+    /// (a RAR entry of unknown size is listed with a huge placeholder size,
+    /// so it is refused too).
     ///
     /// This does not by itself guarantee extraction stays inside the
     /// destination -- `sevenz_rust2::decompress_file` and unrar's
@@ -436,8 +456,19 @@ impl Archive {
     /// `enclosed_name`). [`Archive::extract_to`] backstops this with a
     /// post-extraction canonicalization walk.
     pub fn validate_entries(&mut self) -> anyhow::Result<()> {
+        let mut count = 0usize;
+        let mut declared = 0u64;
         for entry in self.iter()? {
             let entry = entry?;
+
+            count += 1;
+            if count > MAX_ENTRIES {
+                return Err(errors::too_many_entries(MAX_ENTRIES));
+            }
+            declared = declared.saturating_add(entry.size());
+            if declared > MAX_UNPACKED_SIZE {
+                return Err(errors::too_large(MAX_UNPACKED_SIZE));
+            }
 
             if entry.is_symlink() {
                 return Err(errors::unsafe_path(format!("symlink entry \"{}\"", entry.path().display())));
@@ -448,6 +479,20 @@ impl Archive {
         Ok(())
     }
 
+    /// Unpack the whole archive into `path`, which must be an empty folder
+    /// DDMM has just created for this (nothing else in it, and in
+    /// particular no links: entries are written by plain path joins, and
+    /// the checks assume the folder starts out empty). If a check on what
+    /// was written fails, the folder is removed.
+    ///
+    /// Limits against archive bombs: [`validate_entries`](Self::validate_entries)
+    /// checks the declared entry count and total size first. While
+    /// writing, zip and 7z entries share one byte budget of
+    /// [`MAX_UNPACKED_SIZE`], so an entry that unpacks to more than it
+    /// declared is stopped at the budget. unrar writes files itself and
+    /// can't be metered while it does, so a RAR is held to its declared
+    /// sizes (checked first) and to the total actually on disk (checked by
+    /// the walk afterwards).
     pub fn extract_to(&mut self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         let path = path.as_ref();
 
@@ -459,11 +504,7 @@ impl Archive {
 
         let result = match &mut self.0 {
             ArchiveInner::Zip(archive) => extract_zip(archive, path),
-            ArchiveInner::SevenZ { path: archive, .. } => {
-                // sevenz_rust2 does not support extraction from an open ArchiveReader,
-                // so we re-open the file here.
-                sevenz_rust2::decompress_file(archive, path).map_err(sevenz_error)
-            },
+            ArchiveInner::SevenZ { path: archive, .. } => extract_7z(archive, path),
             ArchiveInner::Rar(archive) => (|| {
                 let mut archive = unrar::Archive::new(archive).open_for_processing().map_err(rar_error)?;
                 loop {
@@ -486,7 +527,9 @@ impl Archive {
         // without following symlinks, reject any symlink found there, and
         // confirm every file's canonicalized path is still inside it.
         // unrar also restores a Unix-made RAR's stored mode as-is
-        // (setuid/setgid included), so the walk clears those bits too.
+        // (setuid/setgid and world-write included), so the walk clears
+        // those bits too. And it totals what was written: the only size
+        // check possible for a RAR once unrar has written it.
         if let Err(e) = verify_extraction_contained(path) {
             let _ = std::fs::remove_dir_all(path);
             return Err(e);
@@ -512,9 +555,17 @@ impl Archive {
 /// - The archive's stored Unix mode is ignored: files and folders are
 ///   created with the process's default permissions (0666/0777 minus the
 ///   umask), so an entry marked setuid, setgid, sticky, executable or
-///   world-writable lands as an ordinary file. HD2 mods are game data and
-///   never need any of those bits.
+///   world-writable lands as an ordinary file (the walk in
+///   [`Archive::extract_to`] then also drops group/other write, as for
+///   every format). HD2 mods are game data and never need any of those
+///   bits.
+/// - All entries together may write at most [`MAX_UNPACKED_SIZE`] bytes.
+///
+/// `dest` must be a freshly created, empty folder (see
+/// [`Archive::extract_to`]). A later entry with the same name as an
+/// earlier file replaces it, as unzip does.
 fn extract_zip(archive: &mut ZipArchive<File>, dest: &Path) -> anyhow::Result<()> {
+    let mut budget = Budget::new(MAX_UNPACKED_SIZE);
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).map_err(zip_error)?;
         let name = file.name().map_err(zip_error)?.into_owned();
@@ -533,15 +584,84 @@ fn extract_zip(archive: &mut ZipArchive<File>, dest: &Path) -> anyhow::Result<()
             std::fs::create_dir_all(parent).map_err(|e| errors::io_error(e, "couldn't create a folder"))?;
         }
         let mut target = File::create(&out).map_err(|e| errors::io_error(e, "couldn't write the file"))?;
-        std::io::copy(&mut file, &mut target).map_err(|e| errors::io_error(e, "couldn't unpack the file"))?;
+        budget.copy(&mut file, &mut target)?;
     }
     Ok(())
+}
+
+/// Unpack a 7z into `dest` (a freshly created, empty folder). sevenz_rust2
+/// confines each entry's path itself (and `validate_entries` already
+/// refused unsafe names); DDMM writes the data, so every entry draws on
+/// one [`MAX_UNPACKED_SIZE`] budget, and no file times or attributes from
+/// the archive are applied.
+fn extract_7z(archive: &Path, dest: &Path) -> anyhow::Result<()> {
+    let mut budget = Budget::new(MAX_UNPACKED_SIZE);
+    // The callback has to return sevenz_rust2's error type; the real
+    // error is kept here and returned instead of the wrapped one.
+    let mut failure: Option<anyhow::Error> = None;
+    let result = sevenz_rust2::decompress_file_with_extract_fn(archive, dest, |entry, reader, out| {
+        let step = (|| -> anyhow::Result<()> {
+            if entry.is_directory() {
+                std::fs::create_dir_all(out).map_err(|e| errors::io_error(e, "couldn't create a folder"))?;
+                return Ok(());
+            }
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| errors::io_error(e, "couldn't create a folder"))?;
+            }
+            let mut target = File::create(out).map_err(|e| errors::io_error(e, "couldn't write the file"))?;
+            budget.copy(reader, &mut target)
+        })();
+        match step {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                let text = e.to_string();
+                failure = Some(e);
+                Err(sevenz_rust2::Error::Other(text.into()))
+            }
+        }
+    });
+    match (result, failure) {
+        (Ok(()), _) => Ok(()),
+        (Err(_), Some(e)) => Err(e),
+        (Err(e), None) => Err(sevenz_error(e)),
+    }
+}
+
+/// Bytes still allowed to be written by one extraction.
+struct Budget {
+    remaining: u64,
+}
+
+impl Budget {
+    fn new(limit: u64) -> Self {
+        Budget { remaining: limit }
+    }
+
+    /// Copy `reader` into `writer`, reading at most one byte past what is
+    /// left, so running over is detected after at most one extra byte.
+    fn copy(&mut self, reader: &mut dyn Read, writer: &mut File) -> anyhow::Result<()> {
+        let mut limited = reader.take(self.remaining + 1);
+        let written = std::io::copy(&mut limited, writer).map_err(|e| errors::io_error(e, "couldn't unpack the file"))?;
+        if written > self.remaining {
+            return Err(errors::too_large(MAX_UNPACKED_SIZE));
+        }
+        self.remaining -= written;
+        Ok(())
+    }
 }
 
 /// Reject a raw (unsanitized) archive entry path if it is absolute, carries
 /// a Windows drive-letter or UNC prefix, or contains a `..` component.
 /// Backslashes are normalized to `/` first so a Windows-made archive's
 /// `..\..\evil.txt` is caught the same as a Unix one's `../../evil.txt`.
+///
+/// Also rejects names Windows can't create or gives a special meaning, on
+/// every platform so the same archive behaves the same everywhere: a `:`
+/// anywhere (an alternate data stream, `file.txt:hidden`), a component
+/// ending in a dot or a space (Windows silently drops them, so `a.` and
+/// `a` would be the same file), and the reserved device names CON, PRN,
+/// AUX, NUL, COM1-9 and LPT1-9, in any case and with or without an
+/// extension (`nul.txt` is still the NUL device).
 fn validate_entry_path(path: &Path) -> anyhow::Result<()> {
     let original = path.to_string_lossy();
     let normalized = original.replace('\\', "/");
@@ -565,19 +685,55 @@ fn validate_entry_path(path: &Path) -> anyhow::Result<()> {
         return Err(errors::unsafe_path(format!("\"{}\"", original)));
     }
 
+    if normalized.contains(':') {
+        return Err(errors::unsafe_path(format!("\"{}\", a `:` in a name", original)));
+    }
+
+    for component in normalized.split('/').filter(|c| !c.is_empty() && *c != ".") {
+        if component.ends_with('.') || component.ends_with(' ') {
+            return Err(errors::unsafe_path(format!("\"{}\", a name ending in a dot or space", original)));
+        }
+        if is_windows_device_name(component) {
+            return Err(errors::unsafe_path(format!(
+                "\"{}\", \"{}\" is a reserved device name on Windows",
+                original, component
+            )));
+        }
+    }
+
     Ok(())
+}
+
+/// CON, PRN, AUX, NUL, COM1-9, LPT1-9 (and COM/LPT with the superscript
+/// digits Windows also reserves), in any case, with or without an
+/// extension. Spaces before the extension don't help (`NUL .txt`).
+fn is_windows_device_name(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or(component).trim_end_matches(' ');
+    let upper = stem.to_uppercase();
+    match upper.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        _ => match (upper.get(..3), upper.get(3..)) {
+            (Some("COM" | "LPT"), Some(digit)) => {
+                matches!(digit, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "\u{b9}" | "\u{b2}" | "\u{b3}")
+            }
+            _ => false,
+        },
+    }
 }
 
 /// Walk `dir` (assumed to already exist) without following symlinks,
 /// rejecting any symlink found and confirming every regular file's
-/// canonicalized path still lives under `dir`. On Unix it also clears any
-/// setuid, setgid or sticky bit an extractor applied from the archive.
+/// canonicalized path still lives under `dir`, and that all files together
+/// stay within [`MAX_UNPACKED_SIZE`]. On Unix it also clears any setuid,
+/// setgid, sticky and group/other write bit an extractor applied from the
+/// archive.
 fn verify_extraction_contained(dir: &Path) -> anyhow::Result<()> {
     let canonical_base = std::fs::canonicalize(dir)?;
-    verify_dir_contained(dir, &canonical_base)
+    let mut total = 0u64;
+    verify_dir_contained(dir, &canonical_base, &mut total)
 }
 
-fn verify_dir_contained(dir: &Path, canonical_base: &Path) -> anyhow::Result<()> {
+fn verify_dir_contained(dir: &Path, canonical_base: &Path, total: &mut u64) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         // `DirEntry::file_type` never follows symlinks.
@@ -590,8 +746,12 @@ fn verify_dir_contained(dir: &Path, canonical_base: &Path) -> anyhow::Result<()>
         #[cfg(unix)]
         clear_special_mode_bits(&entry_path)?;
         if file_type.is_dir() {
-            verify_dir_contained(&entry_path, canonical_base)?;
+            verify_dir_contained(&entry_path, canonical_base, total)?;
         } else if file_type.is_file() {
+            *total = total.saturating_add(entry.metadata()?.len());
+            if *total > MAX_UNPACKED_SIZE {
+                return Err(errors::too_large(MAX_UNPACKED_SIZE));
+            }
             let canonical = std::fs::canonicalize(&entry_path)?;
             if !canonical.starts_with(canonical_base) {
                 return Err(errors::unsafe_path(format!("{:?} escapes the mod directory", entry_path)));
@@ -601,15 +761,15 @@ fn verify_dir_contained(dir: &Path, canonical_base: &Path) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Drop setuid, setgid and sticky from `path` (never a symlink here: the
-/// caller checked), keeping the rest of its mode.
+/// Drop setuid, setgid, sticky and group/other write from `path` (never
+/// a symlink here: the caller checked), keeping the rest of its mode.
 #[cfg(unix)]
 fn clear_special_mode_bits(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    const SPECIAL: u32 = 0o7000;
+    const CLEARED: u32 = 0o7022;
     let mode = std::fs::symlink_metadata(path)?.permissions().mode();
-    if mode & SPECIAL != 0 {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o777))?;
+    if mode & CLEARED != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o755))?;
     }
     Ok(())
 }
@@ -1361,9 +1521,10 @@ mod tests {
         ZipArchive::new(File::open(path).unwrap()).unwrap()
     }
 
-    // The checks below go straight to `extract_zip`, skipping the
-    // `validate_entries` pass `extract_to` runs first, so each one shows the
-    // extraction loop holds the line on its own.
+    // The first two checks below go straight to `extract_zip`, skipping
+    // the `validate_entries` pass `extract_to` runs first, so each shows
+    // the extraction loop holds the line on its own. The mode tests go
+    // through `extract_to`, as an install does.
 
     #[test]
     fn zip_extraction_never_creates_a_symlink() {
@@ -1408,11 +1569,12 @@ mod tests {
 
         Archive::open(&zip_path).unwrap().extract_to(&dest).unwrap();
 
-        // A file DDMM itself creates gets the default mode (0666 minus umask).
+        // A file DDMM itself creates gets the default mode (0666 minus the
+        // umask), less group/other write, which the walk always drops.
         let default = {
             let probe = tmp.path().join("probe");
             File::create(&probe).unwrap();
-            std::fs::metadata(&probe).unwrap().permissions().mode() & 0o7777
+            std::fs::metadata(&probe).unwrap().permissions().mode() & 0o755
         };
         for name in ["suid", "sgid-world-writable", "plain"] {
             let mode = std::fs::metadata(dest.join(name)).unwrap().permissions().mode() & 0o7777;
@@ -1422,9 +1584,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn post_extraction_walk_clears_setuid_setgid_and_sticky() {
+    fn post_extraction_walk_clears_special_bits_and_group_other_write() {
         // unrar restores a Unix-made RAR's stored mode as-is; the walk
-        // after every extraction drops the special bits whatever the format.
+        // after every extraction drops the special bits and group/other
+        // write whatever the format.
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let dest = fresh_dest(tmp.path(), "dest");
@@ -1438,6 +1601,225 @@ mod tests {
         verify_extraction_contained(&dest).unwrap();
 
         assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777, 0o755);
-        assert_eq!(std::fs::metadata(&sub).unwrap().permissions().mode() & 0o7777, 0o777);
+        assert_eq!(std::fs::metadata(&sub).unwrap().permissions().mode() & 0o7777, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_rar_with_setuid_and_world_writable_modes_lands_without_them() {
+        use super::test_fixtures::{rar5_with, RarEntry};
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let entries = [
+            RarEntry { unix_mode: Some(0o40777), ..RarEntry::new("dir/", b"") },
+            RarEntry { unix_mode: Some(0o104777), ..RarEntry::new("dir/suid", b"a") },
+            RarEntry { unix_mode: Some(0o102755), ..RarEntry::new("sgid", b"b") },
+            RarEntry { unix_mode: Some(0o100666), ..RarEntry::new("world-writable", b"c") },
+        ];
+        let path = write(tmp.path(), "unix.rar", &rar5_with(&entries));
+        let dest = fresh_dest(tmp.path(), "out");
+
+        Archive::open(&path).unwrap().extract_to(&dest).unwrap();
+
+        let mode = |p: &str| std::fs::metadata(dest.join(p)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(std::fs::read(dest.join("dir/suid")).unwrap(), b"a");
+        assert_eq!(mode("dir"), 0o755);
+        assert_eq!(mode("dir/suid"), 0o755);
+        assert_eq!(mode("sgid"), 0o755);
+        assert_eq!(mode("world-writable"), 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zip_directory_entries_ignore_their_stored_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = make_zip_with_modes(tmp.path(), "dirs.zip", &[("open/", 0o42777, b""), ("open/f", 0o100644, b"x")]);
+        let dest = fresh_dest(tmp.path(), "dest");
+
+        Archive::open(&zip_path).unwrap().extract_to(&dest).unwrap();
+
+        let default = {
+            let probe = tmp.path().join("probe-dir");
+            std::fs::create_dir(&probe).unwrap();
+            std::fs::metadata(&probe).unwrap().permissions().mode() & 0o755
+        };
+        let mode = std::fs::metadata(dest.join("open")).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, default, "got {mode:o}");
+        assert_eq!(std::fs::read(dest.join("open/f")).unwrap(), b"x");
+    }
+
+    #[test]
+    fn empty_directories_are_kept_in_zip_and_rar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip = write(tmp.path(), "e.zip", &make_zip_bytes(&[("empty/", b""), ("a/b/", b""), ("f.txt", b"f")]));
+        let rar = write(tmp.path(), "e.rar", &rar5(&[("empty/", b""), ("f.txt", b"f")]));
+        for (archive, dirs) in [(zip, &["empty", "a/b"][..]), (rar, &["empty"][..])] {
+            let dest = fresh_dest(tmp.path(), &format!("out-{}", archive.extension().unwrap().to_str().unwrap()));
+            Archive::open(&archive).unwrap().extract_to(&dest).unwrap();
+            for dir in dirs {
+                assert!(dest.join(dir).is_dir(), "{archive:?}: {dir}");
+                assert_eq!(std::fs::read_dir(dest.join(dir)).unwrap().count(), 0, "{archive:?}: {dir}");
+            }
+            assert_eq!(std::fs::read(dest.join("f.txt")).unwrap(), b"f");
+        }
+    }
+
+    /// Rename every occurrence of `from` in a zip's bytes (local and central
+    /// headers) to `to`, which must be the same length: the zip writer
+    /// refuses duplicate names, a hand-edited archive doesn't.
+    fn rename_in_zip(path: &Path, from: &[u8], to: &[u8]) {
+        assert_eq!(from.len(), to.len());
+        let mut bytes = std::fs::read(path).unwrap();
+        let mut i = 0;
+        while let Some(at) = bytes[i..].windows(from.len()).position(|w| w == from) {
+            bytes[i + at..i + at + from.len()].copy_from_slice(to);
+            i += at + from.len();
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn duplicate_zip_entries_replace_the_earlier_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = make_zip(tmp.path(), "dup.zip", &[("a.txt", b"first"), ("b.txt", b"second")]);
+        rename_in_zip(&zip_path, b"b.txt", b"a.txt");
+        let dest = fresh_dest(tmp.path(), "dest");
+
+        Archive::open(&zip_path).unwrap().extract_to(&dest).unwrap();
+
+        assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "second");
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn conflicting_file_and_folder_entries_fail_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A file `x`, then `x/y` needing `x` to be a folder.
+        let file_then_dir = make_zip(tmp.path(), "fd.zip", &[("x", b"file"), ("x/y", b"inner")]);
+        // A folder `x/`, then a file named `x`.
+        let dir_then_file = write(tmp.path(), "df.zip", &make_zip_bytes(&[("x/", b""), ("z", b"file")]));
+        rename_in_zip(&dir_then_file, b"z", b"x");
+        for archive in [file_then_dir, dir_then_file] {
+            let dest = fresh_dest(tmp.path(), &format!("out-{}", archive.file_stem().unwrap().to_str().unwrap()));
+            assert!(Archive::open(&archive).unwrap().extract_to(&dest).is_err(), "{archive:?}");
+            assert!(walk_files(tmp.path()).iter().all(|f| !f.ends_with("y")), "nothing escapes");
+        }
+    }
+
+    #[test]
+    fn windows_only_names_are_refused_everywhere() {
+        for bad in [
+            "file.txt:hidden",
+            "dir:stream/file",
+            "trailing.",
+            "dir./file",
+            "trailing ",
+            "dir /file",
+            "CON",
+            "con.txt",
+            "sub/Nul.patch_0",
+            "aux",
+            "PRN.json",
+            "COM1",
+            "lpt9.txt",
+            "NUL .txt",
+            "COM\u{b9}",
+        ] {
+            let err = validate_entry_path(Path::new(bad)).unwrap_err();
+            assert!(err.to_string().contains("unsafe path"), "{bad}: {err}");
+        }
+        for good in [
+            "./manifest.json",
+            "console.txt",
+            "CONFIG/a",
+            "nul_texture.patch_0",
+            "COM10",
+            "LPT0",
+            "COMA",
+            "my mod v1.2/file",
+            "9ba626afa44a3aa3.patch_0.gpu_resources",
+        ] {
+            validate_entry_path(Path::new(good)).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+    }
+
+    #[test]
+    fn existing_fixture_names_pass_the_windows_name_checks() {
+        for (name, _) in plushie() {
+            validate_entry_path(Path::new(&name)).unwrap();
+        }
+    }
+
+    #[test]
+    fn rar_declaring_more_than_the_cap_is_refused_before_writing() {
+        use super::test_fixtures::{rar5_with, RarEntry};
+        let tmp = tempfile::tempdir().unwrap();
+        let entries = [
+            RarEntry::new("small.patch_0", b"a"),
+            RarEntry { declared_size: Some(MAX_UNPACKED_SIZE), ..RarEntry::new("huge.patch_0", b"b") },
+        ];
+        let path = write(tmp.path(), "bomb.rar", &rar5_with(&entries));
+        let dest = fresh_dest(tmp.path(), "out");
+
+        let err = Archive::open(&path).unwrap().extract_to(&dest).unwrap_err();
+        assert!(err.to_string().contains("would unpack to more than 16 GiB"), "{err}");
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0, "nothing written");
+    }
+
+    #[test]
+    fn archive_with_too_many_entries_is_refused_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..=MAX_ENTRIES).map(|i| format!("d{i}/")).collect();
+        let entries: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b""[..])).collect();
+        let path = write(tmp.path(), "many.rar", &rar5(&entries));
+        let dest = fresh_dest(tmp.path(), "out");
+
+        let err = Archive::open(&path).unwrap().extract_to(&dest).unwrap_err();
+        assert!(err.to_string().contains("more than 100000 files and folders"), "{err}");
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0, "nothing written");
+    }
+
+    #[test]
+    fn budget_stops_at_the_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut out = File::create(tmp.path().join("out")).unwrap();
+        let mut budget = Budget::new(10);
+        budget.copy(&mut &[0u8; 6][..], &mut out).unwrap();
+        budget.copy(&mut &[0u8; 4][..], &mut out).unwrap();
+        let err = budget.copy(&mut &[0u8; 1][..], &mut out).unwrap_err();
+        assert!(err.to_string().contains("would unpack to more than"), "{err}");
+        // Reads at most one byte past the limit.
+        let mut budget = Budget::new(3);
+        let mut source = std::io::repeat(1).take(1 << 20);
+        assert!(budget.copy(&mut source, &mut out).is_err());
+        assert_eq!(source.limit(), (1 << 20) - 4);
+    }
+
+    #[test]
+    fn sevenz_extraction_still_writes_every_file() {
+        // 7z now goes through DDMM's own writer (for the byte budget).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = make_7z(tmp.path(), "ok.7z", &[("dir/a.txt", b"aaa"), ("b.txt", b""), ("c.txt", b"ccc")]);
+        let dest = fresh_dest(tmp.path(), "out");
+        Archive::open(&path).unwrap().extract_to(&dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("dir/a.txt")).unwrap(), b"aaa");
+        assert_eq!(std::fs::read(dest.join("b.txt")).unwrap(), b"");
+        assert_eq!(std::fs::read(dest.join("c.txt")).unwrap(), b"ccc");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_extraction_walk_totals_what_was_written() {
+        // A RAR can't be metered while unrar writes it, so the walk checks
+        // the total on disk. A sparse file stands in for a huge one.
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = fresh_dest(tmp.path(), "dest");
+        File::create(dest.join("a")).unwrap().set_len(MAX_UNPACKED_SIZE / 2).unwrap();
+        verify_extraction_contained(&dest).unwrap();
+        std::fs::create_dir(dest.join("sub")).unwrap();
+        File::create(dest.join("sub/b")).unwrap().set_len(MAX_UNPACKED_SIZE / 2 + 1).unwrap();
+        let err = verify_extraction_contained(&dest).unwrap_err();
+        assert!(err.to_string().contains("would unpack to more than"), "{err}");
     }
 }
