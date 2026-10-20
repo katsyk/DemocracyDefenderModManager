@@ -3,8 +3,9 @@
 # root and does not see this file, so audit.yml and build.yml pass the same IDs
 # through the action's `ignore:` input -- keep all three lists in sync.
 #
-# Only advisories with no fix reachable on Tauri 2's GTK3 / webkit2gtk-4.1
-# stack are listed here. Anything new still fails / opens an issue.
+# Only advisories with no fix reachable on Tauri 2 (its GTK3 / webkit2gtk-4.1
+# stack on Linux, and the zbus 5 its plugins use) are listed here. Anything
+# new still fails / opens an issue.
 
 [advisories]
 ignore = [
@@ -22,4 +23,20 @@ ignore = [
     # Variant::array_iter_str (only glib's own definition and unit tests
     # reference it), so the unsound code path is not reachable.
     "RUSTSEC-2024-0429",
+
+    # zvariant, zbus_names and zvariant_derive are "unmaintained" only
+    # because zbus 6 absorbed them (as zbus::wire, zbus::names and zbus's own
+    # derives); no vulnerability is reported. Two copies are in Cargo.lock:
+    # - 5.15 / 4.3.4 via zbus 5.19, used on Linux by tauri-plugin-opener and
+    #   tauri-plugin-single-instance. Every stable 2.x of both requires
+    #   zbus ^5.9; zbus 6 only arrives with their 3.0 (Tauri 3) line.
+    # - 4.2 / 3.0 via zbus 4.4, via secret-service 4, an optional dependency
+    #   of keyring 3.6.3 behind its `async-secret-service` feature. DDMM uses
+    #   `sync-secret-service` (dbus-secret-service, no zbus), so this copy is
+    #   in the lockfile but never compiled (`cargo tree -i zbus@4.4.0 --target
+    #   all` prints nothing). keyring 3.6.3 is the last 3.x; 4.x is a rewrite.
+    # Remove once the plugins (and keyring) move to zbus 6.
+    "RUSTSEC-2026-0370", # zvariant
+    "RUSTSEC-2026-0371", # zbus_names
+    "RUSTSEC-2026-0372", # zvariant_derive
 ]

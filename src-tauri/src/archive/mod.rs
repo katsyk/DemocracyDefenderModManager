@@ -297,7 +297,7 @@ impl Archive {
             ArchiveInner::Zip(archive) => {
                 for i in 0..archive.len() {
                     let file = archive.by_index(i)?;
-                    if Path::new(file.name())
+                    if Path::new(file.name()?.as_ref())
                         .file_name()
                         .and_then(OsStr::to_str) == Some(name)
                     {
@@ -431,10 +431,10 @@ impl Archive {
     ///
     /// This does not by itself guarantee extraction stays inside the
     /// destination -- `sevenz_rust2::decompress_file` and unrar's
-    /// `extract_with_base` do no path sanitization of their own (unlike
-    /// `zip::ZipArchive::extract`, which validates via `enclosed_name` and
-    /// checks symlink targets). [`Archive::extract_to`] backstops this with
-    /// a post-extraction canonicalization walk.
+    /// `extract_with_base` do no path sanitization of their own (zip goes
+    /// through [`extract_zip`], which confines every entry with
+    /// `enclosed_name`). [`Archive::extract_to`] backstops this with a
+    /// post-extraction canonicalization walk.
     pub fn validate_entries(&mut self) -> anyhow::Result<()> {
         for entry in self.iter()? {
             let entry = entry?;
@@ -458,9 +458,7 @@ impl Archive {
         self.validate_entries()?;
 
         let result = match &mut self.0 {
-            ArchiveInner::Zip(archive) => {
-                archive.extract(path).map_err(zip_error)
-            },
+            ArchiveInner::Zip(archive) => extract_zip(archive, path),
             ArchiveInner::SevenZ { path: archive, .. } => {
                 // sevenz_rust2 does not support extraction from an open ArchiveReader,
                 // so we re-open the file here.
@@ -487,6 +485,8 @@ impl Archive {
         // So re-check what actually landed on disk: walk the destination
         // without following symlinks, reject any symlink found there, and
         // confirm every file's canonicalized path is still inside it.
+        // unrar also restores a Unix-made RAR's stored mode as-is
+        // (setuid/setgid included), so the walk clears those bits too.
         if let Err(e) = verify_extraction_contained(path) {
             let _ = std::fs::remove_dir_all(path);
             return Err(e);
@@ -498,6 +498,44 @@ impl Archive {
     pub fn iter<'a>(&'a mut self) -> anyhow::Result<ArchiveIter<'a>> {
         ArchiveIter::new(&mut self.0)
     }
+}
+
+/// Unpack a zip into `dest` entry by entry, instead of through
+/// `ZipArchive::extract`, so that a mod's files are only ever plain files
+/// and folders:
+///
+/// - Symlink entries are refused (`validate_entries` already rejected
+///   them; this is checked again per entry). Nothing here creates a link.
+/// - Every entry is confined to `dest` by `enclosed_name` (on top of
+///   `validate_entry_path`, which already refused `..`, absolute and drive
+///   paths for the whole archive).
+/// - The archive's stored Unix mode is ignored: files and folders are
+///   created with the process's default permissions (0666/0777 minus the
+///   umask), so an entry marked setuid, setgid, sticky, executable or
+///   world-writable lands as an ordinary file. HD2 mods are game data and
+///   never need any of those bits.
+fn extract_zip(archive: &mut ZipArchive<File>, dest: &Path) -> anyhow::Result<()> {
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).map_err(zip_error)?;
+        let name = file.name().map_err(zip_error)?.into_owned();
+        if file.is_symlink() {
+            return Err(errors::unsafe_path(format!("symlink entry \"{name}\"")));
+        }
+        let relative = file
+            .enclosed_name()
+            .ok_or_else(|| errors::unsafe_path(format!("\"{name}\"")))?;
+        let out = dest.join(&relative);
+        if file.is_dir() {
+            std::fs::create_dir_all(&out).map_err(|e| errors::io_error(e, "couldn't create a folder"))?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| errors::io_error(e, "couldn't create a folder"))?;
+        }
+        let mut target = File::create(&out).map_err(|e| errors::io_error(e, "couldn't write the file"))?;
+        std::io::copy(&mut file, &mut target).map_err(|e| errors::io_error(e, "couldn't unpack the file"))?;
+    }
+    Ok(())
 }
 
 /// Reject a raw (unsanitized) archive entry path if it is absolute, carries
@@ -532,7 +570,8 @@ fn validate_entry_path(path: &Path) -> anyhow::Result<()> {
 
 /// Walk `dir` (assumed to already exist) without following symlinks,
 /// rejecting any symlink found and confirming every regular file's
-/// canonicalized path still lives under `dir`.
+/// canonicalized path still lives under `dir`. On Unix it also clears any
+/// setuid, setgid or sticky bit an extractor applied from the archive.
 fn verify_extraction_contained(dir: &Path) -> anyhow::Result<()> {
     let canonical_base = std::fs::canonicalize(dir)?;
     verify_dir_contained(dir, &canonical_base)
@@ -547,7 +586,10 @@ fn verify_dir_contained(dir: &Path, canonical_base: &Path) -> anyhow::Result<()>
 
         if file_type.is_symlink() {
             return Err(errors::unsafe_path(format!("symlink at {:?}", entry_path)));
-        } else if file_type.is_dir() {
+        }
+        #[cfg(unix)]
+        clear_special_mode_bits(&entry_path)?;
+        if file_type.is_dir() {
             verify_dir_contained(&entry_path, canonical_base)?;
         } else if file_type.is_file() {
             let canonical = std::fs::canonicalize(&entry_path)?;
@@ -555,6 +597,19 @@ fn verify_dir_contained(dir: &Path, canonical_base: &Path) -> anyhow::Result<()>
                 return Err(errors::unsafe_path(format!("{:?} escapes the mod directory", entry_path)));
             }
         }
+    }
+    Ok(())
+}
+
+/// Drop setuid, setgid and sticky from `path` (never a symlink here: the
+/// caller checked), keeping the rest of its mode.
+#[cfg(unix)]
+fn clear_special_mode_bits(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    const SPECIAL: u32 = 0o7000;
+    let mode = std::fs::symlink_metadata(path)?.permissions().mode();
+    if mode & SPECIAL != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o777))?;
     }
     Ok(())
 }
@@ -606,17 +661,17 @@ impl<'a> Iterator for ArchiveIter<'a> {
             IterInner::Zip { archive, index } => {
                 if *index < archive.len() {
                     let entry = archive.by_index(*index)
-                        .map(|file| ArchiveEntry {
+                        .and_then(|file| Ok(ArchiveEntry {
                             is_directory: file.is_dir(),
                             // Raw, unsanitized name -- `mangled_name()` would
                             // silently strip `..` components, which would
                             // hide a path-traversal attempt from
                             // `validate_entry_path` instead of letting it
                             // reject the archive.
-                            path: PathBuf::from(file.name()),
+                            path: PathBuf::from(file.name()?.as_ref()),
                             is_symlink: file.is_symlink(),
                             size: file.size(),
-                        })
+                        }))
                         .map_err(zip_error);
                     *index += 1;
                     Some(entry)
@@ -1274,5 +1329,115 @@ mod tests {
             "it's named .7z but its first 512 bytes are all zero where a 7z archive's signature should be, so it \
              is damaged or not a 7z archive"
         );
+    }
+
+    /// A zip whose entries carry the given raw Unix mode (file type bits
+    /// included), as a Unix zip tool would write them. The zip crate's
+    /// writer masks setuid/setgid/sticky away, so the modes are patched
+    /// into the central directory afterwards: each entry's "made by" host
+    /// byte (offset 5) set to Unix and its external attributes (offset 38)
+    /// to `mode << 16`.
+    fn make_zip_with_modes(dir: &Path, file_name: &str, entries: &[(&str, u32, &[u8])]) -> PathBuf {
+        let path = dir.join(file_name);
+        let mut writer = zip::ZipWriter::new(File::create(&path).unwrap());
+        for (name, _, data) in entries {
+            writer.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            writer.write_all(data).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let headers: Vec<usize> = bytes.windows(4).enumerate().filter(|(_, w)| *w == b"PK\x01\x02").map(|(i, _)| i).collect();
+        assert_eq!(headers.len(), entries.len());
+        for (at, (_, mode, _)) in headers.into_iter().zip(entries) {
+            bytes[at + 5] = 3; // Unix
+            bytes[at + 38..at + 42].copy_from_slice(&(mode << 16).to_le_bytes());
+        }
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn open_zip(path: &Path) -> ZipArchive<File> {
+        ZipArchive::new(File::open(path).unwrap()).unwrap()
+    }
+
+    // The checks below go straight to `extract_zip`, skipping the
+    // `validate_entries` pass `extract_to` runs first, so each one shows the
+    // extraction loop holds the line on its own.
+
+    #[test]
+    fn zip_extraction_never_creates_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = make_zip_with_symlink(tmp.path(), "link", "/etc");
+        let dest = fresh_dest(tmp.path(), "dest");
+
+        let err = extract_zip(&mut open_zip(&zip_path), &dest).unwrap_err();
+        assert!(err.to_string().contains("unsafe path"), "{err}");
+        assert!(std::fs::symlink_metadata(dest.join("link")).is_err(), "nothing should exist at the link's path");
+    }
+
+    #[test]
+    fn zip_extraction_refuses_parent_dir_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = make_zip(tmp.path(), "mal.zip", &[("a/../../evil.txt", b"evil")]);
+        let dest = fresh_dest(tmp.path(), "dest");
+
+        let err = extract_zip(&mut open_zip(&zip_path), &dest).unwrap_err();
+        assert!(err.to_string().contains("unsafe path"), "{err}");
+        assert!(!tmp.path().join("evil.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zip_extraction_ignores_stored_unix_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = make_zip_with_modes(
+            tmp.path(),
+            "modes.zip",
+            &[
+                ("suid", 0o104755, b"a"),
+                ("sgid-world-writable", 0o102777, b"b"),
+                ("plain", 0o100644, b"c"),
+            ],
+        );
+        // The archive really does carry the bits (zip 9's `unix_mode()`
+        // already hides setuid/setgid/sticky, so look at the raw field).
+        assert_eq!(open_zip(&zip_path).by_name("suid").unwrap().external_attributes() >> 16, 0o104755);
+        let dest = fresh_dest(tmp.path(), "dest");
+
+        Archive::open(&zip_path).unwrap().extract_to(&dest).unwrap();
+
+        // A file DDMM itself creates gets the default mode (0666 minus umask).
+        let default = {
+            let probe = tmp.path().join("probe");
+            File::create(&probe).unwrap();
+            std::fs::metadata(&probe).unwrap().permissions().mode() & 0o7777
+        };
+        for name in ["suid", "sgid-world-writable", "plain"] {
+            let mode = std::fs::metadata(dest.join(name)).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, default, "{name} should have the default mode, got {mode:o}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_extraction_walk_clears_setuid_setgid_and_sticky() {
+        // unrar restores a Unix-made RAR's stored mode as-is; the walk
+        // after every extraction drops the special bits whatever the format.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = fresh_dest(tmp.path(), "dest");
+        let sub = dest.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let file = sub.join("payload");
+        File::create(&file).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o6755)).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o1777)).unwrap();
+
+        verify_extraction_contained(&dest).unwrap();
+
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777, 0o755);
+        assert_eq!(std::fs::metadata(&sub).unwrap().permissions().mode() & 0o7777, 0o777);
     }
 }
