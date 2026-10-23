@@ -61,6 +61,11 @@ pub const HINT_ACCESS: &str = "Another program (often an antivirus) may be holdi
 pub const HINT_PATH_TOO_LONG: &str = "The mod's files end up too deep for Windows. Move DDMM's data folder to a \
      shorter path (Settings > Data folder), or rename the archive to something shorter.";
 
+/// The phrase every "refused before extracting" error ends with; the
+/// bridge maps any message containing it (or "unsafe path") to its
+/// `UNSAFE_ARCHIVE` error code.
+pub const REFUSED: &str = "so DDMM refused to extract it";
+
 /// "the archive contains an unsafe path ..." (the bridge maps any message
 /// containing "unsafe path" to its `UNSAFE_ARCHIVE` error code).
 pub fn unsafe_path(detail: String) -> anyhow::Error {
@@ -70,6 +75,41 @@ pub fn unsafe_path(detail: String) -> anyhow::Error {
              refused to extract it"
         ),
         HINT_UNSAFE,
+    )
+    .into()
+}
+
+pub const HINT_RENAME: &str = "Ask the mod's author to rename the file (or folder) and upload it again, or \
+     extract the archive yourself, rename it, and pack it again.";
+
+/// Why an entry name can't be used on Windows (see [`unsupported_name`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameProblem {
+    /// A `:`, which Windows reads as a drive or an alternate data stream.
+    Colon,
+    /// Ends in a dot or a space, which Windows silently drops.
+    TrailingDotOrSpace,
+    /// CON, PRN, AUX, NUL, COM1-9, LPT1-9, CONIN$ or CONOUT$.
+    ReservedDevice,
+}
+
+/// Refused before extracting: an entry is named in a way Windows can't
+/// use. Not a safety problem, but refused on every platform so the same
+/// archive installs (or doesn't) the same everywhere.
+pub fn unsupported_name(name: &str, component: &str, problem: NameProblem) -> anyhow::Error {
+    let reason = match problem {
+        NameProblem::Colon => "it contains a `:`".to_string(),
+        NameProblem::TrailingDotOrSpace => format!("\"{component}\" ends in a dot or a space"),
+        NameProblem::ReservedDevice => {
+            format!("\"{component}\" is a name Windows reserves for a device, like CON or NUL")
+        }
+    };
+    ArchiveError::with_hint(
+        format!(
+            "the archive contains a file or folder name Windows can't use (\"{name}\": {reason}). DDMM refuses \
+             such names on every platform, {REFUSED}"
+        ),
+        HINT_RENAME,
     )
     .into()
 }

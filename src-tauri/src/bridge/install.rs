@@ -43,11 +43,14 @@ impl InstallError {
     }
 
     /// Map a failure from the shared archive-install path to a protocol
-    /// error code. The archive module rejects path traversal, absolute
-    /// paths and symlink entries with an "unsafe path" error; the protocol
-    /// reports those as `UNSAFE_ARCHIVE` rather than a generic `INTERNAL`.
+    /// error code. The archive module refuses path traversal, absolute
+    /// paths and symlink entries ("unsafe path"), and names Windows can't
+    /// use or archives over its size / entry-count limits ("... so DDMM
+    /// refused to extract it"); the protocol reports all of those as
+    /// `UNSAFE_ARCHIVE` (a failed pre-install check) rather than a generic
+    /// `INTERNAL`.
     fn from_install_failure(message: String) -> Self {
-        let code = if message.contains("unsafe path") {
+        let code = if message.contains("unsafe path") || message.contains(crate::archive::REFUSED) {
             ErrorCode::UnsafeArchive
         } else {
             ErrorCode::Internal
@@ -848,6 +851,24 @@ mod tests {
         assert!(mods.is_empty());
         // No half-installed "ghost" mod directory may be left behind.
         assert!(!dir.path().join("mods").join("evil").exists());
+    }
+
+    #[tokio::test]
+    async fn install_file_maps_a_windows_only_name_to_unsafe_archive_without_calling_it_unsafe() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("mods")).await.unwrap();
+        let state = AppState::new(dir.path().to_path_buf());
+        let mut mods = Vec::new();
+
+        let file = dir.path().join("con.zip");
+        make_zip(&file, &[("textures/CON.patch_0", b"x")]);
+        let err = install_file(&state, &mut mods, &file, Some(PAGE_URL), None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::UnsafeArchive, "{}", err.message);
+        assert!(err.message.contains("name Windows can't use"), "{}", err.message);
+        assert!(!err.message.contains("unsafe path"), "{}", err.message);
+        assert!(mods.is_empty());
     }
 
     #[cfg(unix)]

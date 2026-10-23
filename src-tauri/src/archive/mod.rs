@@ -6,7 +6,7 @@ mod errors;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 
-pub use errors::{hint_of, io_error, is_archive_problem, ArchiveError};
+pub use errors::{hint_of, io_error, is_archive_problem, ArchiveError, REFUSED};
 use errors::{rar_error, sevenz_error, zip_error};
 
 /// The most bytes one archive may unpack to, counted from the sizes its
@@ -660,8 +660,10 @@ impl Budget {
 /// anywhere (an alternate data stream, `file.txt:hidden`), a component
 /// ending in a dot or a space (Windows silently drops them, so `a.` and
 /// `a` would be the same file), and the reserved device names CON, PRN,
-/// AUX, NUL, COM1-9 and LPT1-9, in any case and with or without an
-/// extension (`nul.txt` is still the NUL device).
+/// AUX, NUL, COM1-9, LPT1-9, CONIN$ and CONOUT$, in any case and with or
+/// without an extension (`nul.txt` is still the NUL device). These get
+/// their own error ([`errors::unsupported_name`]): they aren't unsafe,
+/// just unusable on Windows.
 fn validate_entry_path(path: &Path) -> anyhow::Result<()> {
     let original = path.to_string_lossy();
     let normalized = original.replace('\\', "/");
@@ -685,33 +687,34 @@ fn validate_entry_path(path: &Path) -> anyhow::Result<()> {
         return Err(errors::unsafe_path(format!("\"{}\"", original)));
     }
 
-    if normalized.contains(':') {
-        return Err(errors::unsafe_path(format!("\"{}\", a `:` in a name", original)));
-    }
-
+    use errors::NameProblem;
     for component in normalized.split('/').filter(|c| !c.is_empty() && *c != ".") {
-        if component.ends_with('.') || component.ends_with(' ') {
-            return Err(errors::unsafe_path(format!("\"{}\", a name ending in a dot or space", original)));
-        }
-        if is_windows_device_name(component) {
-            return Err(errors::unsafe_path(format!(
-                "\"{}\", \"{}\" is a reserved device name on Windows",
-                original, component
-            )));
+        let problem = if component.contains(':') {
+            Some(NameProblem::Colon)
+        } else if component.ends_with('.') || component.ends_with(' ') {
+            Some(NameProblem::TrailingDotOrSpace)
+        } else if is_windows_device_name(component) {
+            Some(NameProblem::ReservedDevice)
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            return Err(errors::unsupported_name(&original, component, problem));
         }
     }
 
     Ok(())
 }
 
-/// CON, PRN, AUX, NUL, COM1-9, LPT1-9 (and COM/LPT with the superscript
-/// digits Windows also reserves), in any case, with or without an
-/// extension. Spaces before the extension don't help (`NUL .txt`).
+/// CON, PRN, AUX, NUL, CONIN$, CONOUT$, COM1-9, LPT1-9 (and COM/LPT with
+/// the superscript digits Windows also reserves), in any case, with or
+/// without an extension. Spaces before the extension don't help
+/// (`NUL .txt`).
 fn is_windows_device_name(component: &str) -> bool {
     let stem = component.split('.').next().unwrap_or(component).trim_end_matches(' ');
     let upper = stem.to_uppercase();
     match upper.as_str() {
-        "CON" | "PRN" | "AUX" | "NUL" => true,
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
         _ => match (upper.get(..3), upper.get(3..)) {
             (Some("COM" | "LPT"), Some(digit)) => {
                 matches!(digit, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "\u{b9}" | "\u{b2}" | "\u{b3}")
@@ -1725,10 +1728,22 @@ mod tests {
             "lpt9.txt",
             "NUL .txt",
             "COM\u{b9}",
+            "CONIN$",
+            "conout$.log",
         ] {
             let err = validate_entry_path(Path::new(bad)).unwrap_err();
-            assert!(err.to_string().contains("unsafe path"), "{bad}: {err}");
+            let text = err.to_string();
+            assert!(text.contains("name Windows can't use"), "{bad}: {text}");
+            assert!(!text.contains("unsafe path") && !text.contains("outside"), "{bad}: {text}");
+            assert_eq!(errors::hint_of(&err), Some(errors::HINT_RENAME), "{bad}");
         }
+        let reason = |name: &str| validate_entry_path(Path::new(name)).unwrap_err().to_string();
+        assert!(reason("mod:b.txt").contains("contains a `:`"));
+        // `a:b.txt` is different: a drive-relative path (drive A:), which really
+        // would write outside the folder on Windows.
+        assert!(reason("a:b.txt").contains("unsafe path"));
+        assert!(reason("dir./f").contains("\"dir.\" ends in a dot or a space"));
+        assert!(reason("sub/aux.json").contains("\"aux.json\" is a name Windows reserves for a device"));
         for good in [
             "./manifest.json",
             "console.txt",
@@ -1737,6 +1752,8 @@ mod tests {
             "COM10",
             "LPT0",
             "COMA",
+            "CONINX",
+            "conout.txt",
             "my mod v1.2/file",
             "9ba626afa44a3aa3.patch_0.gpu_resources",
         ] {

@@ -291,7 +291,7 @@ Reply: `{ "id": "5", "ok": true, "type": "opened" }`
 | `FORBIDDEN_ORIGIN` | Caller isn't an allowed extension |
 | `DECLINED` | The user answered Deny / closed the prompt, or kept the installed mod when asked whether to replace it |
 | `NOT_ARCHIVE` | File isn't a zip/7z/rar |
-| `UNSAFE_ARCHIVE` | Archive failed path-traversal / symlink validation |
+| `UNSAFE_ARCHIVE` | Archive failed a pre-install check: path traversal / symlink validation, a file name Windows can't use, or the size / entry-count limits |
 | `FILE_NOT_FOUND` | `file` doesn't exist or isn't a regular file |
 | `GAME_NOT_FOUND` | `afterInstall: deploy` but the game path isn't set/valid (mod is still installed) |
 | `DEPLOY_FAILED` | Installed, but deploy failed (mod is still installed) |
