@@ -46,10 +46,35 @@ fn header(body: &[u8], out: &mut Vec<u8>) {
 /// Names are stored exactly as given, so `..\\evil` or `/abs` can be
 /// written to test the path checks.
 pub fn rar5(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let entries: Vec<RarEntry> = entries.iter().map(|(name, data)| RarEntry::new(name, data)).collect();
+    rar5_with(&entries)
+}
+
+/// One entry for [`rar5_with`]: Windows-made by default.
+pub struct RarEntry<'a> {
+    pub name: &'a str,
+    pub data: &'a [u8],
+    /// `Some(mode)`: made on Unix, with this raw `st_mode` (type bits
+    /// included) as its attributes, which unrar restores as-is.
+    pub unix_mode: Option<u32>,
+    /// The unpacked size the header declares, if not `data.len()`.
+    pub declared_size: Option<u64>,
+}
+
+impl<'a> RarEntry<'a> {
+    pub fn new(name: &'a str, data: &'a [u8]) -> Self {
+        RarEntry { name, data, unix_mode: None, declared_size: None }
+    }
+}
+
+/// [`rar5`] with control over each entry's host OS, attributes and
+/// declared size.
+pub fn rar5_with(entries: &[RarEntry]) -> Vec<u8> {
     let mut out = b"Rar!\x1a\x07\x01\x00".to_vec();
     // Main archive header: type 1, no header flags, no archive flags.
     header(&[1, 0, 0], &mut out);
-    for (name, data) in entries {
+    for entry in entries {
+        let (name, data) = (entry.name, entry.data);
         let is_dir = name.ends_with('/');
         let name = name.trim_end_matches('/').as_bytes();
         let mut body = Vec::new();
@@ -59,13 +84,19 @@ pub fn rar5(entries: &[(&str, &[u8])]) -> Vec<u8> {
             vint(data.len() as u64, &mut body); // data size
         }
         vint(if is_dir { 0x0001 } else { 0x0004 }, &mut body); // file flags: directory / CRC32 present
-        vint(if is_dir { 0 } else { data.len() as u64 }, &mut body); // unpacked size
-        vint(if is_dir { 0x10 } else { 0x20 }, &mut body); // Windows attributes
+        let unpacked = if is_dir { 0 } else { entry.declared_size.unwrap_or(data.len() as u64) };
+        vint(unpacked, &mut body); // unpacked size
+        let attributes = match entry.unix_mode {
+            Some(mode) => mode as u64,
+            None if is_dir => 0x10,
+            None => 0x20,
+        };
+        vint(attributes, &mut body); // Windows attributes, or Unix st_mode
         if !is_dir {
             body.extend_from_slice(&crc32(data).to_le_bytes());
         }
         vint(0, &mut body); // compression info: version 0, method 0 (store)
-        vint(0, &mut body); // host OS: Windows
+        vint(if entry.unix_mode.is_some() { 1 } else { 0 }, &mut body); // host OS: Unix / Windows
         vint(name.len() as u64, &mut body);
         body.extend_from_slice(name);
         header(&body, &mut out);
