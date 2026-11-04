@@ -65,7 +65,7 @@ libc = "0.2"
 winreg = "0.56.0"
 # Free space on the drive a data folder move goes to (`data_move::available_space`).
 # ...and whether the process named in bridge.json is still running (`bridge::state::process_is_alive`).
-windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
