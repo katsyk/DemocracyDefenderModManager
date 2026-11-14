@@ -136,11 +136,22 @@
         close(refocus);
         if (!refocus) return;
         // A removed row can linger for a moment (the list animates it
-        // out): keep watching for a few frames until it's gone.
-        let frames = 30;
+        // out, 320 ms): keep watching for up to a second, whatever the
+        // display's frame rate, until it's gone. Stops as soon as the user
+        // clicks or presses a key: never pulls the focus back after that.
+        const deadline = performance.now() + 1000;
+        let stopped = false;
+        const stop = () => {
+            stopped = true;
+            window.removeEventListener("pointerdown", stop, true);
+            window.removeEventListener("keydown", stop, true);
+        };
+        window.addEventListener("pointerdown", stop, true);
+        window.addEventListener("keydown", stop, true);
         const settle = () => {
+            if (stopped) return;
             const active = document.activeElement;
-            if (active && active !== document.body && active !== button) return;
+            if (active && active !== document.body && active !== button) return stop();
             if (!button?.isConnected) {
                 const after = openers().filter(b => !b.closest("[inert]"));
                 const target = after[Math.min(at, after.length - 1)] ?? document.querySelector<HTMLElement>("main");
@@ -148,10 +159,11 @@
                     if (target.tagName === "MAIN" && !target.hasAttribute("tabindex")) target.tabIndex = -1;
                     target.focus();
                 }
-                return;
+                return stop();
             }
             if (active !== button && !button.closest("[inert]")) button.focus();
-            if (--frames > 0) requestAnimationFrame(settle);
+            if (performance.now() < deadline) requestAnimationFrame(settle);
+            else stop();
         };
         setTimeout(settle);
     }

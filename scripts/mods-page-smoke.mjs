@@ -793,6 +793,7 @@ const scenarios = {
             let f = await focused();
             r.expect(f.inMenu && f.text === "Remove", `the focus is on its first item (${f.text})`);
             r.expect(await opener.getAttribute("aria-expanded") === "true", "the button says the menu is open");
+            r.expect(await menu.getAttribute("aria-label") === "Mod actions: V1 mod" && await opener.getAttribute("aria-label") === "Mod actions: V1 mod", "the menu and its button name the mod");
 
             // First entry: Move Up is disabled, so Down goes to Move Down.
             await page.keyboard.press("ArrowDown");
@@ -891,6 +892,31 @@ const scenarios = {
             await page.waitForTimeout(300);
             r.expect(r.calls.filter(c => c.cmd === "cancel_handoff").length === 1, "waiting: Escape cancels the handoff");
             r.expect(await page.locator("button", { hasText: "Choose File" }).count() === 0, "waiting: Escape closes it");
+        },
+    },
+    // A file picked with "Choose File" is installing (the status still
+    // says waiting): Cancel is disabled and Escape does nothing, so its
+    // result isn't dropped.
+    eschandoffchoose: {
+        data: (d) => {
+            d.classify_download_url = { Provider: "nexus", DisplayName: "Nexus Mods", RequiresHandoff: true };
+            d["plugin:dialog|open"] = "/dl/x.zip";
+            d.__hang = ["install_handoff_file"];
+        },
+        async check(page, r) {
+            await page.locator("button", { hasText: "Add URL" }).click({ timeout: 2000 });
+            await page.locator("#input").fill("https://www.nexusmods.com/helldivers2/mods/1");
+            await page.getByText("Confirm", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            const cancel = page.locator("button", { hasText: "Cancel" });
+            r.expect(!(await cancel.isDisabled()), "Cancel is enabled while waiting");
+            await page.locator("button", { hasText: "Choose File" }).click({ timeout: 2000 });
+            await page.waitForTimeout(400);
+            r.expect(r.calls.some(c => c.cmd === "install_handoff_file"), "the chosen file is installing");
+            r.expect(await cancel.isDisabled(), "Cancel is disabled while it installs");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(300);
+            r.expect(await page.locator("button", { hasText: "Choose File" }).count() === 1, "Escape leaves it open");
         },
     },
     // Escape in a text popup (focus in its input): Cancel.

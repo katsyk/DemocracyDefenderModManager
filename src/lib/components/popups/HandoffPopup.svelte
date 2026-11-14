@@ -36,8 +36,14 @@
         view = { ...popup.view };
     }
 
+    /** "Choose File" is installing a file: Cancel would drop its result
+     * (the status stays "Waiting" meanwhile). Kept on the popup too, for a
+     * remount. */
+    let installingChosenFile = $state(false);
+
     onMount(() => {
         view = { ...popup.view };
+        installingChosenFile = popup.installingChosenFile;
         popup.onViewChange = () => (view = { ...popup.view });
         if (!popup.started) {
             popup.started = true;
@@ -106,6 +112,7 @@
         if (!files) return;
 
         popup.installingChosenFile = true;
+        installingChosenFile = true;
         try {
             await cancelHandoff();
         } catch {
@@ -148,7 +155,7 @@
         </div>
     {/if}
     <div class="flex flex-row gap-2 justify-between">
-        <button class="hd2mm-button" disabled={view.status === "Installing"} onclick={onCancel}>{t("popup.handoff.cancel_button.text")}</button>
+        <button class="hd2mm-button" disabled={view.status === "Installing" || installingChosenFile} onclick={onCancel}>{t("popup.handoff.cancel_button.text")}</button>
         <button class="hd2mm-button" onclick={onChooseFile}>{t("popup.handoff.choose_file_button.text")}</button>
     </div>
 </PopupBase>

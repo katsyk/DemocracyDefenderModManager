@@ -1841,7 +1841,7 @@
                                     <span class="text-xs truncate">{t("pages.mods.missing_entry.message")}</span>
                                     <span class="text-xs text-zinc-500 truncate">{config.Guid}</span>
                                 </div>
-                                <PopupMenuButton insertTarget="main" label={t("pages.mods.entry_menu.label")}>
+                                <PopupMenuButton insertTarget="main" label={t("pages.mods.entry_menu.label", { name: t("pages.mods.missing_entry.title") })}>
                                     <button role="menuitem" tabindex="-1" onclick={() => onRemoveMissing(ci)}>
                                         <Eraser />
                                         <span>{t("pages.mods.entry_menu.remove")}</span>
@@ -1924,7 +1924,7 @@
                                         <PencilSquare class="block mx-auto" />
                                     </button>
                                 {/if}
-                                <PopupMenuButton insertTarget="main" label={t("pages.mods.entry_menu.label")}>
+                                <PopupMenuButton insertTarget="main" label={t("pages.mods.entry_menu.label", { name: mod.name })}>
                                     <button role="menuitem" tabindex="-1" onclick={() => onRemove(ci)}>
                                         <Eraser />
                                         <span>{t("pages.mods.entry_menu.remove")}</span>
