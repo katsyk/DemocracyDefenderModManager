@@ -1246,22 +1246,27 @@
         if (!saved.ok) log.warn(`Failed to save profiles after removing a missing entry: ${saved.error}`);
     }
 
-    function onMoveUp(i: number) {
-        moveEntry(profileConfigs, i, i - 1);
-    }
-
-    function onMoveDown(i: number) {
-        moveEntry(profileConfigs, i, i + 1);
+    /** Move Up / Move Down: past the next entry shown, to its place in the
+     * whole list. While the search hides some mods, the neighbour in the
+     * whole list may be hidden, and swapping with it would change nothing
+     * visible. `i` is the entry's index in the whole list. */
+    function onMoveStep(i: number, step: -1 | 1) {
+        const shownAt = profileEntries.findIndex(([, , ci]) => ci === i);
+        const neighbour = profileEntries[shownAt + step];
+        if (shownAt === -1 || !neighbour) return;
+        moveEntry(profileConfigs, i, neighbour[2]);
     }
 
     /** Move to Top / Move to Bottom: `i` is the entry's index in the whole
      * list (not the filtered one), so it goes to that end of the whole
-     * load order even while the search hides some mods. The search then
-     * says so, since mods it hides may now be on the other side of it. */
+     * load order even while the search hides some mods. When it does, a
+     * message says so, since hidden mods may now be on the other side of
+     * it. */
     function onToEnd(i: number, end: "top" | "bottom") {
         const name = mods.find(m => m.guid === profileConfigs[i]?.Guid)?.name ?? t("pages.mods.missing_entry.title");
+        const someHidden = profileEntries.length < profileConfigs.length;
         if (!moveEntry(profileConfigs, i, end === "top" ? 0 : profileConfigs.length - 1)) return;
-        if (searchText.length === 0) return;
+        if (!someHidden) return;
         showToast("info", end === "top"
             ? t("toast.load_order.moved_to_top_filtered", { name })
             : t("toast.load_order.moved_to_bottom_filtered", { name }));
@@ -1842,11 +1847,11 @@
                                         <span>{t("pages.mods.entry_menu.remove")}</span>
                                     </button>
                                     <hr>
-                                    <button disabled={ci === 0} onclick={() => onMoveUp(ci)}>
+                                    <button disabled={i === 0} onclick={() => onMoveStep(ci, -1)}>
                                         <CaretUp />
                                         <span>{t("pages.mods.entry_menu.move_up")}</span>
                                     </button>
-                                    <button disabled={ci === profileConfigs.length - 1} onclick={() => onMoveDown(ci)}>
+                                    <button disabled={i === profileEntries.length - 1} onclick={() => onMoveStep(ci, 1)}>
                                         <CaretDown />
                                         <span>{t("pages.mods.entry_menu.move_down")}</span>
                                     </button>
@@ -1926,15 +1931,17 @@
                                     </button>
                                     <hr>
                                     <button
-                                        disabled={ci === 0}
-                                        onclick={() => onMoveUp(ci)}
+                                        disabled={i === 0}
+                                        onclick={() => onMoveStep(ci, -1)}
+                                        data-testid="entry-move-up"
                                     >
                                         <CaretUp />
                                         <span>{t("pages.mods.entry_menu.move_up")}</span>
                                     </button>
                                     <button
-                                        disabled={ci === profileConfigs.length - 1}
-                                        onclick={() => onMoveDown(ci)}
+                                        disabled={i === profileEntries.length - 1}
+                                        onclick={() => onMoveStep(ci, 1)}
+                                        data-testid="entry-move-down"
                                     >
                                         <CaretDown />
                                         <span>{t("pages.mods.entry_menu.move_down")}</span>

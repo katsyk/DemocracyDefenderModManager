@@ -65,7 +65,11 @@ game after a deploy.
   the three-dot button and press Enter to open the menu, then keep pressing Tab until the action is highlighted
   and press Enter.
 - With a search active, these still move the mod to the top or bottom of the *whole* list, counting the mods the
-  search hides, not just the ones shown. A message says so; clear the search to see where it landed.
+  search hides, not just the ones shown. When the search hides any mods, a message says so; clear the search to
+  see where it landed.
+- With a search active, **Move Up** and **Move Down** move the mod past the next mod *shown* above or below it,
+  skipping any the search hides in between (those keep their places). They're greyed out for the first and last
+  mod shown.
 - A "Mod not found" entry has them too, since it keeps its place in the load order.
 
 For example, with two armor retextures that both change the same armor:

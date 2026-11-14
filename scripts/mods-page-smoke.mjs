@@ -579,6 +579,49 @@ const scenarios = {
             r.expect(order.join() === [G(4), G(1), G(2), G(99), G(3)].join(), `saved at the ends of the whole list (${order.join()})`);
         },
     },
+    // A search that hides nothing: no message about hidden mods.
+    movefilternone: {
+        data: (d) => d.load_profiles.Profiles[0].Configs.pop(),
+        async check(page, r) {
+            await page.getByPlaceholder("Search", { exact: true }).fill("o");
+            await page.waitForTimeout(300);
+            r.expect((await rows(page)).length === 4, "the search shows every mod");
+            await openEntryMenu(page, "Legacy mod");
+            await page.getByTestId("entry-move-top").click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            r.expect((await rows(page))[0] === "Legacy mod", "it's moved");
+            r.expect(await page.getByText("the search hides", { exact: false }).count() === 0, "no message about hidden mods");
+        },
+    },
+    // Move Up / Move Down with a search active: past the next mod shown,
+    // not a hidden one (which would change nothing on screen); off at the
+    // ends of what's shown.
+    movestepfilter: {
+        async check(page, r) {
+            const search = page.getByPlaceholder("Search", { exact: true });
+            await search.fill("mod");
+            await page.waitForFunction(() => document.querySelectorAll("main span.text-2xl").length === 3, null, { timeout: 3000 }).catch(() => {});
+            r.expect((await rows(page)).join() === "V1 mod,Legacy mod,Leniently parsed mod", `the search hides one mod (${(await rows(page)).join()})`);
+            await openEntryMenu(page, "Legacy mod");
+            await page.getByTestId("entry-move-up").click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            r.expect((await rows(page)).join() === "Legacy mod,V1 mod,Leniently parsed mod", `Move Up passes the mod shown above (${(await rows(page)).join()})`);
+            await openEntryMenu(page, "Legacy mod");
+            r.expect(await page.getByTestId("entry-move-up").isDisabled(), "Move Up is off for the first mod shown");
+            await page.mouse.click(5, 5);
+            await page.waitForTimeout(200);
+            await openEntryMenu(page, "V1 mod");
+            await page.getByTestId("entry-move-down").click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            r.expect((await rows(page)).join() === "Legacy mod,Leniently parsed mod,V1 mod", `Move Down passes the mod shown below (${(await rows(page)).join()})`);
+            await openEntryMenu(page, "V1 mod");
+            r.expect(await page.getByTestId("entry-move-down").isDisabled(), "Move Down is off for the last mod shown");
+            await page.mouse.click(5, 5);
+            await page.waitForTimeout(200);
+            const order = await savedOrder(page, r);
+            r.expect(order.join() === [G(3), G(2), G(4), G(1), G(99)].join(), `hidden entries keep their places (${order.join()})`);
+        },
+    },
     // From the keyboard: open the menu with Enter, reach the action, press
     // Enter.
     movekeys: {
