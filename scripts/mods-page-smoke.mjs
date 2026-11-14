@@ -769,6 +769,76 @@ const scenarios = {
             r.expect(!r.calls.some(c => c.cmd === "delete_mod"), "nothing is deleted");
         },
     },
+    // The per-mod three-dot menu from the keyboard: opens on its first
+    // item, arrows skip disabled items, Escape closes only the menu and
+    // goes back to the button, Tab and a click outside close it.
+    menukeys: {
+        async check(page, r) {
+            const menu = page.getByTestId("entry-menu");
+            const opener = page.locator("main button[aria-haspopup='menu']").first();
+            const focused = () => page.evaluate(() => {
+                const a = document.activeElement;
+                return { text: a?.textContent?.trim() ?? "", inMenu: !!a?.closest("[data-testid='entry-menu']"), opener: a?.getAttribute("aria-haspopup") === "menu", body: a === document.body };
+            });
+            const order = () => r.saves.at(-1)?.Profiles[0].Configs.map(c => c.Guid).join();
+
+            await opener.focus();
+            await page.keyboard.press("Enter");
+            await page.waitForTimeout(300);
+            r.expect(await menu.count() === 1, "Enter opens the menu");
+            let f = await focused();
+            r.expect(f.inMenu && f.text === "Remove", `the focus is on its first item (${f.text})`);
+            r.expect(await opener.getAttribute("aria-expanded") === "true", "the button says the menu is open");
+
+            // First entry: Move Up is disabled, so Down goes to Move Down.
+            await page.keyboard.press("ArrowDown");
+            f = await focused();
+            r.expect(f.text === "Move Down", `ArrowDown skips the disabled item (${f.text})`);
+            await page.keyboard.press("ArrowUp");
+            f = await focused();
+            r.expect(f.text === "Remove", `ArrowUp goes back (${f.text})`);
+            await page.keyboard.press("ArrowUp");
+            f = await focused();
+            r.expect(f.inMenu && f.text !== "Remove", `ArrowUp on the first item wraps to the last (${f.text})`);
+
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(200);
+            r.expect(await menu.count() === 0, "Escape closes the menu");
+            f = await focused();
+            r.expect(f.opener, "Escape puts the focus back on the button");
+            r.expect(await page.getByText(DELETE_QUESTION).count() === 0 && !r.calls.some(c => c.cmd === "deploy"), "Escape does nothing else");
+
+            await page.keyboard.press("Enter");
+            await page.waitForTimeout(300);
+            r.expect(await menu.count() === 1, "it opens again");
+            await page.keyboard.press("Tab");
+            await page.waitForTimeout(200);
+            f = await focused();
+            r.expect(await menu.count() === 0 && !f.inMenu && !f.body && !f.opener, "Tab closes it and moves on from the button");
+
+            await opener.click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            r.expect(await menu.count() === 1, "a click opens it");
+            await page.mouse.click(5, 5);
+            await page.waitForTimeout(200);
+            r.expect(await menu.count() === 0, "a click outside closes it");
+
+            // Choosing an item from the keyboard: done, focus back on a
+            // three-dot button.
+            const before = order();
+            await opener.focus();
+            await page.keyboard.press("Enter");
+            await page.waitForTimeout(300);
+            await page.keyboard.press("ArrowDown");
+            await page.keyboard.press("Enter");
+            await page.waitForTimeout(400);
+            r.expect(await menu.count() === 0, "choosing an item closes the menu");
+            r.expect((await rows(page))[1] === "V1 mod", `Move Down moved it (${(await rows(page)).join(", ")}; ${before} -> ${order()})`);
+            f = await focused();
+            r.expect(f.opener, "the focus is back on a three-dot button");
+            r.expect(r.errors.length === 0, "no page error");
+        },
+    },
     // Init itself fails.
     initfail: {
         data: (d) => { d.load_profiles.Profiles = null; },
