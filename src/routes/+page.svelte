@@ -12,7 +12,7 @@
     import { useLocalization } from "$lib/state/localization.svelte";
     import { Mod } from "$lib/models/mod";
     import type {Config, Profile, ProfilesConfig} from "$lib/models/profile";
-    import { defaultConfigFor, deployableEntries, fitConfig, removeDuplicateEntries, removeEntriesOf, renameEntries } from "$lib/utils/profileEntries";
+    import { defaultConfigFor, deployableEntries, fitConfig, moveEntry, removeDuplicateEntries, removeEntriesOf, renameEntries } from "$lib/utils/profileEntries";
     import {
         addMod, addMods, addModFolder, addPaths, addModFromUrl, deleteMod, getMods, loadProfiles, saveProfiles,
         loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath,
@@ -1216,8 +1216,7 @@
 
         if (isCanceled || typeof targetItemIndex !== "number" || draggedItemIndex === targetItemIndex) return;
 
-        const [elm] = profileConfigs.splice(draggedItemIndex, 1);
-        profileConfigs.splice(targetItemIndex, 0, elm);
+        moveEntry(profileConfigs, draggedItemIndex, targetItemIndex);
     }
 
     async function onEditConfig(i: number) {
@@ -1248,31 +1247,24 @@
     }
 
     function onMoveUp(i: number) {
-        if (i === 0) return;
-
-        const [elm] = profileConfigs.splice(i, 1);
-        profileConfigs.splice(i - 1, 0, elm);
+        moveEntry(profileConfigs, i, i - 1);
     }
 
     function onMoveDown(i: number) {
-        if (i === profileConfigs.length - 1) return;
-
-        const [elm] = profileConfigs.splice(i, 1);
-        profileConfigs.splice(i + 1, 0, elm);
+        moveEntry(profileConfigs, i, i + 1);
     }
 
-    function onToTop(i: number) {
-        if (i === 0) return;
-
-        const [elm] = profileConfigs.splice(i, 1);
-        profileConfigs.splice(0, 0, elm);
-    }
-
-    function onToBottom(i: number) {
-        if (i === profileConfigs.length - 1) return;
-
-        const [elm] = profileConfigs.splice(i, 1);
-        profileConfigs.push(elm);
+    /** Move to Top / Move to Bottom: `i` is the entry's index in the whole
+     * list (not the filtered one), so it goes to that end of the whole
+     * load order even while the search hides some mods. The search then
+     * says so, since mods it hides may now be on the other side of it. */
+    function onToEnd(i: number, end: "top" | "bottom") {
+        const name = mods.find(m => m.guid === profileConfigs[i]?.Guid)?.name ?? t("pages.mods.missing_entry.title");
+        if (!moveEntry(profileConfigs, i, end === "top" ? 0 : profileConfigs.length - 1)) return;
+        if (searchText.length === 0) return;
+        showToast("info", end === "top"
+            ? t("toast.load_order.moved_to_top_filtered", { name })
+            : t("toast.load_order.moved_to_bottom_filtered", { name }));
     }
 
     async function onToggleLibrary() {
@@ -1858,6 +1850,14 @@
                                         <CaretDown />
                                         <span>{t("pages.mods.entry_menu.move_down")}</span>
                                     </button>
+                                    <button disabled={ci === 0} onclick={() => onToEnd(ci, "top")} data-testid="entry-move-top">
+                                        <ArrowBarUp />
+                                        <span>{t("pages.mods.entry_menu.to_top")}</span>
+                                    </button>
+                                    <button disabled={ci === profileConfigs.length - 1} onclick={() => onToEnd(ci, "bottom")} data-testid="entry-move-bottom">
+                                        <ArrowBarDown />
+                                        <span>{t("pages.mods.entry_menu.to_bottom")}</span>
+                                    </button>
                                 </PopupMenuButton>
                             </div>
                             {:else}
@@ -1941,14 +1941,16 @@
                                     </button>
                                     <button
                                         disabled={ci === 0}
-                                        onclick={() => onToTop(ci)}
+                                        onclick={() => onToEnd(ci, "top")}
+                                        data-testid="entry-move-top"
                                     >
                                         <ArrowBarUp />
                                         <span>{t("pages.mods.entry_menu.to_top")}</span>
                                     </button>
                                     <button
                                         disabled={ci === profileConfigs.length - 1}
-                                        onclick={() => onToBottom(ci)}
+                                        onclick={() => onToEnd(ci, "bottom")}
+                                        data-testid="entry-move-bottom"
                                     >
                                         <ArrowBarDown />
                                         <span>{t("pages.mods.entry_menu.to_bottom")}</span>

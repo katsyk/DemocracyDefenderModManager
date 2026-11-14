@@ -112,3 +112,16 @@ export function removeDuplicateEntries(configs: Config[]): string[] {
     }
     return repeated;
 }
+
+/** Move the entry at `from` to position `to` in `list`, in place (so a
+ * list shown on the page updates too), shifting the ones between. Every
+ * way of changing the load order goes through here: dragging, Move Up and
+ * Move Down, and Move to Top and Move to Bottom. Returns whether anything
+ * moved (not when `from` or `to` is outside the list, or they're equal). */
+export function moveEntry<T>(list: T[], from: number, to: number): boolean {
+    const inList = (i: number) => Number.isInteger(i) && i >= 0 && i < list.length;
+    if (!inList(from) || !inList(to) || from === to) return false;
+    const [entry] = list.splice(from, 1);
+    list.splice(to, 0, entry);
+    return true;
+}

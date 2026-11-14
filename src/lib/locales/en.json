@@ -265,8 +265,8 @@
                 "remove": "Remove",
                 "move_up": "Move Up",
                 "move_down": "Move Down",
-                "to_top": "To Top",
-                "to_bottom": "To Bottom"
+                "to_top": "Move to Top (lowest priority)",
+                "to_bottom": "Move to Bottom (highest priority)"
             }
         },
         "settings": {
@@ -795,6 +795,10 @@
             "game_running": "Mods updated, but Helldivers 2 is running: deploy after closing it to use the new versions."
         },
         "drop_while_busy": "Finish or close the open window first, then drop the files again.",
+        "load_order": {
+            "moved_to_top_filtered": "Moved \"{name}\" to the top of the whole list (lowest priority), counting the mods the search hides.",
+            "moved_to_bottom_filtered": "Moved \"{name}\" to the bottom of the whole list (highest priority), counting the mods the search hides."
+        },
         "import": {
             "added_to_profile": "Imported mods were added to \"{profile}\". Deploy to use them.",
             "profile_save_failed": "The mods were imported, but the profile couldn't be saved: {error}"
