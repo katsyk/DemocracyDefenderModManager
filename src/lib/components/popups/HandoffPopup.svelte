@@ -148,7 +148,7 @@
         </div>
     {/if}
     <div class="flex flex-row gap-2 justify-between">
-        <button class="hd2mm-button" onclick={onCancel}>{t("popup.handoff.cancel_button.text")}</button>
+        <button class="hd2mm-button" disabled={view.status === "Installing"} onclick={onCancel}>{t("popup.handoff.cancel_button.text")}</button>
         <button class="hd2mm-button" onclick={onChooseFile}>{t("popup.handoff.choose_file_button.text")}</button>
     </div>
 </PopupBase>

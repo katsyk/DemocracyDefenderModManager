@@ -65,6 +65,9 @@ const DELETE_QUESTION = "Are you sure you want to delete this mod?";
 const replaceOffer = () => ({ guid: G(1), fileName: "V1 mod-2.zip", installedName: "V1 mod",
     installedVersion: "1.0", newName: "V1 mod", newVersion: "2.0", sameName: true });
 
+const importScan = () => ({ Root: "/dl", Truncated: false, FreeBytes: null, Cancelled: false, ScanToken: 1,
+    Items: [{ Id: 1, Kind: "Archive", Path: "/dl/a.zip", Name: "A mod", Size: 10, FileSize: 10, Status: { Kind: "New" } }] });
+
 /** A mod in the library only (not in the profile), so it can be deleted. */
 const inLibraryOnly = (d) => d.load_profiles.Profiles[0].Configs.splice(1, 1);
 
@@ -636,14 +639,15 @@ const scenarios = {
             await entryRow(page, "Legacy mod").locator("button.hd2mm-button-nop.p-2").last().focus();
             await page.keyboard.press("Enter");
             await page.waitForTimeout(300);
+            // The menu opens on its first item; the arrows reach the rest.
             const focused = [];
-            for (let i = 0; i < 30; i++) {
-                await page.keyboard.press("Tab");
+            for (let i = 0; i < 10; i++) {
                 const t = await page.evaluate(() => document.activeElement?.getAttribute("data-testid") ?? document.activeElement?.textContent?.trim().slice(0, 30));
                 focused.push(t);
                 if (t === "entry-move-top") break;
+                await page.keyboard.press("ArrowDown");
             }
-            r.expect(focused.at(-1) === "entry-move-top", `Tab reaches Move to Top (${focused.join(" | ")})`);
+            r.expect(focused.at(-1) === "entry-move-top", `the arrows reach Move to Top (${focused.join(" | ")})`);
             await page.keyboard.press("Enter");
             await page.waitForTimeout(300);
             r.expect((await rows(page))[0] === "Legacy mod", "Enter moves it");
@@ -837,6 +841,226 @@ const scenarios = {
             f = await focused();
             r.expect(f.opener, "the focus is back on a three-dot button");
             r.expect(r.errors.length === 0, "no page error");
+        },
+    },
+    // Escape on the browser extension's "Allow ...?": Deny, answered.
+    escbridge: {
+        async check(page, r) {
+            await page.evaluate(() => window.__smokeEmit("bridge://consent-request", { requestId: "b1", site: "example.com" }));
+            await page.waitForTimeout(300);
+            r.expect(await page.getByText("Deny", { exact: true }).count() === 1, "the question is shown");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(300);
+            const c = r.calls.filter(c => c.cmd === "resolve_bridge_consent").map(c => `${c.args.requestId}:${c.args.decision}`);
+            r.expect(c.join() === "b1:Deny", `Escape answers Deny (${c.join()})`);
+        },
+    },
+    // Escape on a new download found by auto-import: Ignore.
+    escautoimport: {
+        async check(page, r) {
+            await page.evaluate(() => window.__smokeEmit("auto-import://candidate", { file: "/dl/x.zip" }));
+            await page.waitForTimeout(300);
+            r.expect(await page.getByText("Ignore", { exact: true }).count() === 1, "the question is shown");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(300);
+            r.expect(await page.getByText("Ignore", { exact: true }).count() === 0, "Escape closes it");
+            r.expect(!r.calls.some(c => /add_mod|import/.test(c.cmd)), "nothing is installed");
+        },
+    },
+    // Escape on the browser handoff: nothing while installing (Cancel is
+    // disabled then too), Cancel while waiting.
+    eschandoff: {
+        data: (d) => { d.classify_download_url = { Provider: "nexus", DisplayName: "Nexus Mods", RequiresHandoff: true }; },
+        async check(page, r) {
+            await page.locator("button", { hasText: "Add URL" }).click({ timeout: 2000 });
+            await page.locator("#input").fill("https://www.nexusmods.com/helldivers2/mods/1");
+            await page.getByText("Confirm", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            const cancel = page.locator("button", { hasText: "Cancel" });
+            await page.evaluate(() => window.__smokeEmit("handoff", { Status: "Installing" }));
+            await page.waitForTimeout(200);
+            r.expect(await cancel.isDisabled(), "Cancel is disabled while installing");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(300);
+            r.expect(await page.locator("button", { hasText: "Choose File" }).count() === 1, "installing: Escape leaves it open");
+            r.expect(!r.calls.some(c => c.cmd === "cancel_handoff"), "installing: nothing cancelled");
+            await page.evaluate(() => window.__smokeEmit("handoff", { Status: "Waiting" }));
+            await page.waitForTimeout(200);
+            r.expect(!(await cancel.isDisabled()), "Cancel is enabled while waiting");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(300);
+            r.expect(r.calls.filter(c => c.cmd === "cancel_handoff").length === 1, "waiting: Escape cancels the handoff");
+            r.expect(await page.locator("button", { hasText: "Choose File" }).count() === 0, "waiting: Escape closes it");
+        },
+    },
+    // Escape in a text popup (focus in its input): Cancel.
+    escinput: {
+        async check(page, r) {
+            await page.locator("button", { hasText: "Add URL" }).click({ timeout: 2000 });
+            await page.locator("#input").fill("https://x");
+            await page.locator("#input").press("Escape");
+            await page.waitForTimeout(300);
+            r.expect(await page.locator("#input").count() === 0, "Escape closes it");
+            r.expect(!r.calls.some(c => c.cmd === "classify_download_url"), "nothing is added");
+        },
+    },
+    // An Escape whose keyup never comes (the window lost focus, or was
+    // hidden, with it down): the next press still works.
+    escrearm: {
+        async check(page, r) {
+            const ask = async (id) => {
+                await page.evaluate(([o, id]) => window.__smokeEmit("install://replace-request", { requestId: id, offer: o }), [replaceOffer(), id]);
+                await page.waitForTimeout(300);
+            };
+            const esc = () => page.evaluate(() => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+            const answered = () => r.calls.filter(c => c.cmd === "resolve_replace_request").map(c => c.args.requestId).join();
+            await ask("x1");
+            await esc();
+            await page.waitForTimeout(300);
+            await ask("x2");
+            await esc();
+            await page.waitForTimeout(300);
+            r.expect(answered() === "x1", `no keyup: the next keydown is held back (${answered()})`);
+            await page.evaluate(() => window.dispatchEvent(new Event("blur")));
+            await esc();
+            await page.waitForTimeout(300);
+            r.expect(answered() === "x1,x2", `losing focus lets the next one through (${answered()})`);
+            await ask("x3");
+            await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+            await esc();
+            await page.waitForTimeout(300);
+            r.expect(answered() === "x1,x2,x3", `being hidden lets the next one through (${answered()})`);
+        },
+    },
+    // Escape through "Import mods": Close on the source step; nothing on
+    // the checklist or while importing.
+    escimport: {
+        data: (d) => {
+            d["plugin:dialog|open"] = "/dl";
+            d.scan_import_folder = importScan();
+            d.__hang = ["run_import"];
+        },
+        async check(page, r) {
+            const open = () => page.getByTestId("import-button").click({ timeout: 2000 });
+            await open();
+            await page.waitForTimeout(400);
+            r.expect(await page.getByTestId("import-choose-folder").count() === 1, "the source step is shown");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(300);
+            r.expect(await page.getByTestId("import-choose-folder").count() === 0, "source step: Escape closes it");
+
+            await open();
+            await page.waitForTimeout(400);
+            await page.getByTestId("import-choose-folder").click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(await page.getByTestId("import-start").count() === 1, "the checklist is shown");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(300);
+            r.expect(await page.getByTestId("import-start").count() === 1, "checklist: Escape leaves it");
+
+            await page.getByTestId("import-start").click({ timeout: 2000 });
+            await page.waitForTimeout(400);
+            r.expect(await page.getByTestId("import-cancel").count() === 1, "the import is running");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(300);
+            r.expect(await page.getByTestId("import-cancel").count() === 1, "importing: Escape leaves it");
+            r.expect(!r.calls.some(c => c.cmd === "cancel_import"), "importing: nothing cancelled");
+        },
+    },
+    // Escape on the import's summary: Finish.
+    escimportdone: {
+        data: (d) => {
+            d["plugin:dialog|open"] = "/dl";
+            d.scan_import_folder = importScan();
+            d.run_import = { Imported: [], Linked: [], Failed: [], NotStarted: 0, Cancelled: false };
+        },
+        async check(page, r) {
+            await page.getByTestId("import-button").click({ timeout: 2000 });
+            await page.waitForTimeout(400);
+            await page.getByTestId("import-choose-folder").click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            await page.getByTestId("import-start").click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(await page.getByTestId("import-finish").count() === 1, "the summary is shown");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(400);
+            r.expect(await page.getByTestId("import-finish").count() === 0, "summary: Escape finishes");
+            r.expect(r.errors.length === 0, "no page error");
+        },
+    },
+    // Escape on "Update in your browser": Close, nothing opened.
+    escbrowserupdate: {
+        data: (d) => { d.browser_extension_active = true; d.get_last_update_report.Results[0].PageUrl = "https://example.invalid/1"; },
+        async check(page, r) {
+            await page.locator("main button.hd2mm-success-button", { hasText: /^\s*Update\s*$/ }).first().click({ timeout: 2000 });
+            await page.waitForTimeout(400);
+            r.expect(await page.getByText("Update in your browser").count() === 1, "the popup is shown");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(400);
+            r.expect(await page.getByText("Update in your browser").count() === 0, "Escape closes it");
+            r.expect(!r.calls.some(c => c.cmd === "start_handoff") && !r.pluginCalls.some(c => c.startsWith("plugin:opener")), "nothing is opened");
+        },
+    },
+    // A popup that doesn't take the focus shows up while the three-dot
+    // menu is open: the menu closes (the page is inert, out of reach),
+    // and Escape answers the popup.
+    menupopup: {
+        async check(page, r) {
+            await page.locator("main button[aria-haspopup='menu']").first().focus();
+            await page.keyboard.press("Enter");
+            await page.waitForTimeout(300);
+            r.expect(await page.getByTestId("entry-menu").count() === 1, "the menu is open");
+            await page.evaluate(() => window.__smokeEmit("bridge://consent-request", { requestId: "b1", site: "example.com" }));
+            await page.waitForTimeout(400);
+            r.expect(await page.getByTestId("entry-menu").count() === 0, "the popup closes the menu");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(300);
+            const c = r.calls.filter(c => c.cmd === "resolve_bridge_consent").map(c => c.args.decision);
+            r.expect(c.join() === "Deny", `Escape answers the popup (${c.join()})`);
+        },
+    },
+    // Remove from the keyboard: the focus goes to the next row's
+    // three-dot button (the previous row's after the last row; the page
+    // with no rows left), not nowhere.
+    menuremove: {
+        data: (d) => { d.load_profiles.Profiles[0].Configs.splice(2); },
+        async check(page, r) {
+            const openers = page.locator("main button[aria-haspopup='menu']");
+            const focusedOpener = () => page.evaluate(() => {
+                const all = [...document.querySelectorAll("main button[aria-haspopup='menu']")];
+                return { at: all.indexOf(document.activeElement), tag: document.activeElement?.tagName };
+            });
+            const remove = async (n) => {
+                await openers.nth(n).focus();
+                await page.keyboard.press("Enter");
+                await page.waitForTimeout(300);
+                r.expect((await page.evaluate(() => document.activeElement?.textContent?.trim())) === "Remove", "the menu opens on Remove");
+                await page.keyboard.press("Enter");
+                await page.waitForTimeout(400);
+            };
+            r.expect(await openers.count() === 2, "two rows");
+            await remove(0);
+            let f = await focusedOpener();
+            r.expect((await rows(page)).join() === "First Person (experimental)", `the first row is removed (${(await rows(page)).join()})`);
+            r.expect(f.at === 0, `the focus is on the next row's button (${JSON.stringify(f)})`);
+            await remove(0);
+            f = await focusedOpener();
+            r.expect(await openers.count() === 0, "no rows left");
+            r.expect(f.tag === "MAIN", `the focus is on the page (${JSON.stringify(f)})`);
+        },
+    },
+    // Remove the last row from the keyboard: the previous row's button.
+    menuremovelast: {
+        data: (d) => { d.load_profiles.Profiles[0].Configs.splice(3); },
+        async check(page, r) {
+            const openers = page.locator("main button[aria-haspopup='menu']");
+            await openers.nth(2).focus();
+            await page.keyboard.press("Enter");
+            await page.waitForTimeout(300);
+            await page.keyboard.press("Enter");
+            await page.waitForTimeout(400);
+            const f = await page.evaluate(() => [...document.querySelectorAll("main button[aria-haspopup='menu']")].indexOf(document.activeElement));
+            r.expect(await openers.count() === 2 && f === 1, `the focus is on the previous row's button (${f})`);
         },
     },
     // Init itself fails.

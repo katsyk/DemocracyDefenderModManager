@@ -262,6 +262,7 @@
             "unskip_version": "Stop skipping {version}",
             "needs_nexus_key": "Optional: add a Nexus Mods API key in Settings to check for updates",
             "entry_menu": {
+                "label": "Mod actions",
                 "remove": "Remove",
                 "move_up": "Move Up",
                 "move_down": "Move Down",

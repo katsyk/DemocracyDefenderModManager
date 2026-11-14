@@ -68,6 +68,8 @@
 </script>
 
 <svelte:window onkeydown={onKeydown} onkeyup={onKeyup} onblur={() => (escapeArmed = true)} />
+<!-- Hidden (minimized) with Escape down: its keyup may never come. -->
+<svelte:document onvisibilitychange={() => (escapeArmed = true)} />
 
 {#if popup.isShown}
     {#key popup.currentPopup}

@@ -53,14 +53,11 @@ export abstract class Popup<T = void> {
     /**
      * Escape pressed while this is the top popup (see `Popup.svelte`): do
      * what its safe button does (Cancel, No, Close, OK), through the same
-     * code as clicking it, and return true. A popup with no safe way out
-     * -- an operation in progress, or one whose only way out applies or
-     * loses the user's choices -- does nothing and returns false, which
-     * is the default.
+     * code as clicking it. A popup with no safe way out -- an operation in
+     * progress, or one whose only way out applies or loses the user's
+     * choices -- does nothing, which is the default.
      */
-    dismiss(): boolean {
-        return false;
-    }
+    dismiss(): void {}
 }
 
 export class ConfirmPopup extends Popup<boolean> {
@@ -78,9 +75,8 @@ export class ConfirmPopup extends Popup<boolean> {
     }
 
     /** No: every question asked with it has "No" as the safe answer. */
-    override dismiss(): boolean {
+    override dismiss(): void {
         this.close(false);
-        return true;
     }
 }
 
@@ -99,9 +95,8 @@ export class InputPopup extends Popup<string | null> {
     }
 
     /** Cancel. */
-    override dismiss(): boolean {
+    override dismiss(): void {
         this.close(null);
-        return true;
     }
 }
 
@@ -124,9 +119,8 @@ export class NotificationPopup extends Popup {
     }
 
     /** OK. */
-    override dismiss(): boolean {
+    override dismiss(): void {
         this.close();
-        return true;
     }
 }
 
@@ -141,9 +135,8 @@ export class ErrorPopup extends Popup {
     }
 
     /** OK. */
-    override dismiss(): boolean {
+    override dismiss(): void {
         this.close();
-        return true;
     }
 }
 
@@ -155,9 +148,8 @@ export class AddResultPopup extends Popup {
     }
 
     /** OK. */
-    override dismiss(): boolean {
+    override dismiss(): void {
         this.close();
-        return true;
     }
 }
 
@@ -231,10 +223,9 @@ export class HandoffPopup extends Popup<HandoffResult> {
 
     /** Cancel while waiting for the download (or after an error); nothing
      * while a file is being installed, which Cancel wouldn't stop. */
-    override dismiss(): boolean {
-        if (this.installingChosenFile || this.view.status === "Installing") return false;
+    override dismiss(): void {
+        if (this.installingChosenFile || this.view.status === "Installing") return;
         void this.cancel();
-        return true;
     }
 }
 
@@ -260,9 +251,8 @@ export class BridgeConsentPopup extends Popup<BridgeConsentDecision> {
     }
 
     /** Deny: nothing is installed, and nothing is remembered. */
-    override dismiss(): boolean {
+    override dismiss(): void {
         this.close("Deny");
-        return true;
     }
 }
 
@@ -284,9 +274,8 @@ export class ReplacePopup extends Popup<boolean> {
     }
 
     /** Cancel: keeps the installed mod. */
-    override dismiss(): boolean {
+    override dismiss(): void {
         this.close(false);
-        return true;
     }
 }
 
@@ -311,9 +300,8 @@ export class AutoImportPopup extends Popup<AutoImportDecision> {
     }
 
     /** Ignore: the file is left where it is. */
-    override dismiss(): boolean {
+    override dismiss(): void {
         this.close("Ignore");
-        return true;
     }
 }
 export type UpdatesPopupAction =
@@ -340,9 +328,8 @@ export class UpdatesPopup extends Popup<UpdatesPopupAction> {
     }
 
     /** Close. */
-    override dismiss(): boolean {
+    override dismiss(): void {
         this.close(null);
-        return true;
     }
 }
 
@@ -358,9 +345,8 @@ export class UpdateFilePickPopup extends Popup<UpdateFile | null> {
     }
 
     /** Cancel. */
-    override dismiss(): boolean {
+    override dismiss(): void {
         this.close(null);
-        return true;
     }
 }
 
@@ -410,9 +396,8 @@ export class DataFolderMovePopup extends Popup<DataFolderMoveDecision> {
     }
 
     /** Cancel: nothing is moved. */
-    override dismiss(): boolean {
+    override dismiss(): void {
         this.close(null);
-        return true;
     }
 }
 
@@ -460,9 +445,8 @@ export class BrowserUpdatePopup extends Popup<BrowserUpdateDecision> {
     }
 
     /** Close (one update) or Stop (a run of updates). */
-    override dismiss(): boolean {
+    override dismiss(): void {
         this.close("Stop");
-        return true;
     }
 }
 
@@ -498,21 +482,20 @@ export class ImportPopup extends Popup<ImportPopupResult> {
     }
 
     /** Close before anything is picked (or after a scan that found
-     * nothing), Finish on the summary; nothing while scanning or importing
-     * (Cancel there doesn't close it), or on the checklist, where the
-     * ticks would be lost. */
-    override dismiss(): boolean {
+     * nothing). On the summary, Finish: the import is done, and Finish only
+     * acknowledges it, like OK (with "Also add them to ..." as already
+     * ticked, in view). Nothing while scanning or importing (Cancel there
+     * doesn't close it), or on the checklist, where the ticks would be
+     * lost. */
+    override dismiss(): void {
         switch (this.wizard.step) {
             case "source":
             case "stopped":
                 this.close(null);
-                return true;
+                return;
             case "done":
-                if (!this.wizard.report) return false;
                 this.finish();
-                return true;
-            default:
-                return false;
+                return;
         }
     }
 }
