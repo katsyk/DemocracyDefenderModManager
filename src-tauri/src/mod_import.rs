@@ -784,13 +784,30 @@ pub struct InstalledIndex {
 /// An installed mod, as an import row that has its ID sees it.
 #[derive(Debug)]
 struct IdOwner {
+    name: String,
     directory: PathBuf,
     /// As the single-file Replace question shows it.
     version: Option<String>,
     /// When the Nexus file it was installed from was uploaded.
     uploaded_at: Option<i64>,
-    /// Lower-cased names of the archives it was installed or imported from.
-    file_names: HashSet<String>,
+    /// Lower-cased names of the archives it was installed or imported from
+    /// (as recorded in its origin record).
+    archive_names: HashSet<String>,
+    /// Lower-cased name of the mod folder it was imported from, if any.
+    source_folder: Option<String>,
+}
+
+/// What the scan can tell about an archive with an installed mod's ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileEvidence {
+    /// The very file the mod came from.
+    Same,
+    /// Positively a different file: other bytes than the archive it was
+    /// imported from, another recorded file name, another manifest name,
+    /// or another version.
+    Different,
+    /// Nothing says either way (e.g. a mod added as a folder).
+    Unknown,
 }
 
 impl InstalledIndex {
@@ -823,18 +840,28 @@ impl InstalledIndex {
                 }
             }
             let nexus_file = files.iter().find(|f| f.provider.eq_ignore_ascii_case("nexus"));
-            let mut owned_names: HashSet<String> =
+            let mut archive_names: HashSet<String> =
                 files.iter().filter_map(|f| f.file_name.as_ref()).map(|n| n.to_lowercase()).collect();
-            if let Some(n) = sidecar.as_ref().and_then(|s| s.imported_archive.as_ref()).and_then(|f| f.file_name.as_ref()) {
-                owned_names.insert(n.to_lowercase());
+            let mut source_folder = None;
+            if let Some(fp) = sidecar.as_ref().and_then(|s| s.imported_archive.as_ref()) {
+                if let Some(n) = &fp.file_name {
+                    // A folder import records its folder's name, unhashed.
+                    if fp.sha256.is_empty() {
+                        source_folder = Some(n.to_lowercase());
+                    } else {
+                        archive_names.insert(n.to_lowercase());
+                    }
+                }
             }
             index.owners.insert(
                 guid,
                 IdOwner {
+                    name: name.clone(),
                     directory: m.directory.clone(),
                     version: m.sources.iter().find_map(|s| s.version.clone()),
                     uploaded_at: nexus_file.and_then(|f| f.uploaded_at),
-                    file_names: owned_names,
+                    archive_names,
+                    source_folder,
                 },
             );
             let sidecar_versions: HashMap<String, Option<String>> = sidecar
@@ -909,9 +936,11 @@ pub fn resolve_statuses(items: &mut [ScanItem], installed: &InstalledIndex) {
         if item.status != ItemStatus::New {
             continue;
         }
-        item.same_id_installed = item
-            .guid
-            .is_some_and(|g| (!item.local_guid || item.kind == ItemKind::Folder) && installed.guids.contains_key(&g));
+        item.same_id_installed = item.guid.is_some_and(|g| {
+            (!item.local_guid || item.kind == ItemKind::Folder)
+                && installed.guids.contains_key(&g)
+                && !is_source_folder_of(item, installed, g)
+        });
         if let Some((status, link_to)) = installed_status(item, installed) {
             item.status = status;
             item.link_to = link_to;
@@ -1112,33 +1141,65 @@ fn already_installed(item: &ScanItem, installed: &InstalledIndex, name: &str, gu
     }
 }
 
-/// Whether `item` is the very file the installed mod `guid` was installed
-/// or imported from: the same bytes, or the same archive file name -- as
-/// recorded with the mod, or, when nothing is recorded (added with Add
-/// before DDMM noted file names), its folder named after the archive.
-fn same_file_as_installed(item: &ScanItem, installed: &InstalledIndex, guid: Uuid) -> bool {
-    let same_bytes = item.sha256.as_ref().is_some_and(|sha| {
-        installed.fingerprints.iter().any(|(f, _, g)| *g == guid && f.size == item.file_size && &f.sha256 == sha)
-    });
-    if same_bytes {
-        return true;
+/// Whether the folder `item` is the one the installed mod `guid` was
+/// imported from (re-scanning a manager's folder after importing it).
+fn is_source_folder_of(item: &ScanItem, installed: &InstalledIndex, guid: Uuid) -> bool {
+    let folder = item.path.file_name().map(|n| n.to_string_lossy().to_lowercase());
+    item.kind == ItemKind::Folder
+        && folder.is_some()
+        && installed.owners.get(&guid).is_some_and(|o| o.source_folder == folder)
+}
+
+/// Whether the archive `item` is the file the installed mod `guid` came
+/// from, positively a different one, or can't be told. A replace is only
+/// offered for [`FileEvidence::Different`]; otherwise the row keeps the
+/// "already installed" status it always had (including "will add Nexus
+/// info" for a mod added by hand).
+///
+/// In order: the archive the mod was imported from (size and SHA-256)
+/// decides when there is one -- a matching file name never overrules it;
+/// then the archive names recorded with the mod; then the manifest name;
+/// then the version; then, for a mod added with Add before file names
+/// were recorded, its folder named after the archive.
+fn file_evidence(item: &ScanItem, installed: &InstalledIndex, guid: Uuid) -> FileEvidence {
+    let Some(owner) = installed.owners.get(&guid) else { return FileEvidence::Unknown };
+    if let Some((f, ..)) = installed.fingerprints.iter().find(|(_, _, g)| *g == guid) {
+        if f.size != item.file_size {
+            return FileEvidence::Different;
+        }
+        return match &item.sha256 {
+            Some(sha) if *sha == f.sha256 => FileEvidence::Same,
+            Some(_) => FileEvidence::Different,
+            None => FileEvidence::Unknown,
+        };
     }
-    let Some(owner) = installed.owners.get(&guid) else { return false };
     let file_name = item.path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-    if !owner.file_names.is_empty() {
-        return owner.file_names.contains(&file_name);
+    if !owner.archive_names.is_empty() {
+        return if owner.archive_names.contains(&file_name) { FileEvidence::Same } else { FileEvidence::Different };
+    }
+    if !owner.name.trim().eq_ignore_ascii_case(item.name.trim()) {
+        return FileEvidence::Different;
+    }
+    if let (Some(a), Some(b)) = (&owner.version, item.nexus.as_ref().and_then(|n| n.version.as_ref())) {
+        return if versions_equal(a, b) { FileEvidence::Same } else { FileEvidence::Different };
     }
     let stem = item.path.file_stem().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-    owner.directory.file_name().is_some_and(|d| d.to_string_lossy().to_lowercase() == stem)
+    if owner.directory.file_name().is_some_and(|d| d.to_string_lossy().to_lowercase() == stem) {
+        return FileEvidence::Same;
+    }
+    FileEvidence::Unknown
 }
 
 /// What a row that can replace the installed mod `name` (`owner`) shows.
 fn replace_info(item: &ScanItem, name: &str, owner: &IdOwner) -> ReplaceInfo {
     let version = item.nexus.as_ref().and_then(|n| n.version.clone());
-    let older_version = match (&owner.version, &version) {
-        (Some(installed), Some(new)) => Some(
-            crate::providers::compare_versions(installed, new) == crate::providers::VersionRelation::InstalledNewer,
-        ),
+    // Only plain dotted numbers that differ decide by version; anything
+    // else (equal, or "1.2a") leaves it to the Nexus upload times.
+    let older_version = match (
+        owner.version.as_deref().and_then(crate::providers::numeric_version),
+        version.as_deref().and_then(crate::providers::numeric_version),
+    ) {
+        (Some(installed), Some(new)) if installed != new => Some(new < installed),
         _ => None,
     };
     let older_upload = match (owner.uploaded_at, item.nexus.as_ref().and_then(|n| n.uploaded_at)) {
@@ -1160,11 +1221,11 @@ fn installed_status(item: &ScanItem, installed: &InstalledIndex) -> Option<(Item
     if let Some(guid) = item.guid {
         if !item.local_guid || item.kind == ItemKind::Folder {
             if let Some(name) = installed.guids.get(&guid) {
-                // An archive with the author's ID that isn't the file the
-                // mod came from can replace it, as adding it on its own
-                // asks to. A folder can't: the replace swap is
-                // archive-based.
-                if item.kind == ItemKind::Archive && !same_file_as_installed(item, installed, guid) {
+                // An archive with the author's ID that is positively a
+                // different file than the one the mod came from can
+                // replace it, as adding it on its own asks to. A folder
+                // can't: the replace swap is archive-based.
+                if item.kind == ItemKind::Archive && file_evidence(item, installed, guid) == FileEvidence::Different {
                     return Some((ItemStatus::ReplaceInstalled { name: name.clone() }, None));
                 }
                 return Some(already_installed(item, installed, name, guid));
@@ -1548,16 +1609,18 @@ pub async fn run_import(
                     id: item.id,
                     name: item.name.clone(),
                     reason: format!(
-                        "\"{by}\" already replaced the mod with this ID in this import, and only one file can \
-                         replace a mod. Nothing was changed for this file."
+                        "\"{by}\" was already chosen to replace the mod with this ID in this import, and only one \
+                         file can replace a mod. Nothing was changed for this file."
                     ),
                 });
                 bytes_done = bytes_done.saturating_add(item.size);
                 continue;
             }
+            // Reserved before the attempt: a second file for the same mod
+            // never runs, whatever happens to this one.
+            replaced_by.insert(target.guid, item.name.clone());
             match replace_one(state, item, target).await {
                 Ok(Some(replaced)) => {
-                    replaced_by.insert(target.guid, item.name.clone());
                     report.replaced.push(replaced);
                     bytes_done = bytes_done.saturating_add(item.size);
                     if cancel.load(Ordering::SeqCst) {
@@ -1828,6 +1891,13 @@ async fn replace_one(state: &AppState, item: &ScanItem, target: &ReplaceTarget) 
         let mut guard = state.mods.lock().await;
         let mods = guard.as_mut().ok_or_else(|| anyhow::anyhow!("mods not read"))?;
         let Some(previous) = mods.iter().find(|m| m.guid() == target.guid) else { return Ok(None) };
+        if previous.directory != target.directory {
+            anyhow::bail!(
+                "\"{}\" has this file's ID now, not the mod the import list offered to replace (that one was removed \
+                 meanwhile). Nothing was changed; scan again to see what this file can replace.",
+                previous.name()
+            );
+        }
         let previous_name = previous.name().to_string();
         // Checked under the same lock, so it's never "added as new" here.
         let (m, warning, _) = install_or_replace(state, mods, &item.path, Some(target.clone()))

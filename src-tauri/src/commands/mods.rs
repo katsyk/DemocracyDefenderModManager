@@ -869,8 +869,8 @@ fn check_not_installed(mods: &[Mod], new: &Mod, subject: &str, route: AddRoute) 
     let how = match route {
         AddRoute::Archive => Some("add the file again with DDMM's Mods page open and choose Replace when asked"),
         AddRoute::Import => Some(
-            "tick it where the import list offers to replace the installed mod (scan again if it doesn't), or add \
-             the file on its own with Add (or drop it on the Mods page) and choose Replace when asked",
+            "add the file on its own with Add (or drop it on the Mods page) and choose Replace when asked (the import \
+             list only offers to replace a mod when it can tell the file differs from the one installed)",
         ),
         AddRoute::Folder => None,
     };
@@ -4612,7 +4612,7 @@ mod tests {
         let mut guard = state.mods.lock().await;
         let msg = message(install_from_archive_as(base.path(), guard.as_mut().unwrap(), &file, "Cool Mod 2").await);
         assert!(msg.contains("add the file on its own with Add (or drop it on the Mods page)"), "{msg}");
-        assert!(msg.contains("tick it where the import list offers to replace the installed mod"), "{msg}");
+        assert!(msg.contains("the import list only offers to replace a mod when it can tell the file differs"), "{msg}");
     }
 
     /// The mod asked about was removed and another one with the same ID

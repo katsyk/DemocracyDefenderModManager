@@ -1565,18 +1565,21 @@ async fn cancel_during_a_replace_keeps_it_and_reports_it() {
     let state = state_with_empty_library(&base).await;
     let guids = ["aaaaaaaa-0000-4000-8000-000000000001", "aaaaaaaa-0000-4000-8000-000000000002"];
     let mut installed = Vec::new();
+    let new_names: Vec<String> = (0..2).map(|i| nexus_name(&format!("Mod {i}"), 100 + i, "2.0", 1_710_000_000)).collect();
     for (i, g) in guids.iter().enumerate() {
-        let f = old.join(format!("Mod {i}.zip"));
+        let f = old.join(nexus_name(&format!("Mod {i}"), 100 + i as u32, "1.0", 1_700_000_000));
         make_zip(&f, &[("manifest.json", &author_manifest(g, &format!("Mod {i}"))), (PATCH, b"old")]);
         installed.push(add(&state, &f).await);
-        make_zip(&src.join(format!("Mod {i} new.zip")), &[("manifest.json", &author_manifest(g, &format!("Mod {i}"))), (PATCH, b"new")]);
+        make_zip(&src.join(&new_names[i]), &[("manifest.json", &author_manifest(g, &format!("Mod {i}"))), (PATCH, b"new")]);
     }
     mod_zip(&src.join("A first.zip"), "first");
     mod_zip(&src.join("Z last.zip"), "last");
 
     let scan = scan_folder(&src, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
-    let chosen: Vec<ScanItem> =
-        ["A first.zip", "Mod 0 new.zip", "Mod 1 new.zip", "Z last.zip"].iter().map(|f| by_file(&scan, f).clone()).collect();
+    let chosen: Vec<ScanItem> = ["A first.zip", new_names[0].as_str(), new_names[1].as_str(), "Z last.zip"]
+        .iter()
+        .map(|f| by_file(&scan, f).clone())
+        .collect();
     let cancel = AtomicBool::new(false);
     // Pressed while the first replace (index 1) runs.
     let report = run_import(&state, chosen, &cancel, |p| {
@@ -1593,7 +1596,172 @@ async fn cancel_during_a_replace_keeps_it_and_reports_it() {
     assert_eq!(report.not_started, 2);
     assert_eq!(std::fs::read(installed[0].directory.join(PATCH)).unwrap(), b"new");
     assert_eq!(std::fs::read(installed[1].directory.join(PATCH)).unwrap(), b"old");
-    assert_eq!(installed_dirs(&base), vec!["A first", "Mod 0", "Mod 1"]);
+    assert_eq!(installed_dirs(&base), vec!["A first", "Mod 0-100-1-0-1700000000", "Mod 1-101-1-0-1700000000"]);
+}
+
+/// Cancel while a *new* mod is being imported after earlier replaces: the
+/// new one is removed again, as always; the replaces stay and are
+/// reported.
+#[tokio::test]
+async fn cancel_after_replaces_rolls_back_only_the_new_install() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, src, cool, _) = library_with_cool_mod(root.path()).await;
+    let base = root.path().join("ddmm");
+    let v20 = nexus_name("Cool Mod", 1234, "2.0", 1_718_000_000);
+    options_zip(&src.join(&v20), COOL_GUID, "Cool Mod", &["Red", "Blue"], b"v2.0");
+    mod_zip(&src.join("New One.zip"), "one");
+    mod_zip(&src.join("New Two.zip"), "two");
+    let scan = scan_folder(&src, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    let chosen: Vec<ScanItem> = [v20.as_str(), "New One.zip", "New Two.zip"].iter().map(|f| by_file(&scan, f).clone()).collect();
+    let cancel = AtomicBool::new(false);
+    let report = run_import(&state, chosen, &cancel, |p| {
+        if p.done == 1 && p.current.is_some() {
+            cancel.store(true, Ordering::SeqCst);
+        }
+    })
+    .await;
+    assert!(report.cancelled);
+    assert_eq!(report.replaced.len(), 1);
+    assert!(report.imported.is_empty());
+    assert_eq!(report.rolled_back.as_deref(), Some("New One"));
+    assert_eq!(report.not_started, 1);
+    assert_eq!(std::fs::read(cool.directory.join("Red").join(PATCH)).unwrap(), b"v2.0");
+    assert_eq!(installed_dirs(&base), vec!["Alpha", "Cool Mod-1234-1-0-1700000000"]);
+}
+
+/// A mod added by hand as a folder (no origin record), then its Nexus
+/// download with the same ID found in Downloads: nothing shows the file
+/// differs, so it stays "will add Nexus info" (ticked) -- importing only
+/// links it -- and no replace is offered.
+#[tokio::test]
+async fn a_hand_added_folder_still_gets_its_nexus_info_not_a_replace() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("ddmm");
+    let src = root.path().join("Downloads");
+    let folder = root.path().join("Cool Mod");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("manifest.json"), author_manifest(COOL_GUID, "Cool Mod")).unwrap();
+    std::fs::write(folder.join(PATCH), b"same").unwrap();
+    let state = state_with_empty_library(&base).await;
+    {
+        let mut guard = state.mods.lock().await;
+        crate::commands::mods::install_from_folder_as(&base, guard.as_mut().unwrap(), &folder, None).await.unwrap();
+    }
+    let zip = nexus_name("Cool Mod", 1234, "1.0", 1_700_000_000);
+    make_zip(&src.join(&zip), &[("manifest.json", &author_manifest(COOL_GUID, "Cool Mod")), (PATCH, b"same")]);
+
+    let scan = scan_folder(&src, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    let row = by_file(&scan, &zip);
+    assert_eq!(row.status, ItemStatus::InstalledAddSource { name: "Cool Mod".into() });
+    assert!(row.status.selected_by_default());
+    assert!(row.replace.is_none() && row.replace_target.is_none());
+    let report = run_import(&state, ids(&scan), &no_cancel(), |_| {}).await;
+    assert_eq!(report.linked.len(), 1);
+    assert!(report.replaced.is_empty() && report.imported.is_empty());
+    assert_eq!(std::fs::read(base.join(MODS_DIRECTORY).join("Cool Mod").join(PATCH)).unwrap(), b"same");
+}
+
+/// The archive a mod was imported from decides by its bytes: a different
+/// file that happens to have the same name is a different file.
+#[tokio::test]
+async fn a_recorded_fingerprint_beats_a_matching_file_name() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("ddmm");
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    let state = state_with_empty_library(&base).await;
+    options_zip(&first.join("Cool Mod.zip"), COOL_GUID, "Cool Mod", &["Red"], b"first");
+    let scan = scan_folder(&first, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    assert_eq!(run_import(&state, ids(&scan), &no_cancel(), |_| {}).await.imported.len(), 1);
+
+    // The same file again: already in DDMM.
+    let rescan = scan_folder(&first, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    assert!(matches!(rescan.items[0].status, ItemStatus::Installed { .. }), "{:?}", rescan.items[0].status);
+    // Same name, other bytes (and size): can replace.
+    options_zip(&second.join("Cool Mod.zip"), COOL_GUID, "Cool Mod", &["Red", "Blue"], b"second, longer");
+    let scan = scan_folder(&second, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    assert_eq!(scan.items[0].status, ItemStatus::ReplaceInstalled { name: "Cool Mod".into() });
+    // Same name and size, other bytes: can replace too.
+    options_zip(&second.join("Cool Mod.zip"), COOL_GUID, "Cool Mod", &["Red"], b"FIRST");
+    assert_eq!(
+        std::fs::metadata(second.join("Cool Mod.zip")).unwrap().len(),
+        std::fs::metadata(first.join("Cool Mod.zip")).unwrap().len()
+    );
+    let scan = scan_folder(&second, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    assert_eq!(scan.items[0].status, ItemStatus::ReplaceInstalled { name: "Cool Mod".into() });
+}
+
+/// Nothing says the file differs (same name, no version, no record): no
+/// replace is offered; the row stays "already in DDMM".
+#[tokio::test]
+async fn no_evidence_of_a_different_file_offers_no_replace() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("ddmm");
+    let src = root.path().join("dl");
+    std::fs::create_dir_all(&src).unwrap();
+    let state = state_with_empty_library(&base).await;
+    let first = root.path().join("Cool Mod.zip");
+    make_zip(&first, &[("manifest.json", &author_manifest(COOL_GUID, "Cool Mod")), (PATCH, b"a")]);
+    add(&state, &first).await;
+    make_zip(&src.join("cool-mod-repack.zip"), &[("manifest.json", &author_manifest(COOL_GUID, "Cool Mod")), (PATCH, b"b")]);
+    let scan = scan_folder(&src, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    assert_eq!(scan.items[0].status, ItemStatus::Installed { name: "Cool Mod".into() });
+    assert!(scan.items[0].replace.is_none());
+}
+
+/// Re-scanning another manager's folder after importing it: the folders
+/// DDMM imported aren't flagged as "has the ID of a mod you have" (which
+/// would put the can't-replace note on every one of them).
+#[tokio::test]
+async fn rescanning_an_imported_manager_folder_flags_no_folders() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("ddmm");
+    let storage = older_manager_storage(root.path()).join("Mods");
+    let state = state_with_empty_library(&base).await;
+    let scan = scan_folder(&storage, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    let report = run_import(&state, ids(&scan), &no_cancel(), |_| {}).await;
+    assert!(!report.imported.is_empty() && report.failed.is_empty(), "{:?}", report.failed);
+    let rescan = scan_folder(&storage, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    assert!(rescan.items.iter().any(|i| i.guid.is_some()));
+    assert!(rescan.items.iter().all(|i| !i.same_id_installed), "{:?}", rescan.items);
+    assert!(rescan.items.iter().all(|i| i.replace.is_none()));
+}
+
+/// Downgrade: plain numbers that differ decide; otherwise (equal, or
+/// versions like "1.2a") the Nexus upload times do; with neither, it's
+/// not called one.
+#[test]
+fn downgrade_falls_back_to_upload_times() {
+    let owner = |version: Option<&str>, uploaded_at: Option<i64>| IdOwner {
+        name: "Cool Mod".into(),
+        directory: PathBuf::from("/mods/Cool Mod"),
+        version: version.map(str::to_string),
+        uploaded_at,
+        archive_names: HashSet::new(),
+        source_folder: None,
+    };
+    let file = |version: Option<&str>, uploaded_at: Option<i64>| {
+        let mut item = inspect(0, &Candidate { kind: ItemKind::Archive, path: PathBuf::from("/nonexistent/x.zip") });
+        item.name = "Cool Mod".into();
+        item.nexus = Some(NexusRef {
+            mod_id: "1234".into(),
+            version: version.map(str::to_string),
+            uploaded_at,
+            ..Default::default()
+        });
+        item
+    };
+    let down = |o: IdOwner, f: ScanItem| replace_info(&f, "Cool Mod", &o).downgrade;
+    assert!(down(owner(Some("1.2a"), Some(1_720_000_000)), file(Some("1.1a"), Some(1_700_000_000))));
+    assert!(!down(owner(Some("1.2a"), Some(1_700_000_000)), file(Some("1.1a"), Some(1_720_000_000))));
+    assert!(down(owner(Some("1.0"), Some(1_720_000_000)), file(Some("1.0"), Some(1_700_000_000))), "equal: upload decides");
+    assert!(down(owner(Some("2.0"), Some(1_700_000_000)), file(Some("1.5"), Some(1_720_000_000))), "numbers decide first");
+    assert!(!down(owner(Some("1.5"), Some(1_720_000_000)), file(Some("2.0"), Some(1_700_000_000))));
+    assert!(!down(owner(Some("beta"), None), file(Some("alpha"), None)), "nothing to go by");
+    assert!(!down(owner(None, None), file(None, None)));
 }
 
 /// Mod folders (another manager's unpacked mods) can't replace: the swap
