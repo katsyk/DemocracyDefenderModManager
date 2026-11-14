@@ -602,11 +602,16 @@
      * in profiles.json), forget what the last update check said about the
      * old one, and save. */
     async function onModReplaced(mod: Mod) {
-        replaceMod(mod.guid, mod);
+        await onModsReplaced([mod]);
+    }
+
+    /** `onModReplaced` for several mods at once (an import), saving once. */
+    async function onModsReplaced(replaced: Mod[]) {
+        for (const mod of replaced) replaceMod(mod.guid, mod);
         if (profilesLoaded && currentProfile) applyCurrentConfigChanges();
-        const reset = fitProfilesToMods(profiles, [mod]);
+        const reset = fitProfilesToMods(profiles, replaced);
         if (reset.length > 0) log.info(`Options of the replaced mod reset to fit it: ${reset.join(", ")}`);
-        updateStatuses = updateStatuses.filter(u => u.Guid !== mod.guid);
+        updateStatuses = updateStatuses.filter(u => !replaced.some(m => m.guid === u.Guid));
         await refreshUpdateStatuses();
         if (!profilesLoaded) return;
         const saved = await doSaveProfiles();
@@ -1560,7 +1565,10 @@
 
     /** "Import mods": scan another mod manager's folder, a folder of
      * archives, or `paths`; then add what was imported to the active
-     * profile (keeping the source's order, on/off state and options). */
+     * profile (keeping the source's order, on/off state and options).
+     * Mods the import replaced keep their entries: their options are
+     * fitted as after a single Replace, and -- once, at the end -- they're
+     * redeployed (or DDMM asks) when one is on in the active profile. */
     async function onImport(paths?: string[]) {
         importWindows++;
         let result;
@@ -1571,7 +1579,13 @@
         }
         mods = await getMods();
         importSources = [];
-        if (!result || result.report.Imported.length === 0) return;
+        if (!result) return;
+        const replaced = result.report.Replaced.map(r => mods.find(m => m.guid === r.Guid)).filter((m): m is Mod => !!m);
+        if (replaced.length > 0) await onModsReplaced(replaced);
+        if (result.report.Imported.length === 0) {
+            await afterUpdates(replaced.map(m => m.guid));
+            return;
+        }
         await refreshUpdateStatuses();
 
         if (result.addToProfile && currentProfile) {
@@ -1594,6 +1608,7 @@
                 showPopup(new NotificationPopup("warning", t("toast.import.profile_save_failed", { error: saved.error })));
             }
         }
+        await afterUpdates(replaced.map(m => m.guid));
     }
 
     async function onAddMod() {

@@ -55,7 +55,8 @@ Nexus Mods id and version (when known), and a status:
 | **New** | Not in DDMM yet | Yes |
 | **Already in DDMM as "…"** | The same mod is installed (same ID, same archive, same file name, or same Nexus file) | No |
 | **Already in DDMM: will add Nexus info** | You already added this mod yourself (for example with Add), but DDMM doesn't know its Nexus page yet; the import knows it | Yes |
-| **Another version is in DDMM** | Same Nexus mod and file, different version | No |
+| **Has the ID of "…" in DDMM: can replace it** | An archive whose `manifest.json` has the ID of an installed mod, and that isn't the file that mod came from. Ticking it **replaces** that mod; see [Replacing mods you already have](#replacing-mods-you-already-have) | No, never (not even by Select All) |
+| **Another version is in DDMM** | Same Nexus mod and file, different version (but no shared ID, so it can't replace: use [Update](updating-mods.md) on the mod) | No |
 | **Same as "…"** | An identical copy of another item in the list (the very same files), e.g. `Mod (1).zip` next to `Mod.zip` | Can't be ticked |
 | **Older version of "…"** | Another version of a mod that's also in the list: the same mod ID with different files, or the same Nexus file downloaded more than once. Only the newest is ticked: the one Nexus uploaded last, else the higher version number, else the newer file | No |
 | **No Helldivers 2 mod files inside** | An archive with no Helldivers 2 patch files or `manifest.json` (a Downloads folder holds other things too) | No |
@@ -67,7 +68,8 @@ is ticked.
 If the folder you pick is a single mod itself (it has its own `manifest.json`, with its options in subfolders),
 the list shows just that one mod.
 
-To change the selection, use **Select All**, **Select None** and **Only New**, or type in the filter box. Below
+To change the selection, use **Select All**, **Select None** and **Only New**, or type in the filter box. **Select
+All** ticks everything except files that would replace a mod you have (those keep whatever you set). Below
 the list you see how much space the selection needs once unpacked, and how much is free on the drive with
 DDMM's data folder. If it won't fit, the import stops before it starts and tells you why.
 
@@ -82,10 +84,47 @@ copied.
 
 - **Cancel** stops after the mod being copied at that moment, which is removed again. Everything finished before
   that stays. To get the rest later, run Import again: what's already there is recognized and left unticked.
+  A **replace** can't be undone: if Cancel is pressed while a mod is being replaced, that replace finishes and
+  the import stops after it. Each replace is all-or-nothing on its own, and the summary lists every mod that
+  was replaced, together with a note that they stay replaced.
 - **A mod that fails** (for example an archive damaged partway through) doesn't stop the others. The summary at
   the end lists each one with the reason. You never get a separate error popup for every mod.
 - **While an import runs**, other changes to DDMM's data wait, and moving the data folder is refused. If you
   try to close DDMM with the Import window open, it asks first.
+
+## Replacing mods you already have
+
+Every mod has an ID (the `Guid` in its `manifest.json`), and two installed mods can't share one. An archive in the
+list with the ID of a mod you already have (and that isn't the very file that mod came from) can **replace** it.
+It's the bulk version of the question DDMM asks when you
+[add such a file on its own](adding-mods.md#replacing-an-installed-mod):
+
+- The row names both mods and their versions when known: *Can replace "Cool Mod" (version 1.0) with this file
+  ("Cool Mod" (version 2.0))*.
+- **Downgrade** is shown in yellow when the file is older than the installed mod (a lower version number, or an
+  earlier Nexus upload). The same goes for an *Older version of "…"* row that has the installed mod's ID: it can
+  replace it too, and is labelled the same way.
+- **Different names**: the row warns that these may be two different mods that share an ID (an author copied
+  another mod's `manifest.json`). Replacing removes the installed one and puts the new one in its place.
+
+These rows are **never ticked for you**: not by default, not by **Only New**, and not by **Select All**. Each
+replace removes an installed mod's files, and may put a different mod in its place, so you tick each one
+yourself. Ticking a row means *replace*. Only one file can replace a given mod: ticking a second file for the
+same mod unticks the first.
+
+A ticked row goes through exactly the same swap as **Replace** on a single file: the file is unpacked and checked
+completely first (if anything goes wrong, the installed mod stays as it was), and the mod keeps its ID and folder,
+so its **place in every profile**, whether it's **on**, and its **option choices** that still fit (the rest are
+reset to the defaults). The other mod manager's load order and on/off state aren't applied to a replaced mod.
+Where the mod came from is recorded afresh for the new file, and what the last update check said about it is
+cleared. If the installed mod was removed after the scan, the file is imported as a new mod instead.
+
+The summary lists replaced mods separately. When one of them is on in your active profile, DDMM redeploys once at
+the end (or asks to), [as after an update](updating-mods.md#after-updating-redeploy).
+
+**Mod folders can't replace.** Replacing works on archives only. A mod folder (for example, one installed by
+another mod manager) with the ID of a mod you have stays *Already in DDMM*, and the list says so. To use that
+folder's version, remove the installed mod first and import again.
 
 ## Mods you already added by hand
 

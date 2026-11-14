@@ -568,6 +568,9 @@ export type ImportItemStatus =
     | { Kind: "Installed"; Name: string }
     | { Kind: "InstalledAddSource"; Name: string }
     | { Kind: "InstalledOtherVersion"; Name: string }
+    /** An archive with the ID of the installed mod `Name` (not the file it
+     * came from): ticking it replaces that mod. Never ticked for the user. */
+    | { Kind: "ReplaceInstalled"; Name: string }
     | { Kind: "Duplicate"; Of: string }
     | { Kind: "OlderVersion"; Of: string }
     | { Kind: "NotAMod" }
@@ -585,6 +588,22 @@ export type ImportItem = {
     Nexus?: { ModId: string; FileId?: string; Version?: string; UploadedAt?: number; FileName?: string };
     Status: ImportItemStatus;
     Profile?: { Enabled: boolean; Order: number };
+    /** Ticking this archive replaces the installed mod with its ID (it's
+     * `ReplaceInstalled`, or an older version of such a file). */
+    Replace?: ImportReplaceInfo;
+    /** Has the ID of an installed mod (a mod folder with it can't replace
+     * that mod; only an archive can). */
+    SameIdInstalled?: boolean;
+};
+
+/** Both mods, as the single-file Replace question shows them. */
+export type ImportReplaceInfo = {
+    InstalledName: string;
+    InstalledVersion?: string;
+    Version?: string;
+    SameName: boolean;
+    /** The file is older than the installed mod. */
+    Downgrade: boolean;
 };
 
 export type ImportScan = {
@@ -621,6 +640,9 @@ export type ImportReport = {
     /** Already in DDMM; only their Nexus Mods info was added. */
     Linked: { Id: number; Name: string }[];
     Failed: { Id: number; Name: string; Reason: string }[];
+    /** Installed mods a chosen file with their ID replaced. Cancel never
+     * undoes these. */
+    Replaced: { Id: number; Name: string; PreviousName: string; Guid: UUID; Warning?: string }[];
     NotStarted: number;
     Cancelled: boolean;
     RolledBack?: string;

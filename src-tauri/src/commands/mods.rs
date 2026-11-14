@@ -842,13 +842,16 @@ fn manifest_failure(subject: &str, e: anyhow::Error) -> InstallError {
 /// An archive added on the Mods page never gets here with such an ID: the
 /// user is asked whether to replace the installed mod instead (see
 /// [`decide_replace`]). It does when the question couldn't be asked, or in
-/// the bulk import (which never asks), so the hint says how to get it.
+/// the bulk import for a row that wasn't offered (or ticked) as a replace
+/// (see `mod_import::ItemStatus::ReplaceInstalled`), so the hint says how
+/// to get it.
 /// How a mod is being added, for [`check_not_installed`]'s hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AddRoute {
     /// An archive added one by one (Add, drop, Add URL, a browser install).
     Archive,
-    /// An archive in the bulk import, which never asks to replace.
+    /// An archive in the bulk import, which never asks: it replaces only
+    /// what the user ticked as a replace in its list.
     Import,
     Folder,
 }
@@ -865,9 +868,10 @@ fn check_not_installed(mods: &[Mod], new: &Mod, subject: &str, route: AddRoute) 
     let same_name = existing.name().trim().eq_ignore_ascii_case(new.name().trim());
     let how = match route {
         AddRoute::Archive => Some("add the file again with DDMM's Mods page open and choose Replace when asked"),
-        AddRoute::Import => {
-            Some("add the file on its own with Add (or drop it on the Mods page) and choose Replace when asked")
-        }
+        AddRoute::Import => Some(
+            "tick it where the import list offers to replace the installed mod (scan again if it doesn't), or add \
+             the file on its own with Add (or drop it on the Mods page) and choose Replace when asked",
+        ),
         AddRoute::Folder => None,
     };
     let hint = if let (true, Some(how)) = (same_name, how) {
@@ -4595,7 +4599,8 @@ mod tests {
     }
 
 
-    /// The bulk import never asks: its hint says to add the file on its own.
+    /// The bulk import never asks: its hint says how to replace (tick it
+    /// as a replace in the import list, or add the file on its own).
     #[tokio::test]
     async fn the_import_says_to_add_the_file_on_its_own_to_replace() {
         let base = tempfile::tempdir().unwrap();
@@ -4607,6 +4612,7 @@ mod tests {
         let mut guard = state.mods.lock().await;
         let msg = message(install_from_archive_as(base.path(), guard.as_mut().unwrap(), &file, "Cool Mod 2").await);
         assert!(msg.contains("add the file on its own with Add (or drop it on the Mods page)"), "{msg}");
+        assert!(msg.contains("tick it where the import list offers to replace the installed mod"), "{msg}");
     }
 
     /// The mod asked about was removed and another one with the same ID

@@ -5,7 +5,7 @@
     import PopupBase from "./PopupBase.svelte";
     import { ImportPopup } from "$lib/types/popup";
     import { useLocalization } from "$lib/state/localization.svelte";
-    import { blocked } from "$lib/state/importWizard.svelte";
+    import { blocked, replaces } from "$lib/state/importWizard.svelte";
     import { formatBytes } from "$lib/utils/bytes";
     import type { ImportItem, ImportSource } from "$lib/utils/commands";
     import { FolderSymlink, FolderPlus, Search } from "svelte-bootstrap-icons";
@@ -48,6 +48,7 @@
             case "Installed": return t("popup.import.status.installed", { name: s.Name });
             case "InstalledAddSource": return t("popup.import.status.installed_add_source", { name: s.Name });
             case "InstalledOtherVersion": return t("popup.import.status.installed_other_version", { name: s.Name });
+            case "ReplaceInstalled": return t("popup.import.status.replace_installed", { name: s.Name });
             case "Duplicate": return t("popup.import.status.duplicate", { name: s.Of });
             case "OlderVersion": return t("popup.import.status.older_version", { name: s.Of });
             case "NotAMod": return t("popup.import.status.not_a_mod");
@@ -59,9 +60,22 @@
         switch (item.Status.Kind) {
             case "New": return "text-green-400";
             case "InstalledAddSource": return "text-sky-300";
+            case "ReplaceInstalled": return "text-yellow-300";
             case "Unreadable": return "text-red-400";
             default: return "text-zinc-400";
         }
+    }
+
+    /** Both mods' names and versions, as the single-file Replace
+     * question words them. */
+    function replaceNames(item: ImportItem) {
+        const r = item.Replace!;
+        return {
+            installed: r.InstalledName,
+            installedVersion: r.InstalledVersion ? t("popup.replace.version", { version: r.InstalledVersion }) : "",
+            new: item.Name,
+            newVersion: r.Version ? t("popup.replace.version", { version: r.Version }) : "",
+        };
     }
 
     function fileName(path: string): string {
@@ -83,7 +97,8 @@
 
     /** New first, then what needs a look, then what's already here or
      * can't be imported; by name within each group. */
-    const STATUS_ORDER = ["New", "InstalledAddSource", "InstalledOtherVersion", "OlderVersion", "NotAMod", "Installed", "Duplicate", "Unreadable"];
+    const STATUS_ORDER = ["New", "InstalledAddSource", "ReplaceInstalled", "InstalledOtherVersion", "OlderVersion", "NotAMod", "Installed", "Duplicate", "Unreadable"];
+    const INSTALLED_KINDS = ["Installed", "InstalledOtherVersion", "InstalledAddSource", "ReplaceInstalled"];
     let items = $derived(
         [...(w.scan?.Items ?? [])].sort((a, b) =>
             STATUS_ORDER.indexOf(a.Status.Kind) - STATUS_ORDER.indexOf(b.Status.Kind) || a.Name.localeCompare(b.Name, undefined, { numeric: true }))
@@ -95,18 +110,23 @@
     );
     let counts = $derived({
         new: items.filter(i => i.Status.Kind === "New").length,
-        installed: items.filter(i => ["Installed", "InstalledOtherVersion", "InstalledAddSource"].includes(i.Status.Kind)).length,
+        installed: items.filter(i => INSTALLED_KINDS.includes(i.Status.Kind)).length,
         linkable: items.filter(i => i.Status.Kind === "InstalledAddSource").length,
-        other: items.filter(i => !["New", "Installed", "InstalledOtherVersion", "InstalledAddSource"].includes(i.Status.Kind)).length,
+        replaceable: items.filter(replaces).length,
+        sameIdFolders: items.filter(i => i.Kind === "Folder" && i.SameIdInstalled && !i.Replace).length,
+        other: items.filter(i => !["New", ...INSTALLED_KINDS].includes(i.Status.Kind)).length,
     });
     let selectedCount = $derived(w.selected.size);
+    let selectedReplaceCount = $derived(w.selectedReplaces.length);
     let tooBig = $derived(w.scan?.FreeBytes != null && w.selectedBytes + 256 * 1024 * 1024 > w.scan.FreeBytes);
     let importPercent = $derived(
         w.progress && w.progress.BytesTotal > 0
             ? Math.min(100, Math.round((w.progress.BytesDone / w.progress.BytesTotal) * 100))
             : 0
     );
-    let warningCount = $derived(w.report?.Imported.filter(m => m.Warning).length ?? 0);
+    let warningCount = $derived(
+        (w.report?.Imported.filter(m => m.Warning).length ?? 0) + (w.report?.Replaced.filter(m => m.Warning).length ?? 0)
+    );
     let scanPercent = $derived(w.scanTotal > 0 ? Math.round((w.scanDone / w.scanTotal) * 100) : 0);
 </script>
 
@@ -185,6 +205,20 @@
                             : t("popup.import.linkable", { count: counts.linkable })}
                     </p>
                 {/if}
+                {#if counts.replaceable > 0}
+                    <p class="text-xs text-yellow-300" data-testid="import-replaceable">
+                        {counts.replaceable === 1
+                            ? t("popup.import.replaceable_one")
+                            : t("popup.import.replaceable", { count: counts.replaceable })}
+                    </p>
+                {/if}
+                {#if counts.sameIdFolders > 0}
+                    <p class="text-xs text-zinc-400" data-testid="import-same-id-folders">
+                        {counts.sameIdFolders === 1
+                            ? t("popup.import.same_id_folders_one")
+                            : t("popup.import.same_id_folders", { count: counts.sameIdFolders })}
+                    </p>
+                {/if}
                 {#if w.scan.Truncated}
                     <p class="text-xs text-yellow-300">{t("popup.import.truncated")}</p>
                 {/if}
@@ -207,7 +241,8 @@
                                 checked={w.selected.has(item.Id)}
                                 disabled={blocked(item)}
                                 onchange={(e) => w.toggle(item, (e.currentTarget as HTMLInputElement).checked)}
-                                aria-label={item.Name}
+                                aria-label={replaces(item) ? t("popup.import.replace.tick", { name: item.Name, installed: item.Replace!.InstalledName }) : item.Name}
+                                title={replaces(item) ? t("popup.import.replace.tick", { name: item.Name, installed: item.Replace!.InstalledName }) : undefined}
                             />
                             <div class="flex-1 min-w-0 flex flex-col">
                                 <div class="flex flex-row gap-2 items-baseline min-w-0">
@@ -215,12 +250,32 @@
                                     <span class="text-xs shrink-0 {statusClass(item)} truncate max-w-72" title={statusText(item)}>{statusText(item)}</span>
                                 </div>
                                 <span class="truncate text-xs text-zinc-500" title={item.Path}>{details(item)}</span>
+                                {#if replaces(item)}
+                                    <div class="flex flex-col text-xs" data-testid="import-replace">
+                                        <span class:text-yellow-200={w.selected.has(item.Id)} class:text-zinc-300={!w.selected.has(item.Id)}>
+                                            {w.selected.has(item.Id)
+                                                ? t("popup.import.replace.will", replaceNames(item))
+                                                : t("popup.import.replace.can", replaceNames(item))}
+                                        </span>
+                                        {#if item.Replace!.Downgrade}
+                                            <span class="text-yellow-300" data-testid="import-replace-downgrade">{t("popup.import.replace.downgrade", replaceNames(item))}</span>
+                                        {/if}
+                                        {#if !item.Replace!.SameName}
+                                            <span class="text-yellow-300" data-testid="import-replace-different">{t("popup.import.replace.different", replaceNames(item))}</span>
+                                        {/if}
+                                    </div>
+                                {/if}
                             </div>
                         </li>
                     {/each}
                 </ul>
                 <p class="text-xs" class:text-red-400={tooBig} class:text-zinc-400={!tooBig} data-testid="import-selection">
                     {t("popup.import.selection", { count: selectedCount, size: formatBytes(w.selectedBytes) })}
+                    {#if selectedReplaceCount > 0}
+                        · {selectedReplaceCount === 1
+                            ? t("popup.import.selection_replaces_one")
+                            : t("popup.import.selection_replaces", { count: selectedReplaceCount })}
+                    {/if}
                     {#if w.scan.FreeBytes != null}
                         · {t("popup.import.free", { size: formatBytes(w.scan.FreeBytes) })}
                     {/if}
@@ -237,6 +292,9 @@
                             {/if}
                         </span>
                     </label>
+                {/if}
+                {#if selectedReplaceCount > 0}
+                    <p class="text-xs text-zinc-400" data-testid="import-replace-keeps">{t("popup.import.replace.keeps")}</p>
                 {/if}
                 <p class="text-xs text-zinc-500">{t("popup.import.read_only_note")}</p>
             {/if}
@@ -277,6 +335,11 @@
                 {w.report.Imported.length === 1
                     ? t("popup.import.done_imported_one")
                     : t("popup.import.done_imported", { count: w.report.Imported.length })}
+                {#if w.report.Replaced.length > 0}
+                    {w.report.Replaced.length === 1
+                        ? t("popup.import.done_replaced_one")
+                        : t("popup.import.done_replaced", { count: w.report.Replaced.length })}
+                {/if}
                 {#if w.report.Linked.length > 0}
                     {w.report.Linked.length === 1
                         ? t("popup.import.done_linked_one")
@@ -296,7 +359,21 @@
                     {#if w.report.RolledBack}
                         {t("popup.import.done_rolled_back", { name: w.report.RolledBack })}
                     {/if}
+                    {#if w.report.Replaced.length > 0}
+                        {t("popup.import.done_cancelled_replaced")}
+                    {/if}
                 </p>
+            {/if}
+            {#if w.report.Replaced.length > 0}
+                <ul class="min-h-8 shrink overflow-y-auto border border-zinc-600 divide-y divide-zinc-700" data-testid="import-replaced">
+                    {#each withUniqueKeys(w.report.Replaced, r => String(r.Id)) as [replaced, key] (key)}
+                        <li class="px-2 py-1 text-sm text-zinc-200">
+                            {replaced.PreviousName === replaced.Name
+                                ? t("popup.import.done_replaced_item", { name: replaced.Name })
+                                : t("popup.import.done_replaced_item_renamed", { name: replaced.Name, previous: replaced.PreviousName })}
+                        </li>
+                    {/each}
+                </ul>
             {/if}
             {#if w.report.Failed.length > 0}
                 <ul class="min-h-16 shrink overflow-y-auto border border-zinc-600 divide-y divide-zinc-700" data-testid="import-failures">
