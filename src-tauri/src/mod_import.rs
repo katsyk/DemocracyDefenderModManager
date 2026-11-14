@@ -786,8 +786,12 @@ pub struct InstalledIndex {
 struct IdOwner {
     name: String,
     directory: PathBuf,
-    /// As the single-file Replace question shows it.
+    /// As the single-file Replace question shows it (may come from its
+    /// manifest).
     version: Option<String>,
+    /// The version in its origin record: one DDMM noted itself, from a
+    /// download name or an install/update source.
+    recorded_version: Option<String>,
     /// When the Nexus file it was installed from was uploaded.
     uploaded_at: Option<i64>,
     /// Lower-cased names of the archives it was installed or imported from
@@ -859,6 +863,7 @@ impl InstalledIndex {
                     name: name.clone(),
                     directory: m.directory.clone(),
                     version: m.sources.iter().find_map(|s| s.version.clone()),
+                    recorded_version: sidecar.as_ref().and_then(|s| s.sources.iter().find_map(|s| s.version.clone())),
                     uploaded_at: nexus_file.and_then(|f| f.uploaded_at),
                     archive_names,
                     source_folder,
@@ -1158,9 +1163,11 @@ fn is_source_folder_of(item: &ScanItem, installed: &InstalledIndex, guid: Uuid) 
 ///
 /// In order: the archive the mod was imported from (size and SHA-256)
 /// decides when there is one -- a matching file name never overrules it;
-/// then the archive names recorded with the mod; then the manifest name;
-/// then the version; then, for a mod added with Add before file names
-/// were recorded, its folder named after the archive.
+/// then the archive names recorded with the mod (not for a copy-style
+/// name like `X (1).zip`); then the manifest name; then the versions DDMM
+/// recorded (never one a manifest declares); then, for a mod added with
+/// Add before file names were recorded, its folder named after the
+/// archive.
 fn file_evidence(item: &ScanItem, installed: &InstalledIndex, guid: Uuid) -> FileEvidence {
     let Some(owner) = installed.owners.get(&guid) else { return FileEvidence::Unknown };
     if let Some((f, ..)) = installed.fingerprints.iter().find(|(_, _, g)| *g == guid) {
@@ -1174,13 +1181,21 @@ fn file_evidence(item: &ScanItem, installed: &InstalledIndex, guid: Uuid) -> Fil
         };
     }
     let file_name = item.path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-    if !owner.archive_names.is_empty() {
+    // A browser's or Explorer's second copy (`X (1).zip`) has another name
+    // but says nothing about its content: the name rule skips it.
+    if !owner.archive_names.is_empty() && !looks_like_a_copy(&item.path) {
         return if owner.archive_names.contains(&file_name) { FileEvidence::Same } else { FileEvidence::Different };
     }
     if !owner.name.trim().eq_ignore_ascii_case(item.name.trim()) {
         return FileEvidence::Different;
     }
-    if let (Some(a), Some(b)) = (&owner.version, item.nexus.as_ref().and_then(|n| n.version.as_ref())) {
+    // Only versions DDMM recorded itself count: the installed mod's origin
+    // record, and the version in this download's (Nexus) file name. A
+    // version declared in a manifest is often not bumped by the author, so
+    // two identical files could seem to differ by it.
+    let file_version = nexus_ref_from_name(&item.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), true)
+        .and_then(|n| n.version);
+    if let (Some(a), Some(b)) = (&owner.recorded_version, &file_version) {
         return if versions_equal(a, b) { FileEvidence::Same } else { FileEvidence::Different };
     }
     let stem = item.path.file_stem().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();

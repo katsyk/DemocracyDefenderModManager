@@ -1730,6 +1730,102 @@ async fn rescanning_an_imported_manager_folder_flags_no_folders() {
     assert!(rescan.items.iter().all(|i| i.replace.is_none()));
 }
 
+/// The same content is never offered as a replace by the weaker rules:
+/// a version only the manifest declares (a hand-added folder saying 1.0,
+/// next to its identical Nexus download named 1.1), a browser's copy
+/// name (`... (1).zip`) next to the recorded original, and a file named
+/// like the folder Add made for it.
+#[tokio::test]
+async fn same_content_files_are_left_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("ddmm");
+    let src = root.path().join("Downloads");
+    let orig = root.path().join("orig");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&orig).unwrap();
+    let state = state_with_empty_library(&base).await;
+
+    // A folder whose manifest declares Nexus version 1.0.
+    let declared = format!(
+        r#"{{"Version":1,"Guid":"{COOL_GUID}","Name":"Cool Mod","Description":"","IconPath":null,"Options":null,"NexusData":{{"ModId":1234,"Version":"1.0"}}}}"#
+    );
+    let folder = orig.join("Cool Mod");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("manifest.json"), &declared).unwrap();
+    std::fs::write(folder.join(PATCH), b"same").unwrap();
+    {
+        let mut guard = state.mods.lock().await;
+        crate::commands::mods::install_from_folder_as(&base, guard.as_mut().unwrap(), &folder, None).await.unwrap();
+    }
+    let v11 = nexus_name("Cool Mod", 1234, "1.1", 1_700_000_000);
+    make_zip(&src.join(&v11), &[("manifest.json", declared.as_bytes()), (PATCH, b"same")]);
+
+    // Added with Add from its Nexus download (name recorded); a copy of it.
+    let other = "aaaaaaaa-2222-4222-8222-222222222222";
+    let named = nexus_name("Other Mod", 77, "1.0", 1_700_000_000);
+    make_zip(&orig.join(&named), &[("manifest.json", &author_manifest(other, "Other Mod")), (PATCH, b"other")]);
+    add(&state, &orig.join(&named)).await;
+    let copy = named.replace(".zip", " (1).zip");
+    std::fs::copy(orig.join(&named), src.join(&copy)).unwrap();
+
+    // Added with Add from a plain name (nothing recorded); the same file.
+    let plain = "bbbbbbbb-3333-4333-8333-333333333333";
+    make_zip(&orig.join("Plain Mod.zip"), &[("manifest.json", &author_manifest(plain, "Plain Mod")), (PATCH, b"plain")]);
+    add(&state, &orig.join("Plain Mod.zip")).await;
+    std::fs::copy(orig.join("Plain Mod.zip"), src.join("Plain Mod.zip")).unwrap();
+
+    let scan = scan_folder(&src, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    for file in [v11.as_str(), copy.as_str(), "Plain Mod.zip"] {
+        let row = by_file(&scan, file);
+        assert!(
+            matches!(row.status, ItemStatus::Installed { .. } | ItemStatus::InstalledAddSource { .. }),
+            "{file}: {:?}",
+            row.status
+        );
+        assert!(row.replace.is_none() && row.replace_target.is_none(), "{file}");
+    }
+}
+
+/// Another folder has the ID by import time (the mod the list offered was
+/// removed and another one added): nothing changes, and the failure says
+/// to scan again.
+#[tokio::test]
+async fn a_replace_whose_mod_moved_folders_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, src, cool, _) = library_with_cool_mod(root.path()).await;
+    let v20 = nexus_name("Cool Mod", 1234, "2.0", 1_718_000_000);
+    options_zip(&src.join(&v20), COOL_GUID, "Cool Mod", &["Red", "Blue"], b"v2.0");
+    let scan = scan_folder(&src, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    let mut row = by_file(&scan, &v20).clone();
+    row.replace_target.as_mut().unwrap().directory = cool.directory.with_file_name("Elsewhere");
+    let report = run_import(&state, vec![row], &no_cancel(), |_| {}).await;
+    assert!(report.replaced.is_empty() && report.imported.is_empty());
+    assert_eq!(report.failed.len(), 1);
+    let reason = &report.failed[0].reason;
+    assert!(reason.contains("has this file's ID now") && reason.contains("scan again"), "{reason}");
+    assert_eq!(std::fs::read(cool.directory.join("Red").join(PATCH)).unwrap(), b"v1.0");
+}
+
+/// The mod is reserved before the first attempt: when that one fails, a
+/// second file chosen for the same mod doesn't run either.
+#[tokio::test]
+async fn a_failed_replace_still_reserves_the_mod() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, src, cool, _) = library_with_cool_mod(root.path()).await;
+    let v20 = nexus_name("Cool Mod", 1234, "2.0", 1_718_000_000);
+    let v15 = nexus_name("Cool Mod", 1234, "1.5", 1_710_000_000);
+    options_zip(&src.join(&v20), COOL_GUID, "Cool Mod", &["Red", "Blue"], b"v2.0");
+    options_zip(&src.join(&v15), COOL_GUID, "Cool Mod", &["Red", "Blue"], b"v1.5");
+    let scan = scan_folder(&src, &installed_index(&state).await, &no_cancel(), |_| {}).unwrap();
+    let chosen = vec![by_file(&scan, &v20).clone(), by_file(&scan, &v15).clone()];
+    std::fs::remove_file(src.join(&v20)).unwrap();
+    let report = run_import(&state, chosen, &no_cancel(), |_| {}).await;
+    assert!(report.replaced.is_empty());
+    assert_eq!(report.failed.len(), 2, "{:?}", report.failed);
+    assert!(report.failed[1].reason.contains("was already chosen to replace"), "{}", report.failed[1].reason);
+    assert_eq!(std::fs::read(cool.directory.join("Red").join(PATCH)).unwrap(), b"v1.0");
+}
+
 /// Downgrade: plain numbers that differ decide; otherwise (equal, or
 /// versions like "1.2a") the Nexus upload times do; with neither, it's
 /// not called one.
@@ -1739,6 +1835,7 @@ fn downgrade_falls_back_to_upload_times() {
         name: "Cool Mod".into(),
         directory: PathBuf::from("/mods/Cool Mod"),
         version: version.map(str::to_string),
+        recorded_version: version.map(str::to_string),
         uploaded_at,
         archive_names: HashSet::new(),
         source_folder: None,
