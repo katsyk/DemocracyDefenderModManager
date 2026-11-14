@@ -998,7 +998,7 @@ const scenarios = {
         data: (d) => {
             d["plugin:dialog|open"] = "/dl";
             d.scan_import_folder = importScan();
-            d.run_import = { Imported: [], Linked: [], Failed: [], NotStarted: 0, Cancelled: false };
+            d.run_import = { Imported: [], Linked: [], Failed: [], Replaced: [], NotStarted: 0, Cancelled: false };
         },
         async check(page, r) {
             await page.getByTestId("import-button").click({ timeout: 2000 });
@@ -1087,6 +1087,101 @@ const scenarios = {
             await page.waitForTimeout(400);
             const f = await page.evaluate(() => [...document.querySelectorAll("main button[aria-haspopup='menu']")].indexOf(document.activeElement));
             r.expect(await openers.count() === 2 && f === 1, `the focus is on the previous row's button (${f})`);
+        },
+    },
+    // Bulk add (10 files) with files that have an installed mod's ID: the
+    // import list offers each as a replace, unticked, not even by Select
+    // All; names both mods with their versions, flags a downgrade and two
+    // different mods sharing an ID; one file per mod; Only New unticks a
+    // replace. The ticked replace is imported, listed as replaced, keeps
+    // its place with fitted options, and is redeployed once -- before the
+    // newly imported (enabled) mod is added to the profile, so the deploy
+    // doesn't include it.
+    importreplace: {
+        data: (d) => {
+            d["plugin:dialog|open"] = Array.from({ length: 10 }, (_, i) => `/dl/file ${i}.zip`);
+            const item = (Id, Name, Status, extra = {}) => ({ Id, Kind: "Archive", Path: `/dl/file ${Id}.zip`, Name, Size: 1000, FileSize: 900, Status, ...extra });
+            d.scan_import_paths = { Root: null, Truncated: false, FreeBytes: 1e12, Cancelled: false, ScanToken: 7, Items: [
+                item(0, "Fresh mod", { Kind: "New" }),
+                item(1, "V1 mod", { Kind: "ReplaceInstalled", Name: "V1 mod" }, { Guid: G(1),
+                    Replace: { InstalledName: "V1 mod", InstalledVersion: "1.0", Version: "2.0", SameName: true, Downgrade: false } }),
+                item(2, "V1 mod old", { Kind: "OlderVersion", Of: "V1 mod" }, { Guid: G(1),
+                    Replace: { InstalledName: "V1 mod", InstalledVersion: "1.0", Version: "0.9", SameName: false, Downgrade: true } }),
+                item(3, "Other cam", { Kind: "ReplaceInstalled", Name: "First Person (experimental)" }, { Guid: G(2),
+                    Replace: { InstalledName: "First Person (experimental)", SameName: false, Downgrade: false } }),
+                { ...item(4, "Legacy mod", { Kind: "Installed", Name: "Legacy mod" }, { Guid: G(3), SameIdInstalled: true }), Kind: "Folder", Path: "/other/Legacy mod" },
+                ...[5, 6, 7, 8, 9].map(i => item(i, `New ${i}`, { Kind: "New" })),
+            ] };
+            d.run_import = { Imported: [{ Id: 0, Name: "Fresh mod", Guid: G(50), Enabled: true, Order: 0 }], Linked: [], Failed: [], NotStarted: 0, Cancelled: false,
+                Replaced: [{ Id: 1, Name: "V1 mod", PreviousName: "V1 mod", Guid: G(1) }] };
+        },
+        async check(page, r) {
+            await page.locator("button[title='Add a mod to the library.']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            const box = (label) => page.getByLabel(label, { exact: true });
+            const v2 = box('Replace "V1 mod" with "V1 mod"');
+            const old = box('Replace "V1 mod" with "V1 mod old"');
+            const cam = box('Replace "First Person (experimental)" with "Other cam"');
+            r.expect(await page.getByTestId("import-popup").count() === 1, "10 files open the import list");
+            r.expect(!(await v2.isChecked()) && !(await old.isChecked()) && !(await cam.isChecked()), "replace rows aren't ticked by default");
+            r.expect(await box("Fresh mod").isChecked(), "new rows are");
+            r.expect(await page.getByTestId("import-replaceable").count() === 1, "the list says files can replace mods you have");
+            r.expect(await page.getByTestId("import-same-id-folders").count() === 1, "it says folders can't replace");
+            r.expect(await page.getByTestId("import-replace-downgrade").count() === 1, "the older file is labelled a downgrade");
+            r.expect(await page.getByTestId("import-replace-different").count() === 2, "different names are flagged");
+            const rowTexts = await page.getByTestId("import-replace").allTextContents();
+            r.expect(rowTexts.some(t => t.includes('"V1 mod" (version 1.0)') && t.includes('("V1 mod" (version 2.0))')), `both names and versions are shown (${rowTexts.join(" | ")})`);
+
+            await page.getByText("Select All", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(200);
+            r.expect(!(await v2.isChecked()) && !(await old.isChecked()) && !(await cam.isChecked()), "Select All doesn't tick replace rows");
+            r.expect(await box("New 9").isChecked(), "Select All ticks the rest");
+
+            await v2.check({ timeout: 2000 });
+            await old.check({ timeout: 2000 });
+            await page.waitForTimeout(200);
+            r.expect(await old.isChecked() && !(await v2.isChecked()), "one file per mod: ticking another unticks the first");
+            await v2.check({ timeout: 2000 });
+            await page.waitForTimeout(200);
+            r.expect(await v2.isChecked() && !(await old.isChecked()), "and back");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(300);
+            r.expect(await page.getByTestId("import-popup").count() === 1 && await v2.isChecked(), "Escape on the checklist keeps it open with the replace ticked");
+            r.expect((await page.getByTestId("import-selection").textContent()).includes("1 of them replaces a mod you have"), "the selection counts the replace");
+            r.expect(await page.getByTestId("import-replace-keeps").count() === 1, "it says what a replace keeps");
+            await page.getByText("Select All", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(200);
+            r.expect(await v2.isChecked(), "Select All keeps a replace ticked by hand");
+            await page.getByText("Only New", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(200);
+            r.expect(!(await v2.isChecked()) && await box("Fresh mod").isChecked(), "Only New unticks a replace ticked by hand");
+            await v2.check({ timeout: 2000 });
+
+            // The replaced mod's new manifest has two options instead of
+            // three, and the fresh mod is in the library afterwards.
+            await page.evaluate(([g, fresh]) => {
+                const mods = window.__smokeResponses.get_mods;
+                const m = mods.find(x => x.Manifest.Guid === g);
+                m.Manifest.Options = [{ Name: "A", Description: "", SubOptions: [] }, { Name: "B", Description: "", SubOptions: [] }];
+                mods.push({ Manifest: { Version: 1, Guid: fresh, Name: "Fresh mod", Description: "", Options: null }, Directory: "/data/mods/fresh", Sources: [] });
+            }, [G(1), G(50)]);
+            await page.getByTestId("import-start").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            const ids = r.calls.find(c => c.cmd === "run_import")?.args?.ids ?? [];
+            r.expect(ids.includes(1) && !ids.includes(2) && !ids.includes(3), `only the ticked replace is sent (${JSON.stringify(ids)})`);
+            r.expect((await page.getByTestId("import-done").textContent()).includes("Replaced 1 mod you had"), "the summary lists the replace separately");
+            r.expect((await page.getByTestId("import-replaced").textContent()).includes("V1 mod"), "and names it");
+            await page.getByTestId("import-finish").click({ timeout: 2000 });
+            await page.waitForTimeout(1200);
+            const configs = r.saves.at(-1)?.Profiles[0].Configs ?? [];
+            const entry = configs.find(c => c.Guid === G(1));
+            r.expect(configs[0]?.Guid === G(1) && configs.filter(c => c.Guid === G(1)).length === 1, "it keeps its one place in the profile");
+            r.expect(entry && entry.Enabled === true && JSON.stringify(entry.Toggled) === "[true,true]", `its options are fitted and saved (${JSON.stringify(entry)})`);
+            r.expect(r.calls.filter(c => c.cmd === "deploy").length === 1, "it's redeployed once");
+            const deployed = (r.calls.find(c => c.cmd === "deploy")?.args?.configs ?? []).map(c => c.Guid);
+            r.expect(deployed.includes(G(1)) && !deployed.includes(G(50)), `the deploy covers the replace, not the new import (${JSON.stringify(deployed)})`);
+            r.expect(configs.at(-1)?.Guid === G(50) && configs.at(-1)?.Enabled === true, "the imported mod is added to the profile after that");
+            r.expect(r.errors.length === 0, "no page error");
         },
     },
     // Init itself fails.

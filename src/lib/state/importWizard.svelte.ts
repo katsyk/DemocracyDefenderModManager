@@ -27,6 +27,14 @@ export function blocked(item: ImportItem): boolean {
     return item.Status.Kind === "Unreadable" || item.Status.Kind === "Duplicate";
 }
 
+/** Ticking it replaces the installed mod with its ID. Such rows are only
+ * ever ticked one by one: each one removes an installed mod's files (and
+ * may put a different mod in its place), so neither the default selection
+ * nor "Select All" ever ticks one. */
+export function replaces(item: ImportItem): boolean {
+    return item.Replace !== undefined && !blocked(item);
+}
+
 function errorText(ex: unknown): string {
     if (ex instanceof Error) return ex.message;
     if (typeof ex === "string") return ex;
@@ -55,6 +63,11 @@ export class ImportWizard {
 
     get selectedItems(): ImportItem[] {
         return this.scan?.Items.filter(i => this.selected.has(i.Id)) ?? [];
+    }
+
+    /** Ticked rows that replace an installed mod. */
+    get selectedReplaces(): ImportItem[] {
+        return this.selectedItems.filter(replaces);
     }
 
     /** Space needed: items that only get Nexus info added copy nothing. */
@@ -123,13 +136,29 @@ export class ImportWizard {
     toggle(item: ImportItem, on: boolean) {
         if (blocked(item)) return;
         const next = new Set(this.selected);
-        if (on) next.add(item.Id);
-        else next.delete(item.Id);
+        if (on) {
+            next.add(item.Id);
+            // One file replaces a mod: ticking another for the same mod
+            // unticks the one ticked before.
+            if (replaces(item)) {
+                for (const other of this.scan?.Items ?? []) {
+                    if (other.Id !== item.Id && replaces(other) && other.Guid === item.Guid) next.delete(other.Id);
+                }
+            }
+        } else {
+            next.delete(item.Id);
+        }
         this.selected = next;
     }
 
+    /** Everything that can be imported, except rows that would replace an
+     * installed mod (see `replaces`): those keep whatever they are. */
     selectAll() {
-        this.selected = new Set(this.scan?.Items.filter(i => !blocked(i)).map(i => i.Id) ?? []);
+        const keep = this.scan?.Items.filter(i => replaces(i) && this.selected.has(i.Id)).map(i => i.Id) ?? [];
+        this.selected = new Set([
+            ...(this.scan?.Items.filter(i => !blocked(i) && !replaces(i)).map(i => i.Id) ?? []),
+            ...keep,
+        ]);
     }
 
     selectNone() {

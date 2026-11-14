@@ -207,8 +207,9 @@ pub async fn run_import(
     })
     .await;
     log::info!(
-        "Import finished: {} imported, {} linked, {} failed{}",
+        "Import finished: {} imported, {} replaced, {} linked, {} failed{}",
         report.imported.len(),
+        report.replaced.len(),
         report.linked.len(),
         report.failed.len(),
         if report.cancelled { ", cancelled" } else { "" }
@@ -259,6 +260,9 @@ mod tests {
             manifest_override: None,
             description: None,
             link_to: None,
+            replace: None,
+            replace_target: None,
+            same_id_installed: false,
         }
     }
 

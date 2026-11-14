@@ -12,9 +12,10 @@
 //!    every archive, and every folder that is a mod (has a `manifest.json`
 //!    or Helldivers 2 patch files). It reads each one -- without extracting
 //!    anything -- for its name, size, manifest and Nexus Mods id, then
-//!    marks what's already in DDMM, what's a duplicate, what's an older
-//!    copy of the same file, what isn't a Helldivers 2 mod and what can't
-//!    be read.
+//!    marks what's already in DDMM, what can replace an installed mod with
+//!    its ID (only ever ticked by the user), what's a duplicate, what's an
+//!    older copy of the same file, what isn't a Helldivers 2 mod and what
+//!    can't be read.
 //! 3. [`run_import`] installs the chosen items one after another through
 //!    the normal install code (same archive hardening, same overlap checks)
 //!    with progress and cancel, keeps going past failures, and records the
@@ -42,7 +43,7 @@ mod layouts;
 
 use crate::{
     archive::Archive,
-    commands::mods::{install_from_archive_as, install_from_folder_as, MODS_DIRECTORY},
+    commands::mods::{install_from_archive_as, install_from_folder_as, install_or_replace, ReplaceTarget, MODS_DIRECTORY},
     fs_util::{path_overlap, PathOverlap},
     models::{
         manifest::{Manifest, Source},
@@ -260,6 +261,11 @@ pub enum ItemStatus {
     InstalledAddSource { name: String },
     /// Already in DDMM as `name`, but a different version of it.
     InstalledOtherVersion { name: String },
+    /// An archive whose manifest.json has the ID (GUID) of the installed
+    /// mod `name`, and that isn't the file that mod was installed from.
+    /// Ticking it replaces that mod (see [`ScanItem::replace`]); it's never
+    /// ticked for the user, not even by "Select All".
+    ReplaceInstalled { name: String },
     /// The same archive/mod as another item in this list (`of` is its name).
     Duplicate { of: String },
     /// An older download of the same Nexus file as another item.
@@ -343,6 +349,39 @@ pub struct ScanItem {
     /// that importing this item only adds Nexus info to.
     #[serde(skip)]
     pub link_to: Option<Uuid>,
+    /// Importing this archive replaces an installed mod with its ID (it's
+    /// [`ItemStatus::ReplaceInstalled`], or an older version of such a
+    /// file): what the row says about the two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace: Option<ReplaceInfo>,
+    /// The installed mod (ID and folder) [`ScanItem::replace`] is about,
+    /// so that a different mod that has the ID by import time is never
+    /// replaced instead.
+    #[serde(skip)]
+    pub replace_target: Option<ReplaceTarget>,
+    /// Has the ID (GUID) of an installed mod. A mod folder with it can't
+    /// replace that mod (only an archive can), which the list says.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub same_id_installed: bool,
+}
+
+/// What an import row that can replace an installed mod shows: both names
+/// and versions (as the single-file Replace question does), whether the
+/// names differ (they may be two different mods sharing an ID), and
+/// whether the file is older than the installed mod.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ReplaceInfo {
+    pub installed_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    /// The version this file carries (Nexus download name or manifest).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub same_name: bool,
+    /// The file is older than the installed mod (by version number, or by
+    /// Nexus upload time): replacing with it is a downgrade.
+    pub downgrade: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -611,6 +650,9 @@ fn inspect(id: usize, candidate: &Candidate) -> ScanItem {
         manifest_override: None,
         description: None,
         link_to: None,
+        replace: None,
+        replace_target: None,
+        same_id_installed: false,
     };
 
     let result = match candidate.kind {
@@ -735,6 +777,41 @@ pub struct InstalledIndex {
     file_names: HashMap<String, (String, Uuid)>,
     /// Installed mods that already have a Nexus Mods source.
     has_nexus: HashSet<Uuid>,
+    /// Per installed mod: what an import row that would replace it needs.
+    owners: HashMap<Uuid, IdOwner>,
+}
+
+/// An installed mod, as an import row that has its ID sees it.
+#[derive(Debug)]
+struct IdOwner {
+    name: String,
+    directory: PathBuf,
+    /// As the single-file Replace question shows it (may come from its
+    /// manifest).
+    version: Option<String>,
+    /// The version in its origin record: one DDMM noted itself, from a
+    /// download name or an install/update source.
+    recorded_version: Option<String>,
+    /// When the Nexus file it was installed from was uploaded.
+    uploaded_at: Option<i64>,
+    /// Lower-cased names of the archives it was installed or imported from
+    /// (as recorded in its origin record).
+    archive_names: HashSet<String>,
+    /// Lower-cased name of the mod folder it was imported from, if any.
+    source_folder: Option<String>,
+}
+
+/// What the scan can tell about an archive with an installed mod's ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileEvidence {
+    /// The very file the mod came from.
+    Same,
+    /// Positively a different file: other bytes than the archive it was
+    /// imported from, another recorded file name, another manifest name,
+    /// or another version.
+    Different,
+    /// Nothing says either way (e.g. a mod added as a folder).
+    Unknown,
 }
 
 impl InstalledIndex {
@@ -767,6 +844,31 @@ impl InstalledIndex {
                 }
             }
             let nexus_file = files.iter().find(|f| f.provider.eq_ignore_ascii_case("nexus"));
+            let mut archive_names: HashSet<String> =
+                files.iter().filter_map(|f| f.file_name.as_ref()).map(|n| n.to_lowercase()).collect();
+            let mut source_folder = None;
+            if let Some(fp) = sidecar.as_ref().and_then(|s| s.imported_archive.as_ref()) {
+                if let Some(n) = &fp.file_name {
+                    // A folder import records its folder's name, unhashed.
+                    if fp.sha256.is_empty() {
+                        source_folder = Some(n.to_lowercase());
+                    } else {
+                        archive_names.insert(n.to_lowercase());
+                    }
+                }
+            }
+            index.owners.insert(
+                guid,
+                IdOwner {
+                    name: name.clone(),
+                    directory: m.directory.clone(),
+                    version: m.sources.iter().find_map(|s| s.version.clone()),
+                    recorded_version: sidecar.as_ref().and_then(|s| s.sources.iter().find_map(|s| s.version.clone())),
+                    uploaded_at: nexus_file.and_then(|f| f.uploaded_at),
+                    archive_names,
+                    source_folder,
+                },
+            );
             let sidecar_versions: HashMap<String, Option<String>> = sidecar
                 .as_ref()
                 .map(|s| {
@@ -839,9 +941,20 @@ pub fn resolve_statuses(items: &mut [ScanItem], installed: &InstalledIndex) {
         if item.status != ItemStatus::New {
             continue;
         }
+        item.same_id_installed = item.guid.is_some_and(|g| {
+            (!item.local_guid || item.kind == ItemKind::Folder)
+                && installed.guids.contains_key(&g)
+                && !is_source_folder_of(item, installed, g)
+        });
         if let Some((status, link_to)) = installed_status(item, installed) {
             item.status = status;
             item.link_to = link_to;
+        }
+        if let (ItemStatus::ReplaceInstalled { name }, Some(guid)) = (&item.status, item.guid) {
+            if let Some(owner) = installed.owners.get(&guid) {
+                item.replace = Some(replace_info(item, name, owner));
+                item.replace_target = Some(ReplaceTarget { guid, directory: owner.directory.clone() });
+            }
         }
     }
     // One link per installed mod: the first item wins, the rest are just
@@ -864,13 +977,18 @@ pub fn resolve_statuses(items: &mut [ScanItem], installed: &InstalledIndex) {
     let mut by_hash: HashMap<(u64, String), String> = HashMap::new();
     for &i in &order {
         let item = &mut items[i];
-        if !matches!(item.status, ItemStatus::New | ItemStatus::InstalledOtherVersion { .. }) {
+        if !matches!(
+            item.status,
+            ItemStatus::New | ItemStatus::InstalledOtherVersion { .. } | ItemStatus::ReplaceInstalled { .. }
+        ) {
             continue;
         }
         if let Some(sha) = &item.sha256 {
             let key = (item.file_size, sha.clone());
             if let Some(of) = by_hash.get(&key) {
                 item.status = ItemStatus::Duplicate { of: of.clone() };
+                item.replace = None;
+                item.replace_target = None;
                 continue;
             }
             by_hash.insert(key, item.name.clone());
@@ -884,7 +1002,10 @@ pub fn resolve_statuses(items: &mut [ScanItem], installed: &InstalledIndex) {
     let mut by_guid: HashMap<Uuid, Vec<usize>> = HashMap::new();
     for &i in &order {
         let item = &items[i];
-        if !matches!(item.status, ItemStatus::New | ItemStatus::InstalledOtherVersion { .. }) {
+        if !matches!(
+            item.status,
+            ItemStatus::New | ItemStatus::InstalledOtherVersion { .. } | ItemStatus::ReplaceInstalled { .. }
+        ) {
             continue;
         }
         if let Some(guid) = item.guid.filter(|_| !item.local_guid || item.kind == ItemKind::Folder) {
@@ -916,8 +1037,15 @@ pub fn resolve_statuses(items: &mut [ScanItem], installed: &InstalledIndex) {
                     && items[k].sha256.is_some()
                     && items[k].sha256 == items[i].sha256
             });
+            // An older version of a file that can replace an installed mod
+            // keeps that offer (still unticked, and labelled a downgrade
+            // when it's older than the installed mod too).
             items[i].status = match copy_of {
-                Some(k) => ItemStatus::Duplicate { of: items[k].name.clone() },
+                Some(k) => {
+                    items[i].replace = None;
+                    items[i].replace_target = None;
+                    ItemStatus::Duplicate { of: items[k].name.clone() }
+                }
                 None => ItemStatus::OlderVersion { of: newest_name.clone() },
             };
             kept.push(i);
@@ -1018,12 +1146,103 @@ fn already_installed(item: &ScanItem, installed: &InstalledIndex, name: &str, gu
     }
 }
 
+/// Whether the folder `item` is the one the installed mod `guid` was
+/// imported from (re-scanning a manager's folder after importing it).
+fn is_source_folder_of(item: &ScanItem, installed: &InstalledIndex, guid: Uuid) -> bool {
+    let folder = item.path.file_name().map(|n| n.to_string_lossy().to_lowercase());
+    item.kind == ItemKind::Folder
+        && folder.is_some()
+        && installed.owners.get(&guid).is_some_and(|o| o.source_folder == folder)
+}
+
+/// Whether the archive `item` is the file the installed mod `guid` came
+/// from, positively a different one, or can't be told. A replace is only
+/// offered for [`FileEvidence::Different`]; otherwise the row keeps the
+/// "already installed" status it always had (including "will add Nexus
+/// info" for a mod added by hand).
+///
+/// In order: the archive the mod was imported from (size and SHA-256)
+/// decides when there is one -- a matching file name never overrules it;
+/// then the archive names recorded with the mod (not for a copy-style
+/// name like `X (1).zip`); then the manifest name; then the versions DDMM
+/// recorded (never one a manifest declares); then, for a mod added with
+/// Add before file names were recorded, its folder named after the
+/// archive.
+fn file_evidence(item: &ScanItem, installed: &InstalledIndex, guid: Uuid) -> FileEvidence {
+    let Some(owner) = installed.owners.get(&guid) else { return FileEvidence::Unknown };
+    if let Some((f, ..)) = installed.fingerprints.iter().find(|(_, _, g)| *g == guid) {
+        if f.size != item.file_size {
+            return FileEvidence::Different;
+        }
+        return match &item.sha256 {
+            Some(sha) if *sha == f.sha256 => FileEvidence::Same,
+            Some(_) => FileEvidence::Different,
+            None => FileEvidence::Unknown,
+        };
+    }
+    let file_name = item.path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    // A browser's or Explorer's second copy (`X (1).zip`) has another name
+    // but says nothing about its content: the name rule skips it.
+    if !owner.archive_names.is_empty() && !looks_like_a_copy(&item.path) {
+        return if owner.archive_names.contains(&file_name) { FileEvidence::Same } else { FileEvidence::Different };
+    }
+    if !owner.name.trim().eq_ignore_ascii_case(item.name.trim()) {
+        return FileEvidence::Different;
+    }
+    // Only versions DDMM recorded itself count: the installed mod's origin
+    // record, and the version in this download's (Nexus) file name. A
+    // version declared in a manifest is often not bumped by the author, so
+    // two identical files could seem to differ by it.
+    let file_version = nexus_ref_from_name(&item.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), true)
+        .and_then(|n| n.version);
+    if let (Some(a), Some(b)) = (&owner.recorded_version, &file_version) {
+        return if versions_equal(a, b) { FileEvidence::Same } else { FileEvidence::Different };
+    }
+    let stem = item.path.file_stem().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if owner.directory.file_name().is_some_and(|d| d.to_string_lossy().to_lowercase() == stem) {
+        return FileEvidence::Same;
+    }
+    FileEvidence::Unknown
+}
+
+/// What a row that can replace the installed mod `name` (`owner`) shows.
+fn replace_info(item: &ScanItem, name: &str, owner: &IdOwner) -> ReplaceInfo {
+    let version = item.nexus.as_ref().and_then(|n| n.version.clone());
+    // Only plain dotted numbers that differ decide by version; anything
+    // else (equal, or "1.2a") leaves it to the Nexus upload times.
+    let older_version = match (
+        owner.version.as_deref().and_then(crate::providers::numeric_version),
+        version.as_deref().and_then(crate::providers::numeric_version),
+    ) {
+        (Some(installed), Some(new)) if installed != new => Some(new < installed),
+        _ => None,
+    };
+    let older_upload = match (owner.uploaded_at, item.nexus.as_ref().and_then(|n| n.uploaded_at)) {
+        (Some(installed), Some(new)) => Some(new < installed),
+        _ => None,
+    };
+    ReplaceInfo {
+        installed_name: name.to_string(),
+        installed_version: owner.version.clone(),
+        version,
+        same_name: name.trim().eq_ignore_ascii_case(item.name.trim()),
+        downgrade: older_version.or(older_upload).unwrap_or(false),
+    }
+}
+
 fn installed_status(item: &ScanItem, installed: &InstalledIndex) -> Option<(ItemStatus, Option<Uuid>)> {
     // Same manifest GUID. A manager-generated (`LOCAL...`) GUID only counts
     // for a folder, which carries its manifest (and so its GUID) along.
     if let Some(guid) = item.guid {
         if !item.local_guid || item.kind == ItemKind::Folder {
             if let Some(name) = installed.guids.get(&guid) {
+                // An archive with the author's ID that is positively a
+                // different file than the one the mod came from can
+                // replace it, as adding it on its own asks to. A folder
+                // can't: the replace swap is archive-based.
+                if item.kind == ItemKind::Archive && file_evidence(item, installed, guid) == FileEvidence::Different {
+                    return Some((ItemStatus::ReplaceInstalled { name: name.clone() }, None));
+                }
                 return Some(already_installed(item, installed, name, guid));
             }
         }
@@ -1229,6 +1448,22 @@ pub struct ImportedMod {
     pub warning: Option<String>,
 }
 
+/// An installed mod replaced by an imported file with its ID. It kept its
+/// ID and folder, so its place, on/off and fitting option choices in every
+/// profile.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ReplacedMod {
+    pub id: usize,
+    /// The mod's name now (from the new file).
+    pub name: String,
+    /// What it was called before.
+    pub previous_name: String,
+    pub guid: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ImportProblem {
@@ -1245,6 +1480,10 @@ pub struct ImportReport {
     /// options, order and on/off state untouched).
     pub linked: Vec<ImportProblem>,
     pub failed: Vec<ImportProblem>,
+    /// Installed mods that a chosen file with their ID replaced (see
+    /// [`ItemStatus::ReplaceInstalled`]). Cancel never undoes these: each
+    /// swap is complete once it's listed here.
+    pub replaced: Vec<ReplacedMod>,
     /// Chosen, but not started because the import was cancelled.
     pub not_started: usize,
     pub cancelled: bool,
@@ -1348,6 +1587,14 @@ pub(crate) fn add_nexus_to_sidecar(sidecar: &mut OriginSidecar, nexus: &NexusRef
 /// whole run. `cancel` is checked before each item and after it: an item
 /// that was in flight when Cancel was pressed is removed again, everything
 /// finished before stays. A failing item is recorded and skipped.
+///
+/// An item with a [`ScanItem::replace_target`] replaces that installed mod
+/// through the same swap as adding the file on its own and choosing
+/// Replace ([`install_or_replace`]). Cancel can't undo a replace (the old
+/// version is gone once the swap is done), so one in flight when Cancel
+/// is pressed is finished and reported as replaced (each swap is
+/// all-or-nothing on its own), and the import stops after it. Only one
+/// file replaces a given mod per import; another one chosen for it fails.
 pub async fn run_import(
     state: &AppState,
     items: Vec<ScanItem>,
@@ -1361,6 +1608,7 @@ pub async fn run_import(
     let mut bytes_done = 0u64;
     let mut report = ImportReport::default();
     let mut taken: HashSet<String> = HashSet::new();
+    let mut replaced_by: HashMap<Uuid, String> = HashMap::new();
 
     for (index, item) in items.iter().enumerate() {
         if cancel.load(Ordering::SeqCst) {
@@ -1369,6 +1617,55 @@ pub async fn run_import(
             break;
         }
         progress(ImportProgress { done: index, total, bytes_done, bytes_total, current: Some(item.name.clone()) });
+
+        if let Some(target) = &item.replace_target {
+            if let Some(by) = replaced_by.get(&target.guid) {
+                report.failed.push(ImportProblem {
+                    id: item.id,
+                    name: item.name.clone(),
+                    reason: format!(
+                        "\"{by}\" was already chosen to replace the mod with this ID in this import, and only one \
+                         file can replace a mod. Nothing was changed for this file."
+                    ),
+                });
+                bytes_done = bytes_done.saturating_add(item.size);
+                continue;
+            }
+            // Reserved before the attempt: a second file for the same mod
+            // never runs, whatever happens to this one.
+            replaced_by.insert(target.guid, item.name.clone());
+            match replace_one(state, item, target).await {
+                Ok(Some(replaced)) => {
+                    report.replaced.push(replaced);
+                    bytes_done = bytes_done.saturating_add(item.size);
+                    if cancel.load(Ordering::SeqCst) {
+                        // Pressed during the swap: it's done and stays.
+                        report.cancelled = true;
+                        report.not_started = total - index - 1;
+                        break;
+                    }
+                    continue;
+                }
+                // The mod isn't installed any more: the file is imported
+                // as a new mod, as adding it would.
+                Ok(None) => log::info!(
+                    "Import: the mod to replace ({{{}}}) is no longer installed; importing {:?} as a new mod.",
+                    target.guid,
+                    item.path
+                ),
+                Err(e) => {
+                    log::warn!("Replacing a mod with {:?} failed: {e:#}", item.path);
+                    report.failed.push(ImportProblem { id: item.id, name: item.name.clone(), reason: format!("{e:#}") });
+                    bytes_done = bytes_done.saturating_add(item.size);
+                    if cancel.load(Ordering::SeqCst) {
+                        report.cancelled = true;
+                        report.not_started = total - index - 1;
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
 
         if let Some(target) = item.link_to {
             match link_existing(state, item, target).await {
@@ -1414,7 +1711,7 @@ pub async fn run_import(
         bytes_done = bytes_done.saturating_add(item.size);
     }
     progress(ImportProgress {
-        done: report.imported.len() + report.linked.len() + report.failed.len(),
+        done: report.imported.len() + report.linked.len() + report.replaced.len() + report.failed.len(),
         total,
         bytes_done,
         bytes_total,
@@ -1571,6 +1868,76 @@ async fn remove_imported(state: &AppState, installed: &Mod) {
     }
 }
 
+/// What [`OriginSidecar::imported_archive`] records for `item`: an
+/// archive's size and SHA-256 (so a re-scan knows it), a folder's name.
+async fn fingerprint_of(item: &ScanItem) -> anyhow::Result<ArchiveFingerprint> {
+    let file_name = item.path.file_name().map(|n| n.to_string_lossy().into_owned());
+    if item.kind == ItemKind::Archive {
+        let path = item.path.clone();
+        let sha = match item.sha256.clone() {
+            Some(s) => s,
+            None => tokio::task::spawn_blocking(move || sha256_file(&path)).await??,
+        };
+        Ok(ArchiveFingerprint { size: item.file_size, sha256: sha, file_name })
+    } else {
+        // A folder isn't hashed; its name is enough to know it again when
+        // its copy here got another name (a clash, or a name that isn't
+        // valid on every OS).
+        Ok(ArchiveFingerprint { size: item.file_size, sha256: String::new(), file_name })
+    }
+}
+
+/// Replace the installed mod `target` by the archive `item` through
+/// [`install_or_replace`]: the same swap as adding the file on its own and
+/// choosing Replace (staged and checked first, the folder re-checked,
+/// profiles fitted, the old origin record and update-check entries
+/// dropped). Then the import's own origin record is written for the new
+/// file, as for an imported mod, so a re-scan knows it.
+///
+/// `Ok(None)`: no installed mod has the ID any more, and nothing was
+/// changed (the caller imports the file as a new mod).
+async fn replace_one(state: &AppState, item: &ScanItem, target: &ReplaceTarget) -> anyhow::Result<Option<ReplacedMod>> {
+    ensure_source_allowed(&item.path, &state.base_path)?;
+    if item.kind != ItemKind::Archive {
+        anyhow::bail!("only an archive can replace an installed mod");
+    }
+    let fingerprint = fingerprint_of(item).await?;
+    let (mut replaced, warning, previous_name) = {
+        let mut guard = state.mods.lock().await;
+        let mods = guard.as_mut().ok_or_else(|| anyhow::anyhow!("mods not read"))?;
+        let Some(previous) = mods.iter().find(|m| m.guid() == target.guid) else { return Ok(None) };
+        if previous.directory != target.directory {
+            anyhow::bail!(
+                "\"{}\" has this file's ID now, not the mod the import list offered to replace (that one was removed \
+                 meanwhile). Nothing was changed; scan again to see what this file can replace.",
+                previous.name()
+            );
+        }
+        let previous_name = previous.name().to_string();
+        // Checked under the same lock, so it's never "added as new" here.
+        let (m, warning, _) = install_or_replace(state, mods, &item.path, Some(target.clone()))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        (m, warning, previous_name)
+    };
+
+    let sidecar = sidecar_for(item, &replaced, Some(fingerprint));
+    if let Err(e) = sources::save_origin_sidecar(&replaced.directory, &sidecar).await {
+        log::error!("Couldn't record where {:?} was imported from: {e:#}", replaced.directory);
+    }
+    replaced.resolve_sources().await;
+    {
+        let mut guard = state.mods.lock().await;
+        if let Some(mods) = guard.as_mut() {
+            if let Some(existing) = mods.iter_mut().find(|m| m.guid() == replaced.guid() && m.directory == replaced.directory) {
+                *existing = replaced.clone();
+            }
+        }
+    }
+    log::info!("Import: replaced \"{previous_name}\" with {:?}.", item.path);
+    Ok(Some(ReplacedMod { id: item.id, name: replaced.name().to_string(), previous_name, guid: replaced.guid(), warning }))
+}
+
 async fn import_one(
     state: &AppState,
     mods_root: &Path,
@@ -1579,28 +1946,7 @@ async fn import_one(
 ) -> anyhow::Result<(Mod, Option<String>)> {
     ensure_source_allowed(&item.path, &state.base_path)?;
 
-    let fingerprint = if item.kind == ItemKind::Archive {
-        let path = item.path.clone();
-        let known = item.sha256.clone();
-        let sha = match known {
-            Some(s) => s,
-            None => tokio::task::spawn_blocking(move || sha256_file(&path)).await??,
-        };
-        Some(ArchiveFingerprint {
-            size: item.file_size,
-            sha256: sha,
-            file_name: item.path.file_name().map(|n| n.to_string_lossy().into_owned()),
-        })
-    } else {
-        // A folder isn't hashed; its name is enough to know it again when
-        // its copy here got another name (a clash, or a name that isn't
-        // valid on every OS).
-        Some(ArchiveFingerprint {
-            size: item.file_size,
-            sha256: String::new(),
-            file_name: item.path.file_name().map(|n| n.to_string_lossy().into_owned()),
-        })
-    };
+    let fingerprint = Some(fingerprint_of(item).await?);
 
     let dir_name = unique_dir_name(mods_root, &item.name, taken);
     taken.insert(dir_name.to_lowercase());
