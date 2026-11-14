@@ -938,7 +938,7 @@ fn json_shapes_match_the_frontend_types() {
     let v = serde_json::to_value(&report).unwrap();
     assert_eq!(v["Imported"][0]["Config"]["For"], "Legacy");
     assert_eq!(v["Imported"][0]["Enabled"], true);
-    for key in ["Imported", "Linked", "Failed", "NotStarted", "Cancelled"] {
+    for key in ["Imported", "Linked", "Failed", "Replaced", "NotStarted", "Cancelled"] {
         assert!(v.get(key).is_some(), "{key} missing from {v}");
     }
     let d = serde_json::to_value(DetectedSource { kind: SourceKind::ManagerMods, path: "/x".into(), count: 3 }).unwrap();

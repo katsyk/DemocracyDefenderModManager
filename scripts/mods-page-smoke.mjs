@@ -998,7 +998,7 @@ const scenarios = {
         data: (d) => {
             d["plugin:dialog|open"] = "/dl";
             d.scan_import_folder = importScan();
-            d.run_import = { Imported: [], Linked: [], Failed: [], NotStarted: 0, Cancelled: false };
+            d.run_import = { Imported: [], Linked: [], Failed: [], Replaced: [], NotStarted: 0, Cancelled: false };
         },
         async check(page, r) {
             await page.getByTestId("import-button").click({ timeout: 2000 });
@@ -1144,6 +1144,9 @@ const scenarios = {
             await v2.check({ timeout: 2000 });
             await page.waitForTimeout(200);
             r.expect(await v2.isChecked() && !(await old.isChecked()), "and back");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(300);
+            r.expect(await page.getByTestId("import-popup").count() === 1 && await v2.isChecked(), "Escape on the checklist keeps it open with the replace ticked");
             r.expect((await page.getByTestId("import-selection").textContent()).includes("1 of them replaces a mod you have"), "the selection counts the replace");
             r.expect(await page.getByTestId("import-replace-keeps").count() === 1, "it says what a replace keeps");
             await page.getByText("Select All", { exact: true }).click({ timeout: 2000 });
