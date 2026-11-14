@@ -62,6 +62,21 @@ function fixture() {
 }
 
 const rows = (page) => page.evaluate(() => [...document.querySelectorAll("main span.text-2xl")].map(s => s.textContent.trim()));
+// A profile entry's row by its mod's name (`null`: the "Mod not found" one).
+const entryRow = (page, name) => name === null
+    ? page.getByTestId("missing-mod-entry")
+    : page.locator("main div.rounded", { has: page.locator("span.text-2xl", { hasText: name }) }).last();
+// Opens an entry's three-dot menu (its last button).
+async function openEntryMenu(page, name) {
+    await entryRow(page, name).locator("button.hd2mm-button-nop.p-2").last().click({ timeout: 2000 });
+    await page.waitForTimeout(200);
+}
+// The active profile's order as saved when leaving the page.
+async function savedOrder(page, r) {
+    await page.locator("a[href='/settings']").click({ timeout: 2000 });
+    await page.waitForTimeout(800);
+    return (r.saves.at(-1)?.Profiles[0].Configs ?? []).map(c => c.Guid);
+}
 
 const scenarios = {
     // Everything renders.
@@ -489,6 +504,142 @@ const scenarios = {
             r.expect(JSON.stringify(await rows(page)) === JSON.stringify(before), "the list is unchanged");
             r.expect(await page.getByText("Mod adding failed!").count() === 0, "no error is shown");
             r.expect(!r.calls.some(c => c.cmd === "deploy"), "nothing is deployed");
+        },
+    },
+    // Move to Top: the mod goes first in the load order, and that's what's
+    // saved; the action says which end is which priority.
+    movetop: {
+        async check(page, r) {
+            await openEntryMenu(page, "Legacy mod");
+            const label = (await page.getByTestId("entry-move-top").textContent()).trim();
+            r.expect(label === "Move to Top (lowest priority)", `the action names the priority (${label})`);
+            await page.getByTestId("entry-move-top").click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            r.expect((await rows(page))[0] === "Legacy mod", "it's first in the list");
+            const order = await savedOrder(page, r);
+            r.expect(order.join() === [G(3), G(1), G(2), G(4), G(99)].join(), `it's saved first, the rest in order (${order.join()})`);
+            r.expect(r.errors.length === 0, "no page error");
+        },
+    },
+    // Move to Bottom: past the "Mod not found" entry too (it keeps its
+    // place in the load order).
+    movebottom: {
+        async check(page, r) {
+            await openEntryMenu(page, "First Person (experimental)");
+            const label = (await page.getByTestId("entry-move-bottom").textContent()).trim();
+            r.expect(label === "Move to Bottom (highest priority)", `the action names the priority (${label})`);
+            await page.getByTestId("entry-move-bottom").click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            r.expect((await rows(page)).at(-1) === "First Person (experimental)", "it's last in the list");
+            const order = await savedOrder(page, r);
+            r.expect(order.join() === [G(1), G(3), G(4), G(99), G(2)].join(), `it's saved last, the rest in order (${order.join()})`);
+        },
+    },
+    // A mod already at an end can't be moved to it; the "Mod not found"
+    // entry can be moved like the others.
+    moveends: {
+        async check(page, r) {
+            await openEntryMenu(page, "V1 mod");
+            r.expect(await page.getByTestId("entry-move-top").isDisabled(), "Move to Top is off for the first mod");
+            r.expect(await page.getByTestId("entry-move-bottom").isEnabled(), "Move to Bottom is on for the first mod");
+            await page.mouse.click(5, 5);
+            await page.waitForTimeout(200);
+            await openEntryMenu(page, null);
+            r.expect(await page.getByTestId("entry-move-bottom").isDisabled(), "Move to Bottom is off for the last entry");
+            await page.getByTestId("entry-move-top").click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            const order = await savedOrder(page, r);
+            r.expect(order.join() === [G(99), G(1), G(2), G(3), G(4)].join(), `the missing entry moves to the top (${order.join()})`);
+        },
+    },
+    // With a search active, the mod goes to the end of the whole list,
+    // past the mods the search hides, and a message says so.
+    movefilter: {
+        async check(page, r) {
+            const search = page.getByPlaceholder("Search", { exact: true });
+            await search.fill("Leniently");
+            await page.waitForFunction(() => document.querySelectorAll("main span.text-2xl").length === 1, null, { timeout: 3000 }).catch(() => {});
+            r.expect((await rows(page)).join() === "Leniently parsed mod", `the search shows one mod (${(await rows(page)).join()})`);
+            await openEntryMenu(page, "Leniently parsed mod");
+            r.expect(await page.getByTestId("entry-move-top").isEnabled(), "Move to Top is on although it's first of those shown");
+            await page.getByTestId("entry-move-top").click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            r.expect(await page.getByText("to the top of the whole list (lowest priority)", { exact: false }).count() === 1, "a message says it went to the top of the whole list");
+            await search.fill("Legacy");
+            await page.waitForTimeout(300);
+            await openEntryMenu(page, "Legacy mod");
+            await page.getByTestId("entry-move-bottom").click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            r.expect(await page.getByText("to the bottom of the whole list (highest priority)", { exact: false }).count() === 1, "a message says it went to the bottom of the whole list");
+            await search.fill("");
+            await page.waitForTimeout(300);
+            const shown = await rows(page);
+            r.expect(shown[0] === "Leniently parsed mod" && shown.at(-1) === "Legacy mod", `the whole list has them at its ends (${shown.join()})`);
+            const order = await savedOrder(page, r);
+            r.expect(order.join() === [G(4), G(1), G(2), G(99), G(3)].join(), `saved at the ends of the whole list (${order.join()})`);
+        },
+    },
+    // A search that hides nothing: no message about hidden mods.
+    movefilternone: {
+        data: (d) => d.load_profiles.Profiles[0].Configs.pop(),
+        async check(page, r) {
+            await page.getByPlaceholder("Search", { exact: true }).fill("o");
+            await page.waitForTimeout(300);
+            r.expect((await rows(page)).length === 4, "the search shows every mod");
+            await openEntryMenu(page, "Legacy mod");
+            await page.getByTestId("entry-move-top").click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            r.expect((await rows(page))[0] === "Legacy mod", "it's moved");
+            r.expect(await page.getByText("the search hides", { exact: false }).count() === 0, "no message about hidden mods");
+        },
+    },
+    // Move Up / Move Down with a search active: past the next mod shown,
+    // not a hidden one (which would change nothing on screen); off at the
+    // ends of what's shown.
+    movestepfilter: {
+        async check(page, r) {
+            const search = page.getByPlaceholder("Search", { exact: true });
+            await search.fill("mod");
+            await page.waitForFunction(() => document.querySelectorAll("main span.text-2xl").length === 3, null, { timeout: 3000 }).catch(() => {});
+            r.expect((await rows(page)).join() === "V1 mod,Legacy mod,Leniently parsed mod", `the search hides one mod (${(await rows(page)).join()})`);
+            await openEntryMenu(page, "Legacy mod");
+            await page.getByTestId("entry-move-up").click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            r.expect((await rows(page)).join() === "Legacy mod,V1 mod,Leniently parsed mod", `Move Up passes the mod shown above (${(await rows(page)).join()})`);
+            await openEntryMenu(page, "Legacy mod");
+            r.expect(await page.getByTestId("entry-move-up").isDisabled(), "Move Up is off for the first mod shown");
+            await page.mouse.click(5, 5);
+            await page.waitForTimeout(200);
+            await openEntryMenu(page, "V1 mod");
+            await page.getByTestId("entry-move-down").click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            r.expect((await rows(page)).join() === "Legacy mod,Leniently parsed mod,V1 mod", `Move Down passes the mod shown below (${(await rows(page)).join()})`);
+            await openEntryMenu(page, "V1 mod");
+            r.expect(await page.getByTestId("entry-move-down").isDisabled(), "Move Down is off for the last mod shown");
+            await page.mouse.click(5, 5);
+            await page.waitForTimeout(200);
+            const order = await savedOrder(page, r);
+            r.expect(order.join() === [G(3), G(2), G(4), G(1), G(99)].join(), `hidden entries keep their places (${order.join()})`);
+        },
+    },
+    // From the keyboard: open the menu with Enter, reach the action, press
+    // Enter.
+    movekeys: {
+        async check(page, r) {
+            await entryRow(page, "Legacy mod").locator("button.hd2mm-button-nop.p-2").last().focus();
+            await page.keyboard.press("Enter");
+            await page.waitForTimeout(300);
+            const focused = [];
+            for (let i = 0; i < 30; i++) {
+                await page.keyboard.press("Tab");
+                const t = await page.evaluate(() => document.activeElement?.getAttribute("data-testid") ?? document.activeElement?.textContent?.trim().slice(0, 30));
+                focused.push(t);
+                if (t === "entry-move-top") break;
+            }
+            r.expect(focused.at(-1) === "entry-move-top", `Tab reaches Move to Top (${focused.join(" | ")})`);
+            await page.keyboard.press("Enter");
+            await page.waitForTimeout(300);
+            r.expect((await rows(page))[0] === "Legacy mod", "Enter moves it");
         },
     },
     // Init itself fails.

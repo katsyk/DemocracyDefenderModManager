@@ -28,10 +28,10 @@ there:
 - Mods already in the current profile don't show up in the Library at the same time — the two lists never overlap.
 
 Within the profile's list, each mod's context menu (the three-dot button) offers **Remove** (takes it back out of
-the profile and into the Library — this does not uninstall it), **Move Up**, **Move Down**, **To Top**, and
-**To Bottom**. You can also drag entries to reorder them directly, and search (the search box above the list)
-filters the visible list by name/description — reordering and the Library toggle are disabled while a search is
-active.
+the profile and into the Library — this does not uninstall it), **Move Up**, **Move Down**, **Move to Top
+(lowest priority)**, and **Move to Bottom (highest priority)**. You can also drag entries to reorder them directly,
+and search (the search box above the list) filters the visible list by name/description — dragging and the Library
+toggle are disabled while a search is active.
 
 Order matters: it's the load order. See the next section.
 
@@ -53,8 +53,24 @@ patches for the same file keeps them in its own order. (If that file is in your
 
 Mods that change *different* files don't conflict, and their order doesn't matter.
 
-To change a mod's priority, drag it, or use **Move Up**, **Move Down**, **To Top** and **To Bottom** in its
-three-dot menu, then **Deploy** again. The new order only reaches the game after a deploy.
+To change a mod's priority, drag it, or use **Move Up**, **Move Down**, **Move to Top (lowest priority)** and
+**Move to Bottom (highest priority)** in its three-dot menu, then **Deploy** again. The new order only reaches the
+game after a deploy.
+
+- **Move to Bottom (highest priority)** makes a mod win every conflict: it's loaded last, so its files are the
+  ones you see in game.
+- **Move to Top (lowest priority)** makes a mod lose every conflict: it's loaded first, and any other mod that
+  changes the same files overrides it.
+- Each is greyed out when the mod is already at that end of the list. They work from the keyboard too: Tab to
+  the three-dot button and press Enter to open the menu, then keep pressing Tab until the action is highlighted
+  and press Enter.
+- With a search active, these still move the mod to the top or bottom of the *whole* list, counting the mods the
+  search hides, not just the ones shown. When the search hides any mods, a message says so; clear the search to
+  see where it landed.
+- With a search active, **Move Up** and **Move Down** move the mod past the next mod *shown* above or below it,
+  skipping any the search hides in between (those keep their places). They're greyed out for the first and last
+  mod shown.
+- A "Mod not found" entry has them too, since it keeps its place in the load order.
 
 For example, with two armor retextures that both change the same armor:
 
