@@ -315,7 +315,7 @@
             {/if}
             <button
                 class="hd2mm-success-button self-end"
-                onclick={() => popup.close({ report: w.report!, addToProfile: !!popup.profileName && w.addToProfile })}
+                onclick={() => popup.finish()}
                 data-testid="import-finish"
             >
                 {t("popup.import.finish_button")}

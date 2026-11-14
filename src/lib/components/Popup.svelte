@@ -16,13 +16,60 @@
         return ex instanceof Error ? ex.message : String(ex);
     }
 
+    /** The popup shown with its render error instead, and that error:
+     * there, Escape is its Close button. */
+    let renderFailed: { popup: unknown; message: string } | null = null;
+
     /** A popup that throws while rendering would otherwise leave its
      * caller waiting for good (e.g. "Checking for updates..."): show the
      * error with a Close button instead, and log it. */
     function onRenderError(ex: unknown) {
+        renderFailed = { popup: popup.currentPopup, message: message(ex) };
         log.error(`A popup couldn't be shown (${popup.currentPopup?.constructor?.name ?? "?"}): ${describe(ex)}`).catch(() => {});
     }
+
+    /** Off from an Escape keydown that was acted on until that key is
+     * released: holding Escape (or a platform that doesn't flag the
+     * repeats) never closes more than the top popup. */
+    let escapeArmed = true;
+
+    /** Escape inside an open `<select>` dropdown closes the dropdown. */
+    function inOpenDropdown(target: EventTarget | null): boolean {
+        const select = target instanceof Element ? target.closest("select") : null;
+        if (!select) return false;
+        try {
+            return select.matches(":open");
+        } catch {
+            // No `:open` here: such webviews show the dropdown natively,
+            // and it takes its own Escape before the page sees it.
+            return false;
+        }
+    }
+
+    /** Escape: the top popup's safe choice (Cancel, No, Close, OK), as
+     * if clicked; nothing on one with no safe way out (see
+     * `Popup.dismiss`). Only the top popup, once per key press, and never
+     * the page behind it. */
+    function onKeydown(e: KeyboardEvent) {
+        if (e.key !== "Escape" || !popup.isShown) return;
+        if (e.defaultPrevented || e.isComposing || inOpenDropdown(e.target)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.repeat || !escapeArmed) return;
+        escapeArmed = false;
+        const top = popup.currentPopup;
+        if (renderFailed?.popup === top) top.closeAfterError(renderFailed.message);
+        else top.dismiss();
+    }
+
+    function onKeyup(e: KeyboardEvent) {
+        if (e.key === "Escape") escapeArmed = true;
+    }
 </script>
+
+<svelte:window onkeydown={onKeydown} onkeyup={onKeyup} onblur={() => (escapeArmed = true)} />
+<!-- Hidden (minimized) with Escape down: its keyup may never come. -->
+<svelte:document onvisibilitychange={() => (escapeArmed = true)} />
 
 {#if popup.isShown}
     {#key popup.currentPopup}

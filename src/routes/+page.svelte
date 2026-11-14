@@ -1841,25 +1841,25 @@
                                     <span class="text-xs truncate">{t("pages.mods.missing_entry.message")}</span>
                                     <span class="text-xs text-zinc-500 truncate">{config.Guid}</span>
                                 </div>
-                                <PopupMenuButton insertTarget="main">
-                                    <button onclick={() => onRemoveMissing(ci)}>
+                                <PopupMenuButton insertTarget="main" label={t("pages.mods.entry_menu.label", { name: t("pages.mods.missing_entry.title") })}>
+                                    <button role="menuitem" tabindex="-1" onclick={() => onRemoveMissing(ci)}>
                                         <Eraser />
                                         <span>{t("pages.mods.entry_menu.remove")}</span>
                                     </button>
                                     <hr>
-                                    <button disabled={i === 0} onclick={() => onMoveStep(ci, -1)}>
+                                    <button role="menuitem" tabindex="-1" disabled={i === 0} onclick={() => onMoveStep(ci, -1)}>
                                         <CaretUp />
                                         <span>{t("pages.mods.entry_menu.move_up")}</span>
                                     </button>
-                                    <button disabled={i === profileEntries.length - 1} onclick={() => onMoveStep(ci, 1)}>
+                                    <button role="menuitem" tabindex="-1" disabled={i === profileEntries.length - 1} onclick={() => onMoveStep(ci, 1)}>
                                         <CaretDown />
                                         <span>{t("pages.mods.entry_menu.move_down")}</span>
                                     </button>
-                                    <button disabled={ci === 0} onclick={() => onToEnd(ci, "top")} data-testid="entry-move-top">
+                                    <button role="menuitem" tabindex="-1" disabled={ci === 0} onclick={() => onToEnd(ci, "top")} data-testid="entry-move-top">
                                         <ArrowBarUp />
                                         <span>{t("pages.mods.entry_menu.to_top")}</span>
                                     </button>
-                                    <button disabled={ci === profileConfigs.length - 1} onclick={() => onToEnd(ci, "bottom")} data-testid="entry-move-bottom">
+                                    <button role="menuitem" tabindex="-1" disabled={ci === profileConfigs.length - 1} onclick={() => onToEnd(ci, "bottom")} data-testid="entry-move-bottom">
                                         <ArrowBarDown />
                                         <span>{t("pages.mods.entry_menu.to_bottom")}</span>
                                     </button>
@@ -1924,13 +1924,13 @@
                                         <PencilSquare class="block mx-auto" />
                                     </button>
                                 {/if}
-                                <PopupMenuButton insertTarget="main">
-                                    <button onclick={() => onRemove(ci)}>
+                                <PopupMenuButton insertTarget="main" label={t("pages.mods.entry_menu.label", { name: mod.name })}>
+                                    <button role="menuitem" tabindex="-1" onclick={() => onRemove(ci)}>
                                         <Eraser />
                                         <span>{t("pages.mods.entry_menu.remove")}</span>
                                     </button>
                                     <hr>
-                                    <button
+                                    <button role="menuitem" tabindex="-1"
                                         disabled={i === 0}
                                         onclick={() => onMoveStep(ci, -1)}
                                         data-testid="entry-move-up"
@@ -1938,7 +1938,7 @@
                                         <CaretUp />
                                         <span>{t("pages.mods.entry_menu.move_up")}</span>
                                     </button>
-                                    <button
+                                    <button role="menuitem" tabindex="-1"
                                         disabled={i === profileEntries.length - 1}
                                         onclick={() => onMoveStep(ci, 1)}
                                         data-testid="entry-move-down"
@@ -1946,7 +1946,7 @@
                                         <CaretDown />
                                         <span>{t("pages.mods.entry_menu.move_down")}</span>
                                     </button>
-                                    <button
+                                    <button role="menuitem" tabindex="-1"
                                         disabled={ci === 0}
                                         onclick={() => onToEnd(ci, "top")}
                                         data-testid="entry-move-top"
@@ -1954,7 +1954,7 @@
                                         <ArrowBarUp />
                                         <span>{t("pages.mods.entry_menu.to_top")}</span>
                                     </button>
-                                    <button
+                                    <button role="menuitem" tabindex="-1"
                                         disabled={ci === profileConfigs.length - 1}
                                         onclick={() => onToEnd(ci, "bottom")}
                                         data-testid="entry-move-bottom"
@@ -1965,7 +1965,7 @@
                                     {#if mod.Sources.some((s) => s.PageUrl)}
                                         <hr>
                                         {#each mod.Sources.filter((s) => s.PageUrl) as source}
-                                            <button onclick={() => openUrl(source.PageUrl!)}>
+                                            <button role="menuitem" tabindex="-1" onclick={() => openUrl(source.PageUrl!)}>
                                                 <BoxArrowUpRight />
                                                 <span>{t("pages.mods.open_source_page", { name: source.DisplayName })}</span>
                                             </button>
@@ -1974,29 +1974,29 @@
                                     {#if updatesFor(mod.guid).some(u => u.Status.Kind === "UpdateAvailable" || u.Status.Kind === "Skipped" || u.Status.Kind === "NeedsApiKey" || u.Status.Kind === "NeedsManualCheck")}
                                         <hr>
                                         {#each updatesFor(mod.guid).filter(u => u.Status.Kind === "UpdateAvailable") as entry}
-                                            <button onclick={() => onUpdateEntry(entry)}>
+                                            <button role="menuitem" tabindex="-1" onclick={() => onUpdateEntry(entry)}>
                                                 <CloudArrowDownFill />
                                                 <span>{t("pages.mods.update_from_site", { name: entry.DisplayName })}</span>
                                             </button>
-                                            <button onclick={() => onSkipVersion(entry, true)}>
+                                            <button role="menuitem" tabindex="-1" onclick={() => onSkipVersion(entry, true)}>
                                                 <SkipForward />
                                                 <span>{t("pages.mods.skip_version", { version: entry.LatestVersion ?? "" })}</span>
                                             </button>
                                         {/each}
                                         {#each updatesFor(mod.guid).filter(u => u.Status.Kind === "Skipped") as entry}
-                                            <button onclick={() => onSkipVersion(entry, false)}>
+                                            <button role="menuitem" tabindex="-1" onclick={() => onSkipVersion(entry, false)}>
                                                 <ArrowCounterclockwise />
                                                 <span>{t("pages.mods.unskip_version", { version: entry.LatestVersion ?? "" })}</span>
                                             </button>
                                         {/each}
                                         {#if updatesFor(mod.guid).some(u => u.Status.Kind === "NeedsManualCheck")}
-                                            <button onclick={onCheckUpdates}>
+                                            <button role="menuitem" tabindex="-1" onclick={onCheckUpdates}>
                                                 <ArrowRepeat />
                                                 <span>{t("popup.updates.state.needs_manual_check")}</span>
                                             </button>
                                         {/if}
                                         {#if needsNexusKey(mod.guid)}
-                                            <button onclick={() => goto("/settings#nexus-api-key")}>
+                                            <button role="menuitem" tabindex="-1" onclick={() => goto("/settings#nexus-api-key")}>
                                                 <Key />
                                                 <span>{t("pages.mods.needs_nexus_key")}</span>
                                             </button>
