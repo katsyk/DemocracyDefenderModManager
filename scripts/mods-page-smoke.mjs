@@ -1092,9 +1092,11 @@ const scenarios = {
     // Bulk add (10 files) with files that have an installed mod's ID: the
     // import list offers each as a replace, unticked, not even by Select
     // All; names both mods with their versions, flags a downgrade and two
-    // different mods sharing an ID; one file per mod. The ticked replace
-    // is imported, listed as replaced, keeps its place with fitted options,
-    // and is redeployed once.
+    // different mods sharing an ID; one file per mod; Only New unticks a
+    // replace. The ticked replace is imported, listed as replaced, keeps
+    // its place with fitted options, and is redeployed once -- before the
+    // newly imported (enabled) mod is added to the profile, so the deploy
+    // doesn't include it.
     importreplace: {
         data: (d) => {
             d["plugin:dialog|open"] = Array.from({ length: 10 }, (_, i) => `/dl/file ${i}.zip`);
@@ -1110,7 +1112,7 @@ const scenarios = {
                 { ...item(4, "Legacy mod", { Kind: "Installed", Name: "Legacy mod" }, { Guid: G(3), SameIdInstalled: true }), Kind: "Folder", Path: "/other/Legacy mod" },
                 ...[5, 6, 7, 8, 9].map(i => item(i, `New ${i}`, { Kind: "New" })),
             ] };
-            d.run_import = { Imported: [], Linked: [], Failed: [], NotStarted: 0, Cancelled: false,
+            d.run_import = { Imported: [{ Id: 0, Name: "Fresh mod", Guid: G(50), Enabled: true, Order: 0 }], Linked: [], Failed: [], NotStarted: 0, Cancelled: false,
                 Replaced: [{ Id: 1, Name: "V1 mod", PreviousName: "V1 mod", Guid: G(1) }] };
         },
         async check(page, r) {
@@ -1147,12 +1149,19 @@ const scenarios = {
             await page.getByText("Select All", { exact: true }).click({ timeout: 2000 });
             await page.waitForTimeout(200);
             r.expect(await v2.isChecked(), "Select All keeps a replace ticked by hand");
+            await page.getByText("Only New", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(200);
+            r.expect(!(await v2.isChecked()) && await box("Fresh mod").isChecked(), "Only New unticks a replace ticked by hand");
+            await v2.check({ timeout: 2000 });
 
-            // The replaced mod's new manifest has two options instead of three.
-            await page.evaluate((g) => {
-                const m = window.__smokeResponses.get_mods.find(x => x.Manifest.Guid === g);
+            // The replaced mod's new manifest has two options instead of
+            // three, and the fresh mod is in the library afterwards.
+            await page.evaluate(([g, fresh]) => {
+                const mods = window.__smokeResponses.get_mods;
+                const m = mods.find(x => x.Manifest.Guid === g);
                 m.Manifest.Options = [{ Name: "A", Description: "", SubOptions: [] }, { Name: "B", Description: "", SubOptions: [] }];
-            }, G(1));
+                mods.push({ Manifest: { Version: 1, Guid: fresh, Name: "Fresh mod", Description: "", Options: null }, Directory: "/data/mods/fresh", Sources: [] });
+            }, [G(1), G(50)]);
             await page.getByTestId("import-start").click({ timeout: 2000 });
             await page.waitForTimeout(800);
             const ids = r.calls.find(c => c.cmd === "run_import")?.args?.ids ?? [];
@@ -1166,6 +1175,9 @@ const scenarios = {
             r.expect(configs[0]?.Guid === G(1) && configs.filter(c => c.Guid === G(1)).length === 1, "it keeps its one place in the profile");
             r.expect(entry && entry.Enabled === true && JSON.stringify(entry.Toggled) === "[true,true]", `its options are fitted and saved (${JSON.stringify(entry)})`);
             r.expect(r.calls.filter(c => c.cmd === "deploy").length === 1, "it's redeployed once");
+            const deployed = (r.calls.find(c => c.cmd === "deploy")?.args?.configs ?? []).map(c => c.Guid);
+            r.expect(deployed.includes(G(1)) && !deployed.includes(G(50)), `the deploy covers the replace, not the new import (${JSON.stringify(deployed)})`);
+            r.expect(configs.at(-1)?.Guid === G(50) && configs.at(-1)?.Enabled === true, "the imported mod is added to the profile after that");
             r.expect(r.errors.length === 0, "no page error");
         },
     },

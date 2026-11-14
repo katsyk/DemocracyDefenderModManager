@@ -110,11 +110,11 @@
     );
     let counts = $derived({
         new: items.filter(i => i.Status.Kind === "New").length,
-        installed: items.filter(i => INSTALLED_KINDS.includes(i.Status.Kind)).length,
+        installed: items.filter(i => INSTALLED_KINDS.includes(i.Status.Kind) || replaces(i)).length,
         linkable: items.filter(i => i.Status.Kind === "InstalledAddSource").length,
         replaceable: items.filter(replaces).length,
         sameIdFolders: items.filter(i => i.Kind === "Folder" && i.SameIdInstalled && !i.Replace).length,
-        other: items.filter(i => !["New", ...INSTALLED_KINDS].includes(i.Status.Kind)).length,
+        other: items.filter(i => !["New", ...INSTALLED_KINDS].includes(i.Status.Kind) && !replaces(i)).length,
     });
     let selectedCount = $derived(w.selected.size);
     let selectedReplaceCount = $derived(w.selectedReplaces.length);

@@ -602,20 +602,23 @@
      * in profiles.json), forget what the last update check said about the
      * old one, and save. */
     async function onModReplaced(mod: Mod) {
-        await onModsReplaced([mod]);
+        fitReplacedMods([mod]);
+        await refreshUpdateStatuses();
+        if (!profilesLoaded) return;
+        const saved = await doSaveProfiles();
+        if (!saved.ok) log.warn(`Failed to save profiles after replacing a mod: ${saved.error}`);
     }
 
-    /** `onModReplaced` for several mods at once (an import), saving once. */
-    async function onModsReplaced(replaced: Mod[]) {
+    /** The part of `onModReplaced` that doesn't save or ask the backend:
+     * show the replaced mods, fit their entries in every profile, and
+     * forget their old update-check results. */
+    function fitReplacedMods(replaced: Mod[]) {
+        if (replaced.length === 0) return;
         for (const mod of replaced) replaceMod(mod.guid, mod);
         if (profilesLoaded && currentProfile) applyCurrentConfigChanges();
         const reset = fitProfilesToMods(profiles, replaced);
         if (reset.length > 0) log.info(`Options of the replaced mod reset to fit it: ${reset.join(", ")}`);
         updateStatuses = updateStatuses.filter(u => !replaced.some(m => m.guid === u.Guid));
-        await refreshUpdateStatuses();
-        if (!profilesLoaded) return;
-        const saved = await doSaveProfiles();
-        if (!saved.ok) log.warn(`Failed to save profiles after replacing a mod: ${saved.error}`);
     }
 
     /** Results of several adds: the mods added go into the list, replaced
@@ -1567,8 +1570,10 @@
      * archives, or `paths`; then add what was imported to the active
      * profile (keeping the source's order, on/off state and options).
      * Mods the import replaced keep their entries: their options are
-     * fitted as after a single Replace, and -- once, at the end -- they're
-     * redeployed (or DDMM asks) when one is on in the active profile. */
+     * fitted as after a single Replace and saved, and they're redeployed
+     * (or DDMM asks) once when one is on in the active profile -- before
+     * the newly imported mods are added to it, so that only the replaced
+     * ones are deployed (an import never deploys new mods by itself). */
     async function onImport(paths?: string[]) {
         importWindows++;
         let result;
@@ -1581,12 +1586,16 @@
         importSources = [];
         if (!result) return;
         const replaced = result.report.Replaced.map(r => mods.find(m => m.guid === r.Guid)).filter((m): m is Mod => !!m);
-        if (replaced.length > 0) await onModsReplaced(replaced);
-        if (result.report.Imported.length === 0) {
-            await afterUpdates(replaced.map(m => m.guid));
-            return;
-        }
+        if (result.report.Imported.length === 0 && replaced.length === 0) return;
+        fitReplacedMods(replaced);
         await refreshUpdateStatuses();
+        if (replaced.length > 0) {
+            if (profilesLoaded) {
+                const saved = await doSaveProfiles();
+                if (!saved.ok) log.warn(`Failed to save profiles after replacing mods: ${saved.error}`);
+            }
+            await afterUpdates(replaced.map(m => m.guid));
+        }
 
         if (result.addToProfile && currentProfile) {
             // Ones with a known place in the source's load order first, in
@@ -1608,7 +1617,6 @@
                 showPopup(new NotificationPopup("warning", t("toast.import.profile_save_failed", { error: saved.error })));
             }
         }
-        await afterUpdates(replaced.map(m => m.guid));
     }
 
     async function onAddMod() {

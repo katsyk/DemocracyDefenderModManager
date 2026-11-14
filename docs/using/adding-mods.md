@@ -122,8 +122,8 @@ The question is asked for Add (one file or several), drag and drop, Add URL, `dd
 and the browser extension. Some cases don't ask:
 
 - **Many files at once** (10 or more added or dropped) go through the [import checklist](importing-mods.md), which
-  doesn't ask either. An archive there with the ID of an installed mod is listed as *Has the ID of "…" in DDMM:
-  can replace it*, with both names and versions, the same different-names warning, and a **downgrade** label when
+  doesn't ask either. An archive there with the ID of an installed mod, that DDMM can tell is a different file, is
+  listed as *Has the ID of "…" in DDMM: can replace it*, with both names and versions, the same different-names warning, and a **downgrade** label when
   the file is older than the installed mod. It's never ticked for you (not even by **Select All**); tick it to
   replace that mod, through exactly the same swap as **Replace** here. See
   [Replacing mods you already have](importing-mods.md#replacing-mods-you-already-have). Mod folders in the

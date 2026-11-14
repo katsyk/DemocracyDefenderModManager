@@ -53,9 +53,9 @@ Nexus Mods id and version (when known), and a status:
 | Status | Meaning | Ticked? |
 |---|---|---|
 | **New** | Not in DDMM yet | Yes |
-| **Already in DDMM as "…"** | The same mod is installed (same ID, same archive, same file name, or same Nexus file) | No |
+| **Already in DDMM as "…"** | The same mod is installed: the same archive, the same file name, or the same Nexus file; or the same ID when nothing shows the file is a different one (for an archive that is, see the next rows) | No |
 | **Already in DDMM: will add Nexus info** | You already added this mod yourself (for example with Add), but DDMM doesn't know its Nexus page yet; the import knows it | Yes |
-| **Has the ID of "…" in DDMM: can replace it** | An archive whose `manifest.json` has the ID of an installed mod, and that isn't the file that mod came from. Ticking it **replaces** that mod; see [Replacing mods you already have](#replacing-mods-you-already-have) | No, never (not even by Select All) |
+| **Has the ID of "…" in DDMM: can replace it** | An archive whose `manifest.json` has the ID of an installed mod, and that is known to be a different file than the one that mod came from (other bytes than the archive it was imported from, another recorded file name, another mod name, or another version). Ticking it **replaces** that mod; see [Replacing mods you already have](#replacing-mods-you-already-have) | No, never (not even by Select All) |
 | **Another version is in DDMM** | Same Nexus mod and file, different version (but no shared ID, so it can't replace: use [Update](updating-mods.md) on the mod) | No |
 | **Same as "…"** | An identical copy of another item in the list (the very same files), e.g. `Mod (1).zip` next to `Mod.zip` | Can't be ticked |
 | **Older version of "…"** | Another version of a mod that's also in the list: the same mod ID with different files, or the same Nexus file downloaded more than once. Only the newest is ticked: the one Nexus uploaded last, else the higher version number, else the newer file | No |
@@ -95,7 +95,10 @@ copied.
 ## Replacing mods you already have
 
 Every mod has an ID (the `Guid` in its `manifest.json`), and two installed mods can't share one. An archive in the
-list with the ID of a mod you already have (and that isn't the very file that mod came from) can **replace** it.
+list with the ID of a mod you already have can **replace** it when DDMM can tell it's a different file than the one
+that mod came from. When it can't (for example, a mod you added as a folder, and its download with the same name
+and no version), the row stays *Already in DDMM*, or *will add Nexus info* as described below; to replace that mod
+anyway, add the file on its own.
 It's the bulk version of the question DDMM asks when you
 [add such a file on its own](adding-mods.md#replacing-an-installed-mod):
 

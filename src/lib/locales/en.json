@@ -772,7 +772,7 @@
             "done_cancelled": "Cancelled: {count} mods weren't imported. Run the import again to get them; what's already imported is recognized and skipped.",
             "done_cancelled_one": "Cancelled: 1 mod wasn't imported. Run the import again to get it; what's already imported is recognized and skipped.",
             "done_rolled_back": "\"{name}\", which was being imported, was removed again.",
-            "done_cancelled_replaced": "The mods replaced before that stay replaced: a replace can't be undone once it's done.",
+            "done_cancelled_replaced": "Every mod replaced before you pressed Cancel, and the one being replaced at that moment, stays replaced: a replace can't be undone, so one under way is finished.",
             "done_warnings": "{count} have no Helldivers 2 patch files and won't change anything when deployed.",
             "done_warnings_one": "1 has no Helldivers 2 patch files and won't change anything when deployed.",
             "finish_button": "Done"
