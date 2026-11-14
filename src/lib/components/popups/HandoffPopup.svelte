@@ -92,12 +92,9 @@
         }
     }
 
-    async function onCancel() {
-        try {
-            await cancelHandoff();
-        } finally {
-            popup.close({ status: "Cancelled" });
-        }
+    function onCancel() {
+        // On the popup, so Escape does the same (see `HandoffPopup.dismiss`).
+        void popup.cancel();
     }
 
     async function onChooseFile() {

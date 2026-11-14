@@ -61,6 +61,13 @@ function fixture() {
     };
 }
 
+const DELETE_QUESTION = "Are you sure you want to delete this mod?";
+const replaceOffer = () => ({ guid: G(1), fileName: "V1 mod-2.zip", installedName: "V1 mod",
+    installedVersion: "1.0", newName: "V1 mod", newVersion: "2.0", sameName: true });
+
+/** A mod in the library only (not in the profile), so it can be deleted. */
+const inLibraryOnly = (d) => d.load_profiles.Profiles[0].Configs.splice(1, 1);
+
 const rows = (page) => page.evaluate(() => [...document.querySelectorAll("main span.text-2xl")].map(s => s.textContent.trim()));
 // A profile entry's row by its mod's name (`null`: the "Mod not found" one).
 const entryRow = (page, name) => name === null
@@ -640,6 +647,126 @@ const scenarios = {
             await page.keyboard.press("Enter");
             await page.waitForTimeout(300);
             r.expect((await rows(page))[0] === "Legacy mod", "Enter moves it");
+        },
+    },
+    // Escape on "Delete this mod?": No, the mod stays.
+    escdelete: {
+        data: inLibraryOnly,
+        async check(page, r) {
+            await page.locator("main button[title='Library']").click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            await page.locator("main li button[title='Delete']").first().click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            r.expect(await page.getByText(DELETE_QUESTION).count() === 1, "the question is shown");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(400);
+            r.expect(await page.getByText(DELETE_QUESTION).count() === 0, "Escape closes it");
+            r.expect(!r.calls.some(c => c.cmd === "delete_mod"), "nothing is deleted");
+            r.expect(await page.getByText("Deleting mod...").count() === 0, "no delete is started");
+            r.expect(r.errors.length === 0, "no page error");
+        },
+    },
+    // Escape on "Replace?": Cancel (keep), answered to the backend.
+    escreplace: {
+        async check(page, r) {
+            await page.evaluate((o) => window.__smokeEmit("install://replace-request", { requestId: "e1", offer: o }), replaceOffer());
+            await page.waitForTimeout(400);
+            r.expect(await page.getByTestId("replace-question").count() === 1, "the question is shown");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(400);
+            r.expect(await page.getByTestId("replace-question").count() === 0, "Escape closes it");
+            const answers = r.calls.filter(c => c.cmd === "resolve_replace_request").map(c => `${c.args.requestId}:${c.args.replace}`);
+            r.expect(answers.join() === "e1:false", `Escape answers Cancel (${answers.join()})`);
+        },
+    },
+    // Two popups: Escape closes the top one only, then the next.
+    escstack: {
+        data: inLibraryOnly,
+        async check(page, r) {
+            await page.locator("main button[title='Library']").click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            await page.locator("main li button[title='Delete']").first().click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            await page.evaluate((o) => window.__smokeEmit("install://replace-request", { requestId: "s1", offer: o }), replaceOffer());
+            await page.waitForTimeout(400);
+            r.expect(await page.getByTestId("replace-question").count() === 1, "the top popup is shown");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(400);
+            r.expect(await page.getByTestId("replace-question").count() === 0, "Escape closes the top popup");
+            r.expect(await page.getByText(DELETE_QUESTION).count() === 1, "the one under it stays");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(400);
+            r.expect(await page.getByText(DELETE_QUESTION).count() === 0, "a second Escape closes it");
+            r.expect(!r.calls.some(c => c.cmd === "delete_mod"), "nothing is deleted");
+        },
+    },
+    // Escape on a popup that failed to render: its Close.
+    escpopuperror: {
+        data: (d) => scenarios.popuperror.data(d),
+        async check(page, r) {
+            await page.locator("button[title^='Check installed mods']").click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            r.expect(await page.getByTestId("popup-render-error").count() === 1, "the popup shows its error");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(300);
+            r.expect(await page.getByTestId("popup-render-error").count() === 0, "Escape closes it");
+            r.expect(await page.getByText("Checking for updates...").count() === 0, "the caller isn't left waiting");
+        },
+    },
+    // Escape while a mod is being deleted: the progress popup stays.
+    escprogress: {
+        data: (d) => { inLibraryOnly(d); d.__hang = ["delete_mod"]; },
+        async check(page, r) {
+            await page.locator("main button[title='Library']").click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            await page.locator("main li button[title='Delete']").first().click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            await page.getByText("Yes", { exact: true }).click({ timeout: 2000 });
+            await page.waitForTimeout(400);
+            r.expect(await page.getByText("Deleting mod...").count() === 1, "the progress popup is shown");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(400);
+            r.expect(await page.getByText("Deleting mod...").count() === 1, "Escape leaves it open");
+            r.expect(r.errors.length === 0, "no page error");
+        },
+    },
+    // Escape held down (repeats), or pressed again without being released
+    // in between: one popup closes, not the whole stack.
+    eschold: {
+        data: inLibraryOnly,
+        async check(page, r) {
+            await page.locator("main button[title='Library']").click({ timeout: 2000 });
+            await page.waitForTimeout(500);
+            await page.locator("main li button[title='Delete']").first().click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            const ask = async (id) => {
+                await page.evaluate(([o, id]) => window.__smokeEmit("install://replace-request", { requestId: id, offer: o }), [replaceOffer(), id]);
+                await page.waitForTimeout(400);
+            };
+            await ask("h1");
+            // Held: a keydown, then repeats (Playwright flags a second
+            // `down` of a pressed key as a repeat).
+            await page.keyboard.down("Escape");
+            await page.waitForTimeout(200);
+            for (let i = 0; i < 5; i++) {
+                await page.keyboard.down("Escape");
+                await page.waitForTimeout(100);
+            }
+            await page.keyboard.up("Escape");
+            await page.waitForTimeout(400);
+            r.expect(await page.getByTestId("replace-question").count() === 0, "the top popup closes");
+            r.expect(await page.getByText(DELETE_QUESTION).count() === 1, "held Escape leaves the one under it");
+            // Repeats not flagged as such: still one close until released.
+            await ask("h2");
+            await page.evaluate(() => {
+                for (let i = 0; i < 3; i++) window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+            });
+            await page.waitForTimeout(400);
+            r.expect(await page.getByTestId("replace-question").count() === 0, "the top popup closes again");
+            r.expect(await page.getByText(DELETE_QUESTION).count() === 1, "unreleased Escape leaves the one under it");
+            const answers = r.calls.filter(c => c.cmd === "resolve_replace_request").map(c => `${c.args.requestId}:${c.args.replace}`);
+            r.expect(answers.join() === "h1:false,h2:false", `each answered Cancel once (${answers.join()})`);
+            r.expect(!r.calls.some(c => c.cmd === "delete_mod"), "nothing is deleted");
         },
     },
     // Init itself fails.
