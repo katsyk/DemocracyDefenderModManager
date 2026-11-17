@@ -201,7 +201,7 @@ pub async fn resolve_mod_image(
 pub async fn get_mods(state: State<'_, AppState>) -> TAResult<Vec<Mod>> {
     let mut state_mods = state.mods.lock().await;
     log::info!("Loading mods...");
-    let mods = ensure_mods_loaded(&mut state_mods, &state.base_path).await?;
+    let mods = ensure_mods_loaded(&mut state_mods, &state).await?;
     Ok(mods.clone())
 }
 
@@ -210,24 +210,49 @@ pub async fn get_mods(state: State<'_, AppState>) -> TAResult<Vec<Mod>> {
 /// the browser bridge, which can receive an install before the frontend
 /// has ever called `get_mods` -- e.g. a first run still on the Settings
 /// page, or DDMM just launched by the native-messaging host.
+///
+/// `state_mods` is `state`'s mod list, locked by the caller. The first read
+/// finishes what an update DDMM was closed in the middle of left undone
+/// (see [`recover_leftover_folders`]): the ID changes it finished (or
+/// couldn't write to profiles.json yet) are recorded as this session's
+/// renames, so the page moves its entries too (`get_guid_renames`), and
+/// `load_profiles` stops waiting for the mod list.
 pub(crate) async fn ensure_mods_loaded<'a>(
     state_mods: &'a mut Option<Vec<Mod>>,
-    base_path: &Path,
+    state: &AppState,
 ) -> TAResult<&'a mut Vec<Mod>> {
+    let (mods, renames) = ensure_mods_loaded_at(state_mods, &state.base_path).await?;
+    for (old, new) in renames {
+        state.record_guid_rename(old, new);
+    }
+    state.mods_recovered.store(true, std::sync::atomic::Ordering::Release);
+    Ok(mods)
+}
+
+/// [`ensure_mods_loaded`] for the mod storage of `base_path`, without an
+/// [`AppState`]; also returns the ID changes the first read's recovery
+/// found (none once loaded).
+pub(crate) async fn ensure_mods_loaded_at<'a>(
+    state_mods: &'a mut Option<Vec<Mod>>,
+    base_path: &Path,
+) -> TAResult<(&'a mut Vec<Mod>, Vec<(Uuid, Uuid)>)> {
     if state_mods.is_some() {
         log::debug!("Mods already loaded.");
-        return Ok(state_mods.as_mut().unwrap());
+        return Ok((state_mods.as_mut().unwrap(), Vec::new()));
     }
 
     let mods_dir = base_path.join(MODS_DIRECTORY);
     let mut mods = Vec::new();
+    let mut renames = Vec::new();
     if !mods_dir.is_dir() {
         // First run: nothing installed yet. Still record the (empty) list
         // as loaded, or every install command would fail with "mods not
         // read" until something called get_mods a second time.
         tokio::fs::create_dir_all(&mods_dir).await.into_ta_result()?;
     } else {
-        let still_hidden = recover_leftover_folders(&mods_dir).await;
+        let recovered = recover_leftover_folders(&mods_dir).await;
+        let still_hidden = recovered.still_hidden;
+        renames = recovered.renames;
 
         let mut mods_dir = tokio::fs::read_dir(mods_dir).await.into_ta_result()?;
         while let Some(entry) = mods_dir.next_entry().await.into_ta_result()? {
@@ -276,7 +301,7 @@ pub(crate) async fn ensure_mods_loaded<'a>(
     }
 
     log::info!("Mods loaded.");
-    Ok(state_mods.insert(mods))
+    Ok((state_mods.insert(mods), renames))
 }
 
 /// Delete the mod with `guid`: its folder, the versions its updates
@@ -514,7 +539,7 @@ pub(crate) async fn decide_replace(state: &AppState, archive_file: &Path, asker:
     let Some(manifest) = manifest else { return Ok(ReplaceChoice::Install) };
     let (offer, existing) = {
         let mut guard = state.mods.lock().await;
-        let mods = ensure_mods_loaded(&mut guard, &state.base_path).await.map_err(|e| e.0)?;
+        let mods = ensure_mods_loaded(&mut guard, state).await.map_err(|e| e.0)?;
         match replace_offer(mods, &manifest, archive_file) {
             Some(found) => found,
             None => return Ok(ReplaceChoice::Install),
@@ -1874,6 +1899,10 @@ async fn install_update_steps(
         discard_staging().await;
         return Err(InstallError::new(subject, replace, e));
     }
+    if let Err(e) = sync_staged_tree(&staging_dir).await {
+        discard_staging().await;
+        return Err(InstallError::new(subject, replace, e));
+    }
 
     // What the profiles need once the new version is in: entries moved
     // from DDMM's own ID to the author's (see below), then every entry of
@@ -2000,15 +2029,28 @@ async fn install_update_steps(
 ///   to a visible name so it keeps showing up. When that rename fails it
 ///   is returned, and the caller loads it under its dot-name anyway.
 ///
+/// Order, each step relying on the ones before it:
+///
+/// 1. in-place setups (`.adopt-<id>`), before anything else looks at the
+///    storage's folders: putting one back recreates a visible mod folder
+///    (`mods/<name>`) that the rest of the sweep -- an update backup
+///    waiting for its folder, in particular -- must see as taken, or it
+///    could restore into that name. It only ever touches its own `.adopt-`
+///    folder and the folder named in its record, so nothing later can be
+///    in its way; it never involves an update's record;
+/// 2. unfinished deletes (`.delete-<id>`);
+/// 3. update backups (put back or kept);
+/// 4. update staging copies;
+/// 5. what those updates left for profiles.json ([`finish_follow_ups`]):
+///    it needs the backups dealt with first, to know which version is in
+///    place;
+/// 6. update records left without a backup (never one with a follow-up
+///    still to do);
+/// 7. dot-named mods.
+///
 /// Problems are logged, never fatal: the mod list still loads.
-pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Vec<PathBuf> {
-    // Order: in-place setups (`.adopt-<id>`) first, before anything else
-    // here looks at the storage's folders. Putting one back recreates a
-    // visible mod folder (`mods/<name>`) that the rest of this sweep -- an
-    // update backup waiting for its folder, in particular -- must see as
-    // taken, or it could restore into that name. It only ever touches its
-    // own `.adopt-` folder and the folder named in its record, so nothing
-    // later in the sweep can be in its way.
+pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Recovered {
+    // 1. In-place setups; see the order above.
     let root = mods_root.to_path_buf();
     match tokio::task::spawn_blocking(move || crate::mod_root::recover_in_place_unwraps(&root)).await {
         Ok(left) if !left.is_empty() => {
@@ -2017,7 +2059,7 @@ pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Vec<PathBuf> {
         Ok(_) => {}
         Err(e) => log::warn!("Couldn't check for unfinished in-place setups: {e}"),
     }
-    let Ok(mut entries) = tokio::fs::read_dir(mods_root).await else { return Vec::new() };
+    let Ok(mut entries) = tokio::fs::read_dir(mods_root).await else { return Recovered::default() };
     let mut backups = Vec::new();
     let mut staging = Vec::new();
     let mut hidden_mods = Vec::new();
@@ -2075,7 +2117,7 @@ pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Vec<PathBuf> {
         }
     }
 
-    // Deletes that couldn't finish (a file was in use): only folders DDMM
+    // 2. Deletes that couldn't finish (a file was in use): only folders DDMM
     // set aside itself, i.e. with their record, are deleted.
     for dir in pending_deletes {
         if tokio::fs::symlink_metadata(mod_folder::pending_delete_record_path(&dir)).await.is_err() {
@@ -2099,6 +2141,7 @@ pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Vec<PathBuf> {
             let _ = tokio::fs::remove_file(&record).await;
         }
     }
+    // 3.-7.: see the order above.
     for backup in backups {
         if let Err(e) = recover_update_backup(mods_root, &backup).await {
             log::error!("Couldn't recover {:?}, left as it is: {:#}", backup, e);
@@ -2107,7 +2150,7 @@ pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Vec<PathBuf> {
     for dir in staging {
         remove_if_duplicate(mods_root, &dir, None).await;
     }
-    finish_follow_ups(mods_root, &records).await;
+    let renames = finish_follow_ups(mods_root, &records).await;
     for record in records {
         let backup = backup_of_record(&record);
         // One whose follow-up couldn't be done yet stays for the next start.
@@ -2132,7 +2175,17 @@ pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    still_hidden
+    Recovered { still_hidden, renames }
+}
+
+/// What [`recover_leftover_folders`] hands back.
+#[derive(Debug, Default)]
+pub(crate) struct Recovered {
+    /// Dot-named mod folders that couldn't be renamed: load them anyway.
+    pub still_hidden: Vec<PathBuf>,
+    /// Mods whose ID an unfinished update changed (old, new): their
+    /// entries are moved in profiles.json, or will be on a later start.
+    pub renames: Vec<(Uuid, Uuid)>,
 }
 
 /// What an update backup's record file says.
@@ -2174,8 +2227,12 @@ async fn apply_follow_up(base_path: &Path, follow_up: &FollowUp, manifest: &Mani
     Ok(())
 }
 
-/// The follow-up in the backup record `record` is done: drop it from the
-/// record, or the whole record when its backup folder is gone.
+/// The follow-up in the backup record `record` is done (or moot): drop it
+/// from the record, or the whole record when its backup folder is gone. A
+/// record kept is marked swapped as well: a follow-up is only ever dropped
+/// with a backup still there once the new version is in place, and the
+/// backup must then never be put back (next to the new version, if the
+/// update changed the mod's ID) -- even if marking it failed before.
 async fn finish_record(record: &Path) {
     let backup = backup_of_record(record);
     let result = if tokio::fs::symlink_metadata(&backup).await.is_err() {
@@ -2189,6 +2246,7 @@ async fn finish_record(record: &Path) {
             _ => return,
         };
         value.remove("follow_up");
+        value.insert("swapped".into(), serde_json::Value::Bool(true));
         write_record_value(record, serde_json::Value::Object(value)).await
     };
     if let Err(e) = result {
@@ -2220,11 +2278,17 @@ fn backup_of_record(record: &Path) -> PathBuf {
 /// - it didn't (the old version is back in place): the follow-up is
 ///   dropped, profiles.json is left as it was -- the old state.
 ///
-/// A follow-up that can't be written now (profiles.json in use) stays for
-/// the start after.
-async fn finish_follow_ups(mods_root: &Path, records: &[PathBuf]) {
-    let Some(base_path) = mods_root.parent() else { return };
+/// A follow-up that can't be done now (profiles.json in use, or the new
+/// version's manifest.json unreadable -- e.g. cut short by a power loss)
+/// stays for the start after. Returns the ID changes of the finished swaps
+/// (done or still to do), for this session's renames.
+async fn finish_follow_ups(mods_root: &Path, records: &[PathBuf]) -> Vec<(Uuid, Uuid)> {
+    let mut renames = Vec::new();
+    let Some(base_path) = mods_root.parent() else { return renames };
     for record in records {
+        if crash_point(CrashPoint::RecoveryBeforeProfiles) {
+            return renames;
+        }
         let parsed = read_backup_record(mods_root, record).await;
         let Some(follow_up) = parsed.follow_up else { continue };
         if !parsed.swapped && tokio::fs::symlink_metadata(backup_of_record(record)).await.is_ok() {
@@ -2232,23 +2296,42 @@ async fn finish_follow_ups(mods_root: &Path, records: &[PathBuf]) {
             // this time): left for the next start.
             continue;
         }
-        let installed = match (&parsed.folder, parsed.swapped) {
-            (Some(folder), true) => read_manifest_quietly(&mods_root.join(folder).join(MANIFEST_FILE)).await,
-            _ => None,
+        let folder = match (&parsed.folder, parsed.swapped) {
+            (Some(folder), true) => mods_root.join(folder),
+            _ => {
+                log::info!("{:?}: the update didn't finish, so the profiles stay as they were.", record);
+                finish_record(record).await;
+                continue;
+            }
         };
-        let Some(manifest) = installed.filter(|m| manifest_guid(m) == follow_up.guid) else {
-            log::info!("{:?}: the update didn't finish, so the profiles stay as they were.", record);
+        if tokio::fs::symlink_metadata(&folder).await.is_err() {
+            log::info!("{:?}: the updated mod's folder is gone (deleted since); the profiles stay as they are.", record);
             finish_record(record).await;
             continue;
+        }
+        let Some(manifest) = read_manifest_quietly(&folder.join(MANIFEST_FILE)).await else {
+            log::error!(
+                "{:?}: the updated mod's manifest.json can't be read; its profile entries are left for the next start.",
+                folder
+            );
+            continue;
         };
+        if manifest_guid(&manifest) != follow_up.guid {
+            log::info!("{:?} holds another mod now; the profiles stay as they are.", folder);
+            finish_record(record).await;
+            continue;
+        }
         let mut follow_up = follow_up;
         if let Some(old) = follow_up.moved_from {
             // An old ID that's a mod's again keeps its entries.
-            if !visible_folders_with_guid(mods_root, old).await.is_empty() {
+            if visible_folders_with_guid(mods_root, old).await.is_empty() {
+                renames.push((old, follow_up.guid));
+            } else {
                 follow_up.moved_from = None;
             }
         }
         match apply_follow_up(base_path, &follow_up, &manifest).await {
+            Ok(()) if crash_point(CrashPoint::RecoveryBeforeRecordDropped) => return renames,
             Ok(()) => {
                 log::info!("Finished the profiles of {{{}}} after an update that didn't finish.", follow_up.guid);
                 finish_record(record).await;
@@ -2256,6 +2339,7 @@ async fn finish_follow_ups(mods_root: &Path, records: &[PathBuf]) {
             Err(e) => log::error!("Couldn't finish the profiles of {{{}}} yet (the next start tries again): {e:#}", follow_up.guid),
         }
     }
+    renames
 }
 
 /// Where a test stops an update or replace, as if DDMM crashed there.
@@ -2273,6 +2357,10 @@ pub(crate) enum CrashPoint {
     BeforeProfiles,
     /// profiles.json is written; the record not dropped yet.
     BeforeRecordRemoved,
+    /// Recovery on the next start: before it writes profiles.json.
+    RecoveryBeforeProfiles,
+    /// Recovery: profiles.json written, the record not dropped yet.
+    RecoveryBeforeRecordDropped,
 }
 
 #[cfg(test)]
@@ -2304,10 +2392,59 @@ async fn stage_origin(old_dir: &Path, staging_dir: &Path, manifest: &Manifest, a
         if let Some(sidecar) = nexus_sidecar_from_file_name(&staged, file_name, true).await {
             sources::save_origin_sidecar(staging_dir, &sidecar).await?;
         }
-    } else if let Some(sidecar) = sources::load_origin_sidecar(old_dir).await {
+    } else if let Some(mut sidecar) = sources::load_origin_sidecar(old_dir).await {
+        // What the old version's record says about where it came from; not
+        // what's tied to that version (see `OriginSidecar`).
+        sidecar.skipped_versions.clear();
+        sidecar.imported_archive = None;
         sources::save_origin_sidecar(staging_dir, &sidecar).await?;
     }
     Ok(())
+}
+
+/// Get the staged tree `dir` onto the disk before it's swapped in, so a
+/// power loss after the swap can't leave the new version with empty
+/// files (manifest.json above all). manifest.json must sync; the rest is
+/// best effort (a file that can't be opened for it is logged).
+async fn sync_staged_tree(dir: &Path) -> anyhow::Result<()> {
+    fn sync_file(file: &Path) -> std::io::Result<()> {
+        std::fs::OpenOptions::new().write(true).open(file)?.sync_all()
+    }
+    // A folder's entries (Unix; NTFS journals them itself).
+    fn sync_dir(dir: &Path) {
+        #[cfg(unix)]
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        #[cfg(not(unix))]
+        let _ = dir;
+    }
+    fn walk(dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => {
+                    walk(&path);
+                    sync_dir(&path);
+                }
+                Ok(t) if t.is_file() => {
+                    if let Err(e) = sync_file(&path) {
+                        log::warn!("Couldn't sync {:?} to disk: {}", path, e);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        walk(&dir);
+        sync_file(&dir.join(MANIFEST_FILE)).with_context(|| format!("couldn't write {:?} to disk", dir.join(MANIFEST_FILE)))?;
+        sync_dir(&dir);
+        Ok(())
+    })
+    .await?
 }
 
 async fn read_backup_record(mods_root: &Path, record: &Path) -> BackupRecord {
@@ -2655,7 +2792,7 @@ mod tests {
         make_zip(&archive, &[(&patch_file_name(), b"x")]);
         let state = AppState::new(base.path().to_path_buf());
         let mut guard = state.mods.lock().await;
-        let mods = ensure_mods_loaded(&mut guard, base.path()).await.unwrap();
+        let mods = ensure_mods_loaded_at(&mut guard, base.path()).await.unwrap().0;
         let (m, _) = install_from_archive(&state, mods, &archive).await.unwrap();
         assert_eq!(m.name(), "PawnCompanion");
         assert_eq!(m.directory.file_name().unwrap(), "PawnCompanion 1377 1.35 2026-06-24T03-45Z G8alq8bQH");
@@ -2680,7 +2817,7 @@ mod tests {
         make_zip(&archive, &[(&patch_file_name(), b"x")]);
         let state = AppState::new(base.path().to_path_buf());
         let mut guard = state.mods.lock().await;
-        let mods = ensure_mods_loaded(&mut guard, base.path()).await.unwrap();
+        let mods = ensure_mods_loaded_at(&mut guard, base.path()).await.unwrap().0;
         let (m, _) = install_from_archive(&state, mods, &archive).await.unwrap();
         assert_eq!(m.name(), "EAGLE-2");
         assert_eq!(m.directory.file_name().unwrap(), "EAGLE-2-1065-V1-1-1752787902");
@@ -2747,7 +2884,7 @@ mod tests {
         let state = AppState::new(base.to_path_buf());
         {
             let mut guard = state.mods.lock().await;
-            ensure_mods_loaded(&mut guard, base).await.unwrap();
+            ensure_mods_loaded(&mut guard, &state).await.unwrap();
         }
         state
     }
@@ -3025,7 +3162,7 @@ mod tests {
     async fn ensure_mods_loaded_marks_first_run_as_loaded() {
         let base = tempfile::tempdir().unwrap();
         let mut state_mods = None;
-        let mods = ensure_mods_loaded(&mut state_mods, base.path()).await.unwrap();
+        let mods = ensure_mods_loaded_at(&mut state_mods, base.path()).await.unwrap().0;
         assert!(mods.is_empty());
         assert!(base.path().join(MODS_DIRECTORY).is_dir());
         // Previously the empty first-run list was returned but never stored,
@@ -3038,7 +3175,7 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let (guid, _) = make_existing_mod(base.path(), "CoolMod").await;
         let mut state_mods = None;
-        let mods = ensure_mods_loaded(&mut state_mods, base.path()).await.unwrap();
+        let mods = ensure_mods_loaded_at(&mut state_mods, base.path()).await.unwrap().0;
         assert_eq!(mods.len(), 1);
         assert_eq!(mods[0].guid(), guid);
     }
@@ -3326,7 +3463,7 @@ mod tests {
 
         // And it loads on the next start like any other mod.
         let mut state_mods = None;
-        let loaded = ensure_mods_loaded(&mut state_mods, base.path()).await.unwrap();
+        let loaded = ensure_mods_loaded_at(&mut state_mods, base.path()).await.unwrap().0;
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].guid(), r#mod.guid());
 
@@ -3980,7 +4117,7 @@ mod tests {
 
     async fn load(base: &Path) -> Vec<Mod> {
         let mut state_mods = None;
-        ensure_mods_loaded(&mut state_mods, base).await.unwrap().clone()
+        ensure_mods_loaded_at(&mut state_mods, base).await.unwrap().0.clone()
     }
 
     fn write_swapped_record(backup: &Path, folder: &str) {
@@ -5250,5 +5387,149 @@ mod tests {
         assert_eq!(entries[1]["Enabled"], false);
         assert!(records_in(base.path()).is_empty());
         assert_eq!(mods_folder_names(base.path()), vec!["A".to_string(), "Cool Mod".to_string()]);
+    }
+
+    /// A mod installed without its manifest.json (DDMM's own ID), with
+    /// profile entries in two profiles, then updated with its author's
+    /// manifest -- stopped at `at`. Returns the old ID.
+    async fn id_changing_update_stopped_at(base: &Path, src: &Path, at: CrashPoint) -> Uuid {
+        let state = fresh_library(base).await;
+        let old = install_as_before_unwrapping(&state, src).await;
+        write_profiles(base, &[("Default", &[&old.guid().to_string()]), ("Other", &[&old.guid().to_string()])]);
+        let update = src.join("Cool Mod 1.1.zip");
+        write_zip(&update, &wrapped_entries("Cool Mod/", "Cool Mod", b"v2"));
+        let result = crashing_at(at, async {
+            let mut guard = state.mods.lock().await;
+            install_update_from_archive(&state, guard.as_mut().unwrap(), &update, old.guid()).await
+        })
+        .await;
+        assert!(result.is_err());
+        old.guid()
+    }
+
+    /// The new version's manifest.json unreadable after the swap (a power
+    /// loss can leave it empty): the follow-up is kept, not dropped, and
+    /// done on the start after it's readable again.
+    #[tokio::test]
+    async fn an_unreadable_manifest_after_the_swap_keeps_the_follow_up() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let old = id_changing_update_stopped_at(base.path(), src.path(), CrashPoint::BeforeProfiles).await;
+        let manifest = base.path().join(MODS_DIRECTORY).join("Cool Mod").join(MANIFEST_FILE);
+        let good = std::fs::read(&manifest).unwrap();
+        let before = std::fs::read(base.path().join("profiles.json")).unwrap();
+
+        for broken in [&b""[..], b"{ not json"] {
+            std::fs::write(&manifest, broken).unwrap();
+            assert!(load(base.path()).await.is_empty());
+            assert_eq!(std::fs::read(base.path().join("profiles.json")).unwrap(), before);
+            let records = records_in(base.path());
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["follow_up"]["moved_from"], old.to_string(), "kept for the next start");
+        }
+
+        std::fs::write(&manifest, good).unwrap();
+        restart_twice(base.path()).await;
+        assert_eq!(saved_profile_guids(base.path()), [[WRAPPED_GUID], [WRAPPED_GUID]]);
+        assert!(records_in(base.path()).is_empty());
+    }
+
+    /// The mod's folder holding another mod by the next start (put there by
+    /// hand): its ID isn't the one the follow-up is for, so the profiles
+    /// are left alone and the follow-up dropped.
+    #[tokio::test]
+    async fn a_follow_up_for_a_folder_that_holds_another_mod_is_dropped() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        id_changing_update_stopped_at(base.path(), src.path(), CrashPoint::BeforeProfiles).await;
+        let folder = base.path().join(MODS_DIRECTORY).join("Cool Mod");
+        std::fs::remove_dir_all(&folder).unwrap();
+        write_v1_mod(&folder, GUID_B, "Beta");
+        let before = std::fs::read(base.path().join("profiles.json")).unwrap();
+
+        let mods = load(base.path()).await;
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].guid().to_string(), GUID_B);
+        assert_eq!(std::fs::read(base.path().join("profiles.json")).unwrap(), before, "not moved to a mod that isn't there");
+        assert!(records_in(base.path()).is_empty());
+    }
+
+    /// Recovery itself stopped partway (before and after it writes
+    /// profiles.json), then started again: the same end state.
+    #[tokio::test]
+    async fn recovery_stopped_partway_finishes_on_the_next_start() {
+        for update_at in [CrashPoint::BeforeSwapNoted, CrashPoint::BeforeProfiles] {
+            for recovery_at in [CrashPoint::RecoveryBeforeProfiles, CrashPoint::RecoveryBeforeRecordDropped] {
+                let base = tempfile::tempdir().unwrap();
+                let src = tempfile::tempdir().unwrap();
+                id_changing_update_stopped_at(base.path(), src.path(), update_at).await;
+                crashing_at(recovery_at, load(base.path())).await;
+                assert_eq!(records_in(base.path()).iter().filter(|r| r.get("follow_up").is_some()).count(), 1);
+
+                let mods = restart_twice(base.path()).await;
+                assert_eq!(mods.len(), 1, "{update_at:?} {recovery_at:?}");
+                assert_eq!(mods[0].guid().to_string(), WRAPPED_GUID);
+                assert_eq!(saved_profile_guids(base.path()), [[WRAPPED_GUID], [WRAPPED_GUID]], "{update_at:?} {recovery_at:?}");
+            }
+        }
+    }
+
+    /// Dropping a done follow-up from a record whose backup is still there
+    /// also marks it swapped: the backup is then never put back, even if
+    /// marking it failed during the update.
+    #[tokio::test]
+    async fn finishing_a_record_marks_it_swapped() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join(MODS_DIRECTORY);
+        let backup = root.join(format!(".update-backup-{}", Uuid::new_v4()));
+        write_v1_mod(&backup, GUID_A, "Alpha");
+        let follow_up = FollowUp { guid: Uuid::parse_str(GUID_B).unwrap(), moved_from: Some(Uuid::parse_str(GUID_A).unwrap()) };
+        let record = mod_folder::backup_record_path(&backup);
+        write_backup_record(&record, &root.join("Beta"), false, Some(&follow_up)).await.unwrap();
+        finish_record(&record).await;
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({ "folder": "Beta", "swapped": true }));
+    }
+
+    /// The page's `load_profiles` before anything read the mod list (the
+    /// page asks for both at once): it waits for the recovery, so it gets
+    /// the finished profiles; the ID change is this session's rename; and
+    /// once the list was read it no longer waits for the list.
+    #[tokio::test]
+    async fn load_profiles_waits_for_the_recovery() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let old = id_changing_update_stopped_at(base.path(), src.path(), CrashPoint::BeforeProfiles).await;
+        assert_eq!(saved_profile_guids(base.path()), [[old.to_string()], [old.to_string()]], "not written yet");
+
+        let state = AppState::new(base.path().to_path_buf());
+        let config = crate::commands::profiles::load_profiles_for(&state).await.unwrap();
+        let guids: Vec<String> = config.profiles.iter().flat_map(|p| p.configs().iter().map(|c| c.uuid().to_string())).collect();
+        assert_eq!(guids, [WRAPPED_GUID, WRAPPED_GUID]);
+        assert_eq!(state.guid_renames(), [(old, Uuid::parse_str(WRAPPED_GUID).unwrap())]);
+
+        let held = state.mods.lock().await;
+        let again = tokio::time::timeout(std::time::Duration::from_secs(5), crate::commands::profiles::load_profiles_for(&state)).await;
+        assert!(again.is_ok(), "doesn't wait for the mod list once it was read");
+        drop(held);
+    }
+
+    /// profiles.json that can't be written on the start that finds the
+    /// unfinished ID change: the change is still this session's rename, so
+    /// the page moves its entries (and its save maps them).
+    #[tokio::test]
+    async fn an_id_change_that_cant_be_written_yet_is_still_a_rename() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let old = id_changing_update_stopped_at(base.path(), src.path(), CrashPoint::BeforeProfiles).await;
+        std::fs::write(base.path().join("profiles.json"), b"{ not json").unwrap();
+
+        let state = AppState::new(base.path().to_path_buf());
+        {
+            let mut guard = state.mods.lock().await;
+            ensure_mods_loaded(&mut guard, &state).await.unwrap();
+        }
+        assert_eq!(state.guid_renames(), [(old, Uuid::parse_str(WRAPPED_GUID).unwrap())]);
+        assert_eq!(records_in(base.path()).len(), 1, "still to do");
     }
 }

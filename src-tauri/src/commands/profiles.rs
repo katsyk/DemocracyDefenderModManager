@@ -62,21 +62,23 @@ fn remove_repeated_entries(config: &mut ProfilesConfig) -> usize {
 
 #[tauri::command]
 pub async fn load_profiles(state: State<'_, AppState>) -> TAResult<ProfilesConfig> {
-    // Reading the mod list first finishes the profiles of an update or
-    // replace that DDMM was closed in the middle of (see
-    // `mods::recover_leftover_folders`), so the page never gets them from
-    // before it -- and then saves them over the finished ones.
-    // Once done, never again: an install holding the list must not hold
-    // up the page.
-    use std::sync::atomic::Ordering;
-    if !state.mods_recovered.load(Ordering::Acquire) {
+    load_profiles_for(&state).await.into_ta_result()
+}
+
+/// [`load_profiles`]. Reading the mod list first finishes the profiles of
+/// an update or replace that DDMM was closed in the middle of (see
+/// `mods::recover_leftover_folders`), so the page never gets them from
+/// before it -- and then saves them over the finished ones. Once the list
+/// was read (by anyone), never again: an install holding the list must not
+/// hold up the page.
+pub(crate) async fn load_profiles_for(state: &AppState) -> anyhow::Result<ProfilesConfig> {
+    if !state.mods_recovered.load(std::sync::atomic::Ordering::Acquire) {
         let mut mods = state.mods.lock().await;
-        match crate::commands::mods::ensure_mods_loaded(&mut mods, &state.base_path).await {
-            Ok(_) => state.mods_recovered.store(true, Ordering::Release),
-            Err(e) => log::warn!("Couldn't read the mods before loading the profiles: {e:?}"),
+        if let Err(e) = crate::commands::mods::ensure_mods_loaded(&mut mods, state).await {
+            log::warn!("Couldn't read the mods before loading the profiles: {e:?}");
         }
     }
-    do_load_profiles(&state.base_path).await.into_ta_result()
+    do_load_profiles(&state.base_path).await
 }
 
 #[tauri::command]

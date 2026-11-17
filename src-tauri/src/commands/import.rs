@@ -50,7 +50,7 @@ fn begin(state: &AppState) -> anyhow::Result<(Arc<AtomicBool>, CancelSlot<'_>)> 
 async fn installed_index(state: &AppState) -> TAResult<InstalledIndex> {
     let mods = {
         let mut guard = state.mods.lock().await;
-        ensure_mods_loaded(&mut guard, &state.base_path).await?.clone()
+        ensure_mods_loaded(&mut guard, &state).await?.clone()
     };
     Ok(InstalledIndex::build(&mods).await)
 }
@@ -194,7 +194,7 @@ pub async fn run_import(
     // Make sure the mod list is loaded before installing into it.
     {
         let mut guard = state.mods.lock().await;
-        ensure_mods_loaded(&mut guard, &state.base_path).await?;
+        ensure_mods_loaded(&mut guard, &state).await?;
     }
 
     log::info!("Import: importing {} mod(s), about {} unpacked...", items.len(), crate::data_move::human_bytes(needed));

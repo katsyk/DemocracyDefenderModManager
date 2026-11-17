@@ -768,7 +768,7 @@ async fn run_check_with(
 
     let mods = {
         let mut guard = state.mods.lock().await;
-        ensure_mods_loaded(&mut guard, &state.base_path)
+        ensure_mods_loaded(&mut guard, &state)
             .await
             .map_err(|e| anyhow::anyhow!("{e:?}"))?
             .clone()
@@ -1192,7 +1192,7 @@ pub async fn update_mod_direct(
 
     let (mod_dir, source_id) = {
         let mut guard = state.mods.lock().await;
-        let mods = ensure_mods_loaded(&mut guard, &state.base_path).await?;
+        let mods = ensure_mods_loaded(&mut guard, &state).await?;
         let m = mods
             .iter()
             .find(|m| m.guid() == guid)
@@ -1604,7 +1604,7 @@ mod tests {
 
     async fn loaded(state: &AppState) {
         let mut guard = state.mods.lock().await;
-        ensure_mods_loaded(&mut guard, &state.base_path).await.unwrap();
+        ensure_mods_loaded(&mut guard, &state).await.unwrap();
     }
 
     /// "Skip" writes the sidecar with the mod list locked, so it can't
