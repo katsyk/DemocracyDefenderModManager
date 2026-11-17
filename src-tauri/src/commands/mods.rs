@@ -86,10 +86,10 @@ async fn apply_patch_layout(mod_dir: &Path, manifest: &mut Manifest) -> anyhow::
         // `crate::mod_root`).
         PatchLayout::RootHasFiles => Ok(crate::mod_root::wrapped_manifest_beside_patch_files(mod_dir).map(|folder| {
             format!(
-                "this mod has Helldivers 2 patch files at its top and a manifest.json in its folder \"{folder}\", so it \
+                "This mod has Helldivers 2 patch files at its top and a manifest.json in its folder \"{folder}\", so it \
                  isn't clear which is the mod. DDMM installed it as before: the top-level patch files are the mod, \
                  and that manifest.json isn't used (the folder's files are kept, but not deployed). Ask the mod's \
-                 author how it's meant to be installed"
+                 author how it's meant to be installed."
             )
         })),
         PatchLayout::Options(paths) => {
@@ -1339,9 +1339,12 @@ async fn adopt_folder_in_place(
         ));
     }
 
+    let mut unwrapped = None;
     if find_manifest_file(mod_dir).await.is_none() {
         if let Some(root) = crate::mod_root::folder_root_components(mod_dir) {
+            let shown = root.join("/");
             unwrap_adopted_folder(mods, mod_dir, root, subject).await?;
+            unwrapped = Some(shown);
         }
     }
 
@@ -1374,7 +1377,16 @@ async fn adopt_folder_in_place(
             if !had_manifest {
                 let _ = tokio::fs::remove_file(&manifest_file).await;
             }
-            return Err(e);
+            // Not moved back: the folder is already laid out as the
+            // author's mod, and adding it again picks up from there.
+            return Err(match unwrapped {
+                Some(shown) => e.add_hint(format!(
+                    "Before this, DDMM had already moved the contents of \"{shown}\" up into the mod's folder (that's \
+                     how it sets up a mod folder wrapped in another one); that stays as it is. Adding the folder again \
+                     continues from there."
+                )),
+                None => e,
+            });
         }
     };
 
@@ -1444,11 +1456,38 @@ async fn unwrap_adopted_folder(mods: &[Mod], mod_dir: &Path, root: Vec<String>, 
         .ok_or_else(|| anyhow::anyhow!("{:?} has no parent folder", mod_dir))
         .install_step(subject, InstallStep::PrepareFolder)?;
     let dir = mod_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || crate::mod_root::unwrap_in_place(&mods_root, &dir, &root))
+    use crate::mod_root::UnwrapFailure;
+    let result = tokio::task::spawn_blocking(move || crate::mod_root::unwrap_in_place(&mods_root, &dir, &root))
         .await
-        .map_err(anyhow::Error::from)
-        .and_then(|r| r)
-        .install_step(subject, InstallStep::PrepareFolder)
+        .map_err(|e| UnwrapFailure::Unchanged(e.into()))
+        .and_then(|r| r);
+    match result {
+        Ok(()) => Ok(()),
+        Err(UnwrapFailure::Unchanged(error)) => {
+            let in_use = error.chain().any(|e| {
+                e.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                    // 5: access denied, 32: sharing violation, 33: lock violation.
+                    matches!(io.raw_os_error(), Some(5 | 32 | 33)) || io.kind() == std::io::ErrorKind::PermissionDenied
+                })
+            });
+            let hint = if in_use {
+                "Nothing was changed. A file in the folder is in use: close Helldivers 2 and any window showing \
+                 that folder or a file from it (such as File Explorer), then add the folder again."
+            } else {
+                "Nothing was changed. Try adding the folder again."
+            };
+            Err(InstallError::new(subject, InstallStep::PrepareFolder, error).with_hint(hint))
+        }
+        Err(UnwrapFailure::SetAside { stage, error }) => {
+            let hidden = stage.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let folder = mod_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            Err(InstallError::new(subject, InstallStep::PrepareFolder, error).with_hint(format!(
+                "The folder couldn't be moved back yet: its files are safe in the hidden folder \"{hidden}\" in \
+                 DDMM's mod storage. Restart DDMM and it puts them back as \"{folder}\", as they were; then add the \
+                 folder again."
+            )))
+        }
+    }
 }
 
 async fn install_from_folder_inner(
@@ -1912,11 +1951,20 @@ async fn install_update_steps(
 ///
 /// Problems are logged, never fatal: the mod list still loads.
 pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Vec<PathBuf> {
-    // A wrapped folder being set up where it is when DDMM stopped
-    // (`.adopt-<id>`): put back or finished, by its record.
+    // Order: in-place setups (`.adopt-<id>`) first, before anything else
+    // here looks at the storage's folders. Putting one back recreates a
+    // visible mod folder (`mods/<name>`) that the rest of this sweep -- an
+    // update backup waiting for its folder, in particular -- must see as
+    // taken, or it could restore into that name. It only ever touches its
+    // own `.adopt-` folder and the folder named in its record, so nothing
+    // later in the sweep can be in its way.
     let root = mods_root.to_path_buf();
-    if let Err(e) = tokio::task::spawn_blocking(move || crate::mod_root::recover_in_place_unwraps(&root)).await {
-        log::warn!("Couldn't check for unfinished in-place setups: {e}");
+    match tokio::task::spawn_blocking(move || crate::mod_root::recover_in_place_unwraps(&root)).await {
+        Ok(left) if !left.is_empty() => {
+            log::error!("{} hidden in-place setup folder(s) left in the mod storage: {:?}", left.len(), left)
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("Couldn't check for unfinished in-place setups: {e}"),
     }
     let Ok(mut entries) = tokio::fs::read_dir(mods_root).await else { return Vec::new() };
     let mut backups = Vec::new();

@@ -251,14 +251,39 @@ fn unwrapping_only_touches_a_folder_directly_in_the_storage() {
 }
 
 #[test]
-fn a_failed_move_puts_the_folder_back() {
+fn a_missing_mod_root_is_refused_before_anything_moves() {
     let tmp = tempfile::tempdir().unwrap();
     let (mods_root, mod_dir) = wrapped_in_storage(tmp.path());
     let before = sorted_names(&mod_dir);
-    // A mod root that isn't there: the second rename fails.
     let err = unwrap_in_place(&mods_root, &mod_dir, &["Outer".to_string(), "Missing".to_string()]).unwrap_err();
-    assert!(format!("{err:#}").contains("Missing"), "{err:#}");
+    assert!(matches!(err, UnwrapFailure::Unchanged(_)), "{err:?}");
+    assert!(format!("{err}").contains("Missing"), "{err}");
     assert_eq!(sorted_names(&mods_root), ["Cool Mod", "Other"]);
+    assert_eq!(sorted_names(&mod_dir), before);
+}
+
+/// The second rename fails (here: the wrapper folder is read-only): the
+/// folder is renamed straight back, and the record removed.
+#[cfg(unix)]
+#[test]
+fn a_failed_second_rename_puts_the_folder_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (mods_root, mod_dir) = wrapped_in_storage(tmp.path());
+    let before = sorted_names(&mod_dir);
+    let outer = mod_dir.join("Outer");
+    std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let probe = outer.join("probe");
+    if std::fs::write(&probe, b"").is_ok() {
+        // Running as root: permissions can't make the rename fail.
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let err = unwrap_in_place(&mods_root, &mod_dir, &root()).unwrap_err();
+    std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(err, UnwrapFailure::Unchanged(_)), "{err:?}");
+    assert_eq!(sorted_names(&mods_root), ["Cool Mod", "Other"], "renamed back, record removed");
     assert_eq!(sorted_names(&mod_dir), before);
     assert!(mod_dir.join("Outer").join("Cool Mod").join("manifest.json").is_file());
 }
@@ -327,4 +352,157 @@ fn recovery_never_deletes_what_it_cant_place() {
     assert!(stage.join("Outer").join("Cool Mod").join("manifest.json").is_file());
     assert!(in_place_record_path(&stage).is_file());
     assert_eq!(sorted_names(tmp.path()), ["mods"]);
+}
+
+// --- recovery: what a record may name, and every state it can find ---
+
+#[test]
+fn only_plain_names_are_accepted() {
+    for ok in ["Cool Mod", ".hidden", "a.b", "x y (2)", "..."] {
+        assert!(is_plain_name(ok), "{ok}");
+    }
+    for bad in ["", ".", "..", "C:", "c:", "Z:", "C:nope", "a:b", "/", "/etc", "a/b", "a\\b", "\\\\server", "a\0b"] {
+        assert!(!is_plain_name(bad), "{bad:?}");
+    }
+}
+
+fn write_record(stage: &Path, json: &[u8]) {
+    std::fs::write(in_place_record_path(stage), json).unwrap();
+}
+
+/// A record naming a drive (`C:` replaces the whole path when joined on
+/// Windows) or anything but plain names is refused on every platform:
+/// nothing moves, nothing is deleted, the record stays.
+#[test]
+fn a_record_with_a_drive_or_path_is_left_alone() {
+    for json in [
+        br#"{"folder":"Cool","root":["C:","nope"]}"#.as_slice(),
+        br#"{"folder":"C:","root":["Outer","Cool Mod"]}"#,
+        br#"{"folder":"Cool","root":["Outer","C:\\Windows"]}"#,
+        br#"{"folder":"Cool","root":["/tmp"]}"#,
+        br#"{"folder":"Cool","root":[]}"#,
+        br#"{"folder":".adopt-x","root":["Outer"]}"#,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mods_root, mod_dir) = wrapped_in_storage(tmp.path());
+        let stage = set_aside_for_unwrap(&mods_root, &mod_dir, &root()).unwrap();
+        let before = sorted_names(&stage);
+        write_record(&stage, json);
+        let left = recover_in_place_unwraps(&mods_root);
+        assert_eq!(left, [stage.clone()], "{}", String::from_utf8_lossy(json));
+        assert_eq!(sorted_names(&stage), before);
+        assert!(in_place_record_path(&stage).is_file());
+        assert_eq!(sorted_names(tmp.path()), ["mods"]);
+        assert!(!mods_root.join("Cool").exists());
+    }
+}
+
+#[test]
+fn a_garbage_record_is_left_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mods_root, mod_dir) = wrapped_in_storage(tmp.path());
+    let stage = set_aside_for_unwrap(&mods_root, &mod_dir, &root()).unwrap();
+    write_record(&stage, b"\xff not json {");
+    assert_eq!(recover_in_place_unwraps(&mods_root), [stage.clone()]);
+    assert!(stage.join("Outer").join("Cool Mod").join("manifest.json").is_file());
+    assert!(in_place_record_path(&stage).is_file());
+    assert!(!mod_dir.exists());
+}
+
+/// The record was written, but DDMM stopped before the first rename: the
+/// folder is untouched and the record is just removed.
+#[test]
+fn a_record_without_its_folder_is_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mods_root, mod_dir) = wrapped_in_storage(tmp.path());
+    let before = sorted_names(&mod_dir);
+    let stage = mods_root.join(format!("{}{}", crate::mod_folder::IN_PLACE_UNWRAP_PREFIX, uuid::Uuid::new_v4()));
+    write_record(&stage, br#"{"folder":"Cool Mod","root":["Outer","Cool Mod"]}"#);
+    assert!(recover_in_place_unwraps(&mods_root).is_empty());
+    assert_eq!(sorted_names(&mods_root), ["Cool Mod", "Other"]);
+    assert_eq!(sorted_names(&mod_dir), before);
+}
+
+/// The mod's root was moved out, and then the mod's folder went away
+/// (deleted, or an update of it stopped halfway): the working folder,
+/// now just the wrapper shell, is never renamed into the mod's name.
+#[test]
+fn a_shell_whose_mod_folder_is_gone_is_left_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mods_root, mod_dir) = wrapped_in_storage(tmp.path());
+    let stage = set_aside_for_unwrap(&mods_root, &mod_dir, &root()).unwrap();
+    move_root_into_place(&stage, &mod_dir, &root()).unwrap();
+    std::fs::remove_dir_all(&mod_dir).unwrap();
+    assert_eq!(recover_in_place_unwraps(&mods_root), [stage.clone()]);
+    assert!(!mod_dir.exists());
+    assert!(stage.join("README.txt").is_file());
+    assert!(in_place_record_path(&stage).is_file());
+}
+
+/// DDMM stopped partway through tidying up: some items moved in, a
+/// wrapper folder already removed. The next start finishes.
+#[test]
+fn a_crash_midway_through_cleanup_is_finished() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mods_root, mod_dir) = wrapped_in_storage(tmp.path());
+    let stage = set_aside_for_unwrap(&mods_root, &mod_dir, &root()).unwrap();
+    move_root_into_place(&stage, &mod_dir, &root()).unwrap();
+    std::fs::rename(stage.join("Outer").join("preview.png"), mod_dir.join("preview.png")).unwrap();
+    std::fs::remove_dir(stage.join("Outer")).unwrap();
+    std::fs::rename(stage.join("README.txt"), mod_dir.join("README.txt")).unwrap();
+    assert!(recover_in_place_unwraps(&mods_root).is_empty());
+    assert_unwrapped(&mods_root, &mod_dir);
+}
+
+/// A wrapper folder in the working folder that is a symlink is never
+/// followed: recovery stops before touching anything, and the folder it
+/// points to (outside the storage) keeps its files, OS files included.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_wrapper_is_never_followed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mods_root, mod_dir) = wrapped_in_storage(tmp.path());
+    let outside = tmp.path().join("outside");
+    write(&outside.join("secret.txt"), b"keep");
+    write(&outside.join(".DS_Store"), b"keep");
+    let stage = set_aside_for_unwrap(&mods_root, &mod_dir, &root()).unwrap();
+    move_root_into_place(&stage, &mod_dir, &root()).unwrap();
+    std::fs::remove_file(stage.join("Outer").join("preview.png")).unwrap();
+    std::fs::remove_dir(stage.join("Outer")).unwrap();
+    std::os::unix::fs::symlink(&outside, stage.join("Outer")).unwrap();
+
+    assert_eq!(recover_in_place_unwraps(&mods_root), [stage.clone()]);
+    assert_eq!(sorted_names(&outside), [".DS_Store", "secret.txt"]);
+    assert!(!mod_dir.join("secret.txt").exists());
+    assert!(in_place_record_path(&stage).is_file());
+
+    // Nor at adopt time: a symlinked "wrapper" isn't one.
+    let top = tmp.path().join("mods").join("Linked");
+    std::fs::create_dir_all(&top).unwrap();
+    let real = tmp.path().join("real");
+    write(&real.join("manifest.json"), MANIFEST);
+    std::os::unix::fs::symlink(&real, top.join("Inner")).unwrap();
+    assert_eq!(folder_root_components(&top), None);
+    assert!(unwrap_in_place(&mods_root, &top, &["Inner".to_string()]).is_err());
+    assert!(real.join("manifest.json").is_file());
+    assert!(top.join("Inner").is_symlink());
+}
+
+/// A symlink next to the wrapper folder is moved as the link itself; what
+/// it points to is never touched.
+#[cfg(unix)]
+#[test]
+fn a_symlink_next_to_the_wrapper_moves_as_a_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mods_root, mod_dir) = wrapped_in_storage(tmp.path());
+    let outside = tmp.path().join("outside");
+    write(&outside.join("file.txt"), b"keep");
+    std::os::unix::fs::symlink(&outside, mod_dir.join("link")).unwrap();
+    // An OS-file name that clashes, as a link: only the link is removed.
+    std::fs::remove_file(mod_dir.join(".DS_Store")).unwrap();
+    std::os::unix::fs::symlink(&outside, mod_dir.join(".DS_Store")).unwrap();
+    unwrap_in_place(&mods_root, &mod_dir, &root()).unwrap();
+    assert!(mod_dir.join("link").is_symlink());
+    assert_eq!(std::fs::read(mod_dir.join(".DS_Store")).unwrap(), b"inner");
+    assert_eq!(sorted_names(&outside), ["file.txt"]);
 }

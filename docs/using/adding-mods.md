@@ -43,8 +43,12 @@ folder (after following shortcuts/symlinks, `..`, and on Windows and macOS ignor
   folder (a readme, a picture) is moved in too, because that's your only copy of it; files your operating system
   adds (`.DS_Store`, `Thumbs.db`, `__MACOSX`) are dropped if the mod already has one. If something next to the
   inner folder has the same name as something in it, the folder is refused and nothing is moved: rename or remove
-  one of them and add it again. If DDMM closes while moving the folder, the next start either finishes the move
-  or puts the folder back as it was.
+  one of them and add it again. While moving, DDMM keeps the folder's files in a hidden `.adopt-…` folder in
+  `mods/`. If DDMM closes (or a file is in use) partway, the next start either finishes the move or puts the
+  folder back as it was. In the rare case it can't tell which is safe (for example, the mod's folder was removed
+  in the meantime), it leaves the hidden `.adopt-…` folder as it is, deletes nothing, and says so in the log on
+  every start; move what you need out of it by hand, then delete it. If moving the files up worked but adding the
+  mod then failed, the folder stays unwrapped: add it again to finish.
 
   A wrapped folder that was added this way by an older DDMM keeps the manifest DDMM generated for it (its inner
   folders as options) and isn't moved on its own. It gets the author's manifest the next time it's updated (see

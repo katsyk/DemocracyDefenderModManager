@@ -236,14 +236,63 @@ fn manifest_in(dir: &Path) -> Option<Vec<u8>> {
 
 // --- A wrapped folder set up where it is, in the mod storage ---
 
+/// A single plain folder or file name, safe to join onto a folder: exactly
+/// one normal path component (no separators, not `.` or `..`, no root or
+/// drive such as `C:`), and no `:` anywhere (a drive prefix or an NTFS
+/// stream on Windows). Checked the same way on every platform, so a record
+/// written on one can't escape the storage on another.
+fn is_plain_name(name: &str) -> bool {
+    use std::path::Component;
+    if name.is_empty() || name.contains([':', '/', '\\', '\0']) {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    matches!((components.next(), components.next()), (Some(Component::Normal(c)), None) if c == std::ffi::OsStr::new(name))
+}
+
+/// Whether `path` is a real folder: there, a folder, and not a symlink (or
+/// a junction on Windows).
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+}
+
+/// How far the wrapper folders `root` are still there inside `top`:
+/// `Ok(true)` when the whole chain down to the mod's root is, `Ok(false)`
+/// when it stops early (the rest was moved away or removed). An error when
+/// `top` or any part of the chain that is there isn't a real folder (a
+/// symlink, a junction, a file): then nothing inside it may be touched.
+fn wrapper_chain(top: &Path, root: &[String]) -> std::io::Result<bool> {
+    let unsafe_path = |p: &Path| std::io::Error::other(format!("{p:?} isn't a real folder (a link, or a file)"));
+    if !is_real_dir(top) {
+        return Err(unsafe_path(top));
+    }
+    for depth in 1..=root.len() {
+        let level = top.join(join(&root[..depth]));
+        match std::fs::symlink_metadata(&level) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+            Ok(_) if !is_real_dir(&level) => return Err(unsafe_path(&level)),
+            Ok(_) => {}
+        }
+    }
+    Ok(true)
+}
+
 /// What's next to the wrapper folders `root` (see
 /// [`folder_root_components`]) in `top`: every item directly in `top` and
 /// in each wrapper folder above the mod's root, except the next wrapper
-/// folder down. Symlinks are listed as they are, never followed.
+/// folder down. Levels already gone are skipped. Symlinks are listed as
+/// they are, never followed; a wrapper folder that is one is an error
+/// (see [`wrapper_chain`]).
 fn items_beside_wrappers(top: &Path, root: &[String]) -> std::io::Result<Vec<(PathBuf, String)>> {
+    wrapper_chain(top, root)?;
     let mut out = Vec::new();
     for (depth, next) in root.iter().enumerate() {
-        for entry in std::fs::read_dir(top.join(join(&root[..depth])))? {
+        let level = top.join(join(&root[..depth]));
+        if !is_real_dir(&level) {
+            break;
+        }
+        for entry in std::fs::read_dir(&level)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             if &name != next {
@@ -260,6 +309,9 @@ fn items_beside_wrappers(top: &Path, root: &[String]) -> std::io::Result<Vec<(Pa
 /// name, ignoring letter case. OS files ([`is_os_file`]) never clash:
 /// they are dropped instead. `None` when everything fits. Only reads.
 pub(crate) fn in_place_clash(mod_dir: &Path, root: &[String]) -> std::io::Result<Option<String>> {
+    if !wrapper_chain(mod_dir, root)? {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{:?} isn't there", mod_dir.join(join(root)))));
+    }
     let mut taken = Vec::new();
     for entry in std::fs::read_dir(mod_dir.join(join(root)))? {
         taken.push(entry?.file_name().to_string_lossy().to_lowercase());
@@ -287,16 +339,19 @@ struct InPlaceRecord {
     root: Vec<String>,
 }
 
+impl InPlaceRecord {
+    /// Only plain names (see [`is_plain_name`]): the record is read back
+    /// from disk, and everything it names is joined onto the storage.
+    fn is_safe(&self) -> bool {
+        is_plain_name(&self.folder) && !self.folder.starts_with('.') && !self.root.is_empty() && self.root.iter().all(|c| is_plain_name(c))
+    }
+}
+
 /// The record file for the working folder `stage`.
 fn in_place_record_path(stage: &Path) -> PathBuf {
     let mut name = stage.file_name().unwrap_or_default().to_os_string();
     name.push(crate::mod_folder::IN_PLACE_UNWRAP_RECORD_SUFFIX);
     stage.with_file_name(name)
-}
-
-/// A single plain name: no separators, not `.` or `..`.
-fn is_plain_name(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\'])
 }
 
 /// `std::fs::rename`, retried a few times a moment apart (on Windows a
@@ -311,6 +366,25 @@ fn rename_with_retries(from: &Path, to: &Path) -> std::io::Result<()> {
         attempt = std::fs::rename(from, to);
     }
     attempt
+}
+
+/// Why [`unwrap_in_place`] failed, and so what the user needs to know.
+#[derive(Debug)]
+pub(crate) enum UnwrapFailure {
+    /// Nothing was changed (the folder couldn't be set aside, or was put
+    /// back right away).
+    Unchanged(anyhow::Error),
+    /// The folder is set aside as the hidden working folder `stage` and
+    /// couldn't be put back yet; the next start does.
+    SetAside { stage: PathBuf, error: anyhow::Error },
+}
+
+impl std::fmt::Display for UnwrapFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnwrapFailure::Unchanged(e) | UnwrapFailure::SetAside { error: e, .. } => write!(f, "{e:#}"),
+        }
+    }
 }
 
 /// Step 1 of [`unwrap_in_place`]: record what is about to happen, then
@@ -337,6 +411,7 @@ fn set_aside_for_unwrap(mods_root: &Path, mod_dir: &Path, root: &[String]) -> an
 
 /// Step 2: the mod's root takes the mod folder's place (one rename).
 fn move_root_into_place(stage: &Path, mod_dir: &Path, root: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(wrapper_chain(stage, root)?, "{:?} isn't there", stage.join(join(root)));
     let inner = stage.join(join(root));
     rename_with_retries(&inner, mod_dir).map_err(|e| anyhow::Error::from(e).context(format!("couldn't move {:?} to {:?}", inner, mod_dir)))
 }
@@ -346,37 +421,45 @@ fn move_root_into_place(stage: &Path, mod_dir: &Path, root: &[String]) -> anyhow
 /// remove the then empty wrapper folders and the working folder, then the
 /// record. Nothing else is ever deleted: anything that can't be moved
 /// keeps the working folder (and its record), and the next start tries
-/// again. Returns whether it all went.
+/// again. A wrapper folder that turns out to be a link (or `target` that
+/// isn't a real folder) stops it before anything is touched. Returns
+/// whether it all went.
 fn finish_in_place(stage: &Path, target: &Path, root: &[String]) -> bool {
-    match items_beside_wrappers(stage, root) {
-        Ok(items) => {
-            for (path, name) in items {
-                let dest = target.join(&name);
-                if std::fs::symlink_metadata(&dest).is_ok() {
-                    if is_os_file(&name) {
-                        let is_dir = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
-                        let removed = if is_dir { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
-                        if let Err(e) = removed {
-                            log::warn!("Couldn't remove {:?}: {}", path, e);
-                        }
-                    } else {
-                        log::warn!("Not moving {:?} into {:?}: something there already has its name.", path, target);
-                    }
-                    continue;
-                }
-                if let Err(e) = rename_with_retries(&path, &dest) {
-                    log::warn!("Couldn't move {:?} to {:?}: {}", path, dest, e);
-                }
-            }
-        }
-        Err(e) => log::warn!("Couldn't read {:?}: {}", stage, e),
+    if !is_real_dir(target) {
+        log::warn!("Not finishing {:?}: {:?} isn't a real folder.", stage, target);
+        return false;
     }
-    // Innermost first; `remove_dir` only removes empty folders.
+    let items = match items_beside_wrappers(stage, root) {
+        Ok(items) => items,
+        Err(e) => {
+            log::warn!("Not finishing {:?}: {}", stage, e);
+            return false;
+        }
+    };
+    for (path, name) in items {
+        let dest = target.join(&name);
+        if std::fs::symlink_metadata(&dest).is_ok() {
+            if is_os_file(&name) {
+                // A link is removed itself, never what it points to.
+                let removed = if is_real_dir(&path) { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+                if let Err(e) = removed {
+                    log::warn!("Couldn't remove {:?}: {}", path, e);
+                }
+            } else {
+                log::warn!("Not moving {:?} into {:?}: something there already has its name.", path, target);
+            }
+            continue;
+        }
+        if let Err(e) = rename_with_retries(&path, &dest) {
+            log::warn!("Couldn't move {:?} to {:?}: {}", path, dest, e);
+        }
+    }
+    // Innermost first; `remove_dir` only removes empty folders (and never
+    // follows a link).
     for depth in (0..root.len()).rev() {
         let _ = std::fs::remove_dir(stage.join(join(&root[..depth])));
     }
     if std::fs::symlink_metadata(stage).is_ok() {
-        log::warn!("Left {:?} as it is (not empty); the next start tries again.", stage);
         return false;
     }
     let _ = std::fs::remove_file(in_place_record_path(stage));
@@ -396,33 +479,59 @@ fn finish_in_place(stage: &Path, target: &Path, root: &[String]) -> bool {
 /// `.adopt-<id>` working folder and the mod's root renamed to `mod_dir`,
 /// each in one step. [`recover_in_place_unwraps`] puts a folder back if
 /// DDMM stopped between the two, and finishes the rest otherwise.
-pub(crate) fn unwrap_in_place(mods_root: &Path, mod_dir: &Path, root: &[String]) -> anyhow::Result<()> {
-    crate::mod_folder::ensure_mod_folder(mods_root, mod_dir)?;
-    anyhow::ensure!(!root.is_empty() && root.iter().all(|c| is_plain_name(c)), "not a wrapper folder path: {:?}", root);
-    let stage = set_aside_for_unwrap(mods_root, mod_dir, root)?;
+pub(crate) fn unwrap_in_place(mods_root: &Path, mod_dir: &Path, root: &[String]) -> Result<(), UnwrapFailure> {
+    let unchanged = UnwrapFailure::Unchanged;
+    crate::mod_folder::ensure_mod_folder(mods_root, mod_dir).map_err(unchanged)?;
+    if root.is_empty() || !root.iter().all(|c| is_plain_name(c)) {
+        return Err(unchanged(anyhow::anyhow!("not a wrapper folder path: {:?}", root)));
+    }
+    match wrapper_chain(mod_dir, root) {
+        Ok(true) => {}
+        Ok(false) => return Err(unchanged(anyhow::anyhow!("{:?} isn't there", mod_dir.join(join(root))))),
+        Err(e) => return Err(unchanged(e.into())),
+    }
+    let stage = set_aside_for_unwrap(mods_root, mod_dir, root).map_err(unchanged)?;
     if let Err(e) = move_root_into_place(&stage, mod_dir, root) {
-        match rename_with_retries(&stage, mod_dir) {
+        return match rename_with_retries(&stage, mod_dir) {
             Ok(()) => {
                 let _ = std::fs::remove_file(in_place_record_path(&stage));
+                Err(unchanged(e))
             }
-            Err(back) => log::error!("Couldn't put {:?} back as {:?} yet (done on the next start): {}", stage, mod_dir, back),
-        }
-        return Err(e);
+            Err(back) => {
+                log::error!("Couldn't put {:?} back as {:?} yet (done on the next start): {}", stage, mod_dir, back);
+                Err(UnwrapFailure::SetAside { stage, error: e })
+            }
+        };
     }
-    finish_in_place(&stage, mod_dir, root);
+    if !finish_in_place(&stage, mod_dir, root) {
+        log::warn!(
+            "The mod in {:?} is set up, but {:?} still holds files that couldn't be moved in; the next start tries again.",
+            mod_dir,
+            stage
+        );
+    }
     Ok(())
 }
 
 /// At startup, before the mods are read: put each wrapped folder that
 /// [`unwrap_in_place`] was working on when DDMM stopped in order, by its
-/// record. If the mod's folder isn't there (stopped between the two
-/// renames), the working folder is renamed back to it, as it was before;
-/// if it is, the rest is finished. A working folder without a readable
-/// record, or whose mod root is still inside it while a folder of the
-/// mod's name exists, is left alone. Nothing but OS files is deleted.
-pub(crate) fn recover_in_place_unwraps(mods_root: &Path) {
-    use crate::mod_folder::{IN_PLACE_UNWRAP_PREFIX, IN_PLACE_UNWRAP_RECORD_SUFFIX};
-    let Ok(entries) = std::fs::read_dir(mods_root) else { return };
+/// record (only plain names, see [`InPlaceRecord::is_safe`], and only
+/// folders directly in `mods_root`). Decided by whether the mod's root is
+/// still inside the working folder:
+///
+/// - still there, the mod's folder not: stopped between the two renames,
+///   so the working folder is renamed back, as the folder was before;
+/// - moved out, the mod's folder there: the rest is finished;
+/// - anything else (both there, or neither; an unreadable record; a link
+///   where a wrapper folder should be): left as it is, and logged on
+///   every start.
+///
+/// Nothing but OS files is ever deleted. Returns the working folders left
+/// as they are.
+pub(crate) fn recover_in_place_unwraps(mods_root: &Path) -> Vec<PathBuf> {
+    use crate::mod_folder::{ensure_mod_folder, IN_PLACE_UNWRAP_PREFIX, IN_PLACE_UNWRAP_RECORD_SUFFIX};
+    let mut left = Vec::new();
+    let Ok(entries) = std::fs::read_dir(mods_root) else { return left };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(id) = name.strip_prefix(IN_PLACE_UNWRAP_PREFIX).and_then(|r| r.strip_suffix(IN_PLACE_UNWRAP_RECORD_SUFFIX)) else {
@@ -433,40 +542,57 @@ pub(crate) fn recover_in_place_unwraps(mods_root: &Path) {
         }
         let record_path = entry.path();
         let stage = mods_root.join(format!("{IN_PLACE_UNWRAP_PREFIX}{id}"));
-        let record = std::fs::read(&record_path)
-            .ok()
-            .and_then(|data| serde_json::from_slice::<InPlaceRecord>(&data).ok())
-            .filter(|r| {
-                is_plain_name(&r.folder) && !r.folder.starts_with('.') && !r.root.is_empty() && r.root.iter().all(|c| is_plain_name(c))
-            });
-        let Some(record) = record else {
-            log::warn!("Leaving {:?} and {:?} as they are: the record can't be read.", stage, record_path);
-            continue;
-        };
-        let target = mods_root.join(&record.folder);
         if std::fs::symlink_metadata(&stage).is_err() {
             // Never started, or finished.
             let _ = std::fs::remove_file(&record_path);
             continue;
         }
-        if std::fs::symlink_metadata(&target).is_err() {
-            match rename_with_retries(&stage, &target) {
+        let mut leave = |why: String| {
+            log::error!(
+                "Left the hidden folder {:?} as it is: {why}. It holds files from a mod folder DDMM was setting up \
+                 where it is; move them back by hand if you need them.",
+                stage
+            );
+            left.push(stage.clone());
+        };
+        let record = std::fs::read(&record_path).ok().and_then(|data| serde_json::from_slice::<InPlaceRecord>(&data).ok());
+        let Some(record) = record.filter(InPlaceRecord::is_safe) else {
+            leave(format!("its record {:?} can't be read", record_path));
+            continue;
+        };
+        let target = mods_root.join(&record.folder);
+        if let Err(e) = ensure_mod_folder(mods_root, &stage).and_then(|()| ensure_mod_folder(mods_root, &target)) {
+            leave(format!("{e:#}"));
+            continue;
+        }
+        let root_inside = match wrapper_chain(&stage, &record.root) {
+            Ok(inside) => inside,
+            Err(e) => {
+                leave(e.to_string());
+                continue;
+            }
+        };
+        let target_there = std::fs::symlink_metadata(&target).is_ok();
+        match (root_inside, target_there) {
+            (true, false) => match rename_with_retries(&stage, &target) {
                 Ok(()) => {
                     log::info!("Put {:?} back as it was, after setting it up as a mod didn't finish.", target);
                     let _ = std::fs::remove_file(&record_path);
                 }
-                Err(e) => log::warn!("Couldn't put {:?} back as {:?} yet: {}", stage, target, e),
+                Err(e) => leave(format!("couldn't rename it back to {:?} yet: {e}", target)),
+            },
+            (false, true) => {
+                if finish_in_place(&stage, &target, &record.root) {
+                    log::info!("Finished setting up {:?} where it is.", target);
+                } else {
+                    leave(format!("some of it couldn't be moved into {:?}", target));
+                }
             }
-            continue;
-        }
-        if std::fs::symlink_metadata(stage.join(join(&record.root))).is_ok() {
-            log::warn!("Leaving {:?} as it is: {:?} exists, but the mod's files are still in the working folder.", stage, target);
-            continue;
-        }
-        if finish_in_place(&stage, &target, &record.root) {
-            log::info!("Finished setting up {:?} where it is.", target);
+            (true, true) => leave(format!("{:?} exists, but the mod's files are still in the hidden folder", target)),
+            (false, false) => leave(format!("the mod's folder {:?} is gone (removed since?)", target)),
         }
     }
+    left
 }
 
 #[cfg(test)]

@@ -84,6 +84,15 @@ impl InstallError {
         self
     }
 
+    /// Add `more` after the hint (or make it the hint, if there's none).
+    pub fn add_hint(mut self, more: impl AsRef<str>) -> Self {
+        self.hint = Some(match self.hint.take() {
+            Some(hint) => format!("{hint} {}", more.as_ref()),
+            None => more.as_ref().to_string(),
+        });
+        self
+    }
+
     pub fn step(&self) -> InstallStep {
         self.step
     }
