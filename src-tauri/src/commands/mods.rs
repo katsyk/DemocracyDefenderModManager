@@ -81,7 +81,17 @@ async fn apply_patch_layout(mod_dir: &Path, manifest: &mut Manifest) -> anyhow::
     let layout = detect_patch_layout(mod_dir).await?;
 
     match layout {
-        PatchLayout::RootHasFiles => Ok(None),
+        // Patch files at the top next to a wrapper folder with a
+        // manifest.json: installed the way it always was, but say so (see
+        // `crate::mod_root`).
+        PatchLayout::RootHasFiles => Ok(crate::mod_root::wrapped_manifest_beside_patch_files(mod_dir).map(|folder| {
+            format!(
+                "This mod has Helldivers 2 patch files at its top and a manifest.json in its folder \"{folder}\", so it \
+                 isn't clear which is the mod. DDMM installed it as before: the top-level patch files are the mod, \
+                 and that manifest.json isn't used (the folder's files are kept, but not deployed). Ask the mod's \
+                 author how it's meant to be installed."
+            )
+        })),
         PatchLayout::Options(paths) => {
             if let Manifest::Legacy(legacy) = manifest {
                 legacy.options = Some(paths);
@@ -1304,6 +1314,10 @@ async fn install_folder_steps(
 /// otherwise a local one is generated and written into it (and removed
 /// again if registering fails). Nothing else in the folder is touched, and
 /// the folder is never deleted.
+///
+/// A folder that only wraps the mod's own folder (`mods/My Mod/My Mod/manifest.json`)
+/// is first unwrapped where it is ([`unwrap_adopted_folder`]), so the mod
+/// gets its author's manifest, as it would from the zipped folder.
 async fn adopt_folder_in_place(
     mods: &mut Vec<Mod>,
     mod_dir: &Path,
@@ -1323,6 +1337,15 @@ async fn adopt_folder_in_place(
             InstallStep::Register,
             anyhow::anyhow!("\"{}\" is already installed (it's in your mod list)", existing.name()),
         ));
+    }
+
+    let mut unwrapped = None;
+    if find_manifest_file(mod_dir).await.is_none() {
+        if let Some(root) = crate::mod_root::folder_root_components(mod_dir) {
+            let shown = root.join("/");
+            unwrap_adopted_folder(mods, mod_dir, root, subject).await?;
+            unwrapped = Some(shown);
+        }
     }
 
     let manifest_file = mod_dir.join(MANIFEST_FILE);
@@ -1354,7 +1377,16 @@ async fn adopt_folder_in_place(
             if !had_manifest {
                 let _ = tokio::fs::remove_file(&manifest_file).await;
             }
-            return Err(e);
+            // Not moved back: the folder is already laid out as the
+            // author's mod, and adding it again picks up from there.
+            return Err(match unwrapped {
+                Some(shown) => e.add_hint(format!(
+                    "Before this, DDMM had already moved the contents of \"{shown}\" up into the mod's folder (that's \
+                     how it sets up a mod folder wrapped in another one); that stays as it is. Adding the folder again \
+                     continues from there."
+                )),
+                None => e,
+            });
         }
     };
 
@@ -1366,6 +1398,110 @@ async fn adopt_folder_in_place(
     mods.push(r#mod.clone());
     log::info!("Mod adopted in place.");
     Ok((r#mod, warning))
+}
+
+/// Move the mod's root of a wrapped folder in the mod storage (the
+/// wrapper folders `root` inside `mod_dir`) up into `mod_dir`, with
+/// whatever was next to the wrapper folders (see
+/// [`crate::mod_root::unwrap_in_place`]). The mod keeps the folder it is
+/// in, so that folder stays the one place it lives in for deploy, update,
+/// replace and delete.
+///
+/// Refused, with nothing changed, when the author's manifest.json carries
+/// the ID of a mod already in the list, or when something next to the
+/// wrapper folders has the same name as something in the mod's root.
+async fn unwrap_adopted_folder(mods: &[Mod], mod_dir: &Path, root: Vec<String>, subject: &str) -> Result<(), InstallError> {
+    let shown = root.join("/");
+    let inner = mod_dir.join(root.iter().collect::<PathBuf>());
+    let manifest_path = find_manifest_file(&inner)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("{:?} has no manifest.json", inner))
+        .install_step(subject, InstallStep::ReadManifest)?;
+    let data = tokio::fs::read(&manifest_path)
+        .await
+        .with_context(|| format!("couldn't read {:?}", manifest_path))
+        .install_step(subject, InstallStep::ReadManifest)?;
+    let manifest = Manifest::parse(&data, &manifest_path.to_string_lossy()).install_step(subject, InstallStep::ReadManifest)?;
+    let candidate = Mod { manifest, directory: mod_dir.to_path_buf(), sources: Vec::new() };
+    check_not_installed(mods, &candidate, subject, AddRoute::Folder)?;
+
+    let clash = {
+        let (dir, root) = (mod_dir.to_path_buf(), root.clone());
+        tokio::task::spawn_blocking(move || crate::mod_root::in_place_clash(&dir, &root))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r.map_err(anyhow::Error::from))
+            .install_step(subject, InstallStep::PrepareFolder)?
+    };
+    if let Some(name) = clash {
+        return Err(InstallError::new(
+            subject,
+            InstallStep::PrepareFolder,
+            anyhow::anyhow!(
+                "its mod files and manifest.json are in the folder \"{shown}\" inside it, and \"{name}\" next to \
+                 that folder has the same name as something in it"
+            ),
+        )
+        .with_hint(format!(
+            "DDMM sets the mod up by moving the contents of \"{shown}\" up into the mod's folder, together with \
+             what's next to it. Rename or remove one of the two \"{name}\", then add the folder again. Nothing was \
+             changed."
+        )));
+    }
+
+    log::info!("{:?} wraps its mod's folder {:?}; moving that folder's contents up.", mod_dir, shown);
+    let mods_root = mod_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("{:?} has no parent folder", mod_dir))
+        .install_step(subject, InstallStep::PrepareFolder)?;
+    let dir = mod_dir.to_path_buf();
+    use crate::mod_root::UnwrapFailure;
+    let result = match tokio::task::spawn_blocking(move || crate::mod_root::unwrap_in_place(&mods_root, &dir, &root)).await {
+        Ok(result) => result,
+        // The move stopped somewhere unknown: don't claim nothing changed.
+        Err(e) => {
+            return Err(InstallError::new(subject, InstallStep::PrepareFolder, anyhow::Error::from(e)).with_hint(
+                "DDMM stopped partway through moving the folder's files. Restart DDMM: on the next start it either \
+                 finishes setting the folder up or puts it back as it was. Then add the folder again if it isn't in \
+                 your mod list.",
+            ));
+        }
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(UnwrapFailure::Unchanged(error)) => {
+            let hint = unwrap_refused_hint(&error);
+            Err(InstallError::new(subject, InstallStep::PrepareFolder, error).with_hint(hint))
+        }
+        Err(UnwrapFailure::SetAside { stage, error }) => {
+            let hidden = stage.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let folder = mod_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            Err(InstallError::new(subject, InstallStep::PrepareFolder, error).with_hint(format!(
+                "The folder couldn't be moved back yet: its files are safe in the hidden folder \"{hidden}\" in \
+                 DDMM's mod storage. Restart DDMM and it puts them back as \"{folder}\", as they were; then add the \
+                 folder again."
+            )))
+        }
+    }
+}
+
+/// The hint when moving a wrapped folder's files up was refused before
+/// anything changed: a file in use (Windows), missing permissions, or
+/// anything else.
+fn unwrap_refused_hint(error: &anyhow::Error) -> &'static str {
+    let io_errors = || error.chain().filter_map(|e| e.downcast_ref::<std::io::Error>());
+    // 5: access denied, 32: sharing violation, 33: lock violation -- the
+    // codes Windows gives for a file another program has open.
+    if cfg!(windows) && io_errors().any(|io| matches!(io.raw_os_error(), Some(5 | 32 | 33))) {
+        return "Nothing was changed. A file in the folder is in use: close Helldivers 2 and any window showing \
+                that folder or a file from it (such as File Explorer), then add the folder again.";
+    }
+    if io_errors().any(|io| io.kind() == std::io::ErrorKind::PermissionDenied) {
+        return "Nothing was changed. DDMM isn't allowed to rename things in that folder: check that you own it and \
+                can write to it (and to DDMM's mod storage), then add the folder again.";
+    }
+    "Nothing was changed. Try adding the folder again."
 }
 
 async fn install_from_folder_inner(
@@ -1819,6 +1955,9 @@ async fn install_update_steps(
 ///   loaded) -- e.g. when the update finished, when the mod was deleted
 ///   since, or when restoring it would list two mods with one ID;
 /// - `.update-<id>` (an update's staging copy) is left where it is;
+/// - `.adopt-<id>` (a wrapped folder in the storage being set up where it
+///   is, see [`crate::mod_root::unwrap_in_place`]) is put back, or
+///   finished, by its record, and otherwise left where it is;
 /// - any other dot-folder with a manifest.json (a mod installed by an
 ///   older version from a file whose name started with a dot) is renamed
 ///   to a visible name so it keeps showing up. When that rename fails it
@@ -1826,6 +1965,21 @@ async fn install_update_steps(
 ///
 /// Problems are logged, never fatal: the mod list still loads.
 pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Vec<PathBuf> {
+    // Order: in-place setups (`.adopt-<id>`) first, before anything else
+    // here looks at the storage's folders. Putting one back recreates a
+    // visible mod folder (`mods/<name>`) that the rest of this sweep -- an
+    // update backup waiting for its folder, in particular -- must see as
+    // taken, or it could restore into that name. It only ever touches its
+    // own `.adopt-` folder and the folder named in its record, so nothing
+    // later in the sweep can be in its way.
+    let root = mods_root.to_path_buf();
+    match tokio::task::spawn_blocking(move || crate::mod_root::recover_in_place_unwraps(&root)).await {
+        Ok(left) if !left.is_empty() => {
+            log::error!("{} hidden in-place setup folder(s) left in the mod storage: {:?}", left.len(), left)
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("Couldn't check for unfinished in-place setups: {e}"),
+    }
     let Ok(mut entries) = tokio::fs::read_dir(mods_root).await else { return Vec::new() };
     let mut backups = Vec::new();
     let mut staging = Vec::new();
@@ -1877,6 +2031,8 @@ pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Vec<PathBuf> {
                     Err(e) => log::warn!("Couldn't remove {:?} yet: {:#}", path, e),
                 }
             }
+        } else if name.starts_with(mod_folder::IN_PLACE_UNWRAP_PREFIX) {
+            // The user's own files: handled above, never loaded or renamed.
         } else if is_dir && path.join(MANIFEST_FILE).is_file() {
             hidden_mods.push((path, name));
         }
@@ -4633,4 +4789,8 @@ mod tests {
         assert_eq!(std::fs::read(old.directory.join("Red").join(patch_file_name())).unwrap(), b"v1");
         assert_eq!(mods_folder_names(base.path()), folders_before);
     }
+
+    /// Archives and folders laid out around a wrapper folder, and wrapped
+    /// folders adopted in place in the mod storage.
+    mod wrapper_edges;
 }

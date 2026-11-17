@@ -32,8 +32,28 @@ folder (after following shortcuts/symlinks, `..`, and on Windows and macOS ignor
   install): refused with an explanation, and nothing is copied. Mods in `mods/` that have a `manifest.json` are
   already in your list.
 - **A mod folder sitting directly in `mods/`** that isn't in your list yet (it has no `manifest.json`, for
-  example because you unpacked it there yourself): it's added **where it is**. Nothing is copied or moved; DDMM
-  just writes a `manifest.json` into it.
+  example because you unpacked it there yourself): it's added **where it is**. Nothing is copied; DDMM just
+  writes a `manifest.json` into it.
+
+  If that folder only wraps the mod's own folder, which has the author's `manifest.json`
+  (`mods/My Mod/My Mod v1.2/manifest.json`, the same layouts as in
+  [Zipping the folder or its contents](../authors/packaging.md#zipping-the-folder-or-its-contents)), DDMM uses
+  that `manifest.json`, with the author's ID and options, as it would for the zipped folder. It moves the inner
+  folder's contents up into `mods/My Mod`, so the mod keeps its folder name. Anything else next to the inner
+  folder (a readme, a picture) is moved in too, because that's your only copy of it; files your operating system
+  adds (`.DS_Store`, `Thumbs.db`, `__MACOSX`) are dropped if the mod already has one. If something next to the
+  inner folder has the same name as something in it, the folder is refused and nothing is moved: rename or remove
+  one of them and add it again. While moving, DDMM keeps the folder's files in a hidden `.adopt-…` folder in
+  `mods/`. If DDMM closes (or a file is in use) partway, the next start either finishes the move or puts the
+  folder back as it was. In the rare case it can't tell which is safe (for example, the mod's folder was removed
+  in the meantime), it leaves the hidden `.adopt-…` folder as it is, deletes nothing, and says so in the log on
+  every start; move what you need out of it by hand, then delete it. If moving the files up worked but adding the
+  mod then failed, the folder stays unwrapped: add it again to finish.
+
+  A wrapped folder that was added this way by an older DDMM keeps the manifest DDMM generated for it (its inner
+  folders as options) and isn't moved on its own. It gets the author's manifest the next time it's updated (see
+  [Updating mods](updating-mods.md)). To switch it now, copy its folder somewhere outside `mods/`, remove the mod
+  in DDMM (that deletes its folder in `mods/`), then add the copy with **Add Folder**.
 - **A folder deeper inside one of your mods** (such as a mod's `Options/Red` folder): refused. Pick the mod's own
   folder instead.
 
@@ -70,7 +90,9 @@ Every install goes through the same steps:
 2. If the archive/folder contains a `manifest.json`, that becomes the mod's manifest (see
    [Manifest reference](../authors/manifest.md) for the formats DDMM understands). The `manifest.json` is
    also found when the mod's folder was zipped instead of its contents (`My Mod/manifest.json`): that folder is
-   then installed as the mod. See
+   then installed as the mod. A readme, picture or shortcut next to that folder doesn't change this, and isn't
+   installed (your archive or folder still has it). Patch files next to that folder do: DDMM installs everything
+   as it always did, with the top as the mod, and warns that the folder's `manifest.json` wasn't used. See
    [Zipping the folder or its contents](../authors/packaging.md#zipping-the-folder-or-its-contents).
 3. If there's no `manifest.json`, DDMM generates a minimal one automatically: a random ID, the archive/folder name
    as the mod's name, an empty description — and, for this auto-generated manifest only, DDMM also scans the mod's
