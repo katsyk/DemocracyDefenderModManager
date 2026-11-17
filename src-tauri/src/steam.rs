@@ -231,6 +231,20 @@ mod tests {
         assert!(!process_names_indicate_game_running(std::iter::empty()));
     }
 
+    /// The real process list, refreshed the way `is_game_running` does it:
+    /// guards the sysinfo calls themselves (renamed/changed across sysinfo
+    /// releases), not just the name matching. This test binary must show up
+    /// with a UTF-8 name, and no game runs on a test machine.
+    #[test]
+    fn live_process_list_has_this_process_and_no_game() {
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let me = sysinfo::Pid::from_u32(std::process::id());
+        let name = system.process(me).and_then(|p| p.name().to_str()).unwrap_or_default();
+        assert!(!name.is_empty(), "own process missing from the process list");
+        assert!(!is_game_running());
+    }
+
     #[test]
     fn parses_multiple_library_paths() {
         let vdf = r#"

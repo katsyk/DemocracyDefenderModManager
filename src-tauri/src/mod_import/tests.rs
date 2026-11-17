@@ -1925,3 +1925,39 @@ async fn one_replace_per_mod_and_a_removed_mod_gets_a_new_install() {
     assert_eq!(report.imported.len(), 1);
     assert_eq!(report.imported[0].guid, cool.guid());
 }
+
+/// Archive and folder hashes are stored (fingerprints of installed mods) and
+/// compared later, so their text form must not change across hash crate
+/// upgrades: lowercase hex of the raw digest. Expected values computed
+/// independently (Python hashlib).
+#[test]
+fn file_hashes_are_lowercase_hex_known_vectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let cases: [(&str, Vec<u8>, &str); 3] = [
+        ("empty", Vec::new(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        ("abc", b"abc".to_vec(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        // Larger than the 1 MiB read buffer, so it's hashed in two updates.
+        (
+            "big",
+            (0..1024 * 1024 + 17).map(|i| (i % 251) as u8).collect(),
+            "f4bf9b8dec6e3e28b2ec33266145d244fe97a6bce1ec054ace053bab67d2ef9a",
+        ),
+    ];
+    for (name, bytes, want) in cases {
+        let path = dir.path().join(name);
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(sha256_file(&path).unwrap(), want, "{name}");
+    }
+}
+
+#[test]
+fn folder_hash_known_vector_ignores_the_origin_record() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"abc").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("b.txt"), b"hello\n").unwrap();
+    const WANT: &str = "b466bddaf65f43330c3a578c416018c7f1f50ea9bf86b7821a17567fe7af24ef";
+    assert_eq!(tree_hash(dir.path()).unwrap(), WANT);
+    std::fs::write(dir.path().join(ORIGIN_SIDECAR_FILE), b"{}").unwrap();
+    assert_eq!(tree_hash(dir.path()).unwrap(), WANT);
+}
