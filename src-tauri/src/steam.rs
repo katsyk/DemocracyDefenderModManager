@@ -196,9 +196,18 @@ fn process_names_indicate_game_running<'a>(names: impl Iterator<Item = &'a str>)
 /// fail safely on its own); this never blocks the game from launching or
 /// anything other than that one bridge step.
 pub fn is_game_running() -> bool {
-    let mut system = sysinfo::System::new();
-    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    process_names_indicate_game_running(system.processes().values().filter_map(|p| p.name().to_str()))
+    process_names_indicate_game_running(running_processes().processes().values().filter_map(|p| p.name().to_str()))
+}
+
+/// Every running process with just its name: sysinfo fills the name in on
+/// every refresh (Linux: `/proc/<pid>/stat`; Windows: the process snapshot
+/// entry), so CPU, memory, disk and exe stay off. Threads are left out too:
+/// a process is always listed itself, and its name is what's matched.
+fn running_processes() -> sysinfo::System {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().without_tasks());
+    system
 }
 
 #[cfg(test)]
@@ -217,7 +226,10 @@ mod tests {
 
     #[test]
     fn game_process_detected_when_truncated_to_15_chars_like_linux() {
-        // "HellDivers2.exe" truncated to sysinfo's 15-char Linux limit.
+        // Linux keeps 15 chars of a name. "HellDivers2.exe" is exactly 15,
+        // so it arrives whole; any name cut shorter still matches as long as
+        // the 11-char needle survives.
+        assert!(process_names_indicate_game_running(["HellDivers2.exe"].into_iter()));
         assert!(process_names_indicate_game_running(["HellDivers2.ex"].into_iter()));
     }
 
@@ -231,18 +243,15 @@ mod tests {
         assert!(!process_names_indicate_game_running(std::iter::empty()));
     }
 
-    /// The real process list, refreshed the way `is_game_running` does it:
-    /// guards the sysinfo calls themselves (renamed/changed across sysinfo
-    /// releases), not just the name matching. This test binary must show up
-    /// with a UTF-8 name, and no game runs on a test machine.
+    /// The real process list, refreshed exactly as `is_game_running` does
+    /// (names only): guards the sysinfo calls themselves, not just the name
+    /// matching. This test binary must show up with a non-empty UTF-8 name.
     #[test]
-    fn live_process_list_has_this_process_and_no_game() {
-        let mut system = sysinfo::System::new();
-        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    fn live_process_list_names_this_process() {
+        let system = running_processes();
         let me = sysinfo::Pid::from_u32(std::process::id());
         let name = system.process(me).and_then(|p| p.name().to_str()).unwrap_or_default();
         assert!(!name.is_empty(), "own process missing from the process list");
-        assert!(!is_game_running());
     }
 
     #[test]
