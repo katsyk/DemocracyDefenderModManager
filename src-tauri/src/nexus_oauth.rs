@@ -881,6 +881,22 @@ mod tests {
         assert_eq!(s256_challenge(RFC_VERIFIER), RFC_CHALLENGE);
     }
 
+    /// Pinned across hash crate upgrades: the challenge must stay
+    /// byte-identical (unpadded base64url of the raw 32-byte digest, never
+    /// of a hex string). Expected values computed independently (Python
+    /// hashlib + base64.urlsafe_b64encode).
+    #[test]
+    fn s256_challenge_is_byte_identical_for_more_known_vectors() {
+        // Longest verifier RFC 7636 allows (128 chars), every allowed symbol.
+        let max = "abcdefghijklmnopqrstuvwxyz0123456789-._~ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~\
+                   ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~abcdefgh";
+        assert_eq!(max.len(), 128);
+        assert_eq!(s256_challenge(max), "r1PIZ-XBY-UiST7aXu-8oxGV4xZlIVFPgBY9czKjsmQ");
+        // SHA-256("") — the digest itself, so a change in the output type
+        // shows up even without a valid verifier.
+        assert_eq!(s256_challenge(""), "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU");
+    }
+
     #[test]
     fn pkce_verifier_has_the_right_length_and_charset() {
         let a = Pkce::generate().unwrap();

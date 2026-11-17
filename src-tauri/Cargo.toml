@@ -14,9 +14,8 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset"] }
-tauri-plugin-opener = "2"
-tauri-plugin-log = "2"
-tauri-plugin-fs = "2"
+tauri-plugin-opener = "2.7.3"
+tauri-plugin-log = "2.10.2"
 tauri-plugin-prevent-default = "5"
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
@@ -33,7 +32,7 @@ zip = "9"
 # mod authors pick it); flate2 is already in the tree through `zip`.
 sevenz-rust2 = { version = "0.23", features = ["util", "deflate"] }
 unrar = "0.5"
-tauri-plugin-dialog = "2.7"
+tauri-plugin-dialog = "2.8.4"
 futures = "0.3"
 regex = "1.12"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
@@ -41,14 +40,14 @@ percent-encoding = "2.3.2"
 dirs = "7"
 tauri-plugin-deep-link = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
-sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 url = "2.5"
 # OS keychain for the optional Nexus Mods API key (Windows Credential
 # Manager, macOS Keychain, Linux Secret Service). See `secrets.rs`.
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 # PKCE (S256 code challenge) for the optional "Sign in to Nexus Mods". See
 # `nexus_oauth.rs`.
-sha2 = "0.10"
+sha2 = "0.11"
 base64 = "0.22"
 # File identity (dev+inode / volume+file index) for "is this folder the
 # same as, inside, or containing that one" checks. See `fs_util::path_overlap`.
@@ -65,7 +64,7 @@ libc = "0.2"
 winreg = "0.56.0"
 # Free space on the drive a data folder move goes to (`data_move::available_space`).
 # ...and whether the process named in bridge.json is still running (`bridge::state::process_is_alive`).
-windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
