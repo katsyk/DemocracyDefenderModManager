@@ -101,14 +101,20 @@ my-mod.zip
 
 That folder then becomes the mod's root: only its contents are installed, and every path in your manifest
 (`Include`, `Image`, `IconPath`) is relative to it, exactly as you wrote them. Files that operating systems add
-(`__MACOSX`, `.DS_Store`, `Thumbs.db`, `desktop.ini`) don't count as a second folder. Anything else next to the
-folder, such as a readme, isn't installed.
+(`__MACOSX`, `.DS_Store`, `Thumbs.db`, `desktop.ini`) don't count as a second folder.
+
+Loose files next to the folder that aren't patch files (a readme, a preview image, a `.url` shortcut, a licence)
+don't stop this either, at any of the 3 levels. They aren't installed: they describe the download, not the mod,
+and the archive you shipped still has them. Put anything the mod itself needs (its icon, option images) inside
+the mod's folder, next to `manifest.json`.
 
 DDMM doesn't look inside the folder when the archive's root has:
 
 - a `manifest.json` (that one is used),
 - two or more folders,
-- patch files.
+- patch files. Game files next to the folder make it unclear which is the mod, so DDMM doesn't guess: the archive
+  installs the way it always did, with the root as the mod (nothing is left out, and the folder's `manifest.json`
+  is not used), and DDMM shows a warning saying so. Ship either the folder or the loose patch files, not both.
 
 ## Icons and option images
 

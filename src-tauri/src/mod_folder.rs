@@ -311,6 +311,14 @@ pub fn pending_delete_record_path(dir: &Path) -> PathBuf {
 /// a copy of an archive's contents.
 pub const UNWRAP_PREFIX: &str = ".unwrap-";
 
+/// Prefix of the folder a wrapped mod folder already in the mod storage
+/// is renamed to while its mod's root is moved up into its place (see
+/// [`crate::mod_root::unwrap_in_place`]). Holds the user's own files: it
+/// is never deleted at startup, only put back or finished, by its record.
+pub const IN_PLACE_UNWRAP_PREFIX: &str = ".adopt-";
+/// Suffix of the record written next to an `.adopt-<id>` folder first.
+pub const IN_PLACE_UNWRAP_RECORD_SUFFIX: &str = ".unwrap";
+
 /// Prefix of the throwaway folder an update is extracted into.
 pub const UPDATE_STAGING_PREFIX: &str = ".update-";
 /// Prefix of the folder the old version of a mod is set aside in while an
