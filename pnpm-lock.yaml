@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@humanspeak/svelte-markdown':
-        specifier: ^1.4.1
-        version: 1.9.1(svelte@5.57.1)
+        specifier: ^1.9.5
+        version: 1.9.5(svelte@5.57.1)
       '@rodrigodagostino/svelte-sortable-list':
         specifier: ^2.1.15
         version: 2.2.6(svelte@5.57.1)
@@ -18,17 +18,17 @@ importers:
         specifier: ^2.12.0
         version: 2.12.0
       '@tauri-apps/plugin-dialog':
-        specifier: ^2.7.0
-        version: 2.7.3
-      '@tauri-apps/plugin-fs':
-        specifier: ^2.5.0
-        version: 2.5.2
-      '@tauri-apps/plugin-log':
         specifier: ^2.8.0
-        version: 2.9.2
+        version: 2.8.0
+      '@tauri-apps/plugin-fs':
+        specifier: ^2.6.0
+        version: 2.6.0
+      '@tauri-apps/plugin-log':
+        specifier: ^2.10.0
+        version: 2.10.0
       '@tauri-apps/plugin-opener':
-        specifier: ^2
-        version: 2.5.5
+        specifier: ^2.6.0
+        version: 2.6.0
       '@tauri-apps/plugin-shell':
         specifier: ^2.3.5
         version: 2.3.6
@@ -229,15 +229,18 @@ packages:
     resolution: {integrity: sha512-im7GIIpgjdD6Fx68xCeiXw3XiDv30/WMRAaodMm+ep0ptYfEUd0cdNeTAylHGIRTJIeByKFHdTmPjAktyDM/JQ==}
     engines: {node: '>=20.19.0'}
 
-  '@humanspeak/svelte-markdown@1.9.1':
-    resolution: {integrity: sha512-2JjpATdZfhGQurV38LtkUkPkyQzM7eXku6LoDBeK6i69qqOe0OLmMwpqtMnhwG3ItdxXOt/3miPbSaNTFqMl5Q==}
+  '@humanspeak/svelte-markdown@1.9.5':
+    resolution: {integrity: sha512-RqWrhE+tkqE1i7JQWpgTIzciSWbhAYSyfeCahh+doxOKzm9kkPXxtr+Vb6PEmZWktXXtBIgE7KAUZuso8hFs0A==}
     engines: {node: '>=22'}
     peerDependencies:
+      '@tanstack/highlight': '>=0.1.0'
       katex: '>=0.16.0'
       mermaid: '>=10.0.0'
       shiki: '>=4.0.0'
       svelte: ^5.0.0
     peerDependenciesMeta:
+      '@tanstack/highlight':
+        optional: true
       katex:
         optional: true
       mermaid:
@@ -635,17 +638,17 @@ packages:
     engines: {node: '>= 10'}
     hasBin: true
 
-  '@tauri-apps/plugin-dialog@2.7.3':
-    resolution: {integrity: sha512-CRgE+7TP4tvq9MjBU6f04NLTFIqVMLKHk3hAqlhil00ngK9ACTrXPH3oHpKMProxILodd3YjBoKbMwSI4IEcfA==}
+  '@tauri-apps/plugin-dialog@2.8.0':
+    resolution: {integrity: sha512-HSSD5C8UFE9ijD1wue84F7jjaIReFmj8AAPtS+xyjYRltJafIc4BiWHY7SJ6vbbew6u+YljEJHfyNfy5VwywXg==}
 
-  '@tauri-apps/plugin-fs@2.5.2':
-    resolution: {integrity: sha512-XXvMSnFiob+G1H+YHCDf+bzWVumseQuEIhzpbOJzevUfL4k0U+sTApZWJHpoLiamggnVPJm5dJ5sDsniRyWxlg==}
+  '@tauri-apps/plugin-fs@2.6.0':
+    resolution: {integrity: sha512-MhBAZ4rryd+h9fijd/GWDfArqiAeGI0ZNduV4wuRyUVI6wDZ+oDBY7atqtoXKDwlTUVSvpvmWJAY0ehQd/v6Uw==}
 
-  '@tauri-apps/plugin-log@2.9.2':
-    resolution: {integrity: sha512-QC2uTQyC+4269xawGXzVLDzIvMB2JwzZHd1lg3ltXtXqrauwikqlbNt6Tm3H++1RN0gPtcvp4cBc5bF6u/DUnw==}
+  '@tauri-apps/plugin-log@2.10.0':
+    resolution: {integrity: sha512-IHMspJx/fDA+8q8O6MTbrKffkemSDa1I5iXRhnLrLVnOd7xK4bAosyQbWcjnpPA7E+c6BMkpsE2kESHhkiBrDg==}
 
-  '@tauri-apps/plugin-opener@2.5.5':
-    resolution: {integrity: sha512-xvzGai5aQds8j8R8RsUK/lW6pGG50YgOYIPLzvkqmkwAj7dfySOD7sGtejRzvVdMmv1EQfKVEFh1MvmDp8QR0g==}
+  '@tauri-apps/plugin-opener@2.6.0':
+    resolution: {integrity: sha512-KIl9qkBGyAUrbzfCtdk+NRPTXUOwpMyUKsKN57H6/qA0q8auVywXpfUyWClqX6I/iH8PHmqAUa/KK9YZPWVQew==}
 
   '@tauri-apps/plugin-shell@2.3.6':
     resolution: {integrity: sha512-C2AG+QmBJPK0E3gccLXfRdjTfGBC9DgwzGi/PfYa61ieAZbYvhvOss4OdSGfn/D28N3THGhJZEhf3lozOh/Uqw==}
@@ -1072,7 +1075,7 @@ snapshots:
 
   '@humanspeak/memory-cache@1.2.0': {}
 
-  '@humanspeak/svelte-markdown@1.9.1(svelte@5.57.1)':
+  '@humanspeak/svelte-markdown@1.9.5(svelte@5.57.1)':
     dependencies:
       '@humanspeak/memory-cache': 1.2.0
       github-slugger: 2.0.0
@@ -1349,19 +1352,19 @@ snapshots:
       '@tauri-apps/cli-win32-ia32-msvc': 2.12.0
       '@tauri-apps/cli-win32-x64-msvc': 2.12.0
 
-  '@tauri-apps/plugin-dialog@2.7.3':
+  '@tauri-apps/plugin-dialog@2.8.0':
     dependencies:
       '@tauri-apps/api': 2.12.0
 
-  '@tauri-apps/plugin-fs@2.5.2':
+  '@tauri-apps/plugin-fs@2.6.0':
     dependencies:
       '@tauri-apps/api': 2.12.0
 
-  '@tauri-apps/plugin-log@2.9.2':
+  '@tauri-apps/plugin-log@2.10.0':
     dependencies:
       '@tauri-apps/api': 2.12.0
 
-  '@tauri-apps/plugin-opener@2.5.5':
+  '@tauri-apps/plugin-opener@2.6.0':
     dependencies:
       '@tauri-apps/api': 2.12.0
 
