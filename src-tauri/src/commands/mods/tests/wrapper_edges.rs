@@ -389,3 +389,19 @@ async fn a_mod_adopted_wrapped_before_is_left_alone_until_updated() {
     assert_eq!(updated.directory, dir);
     assert_authors_manifest(&updated, "Cool Mod");
 }
+
+/// Error codes only mean "in use" on Windows; elsewhere 5/32/33 are EIO,
+/// EPIPE and EDOM, and a permission error gets a permissions hint.
+#[test]
+fn the_refused_unwrap_hint_fits_the_platform() {
+    let os = |code| anyhow::Error::from(std::io::Error::from_raw_os_error(code)).context("couldn't move");
+    let denied = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    if cfg!(windows) {
+        assert!(unwrap_refused_hint(&os(32)).contains("in use"));
+    } else {
+        assert!(!unwrap_refused_hint(&os(32)).contains("in use"));
+        assert!(!unwrap_refused_hint(&os(5)).contains("File Explorer"));
+        assert!(unwrap_refused_hint(&denied).contains("isn't allowed"));
+    }
+    assert_eq!(unwrap_refused_hint(&anyhow::anyhow!("other")), "Nothing was changed. Try adding the folder again.");
+}

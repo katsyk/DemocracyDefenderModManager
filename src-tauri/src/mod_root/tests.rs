@@ -506,3 +506,28 @@ fn a_symlink_next_to_the_wrapper_moves_as_a_link() {
     assert_eq!(std::fs::read(mod_dir.join(".DS_Store")).unwrap(), b"inner");
     assert_eq!(sorted_names(&outside), ["file.txt"]);
 }
+
+/// An `.adopt-` working folder that is itself a symlink is left alone:
+/// neither renamed into the mod's name nor finished into it.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_working_folder_is_left_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mods_root, mod_dir) = wrapped_in_storage(tmp.path());
+    let outside = tmp.path().join("outside");
+    write(&outside.join("Outer").join("Cool Mod").join("manifest.json"), MANIFEST);
+    write(&outside.join("README.txt"), b"keep");
+    let stage = mods_root.join(format!("{}{}", crate::mod_folder::IN_PLACE_UNWRAP_PREFIX, uuid::Uuid::new_v4()));
+    std::os::unix::fs::symlink(&outside, &stage).unwrap();
+    write_record(&stage, br#"{"folder":"Gone","root":["Outer","Cool Mod"]}"#);
+    assert_eq!(recover_in_place_unwraps(&mods_root), [stage.clone()]);
+    assert!(stage.is_symlink());
+    assert!(!mods_root.join("Gone").exists());
+    // With the mod's folder there, it isn't finished into it either.
+    let before = sorted_names(&mod_dir);
+    write_record(&stage, br#"{"folder":"Cool Mod","root":["Elsewhere"]}"#);
+    assert_eq!(recover_in_place_unwraps(&mods_root), [stage.clone()]);
+    assert_eq!(sorted_names(&mod_dir), before);
+    assert_eq!(sorted_names(&outside), ["Outer", "README.txt"]);
+    assert!(outside.join("Outer").join("Cool Mod").join("manifest.json").is_file());
+}

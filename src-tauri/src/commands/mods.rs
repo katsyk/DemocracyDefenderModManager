@@ -1457,25 +1457,21 @@ async fn unwrap_adopted_folder(mods: &[Mod], mod_dir: &Path, root: Vec<String>, 
         .install_step(subject, InstallStep::PrepareFolder)?;
     let dir = mod_dir.to_path_buf();
     use crate::mod_root::UnwrapFailure;
-    let result = tokio::task::spawn_blocking(move || crate::mod_root::unwrap_in_place(&mods_root, &dir, &root))
-        .await
-        .map_err(|e| UnwrapFailure::Unchanged(e.into()))
-        .and_then(|r| r);
+    let result = match tokio::task::spawn_blocking(move || crate::mod_root::unwrap_in_place(&mods_root, &dir, &root)).await {
+        Ok(result) => result,
+        // The move stopped somewhere unknown: don't claim nothing changed.
+        Err(e) => {
+            return Err(InstallError::new(subject, InstallStep::PrepareFolder, anyhow::Error::from(e)).with_hint(
+                "DDMM stopped partway through moving the folder's files. Restart DDMM: on the next start it either \
+                 finishes setting the folder up or puts it back as it was. Then add the folder again if it isn't in \
+                 your mod list.",
+            ));
+        }
+    };
     match result {
         Ok(()) => Ok(()),
         Err(UnwrapFailure::Unchanged(error)) => {
-            let in_use = error.chain().any(|e| {
-                e.downcast_ref::<std::io::Error>().is_some_and(|io| {
-                    // 5: access denied, 32: sharing violation, 33: lock violation.
-                    matches!(io.raw_os_error(), Some(5 | 32 | 33)) || io.kind() == std::io::ErrorKind::PermissionDenied
-                })
-            });
-            let hint = if in_use {
-                "Nothing was changed. A file in the folder is in use: close Helldivers 2 and any window showing \
-                 that folder or a file from it (such as File Explorer), then add the folder again."
-            } else {
-                "Nothing was changed. Try adding the folder again."
-            };
+            let hint = unwrap_refused_hint(&error);
             Err(InstallError::new(subject, InstallStep::PrepareFolder, error).with_hint(hint))
         }
         Err(UnwrapFailure::SetAside { stage, error }) => {
@@ -1488,6 +1484,24 @@ async fn unwrap_adopted_folder(mods: &[Mod], mod_dir: &Path, root: Vec<String>, 
             )))
         }
     }
+}
+
+/// The hint when moving a wrapped folder's files up was refused before
+/// anything changed: a file in use (Windows), missing permissions, or
+/// anything else.
+fn unwrap_refused_hint(error: &anyhow::Error) -> &'static str {
+    let io_errors = || error.chain().filter_map(|e| e.downcast_ref::<std::io::Error>());
+    // 5: access denied, 32: sharing violation, 33: lock violation -- the
+    // codes Windows gives for a file another program has open.
+    if cfg!(windows) && io_errors().any(|io| matches!(io.raw_os_error(), Some(5 | 32 | 33))) {
+        return "Nothing was changed. A file in the folder is in use: close Helldivers 2 and any window showing \
+                that folder or a file from it (such as File Explorer), then add the folder again.";
+    }
+    if io_errors().any(|io| io.kind() == std::io::ErrorKind::PermissionDenied) {
+        return "Nothing was changed. DDMM isn't allowed to rename things in that folder: check that you own it and \
+                can write to it (and to DDMM's mod storage), then add the folder again.";
+    }
+    "Nothing was changed. Try adding the folder again."
 }
 
 async fn install_from_folder_inner(
