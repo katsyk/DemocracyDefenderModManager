@@ -49,7 +49,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node
         uses: actions/setup-node@v7
@@ -57,7 +57,7 @@ jobs:
           node-version: 24
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: latest
 
@@ -127,14 +127,14 @@ jobs:
           { echo '```'; cat dist-inspect.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-distros-build
           path: dist/*
           if-no-files-found: error
 
       - name: Upload package inspection
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-distros-inspect
           path: dist-inspect.txt
@@ -160,7 +160,7 @@ jobs:
     name: smoke (${{ matrix.name }})
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download artifacts
         uses: actions/download-artifact@v8
@@ -212,7 +212,7 @@ jobs:
       # build.yml's release / verify-release-assets jobs.
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-distros-smoke-${{ matrix.name }}
           path: out/
