@@ -104,6 +104,10 @@ pub struct AppState {
     /// page moves its own copy (`get_guid_renames`), and saving maps any
     /// old ID it still sends.
     guid_renames: std::sync::Mutex<Vec<(uuid::Uuid, uuid::Uuid)>>,
+    /// Set once the mod list was read this session, which also finishes
+    /// the profiles of an update DDMM was closed in the middle of: until
+    /// then, `load_profiles` reads the mod list first.
+    mods_recovered: AtomicBool,
     /// When the browser extension last talked to this session (any bridge
     /// request) -- decides whether a browser update can finish with the
     /// extension's "Update with DDMM" button.
@@ -166,6 +170,7 @@ impl AppState {
             last_update_report: Mutex::default(),
             last_update_check: Mutex::default(),
             guid_renames: std::sync::Mutex::default(),
+            mods_recovered: AtomicBool::new(false),
             bridge_last_seen: Mutex::default(),
             nexus_sign_in_cancel: Mutex::default(),
             import_cancel: std::sync::Mutex::default(),

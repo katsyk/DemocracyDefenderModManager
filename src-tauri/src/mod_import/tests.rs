@@ -36,7 +36,7 @@ fn nexus_name(name: &str, id: u32, version: &str, ts: u64) -> String {
 async fn state_with_empty_library(base: &Path) -> AppState {
     let state = AppState::new(base.to_path_buf());
     let mut guard = state.mods.lock().await;
-    crate::commands::mods::ensure_mods_loaded(&mut guard, base).await.unwrap();
+    crate::commands::mods::ensure_mods_loaded(&mut guard, &state).await.unwrap();
     drop(guard);
     state
 }
@@ -828,7 +828,7 @@ async fn imports_an_arsenal_library_with_names_nexus_ids_order_and_options() {
     // After a reload from disk, too.
     drop(mods);
     let mut fresh = None;
-    let reloaded = crate::commands::mods::ensure_mods_loaded(&mut fresh, &base).await.unwrap();
+    let reloaded = crate::commands::mods::ensure_mods_loaded_at(&mut fresh, &base).await.unwrap().0;
     assert!(reloaded.iter().any(|m| m.guid().to_string() == "0b8f3c1e-8a41-4b52-9d2c-3f1e2d4c5b6a"));
 
     assert_eq!(snapshot(&data), before);
@@ -1059,7 +1059,7 @@ async fn linking_by_guid_keeps_the_profile_out_of_it() {
     manifest["Guid"] = serde_json::json!("0b8f3c1e-8a41-4b52-9d2c-3f1e2d4c5b6a");
     std::fs::write(dir.join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
     let mut fresh = None;
-    let reloaded = crate::commands::mods::ensure_mods_loaded(&mut fresh, &base).await.unwrap().clone();
+    let reloaded = crate::commands::mods::ensure_mods_loaded_at(&mut fresh, &base).await.unwrap().0.clone();
     *state.mods.lock().await = Some(reloaded);
     let manifest_before = std::fs::read(dir.join("manifest.json")).unwrap();
 

@@ -127,6 +127,14 @@ move to the new ID in every profile. They keep their position and whether they'r
 fit the author's options are reset to the defaults. If another mod in your list already has that `Guid`, the
 updated mod keeps the ID it had.
 
+If DDMM is closed or crashes in the middle of an update or a replace, the next start finishes it. You get one of two
+results. Either the old version is back with your profiles as they were, or the new version is in place with its
+profile entries handled as described above: kept, moved to the new ID, and option choices that no longer fit reset
+to the defaults. The update doesn't leave entries on an ID that no installed mod has, except where described above
+(an author's own new `Guid`). If profiles.json can't be written at that start (another program has it open), DDMM
+tries again on the next start and meanwhile shows the entries under the mod's new ID. Option choices reset this way
+aren't announced with the usual *options reset* message, so check the mod's options after such a crash.
+
 ## Nexus Mods: optional API key (sign-in coming soon) { #nexus-mods-and-the-optional-api-key }
 
 Nexus Mods only answers these questions ("is there a newer file?") for people who have an API key or are signed

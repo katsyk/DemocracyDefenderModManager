@@ -348,6 +348,10 @@
         profiles = loadedConfig.Profiles;
         activeProfile = loadedConfig.Active;
         profilesLoaded = true;
+        // An update DDMM was closed in the middle of may have changed a
+        // mod's ID without getting to profiles.json yet (it was in use):
+        // the backend reports it as a rename, so its entries follow here.
+        await applyGuidRenames();
 
         if (repeated.length > 0) {
             // Saved at once, so the repaired list is what's on disk even if

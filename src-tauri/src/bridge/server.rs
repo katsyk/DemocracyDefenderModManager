@@ -278,7 +278,7 @@ async fn handle_status(app: &AppHandle, id: String) -> String {
     };
     let mod_count = {
         let mut mods_guard = state.mods.lock().await;
-        ensure_mods_loaded(&mut mods_guard, &state.base_path)
+        ensure_mods_loaded(&mut mods_guard, &state)
             .await
             .map(|m| m.len())
             .unwrap_or(0)
@@ -313,7 +313,7 @@ async fn handle_query(app: &AppHandle, raw: serde_json::Value, id: String) -> St
 
     let state = app.state::<AppState>();
     let mut mods_guard = state.mods.lock().await;
-    let mods: &[crate::models::Mod] = match ensure_mods_loaded(&mut mods_guard, &state.base_path).await {
+    let mods: &[crate::models::Mod] = match ensure_mods_loaded(&mut mods_guard, &state).await {
         Ok(m) => m,
         Err(e) => return ErrorReply::new(id, ErrorCode::Internal, format!("couldn't read installed mods: {e}")).to_line(),
     };
@@ -497,7 +497,7 @@ async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String, arr
     // Mods page -- without holding the mod list meanwhile.
     let is_update = {
         let mut mods_guard = state.mods.lock().await;
-        match ensure_mods_loaded(&mut mods_guard, &state.base_path).await {
+        match ensure_mods_loaded(&mut mods_guard, &state).await {
             Ok(mods) => install::update_target(mods, &file, req.page_url.as_deref(), req.download_url.as_deref())
                 .await
                 .is_some(),
@@ -544,7 +544,7 @@ async fn handle_install(app: &AppHandle, raw: serde_json::Value, id: String, arr
 
     let outcome = {
         let mut mods_guard = state.mods.lock().await;
-        let mods = match ensure_mods_loaded(&mut mods_guard, &state.base_path).await {
+        let mods = match ensure_mods_loaded(&mut mods_guard, &state).await {
             Ok(m) => m,
             Err(e) => {
                 return ErrorReply::new(id, ErrorCode::Internal, format!("couldn't read installed mods: {e}")).to_line()
