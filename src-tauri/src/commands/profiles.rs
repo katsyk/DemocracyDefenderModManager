@@ -62,6 +62,20 @@ fn remove_repeated_entries(config: &mut ProfilesConfig) -> usize {
 
 #[tauri::command]
 pub async fn load_profiles(state: State<'_, AppState>) -> TAResult<ProfilesConfig> {
+    // Reading the mod list first finishes the profiles of an update or
+    // replace that DDMM was closed in the middle of (see
+    // `mods::recover_leftover_folders`), so the page never gets them from
+    // before it -- and then saves them over the finished ones.
+    // Once done, never again: an install holding the list must not hold
+    // up the page.
+    use std::sync::atomic::Ordering;
+    if !state.mods_recovered.load(Ordering::Acquire) {
+        let mut mods = state.mods.lock().await;
+        match crate::commands::mods::ensure_mods_loaded(&mut mods, &state.base_path).await {
+            Ok(_) => state.mods_recovered.store(true, Ordering::Release),
+            Err(e) => log::warn!("Couldn't read the mods before loading the profiles: {e:?}"),
+        }
+    }
     do_load_profiles(&state.base_path).await.into_ta_result()
 }
 
@@ -167,11 +181,13 @@ pub async fn remove_from_saved_profiles(base_path: &std::path::Path, guid: uuid:
 }
 
 /// Move every entry of the mod `old` in the saved profiles.json over to
-/// `new` (the ID the mod has after an update), and return how many there
+/// `new` (the ID the mod has after an update), and fit those and the
+/// entries already listing `new` to `manifest`; return how many there
 /// were. On/off and position are kept; option choices that no longer fit
 /// `manifest` are reset to the defaults (see [`fit_config`]). A profile
 /// that already lists `new` keeps whichever entry comes first. Nothing is
-/// written when no profile has `old` (or there's no file yet).
+/// written when no profile has either (or there's no file yet). Running it
+/// again changes nothing.
 pub async fn migrate_saved_profiles(
     base_path: &std::path::Path,
     old: uuid::Uuid,
@@ -187,7 +203,7 @@ pub async fn migrate_saved_profiles(
     for profile in &mut config.profiles {
         match profile {
             Profile::V1 { configs, .. } => {
-                for c in configs.iter_mut().filter(|c| *c.uuid() == old) {
+                for c in configs.iter_mut().filter(|c| *c.uuid() == old || *c.uuid() == new) {
                     *c = fit_config(c, new, manifest);
                     moved += 1;
                 }
@@ -261,10 +277,13 @@ static PROFILES_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()
 
 /// Write profiles.json atomically: into a temporary file next to it, then
 /// renamed over it (retried while another program has it open), so it's
-/// never seen (or left, on a crash) half written.
+/// never seen (or left, on a crash) half written -- and durably, so that
+/// once this returns a crash can't take the write back (an update's
+/// record of what's left to do is dropped only after it).
 async fn write_profiles(base_path: &std::path::Path, config: &ProfilesConfig) -> anyhow::Result<()> {
     let data = serde_json::to_vec_pretty(config)?;
-    crate::fs_util::replace_file(&base_path.join(PROFILES_FILE), &data).await
+    let file = base_path.join(PROFILES_FILE);
+    tokio::task::spawn_blocking(move || crate::fs_util::replace_file_durably_blocking(&file, &data)).await?
 }
 
 #[cfg(test)]

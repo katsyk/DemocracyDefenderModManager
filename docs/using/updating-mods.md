@@ -127,6 +127,10 @@ move to the new ID in every profile. They keep their position and whether they'r
 fit the author's options are reset to the defaults. If another mod in your list already has that `Guid`, the
 updated mod keeps the ID it had.
 
+If DDMM is closed or crashes in the middle of an update or a replace, the next start finishes it: you get either
+the old version with your profiles as they were, or the new version with its profile entries moved and fitted as
+described above. Never a *Mod not found* entry for a mod that's installed.
+
 ## Nexus Mods: optional API key (sign-in coming soon) { #nexus-mods-and-the-optional-api-key }
 
 Nexus Mods only answers these questions ("is there a newer file?") for people who have an API key or are signed

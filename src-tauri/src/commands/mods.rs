@@ -617,9 +617,10 @@ pub(crate) async fn install_or_replace(
 /// reset, in profiles.json too; see `profiles::fit_saved_profiles`).
 ///
 /// Where the mod came from is recorded afresh for the new file, as for a
-/// new install of it: from its Nexus Mods download name (no API call), or
-/// by the caller that knows (Add URL, a browser install). What the last
-/// update check said about the replaced mod is dropped.
+/// new install of it: from its Nexus Mods download name (no API call, and
+/// moved in with the new files), or by the caller that knows (Add URL, a
+/// browser install). What the last update check said about the replaced
+/// mod is dropped.
 pub(crate) async fn replace_from_archive(
     state: &AppState,
     mods: &mut Vec<Mod>,
@@ -628,18 +629,10 @@ pub(crate) async fn replace_from_archive(
 ) -> TAResult<(Mod, Option<String>)> {
     log::info!("Replacing mod {{{}}} with {:?}...", guid, archive_file);
     let subject = subject_of(archive_file);
-    let (mut r#mod, warning) = install_update_steps(state, mods, archive_file, guid, &subject, true)
+    let (r#mod, warning) = install_update_steps(state, mods, archive_file, guid, &subject, true)
         .await
         .map_err(report)?;
 
-    let file_name = archive_file.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
-    record_nexus_from_file_name(mods, &mut r#mod, &file_name, true).await;
-
-    match crate::commands::profiles::fit_saved_profiles(&state.base_path, guid, &r#mod.manifest).await {
-        Ok(0) => {}
-        Ok(n) => log::info!("Fitted {n} profile entr(ies) of the replaced mod to its new manifest."),
-        Err(e) => log::warn!("Couldn't fit the replaced mod's profile entries in profiles.json: {:#}", e),
-    }
     if let Some(report) = state.last_update_report.lock().await.as_mut() {
         report.results.retain(|e| e.guid != guid);
     }
@@ -694,14 +687,29 @@ pub(crate) async fn install_from_archive(state: &AppState, mods: &mut Vec<Mod>, 
 /// came from (Add from URL, browser installs) write their origin afterwards,
 /// which replaces this one: a download URL's attribution always wins.
 async fn record_nexus_from_file_name(mods: &mut [Mod], r#mod: &mut Mod, file_name: &str, is_archive: bool) {
-    let Some(nexus) = crate::mod_import::nexus_ref_from_name(file_name, is_archive) else { return };
+    let Some(sidecar) = nexus_sidecar_from_file_name(r#mod, file_name, is_archive).await else { return };
+    if let Err(e) = sources::save_origin_sidecar(&r#mod.directory, &sidecar).await {
+        log::error!("Failed to record the Nexus Mods source: {}", e);
+        return;
+    }
+    r#mod.resolve_sources().await;
+    if let Some(existing) = mods.iter_mut().find(|m| m.guid() == r#mod.guid()) {
+        *existing = r#mod.clone();
+    }
+}
+
+/// The origin record [`record_nexus_from_file_name`] writes for `r#mod`
+/// (its sources resolved, its folder the one the record goes into), or
+/// `None` when it writes none.
+async fn nexus_sidecar_from_file_name(r#mod: &Mod, file_name: &str, is_archive: bool) -> Option<sources::OriginSidecar> {
+    let nexus = crate::mod_import::nexus_ref_from_name(file_name, is_archive)?;
     let other_page = r#mod.sources.iter().any(|s| {
         s.provider.eq_ignore_ascii_case("nexus")
             && s.origin == sources::SourceOrigin::Manifest
             && sources::resolved_source_id(s).is_some_and(|id| id != nexus.mod_id)
     });
     if other_page || sources::load_origin_sidecar(&r#mod.directory).await.is_some() {
-        return;
+        return None;
     }
     let mut sidecar = sources::OriginSidecar {
         sources: Vec::new(),
@@ -711,17 +719,7 @@ async fn record_nexus_from_file_name(mods: &mut [Mod], r#mod: &mut Mod, file_nam
         imported_archive: None,
     };
     crate::mod_import::add_nexus_to_sidecar(&mut sidecar, &nexus, r#mod);
-    if sidecar.sources.is_empty() && sidecar.installed_files.is_empty() {
-        return;
-    }
-    if let Err(e) = sources::save_origin_sidecar(&r#mod.directory, &sidecar).await {
-        log::error!("Failed to record the Nexus Mods source: {}", e);
-        return;
-    }
-    r#mod.resolve_sources().await;
-    if let Some(existing) = mods.iter_mut().find(|m| m.guid() == r#mod.guid()) {
-        *existing = r#mod.clone();
-    }
+    (!sidecar.sources.is_empty() || !sidecar.installed_files.is_empty()).then_some(sidecar)
 }
 
 /// [`install_from_archive`] named `name` (the generated manifest's name
@@ -1866,21 +1864,48 @@ async fn install_update_steps(
         return Err(InstallError::new(subject, replace, e));
     }
 
-    log::info!("Swapping in updated content for mod {{{}}}...", final_guid);
-    let backup_dir = mods_root.join(format!("{}{}", mod_folder::UPDATE_BACKUP_PREFIX, Uuid::new_v4()));
-    // Note where the old version belongs before setting it aside, so that
-    // if DDMM is closed (or crashes) mid-swap, the next start can put it
-    // back instead of guessing.
-    let record = mod_folder::backup_record_path(&backup_dir);
-    if let Err(e) = write_backup_record(&record, &old_dir, false).await {
+    // Where the mod came from goes in with the new files, so the swap
+    // below moves them in together and a crash after it never leaves the
+    // mod without an origin record. A replace records it afresh, from the
+    // file's Nexus Mods download name (as a new install of the file would);
+    // an update keeps the old record, which its caller then brings up to
+    // date with the new version.
+    if let Err(e) = stage_origin(&old_dir, &staging_dir, &manifest, archive_path, same_id_only).await {
         discard_staging().await;
         return Err(InstallError::new(subject, replace, e));
     }
 
+    // What the profiles need once the new version is in: entries moved
+    // from DDMM's own ID to the author's (see below), then every entry of
+    // the mod fitted to the new manifest.json.
+    let follow_up = FollowUp {
+        guid: final_guid,
+        moved_from: (final_guid != existing_guid && is_local_generated(&old_mod.manifest)).then_some(existing_guid),
+    };
+
+    log::info!("Swapping in updated content for mod {{{}}}...", final_guid);
+    let backup_dir = mods_root.join(format!("{}{}", mod_folder::UPDATE_BACKUP_PREFIX, Uuid::new_v4()));
+    // Note where the old version belongs, and what the profiles need after
+    // the swap, before setting it aside: if DDMM is closed (or crashes)
+    // mid-swap, the next start puts the old version back instead of
+    // guessing; if it stops after the swap, the next start finishes the
+    // profiles (see `finish_follow_ups`).
+    let record = mod_folder::backup_record_path(&backup_dir);
+    if let Err(e) = write_backup_record(&record, &old_dir, false, Some(&follow_up)).await {
+        discard_staging().await;
+        return Err(InstallError::new(subject, replace, e));
+    }
+
+    if crash_point(CrashPoint::BeforeSetAside) {
+        return Err(InstallError::new(subject, replace, anyhow::anyhow!("simulated crash")));
+    }
     if let Err(e) = crate::fs_util::move_path(&old_dir, &backup_dir).await {
         discard_staging().await;
         let _ = tokio::fs::remove_file(&record).await;
         return Err(InstallError::new(subject, replace, e));
+    }
+    if crash_point(CrashPoint::BeforeMoveIn) {
+        return Err(InstallError::new(subject, replace, anyhow::anyhow!("simulated crash")));
     }
 
     if let Err(e) = crate::fs_util::move_path(&staging_dir, &old_dir).await {
@@ -1896,18 +1921,23 @@ async fn install_update_steps(
         return Err(InstallError::new(subject, replace, e));
     }
 
+    if crash_point(CrashPoint::BeforeSwapNoted) {
+        return Err(InstallError::new(subject, replace, anyhow::anyhow!("simulated crash")));
+    }
     // The update is done: note that, so the old version is never put back
-    // over (or next to) the new one.
-    if let Err(e) = write_backup_record(&record, &old_dir, true).await {
+    // over (or next to) the new one. (Should this fail, the next start
+    // still sees the new version in place; see `recover_update_backup`.)
+    if let Err(e) = write_backup_record(&record, &old_dir, true, Some(&follow_up)).await {
         log::warn!("Couldn't note the finished update in {:?}: {}", record, e);
     }
-    match mod_folder::remove_mod_folder(&mods_root, &backup_dir).await {
-        Ok(()) => {
-            let _ = tokio::fs::remove_file(&record).await;
-        }
+    if crash_point(CrashPoint::BeforeBackupRemoved) {
+        return Err(InstallError::new(subject, replace, anyhow::anyhow!("simulated crash")));
+    }
+    // The record itself stays until the profiles are written.
+    if let Err(e) = mod_folder::remove_mod_folder(&mods_root, &backup_dir).await {
         // E.g. a file in it still open on Windows: it stays (hidden, never
         // loaded) with its record, and is deleted along with the mod.
-        Err(e) => log::warn!("Couldn't remove the previous version of the updated mod yet: {:#}", e),
+        log::warn!("Couldn't remove the previous version of the updated mod yet: {:#}", e);
     }
 
     let mut new_mod = Mod {
@@ -1927,12 +1957,19 @@ async fn install_update_steps(
     // An ID DDMM generated, replaced by the author's (the mod was installed
     // before DDMM found manifest.json inside a zipped folder): its profile
     // entries follow it, keeping on/off and their place.
-    if final_guid != existing_guid && is_local_generated(&old_mod.manifest) {
-        state.record_guid_rename(existing_guid, final_guid);
-        match crate::commands::profiles::migrate_saved_profiles(&state.base_path, existing_guid, final_guid, &new_mod.manifest).await {
-            Ok(n) => log::info!("Moved {n} profile entr(ies) from {{{existing_guid}}} to {{{final_guid}}}."),
-            Err(e) => log::error!("Couldn't move the profile entries of {{{existing_guid}}} to {{{final_guid}}}: {e:#}"),
+    if let Some(old) = follow_up.moved_from {
+        state.record_guid_rename(old, final_guid);
+    }
+    if crash_point(CrashPoint::BeforeProfiles) {
+        return Err(InstallError::new(subject, replace, anyhow::anyhow!("simulated crash")));
+    }
+    match apply_follow_up(&state.base_path, &follow_up, &new_mod.manifest).await {
+        Ok(()) if crash_point(CrashPoint::BeforeRecordRemoved) => {
+            return Err(InstallError::new(subject, replace, anyhow::anyhow!("simulated crash")));
         }
+        Ok(()) => finish_record(&record).await,
+        // The record stays: the next start writes them.
+        Err(e) => log::error!("Couldn't update the profile entries of {{{final_guid}}} in profiles.json: {e:#}"),
     }
 
     log::info!("Mod {{{}}} updated successfully.", new_mod.guid());
@@ -2070,14 +2107,13 @@ pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Vec<PathBuf> {
     for dir in staging {
         remove_if_duplicate(mods_root, &dir, None).await;
     }
+    finish_follow_ups(mods_root, &records).await;
     for record in records {
-        let backup = record.with_file_name(
-            record
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .trim_end_matches(mod_folder::UPDATE_BACKUP_RECORD_SUFFIX),
-        );
+        let backup = backup_of_record(&record);
+        // One whose follow-up couldn't be done yet stays for the next start.
+        if read_backup_record(mods_root, &record).await.follow_up.is_some() {
+            continue;
+        }
         if tokio::fs::symlink_metadata(&backup).await.is_err() && mod_folder::ensure_mod_folder(mods_root, &record).is_ok() {
             let _ = tokio::fs::remove_file(&record).await;
         }
@@ -2107,6 +2143,171 @@ struct BackupRecord {
     /// Set once the new version was moved in: the update finished, and the
     /// backup is only the version it replaced.
     swapped: bool,
+    /// What profiles.json still needs once the new version is in; gone
+    /// once it's written.
+    follow_up: Option<FollowUp>,
+}
+
+/// What an update or replace still has to do to profiles.json after its
+/// swap: move the entries of `moved_from` (an ID DDMM generated, replaced
+/// by the author's) over to `guid`, and fit every entry of `guid` to the
+/// mod's new manifest.json (see `profiles::migrate_saved_profiles`). Kept
+/// in the backup record until profiles.json is written, so that a crash
+/// in between is finished on the next start (see [`finish_follow_ups`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FollowUp {
+    pub guid: Uuid,
+    pub moved_from: Option<Uuid>,
+}
+
+/// Do `follow_up` for the mod whose new manifest is `manifest`: one write
+/// of profiles.json (durable), and nothing when no profile lists the mod.
+/// Doing it again changes nothing.
+async fn apply_follow_up(base_path: &Path, follow_up: &FollowUp, manifest: &Manifest) -> anyhow::Result<()> {
+    let from = follow_up.moved_from.unwrap_or(follow_up.guid);
+    let n = crate::commands::profiles::migrate_saved_profiles(base_path, from, follow_up.guid, manifest).await?;
+    match follow_up.moved_from {
+        Some(old) if n > 0 => log::info!("Moved the profile entries of {{{old}}} to {{{}}} and fitted {n} to its manifest.", follow_up.guid),
+        _ if n > 0 => log::info!("Fitted {n} profile entr(ies) of {{{}}} to its new manifest.", follow_up.guid),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The follow-up in the backup record `record` is done: drop it from the
+/// record, or the whole record when its backup folder is gone.
+async fn finish_record(record: &Path) {
+    let backup = backup_of_record(record);
+    let result = if tokio::fs::symlink_metadata(&backup).await.is_err() {
+        match tokio::fs::remove_file(record).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(anyhow::Error::from(e)),
+            _ => Ok(()),
+        }
+    } else {
+        let mut value = match tokio::fs::read(record).await.ok().and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok()) {
+            Some(serde_json::Value::Object(map)) => map,
+            _ => return,
+        };
+        value.remove("follow_up");
+        write_record_value(record, serde_json::Value::Object(value)).await
+    };
+    if let Err(e) = result {
+        log::warn!("Couldn't tidy up {:?} (the next start does): {:#}", record, e);
+    }
+}
+
+/// The backup folder a record file belongs to.
+fn backup_of_record(record: &Path) -> PathBuf {
+    record.with_file_name(
+        record
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .trim_end_matches(mod_folder::UPDATE_BACKUP_RECORD_SUFFIX),
+    )
+}
+
+/// Finish what updates and replaces that didn't finish left for
+/// profiles.json (DDMM closed or crashed between the swap and writing the
+/// profiles): runs on the next start, after the backups were dealt with
+/// (see [`recover_update_backup`]), and before the profiles are read (the
+/// page's `load_profiles` waits for the mod list).
+///
+/// For each record with a follow-up:
+/// - the swap finished (the mod's folder holds the new version): its
+///   entries are moved to the new ID and fitted, then the follow-up is
+///   dropped -- the full new state;
+/// - it didn't (the old version is back in place): the follow-up is
+///   dropped, profiles.json is left as it was -- the old state.
+///
+/// A follow-up that can't be written now (profiles.json in use) stays for
+/// the start after.
+async fn finish_follow_ups(mods_root: &Path, records: &[PathBuf]) {
+    let Some(base_path) = mods_root.parent() else { return };
+    for record in records {
+        let parsed = read_backup_record(mods_root, record).await;
+        let Some(follow_up) = parsed.follow_up else { continue };
+        if !parsed.swapped && tokio::fs::symlink_metadata(backup_of_record(record)).await.is_ok() {
+            // The old version is still set aside (it couldn't be put back
+            // this time): left for the next start.
+            continue;
+        }
+        let installed = match (&parsed.folder, parsed.swapped) {
+            (Some(folder), true) => read_manifest_quietly(&mods_root.join(folder).join(MANIFEST_FILE)).await,
+            _ => None,
+        };
+        let Some(manifest) = installed.filter(|m| manifest_guid(m) == follow_up.guid) else {
+            log::info!("{:?}: the update didn't finish, so the profiles stay as they were.", record);
+            finish_record(record).await;
+            continue;
+        };
+        let mut follow_up = follow_up;
+        if let Some(old) = follow_up.moved_from {
+            // An old ID that's a mod's again keeps its entries.
+            if !visible_folders_with_guid(mods_root, old).await.is_empty() {
+                follow_up.moved_from = None;
+            }
+        }
+        match apply_follow_up(base_path, &follow_up, &manifest).await {
+            Ok(()) => {
+                log::info!("Finished the profiles of {{{}}} after an update that didn't finish.", follow_up.guid);
+                finish_record(record).await;
+            }
+            Err(e) => log::error!("Couldn't finish the profiles of {{{}}} yet (the next start tries again): {e:#}", follow_up.guid),
+        }
+    }
+}
+
+/// Where a test stops an update or replace, as if DDMM crashed there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CrashPoint {
+    /// The record is written; nothing moved yet.
+    BeforeSetAside,
+    /// The old version is set aside; the new one not moved in.
+    BeforeMoveIn,
+    /// The new version is in; the record doesn't say so yet.
+    BeforeSwapNoted,
+    /// The record says so; the old version isn't deleted yet.
+    BeforeBackupRemoved,
+    /// Only profiles.json is left.
+    BeforeProfiles,
+    /// profiles.json is written; the record not dropped yet.
+    BeforeRecordRemoved,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CRASH_AT: std::cell::Cell<Option<CrashPoint>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn crash_point(at: CrashPoint) -> bool {
+    CRASH_AT.with(|c| c.get()) == Some(at)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn crash_point(_: CrashPoint) -> bool {
+    false
+}
+
+/// Put the origin record the new version should start with into the
+/// staged folder `staging_dir` (see [`install_update_steps`]): for a
+/// replace (`fresh`), the one a new install of `archive_path` would get
+/// from its Nexus Mods download name (if any); for an update, the old
+/// version's (in `old_dir`), if it has one.
+async fn stage_origin(old_dir: &Path, staging_dir: &Path, manifest: &Manifest, archive_path: &Path, fresh: bool) -> anyhow::Result<()> {
+    if fresh {
+        let mut staged = Mod { manifest: manifest.clone(), directory: staging_dir.to_path_buf(), sources: Vec::new() };
+        staged.resolve_sources().await;
+        let file_name = archive_path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if let Some(sidecar) = nexus_sidecar_from_file_name(&staged, file_name, true).await {
+            sources::save_origin_sidecar(staging_dir, &sidecar).await?;
+        }
+    } else if let Some(sidecar) = sources::load_origin_sidecar(old_dir).await {
+        sources::save_origin_sidecar(staging_dir, &sidecar).await?;
+    }
+    Ok(())
 }
 
 async fn read_backup_record(mods_root: &Path, record: &Path) -> BackupRecord {
@@ -2119,16 +2320,27 @@ async fn read_backup_record(mods_root: &Path, record: &Path) -> BackupRecord {
             .map(str::to_string)
             .filter(|n| !n.is_empty() && !n.starts_with('.') && mod_folder::ensure_mod_folder(mods_root, &mods_root.join(n)).is_ok()),
         swapped: value.get("swapped").and_then(|v| v.as_bool()).unwrap_or(false),
+        follow_up: value.get("follow_up").and_then(|f| serde_json::from_value(f.clone()).ok()),
     }
 }
 
-/// Write an update backup's record (see [`BackupRecord`]).
-async fn write_backup_record(record: &Path, folder: &Path, swapped: bool) -> std::io::Result<()> {
-    let data = serde_json::json!({
+/// Write an update backup's record (see [`BackupRecord`]): whole or not at
+/// all, and on disk before this returns, so that what's moved after it is
+/// never ahead of its record.
+async fn write_backup_record(record: &Path, folder: &Path, swapped: bool, follow_up: Option<&FollowUp>) -> anyhow::Result<()> {
+    let mut data = serde_json::json!({
         "folder": folder.file_name().map(|n| n.to_string_lossy().into_owned()),
         "swapped": swapped,
     });
-    tokio::fs::write(record, data.to_string()).await
+    if let Some(f) = follow_up {
+        data["follow_up"] = serde_json::to_value(f)?;
+    }
+    write_record_value(record, data).await
+}
+
+async fn write_record_value(record: &Path, data: serde_json::Value) -> anyhow::Result<()> {
+    let record = record.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::fs_util::replace_file_durably_blocking(&record, data.to_string().as_bytes())).await?
 }
 
 /// Delete the leftover `dir` only if one of the visible mod folders
@@ -2214,9 +2426,21 @@ fn same_tree(a: &Path, b: &Path) -> bool {
 async fn recover_update_backup(mods_root: &Path, backup: &Path) -> anyhow::Result<()> {
     mod_folder::ensure_mod_folder(mods_root, backup)?;
     let record_file = mod_folder::backup_record_path(backup);
-    let record = read_backup_record(mods_root, &record_file).await;
+    let mut record = read_backup_record(mods_root, &record_file).await;
     let backup_manifest = read_manifest_quietly(&backup.join(MANIFEST_FILE)).await;
     let backup_guid = backup_manifest.as_ref().map(manifest_guid);
+
+    // Stopped right after the new version was moved in, before the record
+    // said so: its folder has the new version (with the ID the record
+    // expects), so the update did finish. Without this, an update that
+    // changed the mod's ID would bring the old version back next to it.
+    if let (false, Some(follow_up), Some(folder)) = (record.swapped, &record.follow_up, &record.folder) {
+        let installed = read_manifest_quietly(&mods_root.join(folder).join(MANIFEST_FILE)).await;
+        if installed.as_ref().map(manifest_guid) == Some(follow_up.guid) {
+            write_backup_record(&record_file, &mods_root.join(folder), true, Some(follow_up)).await?;
+            record.swapped = true;
+        }
+    }
 
     // An identical copy in place: the only case a backup is deleted.
     let same_id = match backup_guid {
@@ -2231,7 +2455,11 @@ async fn recover_update_backup(mods_root: &Path, backup: &Path) -> anyhow::Resul
         }
     }
     if !candidates.is_empty() && remove_if_duplicate(mods_root, backup, Some(candidates)).await {
-        let _ = tokio::fs::remove_file(&record_file).await;
+        // A finished swap's record with a follow-up stays for
+        // `finish_follow_ups`, which drops it once that's done.
+        if !(record.swapped && record.follow_up.is_some()) {
+            let _ = tokio::fs::remove_file(&record_file).await;
+        }
         return Ok(());
     }
 
@@ -2310,12 +2538,12 @@ async fn claim_replaced_versions_of(mods_root: &Path, mod_dir: &Path, guid: Uuid
         // An unrecorded one gets a record naming no folder: a later delete
         // of a mod in that folder never claims it for deleting.
         let marked = if recorded {
-            write_backup_record(&record, mod_dir, true).await
+            write_backup_record(&record, mod_dir, true, None).await
         } else {
-            tokio::fs::write(&record, serde_json::json!({ "folder": null, "swapped": true }).to_string()).await
+            write_record_value(&record, serde_json::json!({ "folder": null, "swapped": true })).await
         };
         if let Err(e) = marked {
-            log::warn!("Couldn't mark {:?} as never to be restored: {}", backup, e);
+            log::warn!("Couldn't mark {:?} as never to be restored: {:#}", backup, e);
             continue;
         }
         let still_installed = backup_guid.is_some_and(|g| remaining.iter().any(|m| m.guid() == g));
@@ -4793,4 +5021,234 @@ mod tests {
     /// Archives and folders laid out around a wrapper folder, and wrapped
     /// folders adopted in place in the mod storage.
     mod wrapper_edges;
+
+    // --- a crash between an update's swap and its profiles.json write ---
+
+    const ALL_CRASH_POINTS: [CrashPoint; 6] = [
+        CrashPoint::BeforeSetAside,
+        CrashPoint::BeforeMoveIn,
+        CrashPoint::BeforeSwapNoted,
+        CrashPoint::BeforeBackupRemoved,
+        CrashPoint::BeforeProfiles,
+        CrashPoint::BeforeRecordRemoved,
+    ];
+
+    /// Whether DDMM stopped at `at` with the new version already in place.
+    fn swapped_by(at: CrashPoint) -> bool {
+        !matches!(at, CrashPoint::BeforeSetAside | CrashPoint::BeforeMoveIn)
+    }
+
+    /// Run `f` as if DDMM crashed at `at` in it.
+    async fn crashing_at<T>(at: CrashPoint, f: impl std::future::Future<Output = T>) -> T {
+        CRASH_AT.with(|c| c.set(Some(at)));
+        let out = f.await;
+        CRASH_AT.with(|c| c.set(None));
+        out
+    }
+
+    /// The backup records left in the mod storage, as JSON.
+    fn records_in(base: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_dir(base.join(MODS_DIRECTORY))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(mod_folder::UPDATE_BACKUP_RECORD_SUFFIX))
+            .map(|p| serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap())
+            .collect()
+    }
+
+    /// The next start (twice: the second must change nothing), then what
+    /// every start must leave: each profile entry is a loaded mod's (never
+    /// "Mod not found"), no mod is listed twice, no follow-up is left.
+    async fn restart_twice(base: &Path) -> Vec<Mod> {
+        let mods = load(base).await;
+        let profiles = std::fs::read(base.join("profiles.json")).unwrap();
+        let folders = mods_folder_names(base);
+        let again = load(base).await;
+        assert_eq!(std::fs::read(base.join("profiles.json")).unwrap(), profiles, "a second start changes nothing");
+        assert_eq!(mods_folder_names(base), folders);
+        assert_eq!(again.len(), mods.len());
+
+        for guid in saved_profile_guids(base).concat() {
+            assert!(mods.iter().any(|m| m.guid().to_string() == guid), "profile entry {guid} has no mod: {:?}", folders);
+        }
+        let mut guids: Vec<Uuid> = mods.iter().map(Mod::guid).collect();
+        guids.sort();
+        guids.dedup();
+        assert_eq!(guids.len(), mods.len(), "no mod listed twice: {folders:?}");
+        for record in records_in(base) {
+            assert!(record.get("follow_up").is_none(), "{record}");
+        }
+        mods
+    }
+
+    /// An update that moves a mod from DDMM's own ID to its author's
+    /// (PR #80), stopped at every step: the next start leaves either the old
+    /// version with its entries as they were, or the new one with its
+    /// entries moved to the new ID and fitted -- and the origin record it
+    /// had either way.
+    #[tokio::test]
+    async fn an_update_that_changes_the_id_recovers_from_a_crash_at_every_step() {
+        for at in ALL_CRASH_POINTS {
+            let base = tempfile::tempdir().unwrap();
+            let src = tempfile::tempdir().unwrap();
+            let state = fresh_library(base.path()).await;
+            let old = install_as_before_unwrapping(&state, src.path()).await;
+            let other = install_v1(&state, src.path(), "A.zip", GUID_A, "Alpha").await;
+            sources::write_origin_sidecar(
+                &old.directory,
+                vec![Source { provider: "gamebanana".into(), id: Some("777".into()), url: None, version: Some("1.0".into()) }],
+            )
+            .await
+            .unwrap();
+            let data = serde_json::json!({ "Profiles": [
+                { "Version": "V1", "Name": "Default", "Configs": [
+                    { "For": "V1", "Guid": other.guid(), "Enabled": true, "Toggled": [], "Selected": [] },
+                    { "For": "Legacy", "Guid": old.guid(), "Enabled": false, "Selected": 1 },
+                ] },
+                { "Version": "V1", "Name": "Other", "Configs": [
+                    { "For": "Legacy", "Guid": old.guid(), "Enabled": true, "Selected": 0 },
+                ] },
+            ], "Active": 0 });
+            std::fs::write(base.path().join("profiles.json"), data.to_string()).unwrap();
+            let before = std::fs::read(base.path().join("profiles.json")).unwrap();
+
+            let update = src.path().join("Cool Mod 1.1.zip");
+            write_zip(&update, &wrapped_entries("Cool Mod/", "Cool Mod", b"v2"));
+            let result = crashing_at(at, async {
+                let mut guard = state.mods.lock().await;
+                install_update_from_archive(&state, guard.as_mut().unwrap(), &update, old.guid()).await
+            })
+            .await;
+            assert!(result.is_err(), "{at:?}");
+            drop(state);
+
+            let mods = restart_twice(base.path()).await;
+            assert_eq!(mods.len(), 2, "{at:?}");
+            let cool = mods.iter().find(|m| m.guid() != other.guid()).unwrap();
+            assert_eq!(cool.directory, old.directory, "{at:?}");
+            let entries = profile_entries(base.path());
+            if swapped_by(at) {
+                assert_eq!(cool.guid().to_string(), WRAPPED_GUID, "{at:?}");
+                assert_eq!(std::fs::read(cool.directory.join("Red").join(patch_file_name())).unwrap(), b"v2");
+                assert_eq!(saved_profile_guids(base.path()), [vec![GUID_A.to_string(), WRAPPED_GUID.to_string()], vec![WRAPPED_GUID.to_string()]]);
+                assert_eq!(entries[1]["For"], "V1", "{at:?}: fitted to the new manifest");
+                assert_eq!(entries[1]["Enabled"], false, "{at:?}: still off");
+                assert_eq!(entries[1]["Toggled"], serde_json::json!([true, true]));
+                assert_eq!(entries[1]["Selected"], serde_json::json!([0, 0]));
+            } else {
+                assert_eq!(cool.guid(), old.guid(), "{at:?}");
+                assert_eq!(std::fs::read(base.path().join("profiles.json")).unwrap(), before, "{at:?}: profiles untouched");
+            }
+            let sidecar = sources::load_origin_sidecar(&cool.directory).await.expect("origin record kept");
+            assert!(sidecar.sources.iter().any(|s| s.provider == "gamebanana"), "{at:?}");
+        }
+    }
+
+    /// Replace (Add, the browser, the import list -- all the same swap) with
+    /// options that changed, stopped at every step: the next start leaves
+    /// either the old file with its entries as they were, or the new one
+    /// with its entries fitted and the new file's origin recorded.
+    #[tokio::test]
+    async fn a_replace_recovers_from_a_crash_at_every_step() {
+        for at in ALL_CRASH_POINTS {
+            let base = tempfile::tempdir().unwrap();
+            let src = tempfile::tempdir().unwrap();
+            let state = fresh_library(base.path()).await;
+            install_v1(&state, src.path(), "A.zip", GUID_A, "Alpha").await;
+            let old = installed_with_options(&state, src.path(), &["Red", "Blue"]).await;
+            sources::write_origin_sidecar(
+                &old.directory,
+                vec![Source { provider: "gamebanana".into(), id: Some("777".into()), url: None, version: Some("1.0".into()) }],
+            )
+            .await
+            .unwrap();
+            write_replace_profiles(base.path(), GUID_A, REPLACE_GUID);
+            let before = std::fs::read(base.path().join("profiles.json")).unwrap();
+
+            let file = src.path().join("Cool Mod-1234-2-0-1718000000.zip");
+            options_mod_zip(&file, REPLACE_GUID, "Cool Mod", &["Red", "Blue", "Green"], b"v2");
+            let result = crashing_at(at, add_archive(&state, &file, &Asker::Answer(true))).await;
+            assert!(result.is_err(), "{at:?}");
+            drop(state);
+
+            let mods = restart_twice(base.path()).await;
+            assert_eq!(mods.len(), 2, "{at:?}");
+            let cool = mods.iter().find(|m| m.guid().to_string() == REPLACE_GUID).unwrap();
+            assert_eq!(cool.directory, old.directory);
+            let sidecar = sources::load_origin_sidecar(&cool.directory).await.expect("an origin record");
+            if swapped_by(at) {
+                assert_eq!(std::fs::read(cool.directory.join("Green").join(patch_file_name())).unwrap(), b"v2", "{at:?}");
+                let entries = profile_entries(base.path());
+                assert_eq!(entries[1]["Guid"], REPLACE_GUID);
+                assert_eq!(entries[1]["Enabled"], false);
+                assert_eq!(entries[1]["Toggled"], serde_json::json!([true, true, true]), "{at:?}: fitted");
+                assert_eq!(entries[1]["Selected"], serde_json::json!([0, 0, 0]));
+                let data: serde_json::Value = serde_json::from_slice(&std::fs::read(base.path().join("profiles.json")).unwrap()).unwrap();
+                assert_eq!(data["Profiles"][1]["Configs"][0]["Toggled"], serde_json::json!([true, true, true]), "{at:?}");
+                assert!(!sidecar.sources.iter().any(|s| s.provider == "gamebanana"), "{at:?}: the old file's origin is gone");
+                assert!(sidecar.sources.iter().any(|s| s.provider == "nexus" && s.id.as_deref() == Some("1234")), "{at:?}");
+            } else {
+                assert!(!cool.directory.join("Green").exists(), "{at:?}");
+                assert_eq!(std::fs::read(base.path().join("profiles.json")).unwrap(), before, "{at:?}: profiles untouched");
+                assert!(sidecar.sources.iter().any(|s| s.provider == "gamebanana"), "{at:?}");
+            }
+        }
+    }
+
+    /// profiles.json that can't be written (here: can't even be read) when
+    /// the update's follow-up runs, and again on the next start: the
+    /// follow-up stays until a start can write it, then it's done once.
+    #[tokio::test]
+    async fn a_follow_up_that_cant_be_written_waits_for_the_next_start() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        let old = install_as_before_unwrapping(&state, src.path()).await;
+        std::fs::write(base.path().join("profiles.json"), b"{ not json").unwrap();
+
+        let update = src.path().join("Cool Mod 1.1.zip");
+        write_zip(&update, &wrapped_entries("Cool Mod/", "Cool Mod", b"v2"));
+        {
+            let mut guard = state.mods.lock().await;
+            let (updated, _) = install_update_from_archive(&state, guard.as_mut().unwrap(), &update, old.guid()).await.unwrap();
+            assert_eq!(updated.guid().to_string(), WRAPPED_GUID);
+        }
+        drop(state);
+        let pending = records_in(base.path());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["follow_up"]["moved_from"], old.guid().to_string());
+
+        load(base.path()).await;
+        assert_eq!(records_in(base.path()).len(), 1, "still pending");
+
+        write_profiles(base.path(), &[("Default", &[&old.guid().to_string()])]);
+        let mods = restart_twice(base.path()).await;
+        assert_eq!(mods.len(), 1);
+        assert_eq!(saved_profile_guids(base.path()), [[WRAPPED_GUID]]);
+        assert!(records_in(base.path()).is_empty());
+    }
+
+    /// An update with the same ID fits the entries in profiles.json too (so
+    /// a crash before the page saves its own fitted copy loses nothing),
+    /// and leaves no record behind.
+    #[tokio::test]
+    async fn an_update_fits_the_saved_entries_and_leaves_no_record() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let state = fresh_library(base.path()).await;
+        install_v1(&state, src.path(), "A.zip", GUID_A, "Alpha").await;
+        let old = installed_with_options(&state, src.path(), &["Red", "Blue"]).await;
+        write_replace_profiles(base.path(), GUID_A, REPLACE_GUID);
+        let update = src.path().join("Cool Mod 2.zip");
+        options_mod_zip(&update, REPLACE_GUID, "Cool Mod", &["Red", "Blue", "Green"], b"v2");
+        {
+            let mut guard = state.mods.lock().await;
+            install_update_from_archive(&state, guard.as_mut().unwrap(), &update, old.guid()).await.unwrap();
+        }
+        let entries = profile_entries(base.path());
+        assert_eq!(entries[1]["Toggled"], serde_json::json!([true, true, true]));
+        assert_eq!(entries[1]["Enabled"], false);
+        assert!(records_in(base.path()).is_empty());
+        assert_eq!(mods_folder_names(base.path()), vec!["A".to_string(), "Cool Mod".to_string()]);
+    }
 }
