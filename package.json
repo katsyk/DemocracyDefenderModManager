@@ -30,7 +30,7 @@
     "@tailwindcss/vite": "^4.2.2",
     "@tauri-apps/cli": "^2.12.0",
     "svelte": "^5.0.0",
-    "svelte-check": "^4.0.0",
+    "svelte-check": "^4.7.8",
     "tailwindcss": "^4.2.2",
     "typescript": "~6.0.3",
     "vite": "^6.0.3"
