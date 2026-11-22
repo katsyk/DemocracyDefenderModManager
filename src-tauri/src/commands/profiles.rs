@@ -206,32 +206,70 @@ pub async fn migrate_saved_profiles(
     new: uuid::Uuid,
     manifest: &Manifest,
 ) -> anyhow::Result<Migrated> {
-    let _saving = PROFILES_WRITE.lock().await;
+    plan_saved_profiles_migration(base_path, old, new, manifest).await?.write().await
+}
+
+/// [`migrate_saved_profiles`] in two steps: what it would change (with
+/// profiles.json held, so nothing else writes it in between), then
+/// [`MigrationPlan::write`]. Lets the caller note the outcome somewhere
+/// durable before the file is written.
+pub async fn plan_saved_profiles_migration(
+    base_path: &std::path::Path,
+    old: uuid::Uuid,
+    new: uuid::Uuid,
+    manifest: &Manifest,
+) -> anyhow::Result<MigrationPlan> {
+    let saving = PROFILES_WRITE.lock().await;
+    let mut plan = MigrationPlan { _saving: saving, base_path: base_path.to_path_buf(), config: None, migrated: Migrated::default() };
     if !tokio::fs::try_exists(base_path.join(PROFILES_FILE)).await? {
-        return Ok(Migrated::default());
+        return Ok(plan);
     }
     let mut config = do_load_profiles(base_path).await?;
-    let mut migrated = Migrated::default();
     for profile in &mut config.profiles {
         let name = profile.name().to_string();
         match profile {
             Profile::V1 { configs, .. } => {
+                // The entry the profile keeps is its first of either ID
+                // (see `remove_repeated_entries`): whether that one was
+                // reset is what the profile ends up with.
+                let mut first = true;
                 for c in configs.iter_mut().filter(|c| *c.uuid() == old || *c.uuid() == new) {
                     let (fitted, reset) = fit_config(c, new, manifest);
                     *c = fitted;
-                    migrated.entries += 1;
-                    if reset && !migrated.reset_in.contains(&name) {
-                        migrated.reset_in.push(name.clone());
+                    plan.migrated.entries += 1;
+                    // Two profiles with one name are named once.
+                    if first && reset && !plan.migrated.reset_in.contains(&name) {
+                        plan.migrated.reset_in.push(name.clone());
                     }
+                    first = false;
                 }
             }
         }
     }
-    if migrated.entries > 0 {
+    if plan.migrated.entries > 0 {
         remove_repeated_entries(&mut config);
-        write_profiles(base_path, &config).await?;
+        plan.config = Some(config);
     }
-    Ok(migrated)
+    Ok(plan)
+}
+
+/// See [`plan_saved_profiles_migration`].
+pub struct MigrationPlan {
+    _saving: tokio::sync::MutexGuard<'static, ()>,
+    base_path: std::path::PathBuf,
+    /// What to write; `None` when nothing changes.
+    config: Option<ProfilesConfig>,
+    pub migrated: Migrated,
+}
+
+impl MigrationPlan {
+    /// Write profiles.json (durably), if anything changes.
+    pub async fn write(self) -> anyhow::Result<Migrated> {
+        if let Some(config) = &self.config {
+            write_profiles(&self.base_path, config).await?;
+        }
+        Ok(self.migrated)
+    }
 }
 
 /// After the mod `guid` was replaced in place by another file with the
@@ -246,8 +284,9 @@ pub async fn fit_saved_profiles(base_path: &std::path::Path, guid: uuid::Uuid, m
 /// choices when they still fit (same manifest version, same number of
 /// options, sub-option choices in range), else every option on and the
 /// first choice everywhere -- like a new entry, but keeping on/off. Also
-/// returns whether choices were reset that way (an entry that had none to
-/// make loses none).
+/// returns whether choices were reset that way: not for an entry that had
+/// no choices made (see [`made_choices`]). The page's `fitConfig`
+/// (`src/lib/utils/profileEntries.ts`) follows the same rules.
 pub(crate) fn fit_config(config: &Config, guid: uuid::Uuid, manifest: &Manifest) -> (Config, bool) {
     let enabled = config.enabled();
     let in_range = |i: usize, count: usize| i < count.max(1);
@@ -261,7 +300,10 @@ pub(crate) fn fit_config(config: &Config, guid: uuid::Uuid, manifest: &Manifest)
         (Manifest::Legacy(m), Config::Legacy { selected, .. }) if in_range(*selected, m.options.as_ref().map_or(0, Vec::len)) => {
             (Config::Legacy { guid, enabled, selected: *selected }, false)
         }
-        (Manifest::Legacy(_), _) => (Config::Legacy { guid, enabled, selected: 0 }, true),
+        (Manifest::Legacy(m), _) => {
+            let n = m.options.as_ref().map_or(0, Vec::len);
+            (Config::Legacy { guid, enabled, selected: 0 }, made_choices(config, n))
+        }
         (_, Config::V1 { toggled, selected, .. }) | (_, Config::V2 { toggled, selected, .. }) => {
             let subs = subs.unwrap_or_default();
             let same_version = matches!((manifest, config), (Manifest::V1(_), Config::V1 { .. }) | (Manifest::V2(_), Config::V2 { .. }));
@@ -272,15 +314,25 @@ pub(crate) fn fit_config(config: &Config, guid: uuid::Uuid, manifest: &Manifest)
             if fits {
                 (with_version(manifest, guid, enabled, toggled.clone(), selected.clone()), false)
             } else {
-                // An entry that had no choices to make lost none.
-                let had_choices = !toggled.is_empty() || !selected.is_empty();
-                (with_version(manifest, guid, enabled, vec![true; subs.len()], vec![0; subs.len()]), had_choices)
+                let n = subs.len();
+                (with_version(manifest, guid, enabled, vec![true; n], vec![0; n]), made_choices(config, n))
             }
         }
         (_, Config::Legacy { .. }) => {
             let n = subs.map_or(0, |s| s.len());
-            (with_version(manifest, guid, enabled, vec![true; n], vec![0; n]), true)
+            (with_version(manifest, guid, enabled, vec![true; n], vec![0; n]), made_choices(config, n))
         }
+    }
+}
+
+/// Whether resetting `config` for a manifest with `options` options loses
+/// a choice: not for a V1/V2 entry with no choices in it, nor for a Legacy
+/// entry on its first choice (what the page saves for a mod without
+/// options) when the manifest has no options either.
+fn made_choices(config: &Config, options: usize) -> bool {
+    match config {
+        Config::Legacy { selected, .. } => !(*selected == 0 && options == 0),
+        Config::V1 { toggled, selected, .. } | Config::V2 { toggled, selected, .. } => !toggled.is_empty() || !selected.is_empty(),
     }
 }
 
@@ -323,6 +375,54 @@ mod tests {
 
     const A: &str = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
     const B: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+
+    /// Where choices were reset is what each profile ends up with: its
+    /// first entry of the mod (the one kept), each profile name once.
+    #[tokio::test]
+    async fn the_reset_profiles_are_the_ones_whose_kept_entry_was_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = |g: &str, toggled: serde_json::Value| serde_json::json!({ "For": "V1", "Guid": g, "Enabled": true, "Toggled": toggled, "Selected": [0] });
+        let config: ProfilesConfig = serde_json::from_value(serde_json::json!({ "Profiles": [
+            // Kept: the new ID's entry, which fits; the old one after it doesn't.
+            { "Version": "V1", "Name": "Fits", "Configs": [entry(B, serde_json::json!([true])), entry(A, serde_json::json!([true, false]))] },
+            // Two profiles with one name, both reset: named once.
+            { "Version": "V1", "Name": "Twin", "Configs": [entry(A, serde_json::json!([true, false]))] },
+            { "Version": "V1", "Name": "Twin", "Configs": [entry(B, serde_json::json!([false, false]))] },
+        ], "Active": 0 }))
+        .unwrap();
+        write_profiles(dir.path(), &config).await.unwrap();
+        let manifest: Manifest = serde_json::from_value(serde_json::json!({ "Version": 1, "Guid": B, "Name": "M", "Description": "",
+            "Options": [{ "Name": "o", "Description": "" }] }))
+        .unwrap();
+
+        let migrated = migrate_saved_profiles(dir.path(), A.parse().unwrap(), B.parse().unwrap(), &manifest).await.unwrap();
+        assert_eq!(migrated.entries, 4);
+        assert_eq!(migrated.reset_in, ["Twin"]);
+        let loaded = do_load_profiles(dir.path()).await.unwrap();
+        assert_eq!(loaded.profiles[0].configs().len(), 1);
+    }
+
+    /// The page's `fitConfig` rules (tests/unit/profile-entries.test.mjs):
+    /// an entry with no choices made loses none.
+    #[test]
+    fn an_entry_without_choices_made_is_not_reset() {
+        let g: uuid::Uuid = B.parse().unwrap();
+        let v1 = |options: serde_json::Value| -> Manifest {
+            serde_json::from_value(serde_json::json!({ "Version": 1, "Guid": B, "Name": "M", "Description": "", "Options": options })).unwrap()
+        };
+        let config = |v: serde_json::Value| -> Config { serde_json::from_value(v).unwrap() };
+        let legacy_first = config(serde_json::json!({ "For": "Legacy", "Guid": A, "Enabled": true, "Selected": 0 }));
+        let empty = config(serde_json::json!({ "For": "V1", "Guid": A, "Enabled": false, "Toggled": [], "Selected": [] }));
+        let one = serde_json::json!([{ "Name": "o", "Description": "" }]);
+        assert!(!fit_config(&legacy_first, g, &v1(serde_json::json!([]))).1);
+        assert!(!fit_config(&legacy_first, g, &v1(serde_json::Value::Null)).1);
+        assert!(fit_config(&legacy_first, g, &v1(one.clone())).1);
+        let legacy_second = config(serde_json::json!({ "For": "Legacy", "Guid": A, "Enabled": true, "Selected": 1 }));
+        assert!(fit_config(&legacy_second, g, &v1(serde_json::json!([]))).1);
+        assert!(!fit_config(&empty, g, &v1(one)).1);
+        let chosen = config(serde_json::json!({ "For": "V1", "Guid": A, "Enabled": false, "Toggled": [true], "Selected": [0] }));
+        assert!(fit_config(&chosen, g, &v1(serde_json::json!([]))).1);
+    }
 
     #[tokio::test]
     async fn loading_drops_repeated_entries_keeping_the_first() {

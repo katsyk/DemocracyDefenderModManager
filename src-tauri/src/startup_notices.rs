@@ -30,6 +30,10 @@ pub enum NoticeKind {
     /// the mod is at the version it had (put back, if it had been set
     /// aside).
     UpdateUndone,
+    /// A version an update had set aside, with nowhere it was known to
+    /// belong (no record, or its folder taken since) and its ID not
+    /// installed: put back under a free name (`folder`), so it's listed.
+    BackupRestored,
     /// Writing an unfinished update's profile entries reset option choices
     /// that no longer fit the new version (`profiles` names where).
     OptionsReset,
@@ -54,6 +58,13 @@ pub enum NoticeKind {
     DeleteKept,
     /// An installed mod whose manifest.json can't be read: not listed.
     ModUnreadable,
+}
+
+impl NoticeKind {
+    /// Only says what DDMM did; nothing to check. Shown first.
+    pub fn is_info(self) -> bool {
+        matches!(self, NoticeKind::UpdateFinished | NoticeKind::UpdateUndone)
+    }
 }
 
 /// One notice: what happened, to which mod, in which folder.
@@ -98,6 +109,11 @@ impl StartupNotice {
         self.profiles = profiles;
         self
     }
+
+    /// The same event: one notice per kind and mod (or folder).
+    pub fn same_event(&self, other: &StartupNotice) -> bool {
+        self.kind == other.kind && self.guid == other.guid && self.folder == other.folder && self.mod_name == other.mod_name
+    }
 }
 
 /// The notices of one start, without repeats: one per kind and mod (or
@@ -107,10 +123,7 @@ pub struct Notices(Vec<StartupNotice>);
 
 impl Notices {
     pub fn push(&mut self, notice: StartupNotice) {
-        let same = |n: &StartupNotice| {
-            n.kind == notice.kind && n.guid == notice.guid && n.folder == notice.folder && n.mod_name == notice.mod_name
-        };
-        if !self.0.iter().any(same) {
+        if !self.0.iter().any(|n| n.same_event(&notice)) {
             self.0.push(notice);
         }
     }
@@ -148,24 +161,34 @@ pub fn take_startup_notices(state: State<'_, AppState>) -> Vec<StartupNotice> {
     state.take_startup_notices()
 }
 
-/// Open a folder a notice of this session named, in the file manager (or
-/// the folder it was in, if it's gone since). Only those: the page can't
-/// open anything else through this.
+/// Show a folder a notice of this session named in the file manager,
+/// selected in the folder it's in (or that folder, if it's gone since).
+/// Only those: the page can't show anything else through this. Revealed,
+/// never opened: whatever is at that path now (a file put in its place)
+/// is never started.
 #[tauri::command]
-pub fn open_startup_notice_folder(app: tauri::AppHandle, state: State<'_, AppState>, folder: PathBuf) -> TAResult<()> {
+pub async fn open_startup_notice_folder(app: tauri::AppHandle, state: State<'_, AppState>, folder: PathBuf) -> TAResult<()> {
     use tauri_plugin_opener::OpenerExt;
-    let target = state.startup_notice_folder(&folder).ok_or_else(|| anyhow::anyhow!("{} isn't a folder DDMM told you about", folder.display())).into_ta_result()?;
-    log::info!("Opening {:?}.", target);
-    app.opener()
-        .open_path(target.to_string_lossy(), None::<&str>)
-        .map_err(|e| anyhow::anyhow!("couldn't open {}: {e}", target.display()))
-        .into_ta_result()
+    let target = state
+        .startup_notice_folder(&folder)
+        .ok_or_else(|| anyhow::anyhow!("{} isn't a folder DDMM told you about", folder.display()))
+        .into_ta_result()?;
+    log::info!("Showing {:?} in the file manager.", target);
+    tauri::async_runtime::spawn_blocking(move || {
+        app.opener()
+            .reveal_item_in_dir(&target)
+            .map_err(|e| anyhow::anyhow!("couldn't show {}: {e}", target.display()))
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|r| r)
+    .into_ta_result()
 }
 
-/// Where to open `folder` (see [`open_startup_notice_folder`]): itself,
-/// else the folder it was in.
+/// What to reveal for `folder` (see [`open_startup_notice_folder`]):
+/// itself, else the folder it was in.
 pub(crate) fn folder_to_open(folder: &Path) -> PathBuf {
-    if folder.is_dir() {
+    if std::fs::symlink_metadata(folder).is_ok() {
         folder.to_path_buf()
     } else {
         folder.parent().map(Path::to_path_buf).unwrap_or_else(|| folder.to_path_buf())
@@ -187,6 +210,20 @@ mod tests {
     }
 
     #[test]
+    fn what_ddmm_did_comes_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf());
+        let mut notices = Notices::default();
+        notices.push(StartupNotice::new(NoticeKind::StagingKept).named("B"));
+        notices.push(StartupNotice::new(NoticeKind::UpdateFinished).named("A"));
+        notices.push(StartupNotice::new(NoticeKind::OptionsReset).named("A"));
+        notices.push(StartupNotice::new(NoticeKind::UpdateUndone).named("C"));
+        state.add_startup_notices(notices);
+        let kinds: Vec<_> = state.take_startup_notices().iter().map(|n| n.kind).collect();
+        assert_eq!(kinds, [NoticeKind::UpdateFinished, NoticeKind::UpdateUndone, NoticeKind::StagingKept, NoticeKind::OptionsReset]);
+    }
+
+    #[test]
     fn it_serializes_for_the_page() {
         let n = StartupNotice::new(NoticeKind::OptionsReset).named("Cool Mod").profiles(vec!["Default".into()]);
         assert_eq!(
@@ -202,9 +239,11 @@ mod tests {
         let folder = dir.path().join("mods").join(".adopt-1");
         let mut notices = Notices::default();
         notices.push(StartupNotice::new(NoticeKind::AdoptLeft).folder(&folder));
-        state.add_startup_notices(notices);
+        state.add_startup_notices(notices.clone());
         assert_eq!(state.take_startup_notices().len(), 1);
         assert!(state.take_startup_notices().is_empty(), "once per session");
+        state.add_startup_notices(notices);
+        assert!(state.take_startup_notices().is_empty(), "found again in the session (a retried read): not shown again");
         assert_eq!(state.startup_notice_folder(&folder), Some(dir.path().join("mods")), "still openable after it was taken");
         assert_eq!(state.startup_notice_folder(&dir.path().join("mods")), None, "only folders a notice named");
     }

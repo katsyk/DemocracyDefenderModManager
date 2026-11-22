@@ -132,9 +132,11 @@ pub struct AppState {
     /// What the startup recovery did or couldn't do, until the Mods page
     /// takes it (`startup_notices`).
     startup_notices: std::sync::Mutex<Vec<startup_notices::StartupNotice>>,
-    /// The folders this session's notices named, which the page may open
+    /// Every notice of this session, taken or not: one found again (the
+    /// mod list read again after it failed) isn't shown twice, and the
+    /// folders they name are the ones the page may show
     /// (`startup_notices::open_startup_notice_folder`).
-    startup_notice_folders: std::sync::Mutex<Vec<PathBuf>>,
+    startup_notices_seen: std::sync::Mutex<Vec<startup_notices::StartupNotice>>,
 }
 
 /// Shown when something that writes to the data folder is attempted while
@@ -185,29 +187,32 @@ impl AppState {
             deep_links: std::sync::Mutex::default(),
             replace_pending: Mutex::default(),
             startup_notices: std::sync::Mutex::default(),
-            startup_notice_folders: std::sync::Mutex::default(),
+            startup_notices_seen: std::sync::Mutex::default(),
         }
     }
 
     /// Keep the startup recovery's notices for the Mods page.
     pub(crate) fn add_startup_notices(&self, notices: startup_notices::Notices) {
-        let notices = notices.into_vec();
-        if let Ok(mut folders) = self.startup_notice_folders.lock() {
-            folders.extend(notices.iter().filter_map(|n| n.folder.clone()));
-        }
-        if let Ok(mut kept) = self.startup_notices.lock() {
-            kept.extend(notices);
+        let (Ok(mut seen), Ok(mut kept)) = (self.startup_notices_seen.lock(), self.startup_notices.lock()) else { return };
+        for notice in notices.into_vec() {
+            if !seen.iter().any(|s| s.same_event(&notice)) {
+                seen.push(notice.clone());
+                kept.push(notice);
+            }
         }
     }
 
-    /// This session's startup notices; empty from then on.
+    /// This session's startup notices, what DDMM did first; empty from
+    /// then on.
     pub(crate) fn take_startup_notices(&self) -> Vec<startup_notices::StartupNotice> {
-        self.startup_notices.lock().map(|mut n| std::mem::take(&mut *n)).unwrap_or_default()
+        let mut notices = self.startup_notices.lock().map(|mut n| std::mem::take(&mut *n)).unwrap_or_default();
+        notices.sort_by_key(|n| !n.kind.is_info());
+        notices
     }
 
-    /// Where to open `folder`, if a notice of this session named it.
+    /// What to show for `folder`, if a notice of this session named it.
     pub(crate) fn startup_notice_folder(&self, folder: &std::path::Path) -> Option<PathBuf> {
-        let named = self.startup_notice_folders.lock().ok()?.iter().any(|f| f == folder);
+        let named = self.startup_notices_seen.lock().ok()?.iter().any(|n| n.folder.as_deref() == Some(folder));
         named.then(|| startup_notices::folder_to_open(folder))
     }
 
