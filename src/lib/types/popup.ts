@@ -17,13 +17,14 @@ import DataFolderMovePopupComponent from "$lib/components/popups/DataFolderMoveP
 import DataFolderProgressPopupComponent from "$lib/components/popups/DataFolderProgressPopup.svelte";
 import ImportPopupComponent from "$lib/components/popups/ImportPopup.svelte";
 import ReplacePopupComponent from "$lib/components/popups/ReplacePopup.svelte";
+import StartupNoticesPopupComponent from "$lib/components/popups/StartupNoticesPopup.svelte";
 import { ImportWizard } from "$lib/state/importWizard.svelte";
 import type { ModAddResult } from "./results";
 import type { Config } from "$lib/models/profile";
 import type { Mod } from "$lib/models/mod";
 import type { UUID } from "./uuid";
 import { cancelHandoff } from "$lib/utils/commands";
-import type { BridgeConsentDecision, UpdateCheckReport, UpdateFile, UpdateStatusEntry, DataFolderMovePlan, DataFolderMoveResult, ImportReport, ReplaceOffer } from "$lib/utils/commands";
+import type { BridgeConsentDecision, UpdateCheckReport, UpdateFile, UpdateStatusEntry, DataFolderMovePlan, DataFolderMoveResult, ImportReport, ReplaceOffer, StartupNotice } from "$lib/utils/commands";
 
 export abstract class Popup<T = void> {
     abstract component: Component<any, any, any>;
@@ -144,6 +145,21 @@ export class AddResultPopup extends Popup {
     component = AddResultPopupComponent;
 
     constructor(public readonly results: ModAddResult[]) {
+        super();
+    }
+
+    /** OK. */
+    override dismiss(): void {
+        this.close();
+    }
+}
+
+/** What DDMM's startup finished, undid, or had to leave as it is (see
+ * `takeStartupNotices`): one popup listing them all. */
+export class StartupNoticesPopup extends Popup {
+    component = StartupNoticesPopupComponent;
+
+    constructor(public readonly notices: StartupNotice[]) {
         super();
     }
 

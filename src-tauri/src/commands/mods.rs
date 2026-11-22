@@ -19,6 +19,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, State};
 use uuid::Uuid;
+use crate::startup_notices::{NoticeKind, Notices, StartupNotice};
 
 pub(crate) const MODS_DIRECTORY: &'static str = "mods/";
 pub(crate) const MANIFEST_FILE: &'static str = "manifest.json";
@@ -221,29 +222,54 @@ pub(crate) async fn ensure_mods_loaded<'a>(
     state_mods: &'a mut Option<Vec<Mod>>,
     state: &AppState,
 ) -> TAResult<&'a mut Vec<Mod>> {
-    let (mods, renames) = ensure_mods_loaded_at(state_mods, &state.base_path).await?;
+    let mut renames = Vec::new();
+    let mut notices = Notices::default();
+    let loaded = ensure_mods_loaded_into(state_mods, &state.base_path, &mut renames, &mut notices).await;
+    // Kept even when reading the list failed after the recovery: what it
+    // did stands. A later read recovers again and finds the same, which
+    // isn't recorded (or shown) twice.
+    let known = state.guid_renames();
     for (old, new) in renames {
-        state.record_guid_rename(old, new);
+        if !known.contains(&(old, new)) {
+            state.record_guid_rename(old, new);
+        }
     }
+    state.add_startup_notices(notices);
+    let mods = loaded?;
     state.mods_recovered.store(true, std::sync::atomic::Ordering::Release);
     Ok(mods)
 }
 
 /// [`ensure_mods_loaded`] for the mod storage of `base_path`, without an
 /// [`AppState`]; also returns the ID changes the first read's recovery
-/// found (none once loaded).
+/// found and what the user should be told about it (see
+/// [`crate::startup_notices`]) -- neither once loaded.
+#[cfg(test)]
 pub(crate) async fn ensure_mods_loaded_at<'a>(
     state_mods: &'a mut Option<Vec<Mod>>,
     base_path: &Path,
-) -> TAResult<(&'a mut Vec<Mod>, Vec<(Uuid, Uuid)>)> {
+) -> TAResult<(&'a mut Vec<Mod>, Vec<(Uuid, Uuid)>, Notices)> {
+    let mut renames = Vec::new();
+    let mut notices = Notices::default();
+    let mods = ensure_mods_loaded_into(state_mods, base_path, &mut renames, &mut notices).await?;
+    Ok((mods, renames, notices))
+}
+
+/// [`ensure_mods_loaded_at`], with what the recovery found put in
+/// `renames` and `notices` -- also when reading the list then fails.
+async fn ensure_mods_loaded_into<'a>(
+    state_mods: &'a mut Option<Vec<Mod>>,
+    base_path: &Path,
+    renames: &mut Vec<(Uuid, Uuid)>,
+    notices: &mut Notices,
+) -> TAResult<&'a mut Vec<Mod>> {
     if state_mods.is_some() {
         log::debug!("Mods already loaded.");
-        return Ok((state_mods.as_mut().unwrap(), Vec::new()));
+        return Ok(state_mods.as_mut().unwrap());
     }
 
     let mods_dir = base_path.join(MODS_DIRECTORY);
     let mut mods = Vec::new();
-    let mut renames = Vec::new();
     if !mods_dir.is_dir() {
         // First run: nothing installed yet. Still record the (empty) list
         // as loaded, or every install command would fail with "mods not
@@ -252,8 +278,12 @@ pub(crate) async fn ensure_mods_loaded_at<'a>(
     } else {
         let recovered = recover_leftover_folders(&mods_dir).await;
         let still_hidden = recovered.still_hidden;
-        renames = recovered.renames;
+        *renames = recovered.renames;
+        *notices = recovered.notices;
 
+        if fail_point(FailPoint::ModRead) {
+            return Err(anyhow::anyhow!("simulated failure reading the mod list")).into_ta_result();
+        }
         let mut mods_dir = tokio::fs::read_dir(mods_dir).await.into_ta_result()?;
         while let Some(entry) = mods_dir.next_entry().await.into_ta_result()? {
             let mod_dir = entry.path();
@@ -282,6 +312,11 @@ pub(crate) async fn ensure_mods_loaded_at<'a>(
                 Ok(m) => m,
                 Err(e) => {
                     log::error!("Skipping mod in {:?}: {:#}", mod_dir, e);
+                    // One notice per folder: an update waiting on this
+                    // manifest already said so.
+                    if !notices.names_folder(&mod_dir) {
+                        notices.push(StartupNotice::new(NoticeKind::ModUnreadable).named(folder_name(&mod_dir)).folder(&mod_dir));
+                    }
                     continue;
                 }
             };
@@ -301,7 +336,12 @@ pub(crate) async fn ensure_mods_loaded_at<'a>(
     }
 
     log::info!("Mods loaded.");
-    Ok((state_mods.insert(mods), renames))
+    Ok(state_mods.insert(mods))
+}
+
+/// `dir`'s own name, for a notice when there's no manifest to name it.
+fn folder_name(dir: &Path) -> String {
+    dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 /// Delete the mod with `guid`: its folder, the versions its updates
@@ -1767,10 +1807,23 @@ async fn install_update_steps(
     mod_folder::ensure_mod_folder(&mods_root, &old_dir).install_step(subject, replace)?;
 
     let staging_dir = mods_root.join(format!("{}{}", mod_folder::UPDATE_STAGING_PREFIX, Uuid::new_v4()));
-    tokio::fs::create_dir_all(&staging_dir).await.install_step(subject, InstallStep::PrepareFolder)?;
+    // Its record first: a staging folder left by a crash is then known to
+    // be DDMM's own extraction, which the next start deletes.
+    let staging_record = mod_folder::staging_record_path(&staging_dir);
+    write_record_value(&staging_record, serde_json::json!({ "staging": true }))
+        .await
+        .install_step(subject, InstallStep::PrepareFolder)?;
+    if let Err(e) = tokio::fs::create_dir_all(&staging_dir).await {
+        let _ = tokio::fs::remove_file(&staging_record).await;
+        return Err(e).install_step(subject, InstallStep::PrepareFolder);
+    }
     let discard_staging = || async {
-        if let Err(e) = mod_folder::remove_mod_folder(&mods_root, &staging_dir).await {
-            log::error!("Couldn't remove the update's staging folder: {:#}", e);
+        match mod_folder::remove_mod_folder(&mods_root, &staging_dir).await {
+            Ok(()) => {
+                let _ = tokio::fs::remove_file(&staging_record).await;
+            }
+            // The record stays: the next start deletes the rest.
+            Err(e) => log::error!("Couldn't remove the update's staging folder: {:#}", e),
         }
     };
 
@@ -1910,6 +1963,7 @@ async fn install_update_steps(
     let follow_up = FollowUp {
         guid: final_guid,
         moved_from: (final_guid != existing_guid && is_local_generated(&old_mod.manifest)).then_some(existing_guid),
+        reset_in: Vec::new(),
     };
 
     log::info!("Swapping in updated content for mod {{{}}}...", final_guid);
@@ -1950,23 +2004,39 @@ async fn install_update_steps(
         return Err(InstallError::new(subject, replace, e));
     }
 
+    // The staging folder is the mod's folder now.
+    let _ = tokio::fs::remove_file(&staging_record).await;
+
     if crash_point(CrashPoint::BeforeSwapNoted) {
         return Err(InstallError::new(subject, replace, anyhow::anyhow!("simulated crash")));
     }
     // The update is done: note that, so the old version is never put back
-    // over (or next to) the new one. (Should this fail, the next start
-    // still sees the new version in place; see `recover_update_backup`.)
-    if let Err(e) = write_backup_record(&record, &old_dir, true, Some(&follow_up)).await {
-        log::warn!("Couldn't note the finished update in {:?}: {}", record, e);
-    }
+    // over (or next to) the new one.
+    let noted = if fail_point(FailPoint::SwapNote) {
+        Err(anyhow::anyhow!("simulated failure"))
+    } else {
+        write_backup_record(&record, &old_dir, true, Some(&follow_up)).await
+    };
     if crash_point(CrashPoint::BeforeBackupRemoved) {
         return Err(InstallError::new(subject, replace, anyhow::anyhow!("simulated crash")));
     }
-    // The record itself stays until the profiles are written.
-    if let Err(e) = mod_folder::remove_mod_folder(&mods_root, &backup_dir).await {
-        // E.g. a file in it still open on Windows: it stays (hidden, never
-        // loaded) with its record, and is deleted along with the mod.
-        log::warn!("Couldn't remove the previous version of the updated mod yet: {:#}", e);
+    match noted {
+        // The record itself stays until the profiles are written.
+        Ok(()) => {
+            if let Err(e) = mod_folder::remove_mod_folder(&mods_root, &backup_dir).await {
+                // E.g. a file in it still open on Windows: it stays (hidden,
+                // never loaded) with its record, and is deleted along with
+                // the mod.
+                log::warn!("Couldn't remove the previous version of the updated mod yet: {:#}", e);
+            }
+        }
+        // The old version stays (hidden, never loaded): without it, a crash
+        // before the profiles are written would leave a record that says
+        // the swap never happened and nothing to tell otherwise, and the
+        // next start would report the update as undone. With it, the next
+        // start sees the new version in place (`recover_update_backup`);
+        // writing the profiles below marks it swapped (`finish_record`).
+        Err(e) => log::warn!("Couldn't note the finished update in {:?}; keeping the previous version for now: {:#}", record, e),
     }
 
     let mut new_mod = Mod {
@@ -1992,11 +2062,11 @@ async fn install_update_steps(
     if crash_point(CrashPoint::BeforeProfiles) {
         return Err(InstallError::new(subject, replace, anyhow::anyhow!("simulated crash")));
     }
-    match apply_follow_up(&state.base_path, &follow_up, &new_mod.manifest).await {
-        Ok(()) if crash_point(CrashPoint::BeforeRecordRemoved) => {
+    match apply_follow_up(&state.base_path, Some(&record), &follow_up, &new_mod.manifest).await {
+        Ok(_) if crash_point(CrashPoint::BeforeRecordRemoved) => {
             return Err(InstallError::new(subject, replace, anyhow::anyhow!("simulated crash")));
         }
-        Ok(()) => finish_record(&record).await,
+        Ok(_) => finish_record(&record).await,
         // The record stays: the next start writes them.
         Err(e) => log::error!("Couldn't update the profile entries of {{{final_guid}}} in profiles.json: {e:#}"),
     }
@@ -2048,24 +2118,35 @@ async fn install_update_steps(
 ///    still to do);
 /// 7. dot-named mods.
 ///
-/// Problems are logged, never fatal: the mod list still loads.
+/// Problems are logged, never fatal: the mod list still loads. What the
+/// user should know -- what it finished or undid, and what it had to leave
+/// as it is -- is also collected as [`Recovered::notices`].
 pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Recovered {
+    let mut notices = Notices::default();
     // 1. In-place setups; see the order above.
     let root = mods_root.to_path_buf();
     match tokio::task::spawn_blocking(move || crate::mod_root::recover_in_place_unwraps(&root)).await {
         Ok(left) if !left.is_empty() => {
-            log::error!("{} hidden in-place setup folder(s) left in the mod storage: {:?}", left.len(), left)
+            log::error!("{} hidden in-place setup folder(s) left in the mod storage: {:?}", left.len(), left);
+            for stage in left {
+                let notice = StartupNotice::new(NoticeKind::AdoptLeft).folder(&stage);
+                notices.push(match crate::mod_root::in_place_folder_name(&stage) {
+                    Some(name) => notice.named(name),
+                    None => notice,
+                });
+            }
         }
         Ok(_) => {}
         Err(e) => log::warn!("Couldn't check for unfinished in-place setups: {e}"),
     }
-    let Ok(mut entries) = tokio::fs::read_dir(mods_root).await else { return Recovered::default() };
+    let Ok(mut entries) = tokio::fs::read_dir(mods_root).await else { return Recovered { notices, ..Recovered::default() } };
     let mut backups = Vec::new();
     let mut staging = Vec::new();
     let mut hidden_mods = Vec::new();
     let mut records = Vec::new();
     let mut pending_deletes = Vec::new();
     let mut pending_records = Vec::new();
+    let mut staging_records = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
         if !name.starts_with('.') {
@@ -2100,6 +2181,12 @@ pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Recovered {
         } else if let Some(rest) = name.strip_prefix(mod_folder::UPDATE_STAGING_PREFIX) {
             if is_dir && Uuid::parse_str(rest).is_ok() {
                 staging.push(path);
+            } else if !is_dir
+                && rest
+                    .strip_suffix(mod_folder::UPDATE_STAGING_RECORD_SUFFIX)
+                    .is_some_and(|id| Uuid::parse_str(id).is_ok())
+            {
+                staging_records.push(path);
             }
         } else if let Some(rest) = name.strip_prefix(mod_folder::UNWRAP_PREFIX) {
             // An archive unpacked for an install that didn't finish: only
@@ -2122,6 +2209,7 @@ pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Recovered {
     for dir in pending_deletes {
         if tokio::fs::symlink_metadata(mod_folder::pending_delete_record_path(&dir)).await.is_err() {
             log::warn!("Keeping {:?}: it has no record saying DDMM set it aside for deleting.", dir);
+            notices.push(named_by_manifest(StartupNotice::new(NoticeKind::DeleteKept).folder(&dir), &dir).await);
             continue;
         }
         match finish_pending_delete(mods_root, &dir).await {
@@ -2143,14 +2231,55 @@ pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Recovered {
     }
     // 3.-7.: see the order above.
     for backup in backups {
-        if let Err(e) = recover_update_backup(mods_root, &backup).await {
-            log::error!("Couldn't recover {:?}, left as it is: {:#}", backup, e);
+        let name = backup_name(mods_root, &backup).await;
+        match recover_update_backup(mods_root, &backup).await {
+            Ok(BackupOutcome::Restored(to)) => notices.push(StartupNotice::new(NoticeKind::UpdateUndone).named(name).folder(to)),
+            Ok(BackupOutcome::RestoredElsewhere(to)) => {
+                notices.push(StartupNotice::new(NoticeKind::BackupRestored).named(name).folder(to))
+            }
+            Ok(BackupOutcome::Stuck) => notices.push(StartupNotice::new(NoticeKind::BackupKept).named(name).folder(&backup)),
+            Ok(BackupOutcome::Removed | BackupOutcome::Replaced) => {}
+            Err(e) => {
+                log::error!("Couldn't recover {:?}, left as it is: {:#}", backup, e);
+                notices.push(StartupNotice::new(NoticeKind::BackupKept).named(name).folder(&backup));
+            }
         }
     }
     for dir in staging {
-        remove_if_duplicate(mods_root, &dir, None).await;
+        let record = mod_folder::staging_record_path(&dir);
+        let recorded = tokio::fs::symlink_metadata(&record).await.is_ok_and(|m| m.is_file());
+        if recorded && mod_folder::ensure_mod_folder(mods_root, &dir).is_ok() {
+            // DDMM's own extraction, and the swap never happened (it would
+            // have renamed this folder away): only a copy of an archive.
+            match mod_folder::remove_mod_folder(mods_root, &dir).await {
+                Ok(()) => {
+                    log::info!("Removed {:?}, the new files of an update that didn't finish.", dir);
+                    let _ = tokio::fs::remove_file(&record).await;
+                }
+                Err(e) => log::warn!("Couldn't remove {:?} yet (the next start tries again): {:#}", dir, e),
+            }
+            continue;
+        }
+        // Left by an older version, without a record: kept unless it's an
+        // identical copy of the installed mod.
+        if !remove_if_duplicate(mods_root, &dir, None).await && tokio::fs::symlink_metadata(&dir).await.is_ok() {
+            notices.push(named_by_manifest(StartupNotice::new(NoticeKind::StagingKept).folder(&dir), &dir).await);
+        }
     }
-    let renames = finish_follow_ups(mods_root, &records).await;
+    for record in staging_records {
+        // Its folder was swapped in or removed: the record is moot.
+        let dir = record.with_file_name(
+            record
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .trim_end_matches(mod_folder::UPDATE_STAGING_RECORD_SUFFIX),
+        );
+        if tokio::fs::symlink_metadata(&dir).await.is_err() && mod_folder::ensure_mod_folder(mods_root, &record).is_ok() {
+            let _ = tokio::fs::remove_file(&record).await;
+        }
+    }
+    let renames = finish_follow_ups(mods_root, &records, &mut notices).await;
     for record in records {
         let backup = backup_of_record(&record);
         // One whose follow-up couldn't be done yet stays for the next start.
@@ -2175,7 +2304,7 @@ pub(crate) async fn recover_leftover_folders(mods_root: &Path) -> Recovered {
             }
         }
     }
-    Recovered { still_hidden, renames }
+    Recovered { still_hidden, renames, notices }
 }
 
 /// What [`recover_leftover_folders`] hands back.
@@ -2186,6 +2315,46 @@ pub(crate) struct Recovered {
     /// Mods whose ID an unfinished update changed (old, new): their
     /// entries are moved in profiles.json, or will be on a later start.
     pub renames: Vec<(Uuid, Uuid)>,
+    /// What the user should be told (see [`crate::startup_notices`]).
+    pub notices: Notices,
+}
+
+/// What [`recover_update_backup`] did with one backup.
+#[derive(Debug, PartialEq, Eq)]
+enum BackupOutcome {
+    /// Deleted: an identical copy is in place.
+    Removed,
+    /// Kept hidden: the version a finished update replaced (or of a mod
+    /// deleted since). Nothing to tell.
+    Replaced,
+    /// Put back into the folder it was set aside from: the update didn't
+    /// finish.
+    Restored(PathBuf),
+    /// Put back under a free name (no record, or its folder taken since,
+    /// and its ID not installed).
+    RestoredElsewhere(PathBuf),
+    /// Kept hidden, though it may be the only copy: nowhere safe to put it.
+    Stuck,
+}
+
+/// The name of the mod in the backup folder `backup`, for a notice.
+async fn backup_name(mods_root: &Path, backup: &Path) -> String {
+    if let Some(m) = read_manifest_quietly(&backup.join(MANIFEST_FILE)).await {
+        return manifest_name(&m).to_string();
+    }
+    read_backup_record(mods_root, &mod_folder::backup_record_path(backup))
+        .await
+        .folder
+        .unwrap_or_else(|| folder_name(backup))
+}
+
+/// `notice` with the name and ID of the mod in `dir`, if its manifest.json
+/// can be read.
+async fn named_by_manifest(notice: StartupNotice, dir: &Path) -> StartupNotice {
+    match read_manifest_quietly(&dir.join(MANIFEST_FILE)).await {
+        Some(m) => notice.named(manifest_name(&m)).guid(manifest_guid(&m)),
+        None => notice,
+    }
 }
 
 /// What an update backup's record file says.
@@ -2211,20 +2380,54 @@ struct BackupRecord {
 pub(crate) struct FollowUp {
     pub guid: Uuid,
     pub moved_from: Option<Uuid>,
+    /// The profiles in which writing it resets option choices, noted in
+    /// the record before profiles.json is written: a crash after the write
+    /// still tells the user on the next start (when the entries already
+    /// fit, and nothing would say they were reset).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reset_in: Vec<String>,
 }
 
 /// Do `follow_up` for the mod whose new manifest is `manifest`: one write
 /// of profiles.json (durable), and nothing when no profile lists the mod.
 /// Doing it again changes nothing.
-async fn apply_follow_up(base_path: &Path, follow_up: &FollowUp, manifest: &Manifest) -> anyhow::Result<()> {
+/// Returns the profiles in which option choices that no longer fit were
+/// reset -- by this write, or by an earlier one the record (`record`, if
+/// any) noted before it crashed.
+async fn apply_follow_up(base_path: &Path, record: Option<&Path>, follow_up: &FollowUp, manifest: &Manifest) -> anyhow::Result<Vec<String>> {
     let from = follow_up.moved_from.unwrap_or(follow_up.guid);
-    let n = crate::commands::profiles::migrate_saved_profiles(base_path, from, follow_up.guid, manifest).await?;
+    let plan = crate::commands::profiles::plan_saved_profiles_migration(base_path, from, follow_up.guid, manifest).await?;
+    let mut reset_in = follow_up.reset_in.clone();
+    for name in &plan.migrated.reset_in {
+        if !reset_in.contains(name) {
+            reset_in.push(name.clone());
+        }
+    }
+    if let (Some(record), true) = (record, reset_in != follow_up.reset_in) {
+        if let Err(e) = note_reset_in(record, &reset_in).await {
+            log::warn!("Couldn't note the reset options in {:?}: {:#}", record, e);
+        }
+    }
+    let migrated = plan.write().await?;
+    let n = migrated.entries;
     match follow_up.moved_from {
         Some(old) if n > 0 => log::info!("Moved the profile entries of {{{old}}} to {{{}}} and fitted {n} to its manifest.", follow_up.guid),
         _ if n > 0 => log::info!("Fitted {n} profile entr(ies) of {{{}}} to its new manifest.", follow_up.guid),
         _ => {}
     }
-    Ok(())
+    if !migrated.reset_in.is_empty() {
+        log::info!("Option choices of {{{}}} reset to the defaults in: {:?}", follow_up.guid, migrated.reset_in);
+    }
+    Ok(reset_in)
+}
+
+/// Note `reset_in` in the follow-up of the backup record `record` (see
+/// [`FollowUp::reset_in`]).
+async fn note_reset_in(record: &Path, reset_in: &[String]) -> anyhow::Result<()> {
+    let mut value: serde_json::Value = serde_json::from_slice(&tokio::fs::read(record).await?)?;
+    let Some(follow_up) = value.get_mut("follow_up").and_then(|f| f.as_object_mut()) else { return Ok(()) };
+    follow_up.insert("reset_in".into(), serde_json::json!(reset_in));
+    write_record_value(record, value).await
 }
 
 /// The follow-up in the backup record `record` is done (or moot): drop it
@@ -2281,8 +2484,9 @@ fn backup_of_record(record: &Path) -> PathBuf {
 /// A follow-up that can't be done now (profiles.json in use, or the new
 /// version's manifest.json unreadable -- e.g. cut short by a power loss)
 /// stays for the start after. Returns the ID changes of the finished swaps
-/// (done or still to do), for this session's renames.
-async fn finish_follow_ups(mods_root: &Path, records: &[PathBuf]) -> Vec<(Uuid, Uuid)> {
+/// (done or still to do), for this session's renames; what the user should
+/// know goes to `notices`.
+async fn finish_follow_ups(mods_root: &Path, records: &[PathBuf], notices: &mut Notices) -> Vec<(Uuid, Uuid)> {
     let mut renames = Vec::new();
     let Some(base_path) = mods_root.parent() else { return renames };
     for record in records {
@@ -2301,6 +2505,11 @@ async fn finish_follow_ups(mods_root: &Path, records: &[PathBuf]) -> Vec<(Uuid, 
             _ => {
                 log::info!("{:?}: the update didn't finish, so the profiles stay as they were.", record);
                 finish_record(record).await;
+                if let (Some(folder), false) = (&parsed.folder, parsed.swapped) {
+                    let dir = mods_root.join(folder);
+                    let notice = StartupNotice::new(NoticeKind::UpdateUndone).named(folder.as_str()).folder(&dir);
+                    notices.push(named_by_manifest(notice, &dir).await);
+                }
                 continue;
             }
         };
@@ -2314,6 +2523,7 @@ async fn finish_follow_ups(mods_root: &Path, records: &[PathBuf]) -> Vec<(Uuid, 
                 "{:?}: the updated mod's manifest.json can't be read; its profile entries are left for the next start.",
                 folder
             );
+            notices.push(StartupNotice::new(NoticeKind::UpdatePending).named(folder_name(&folder)).guid(follow_up.guid).folder(&folder));
             continue;
         };
         if manifest_guid(&manifest) != follow_up.guid {
@@ -2330,13 +2540,21 @@ async fn finish_follow_ups(mods_root: &Path, records: &[PathBuf]) -> Vec<(Uuid, 
                 follow_up.moved_from = None;
             }
         }
-        match apply_follow_up(base_path, &follow_up, &manifest).await {
-            Ok(()) if crash_point(CrashPoint::RecoveryBeforeRecordDropped) => return renames,
-            Ok(()) => {
+        let name = manifest_name(&manifest).to_string();
+        match apply_follow_up(base_path, Some(record), &follow_up, &manifest).await {
+            Ok(_) if crash_point(CrashPoint::RecoveryBeforeRecordDropped) => return renames,
+            Ok(reset_in) => {
                 log::info!("Finished the profiles of {{{}}} after an update that didn't finish.", follow_up.guid);
                 finish_record(record).await;
+                notices.push(StartupNotice::new(NoticeKind::UpdateFinished).named(name.as_str()).guid(follow_up.guid).folder(&folder));
+                if !reset_in.is_empty() {
+                    notices.push(StartupNotice::new(NoticeKind::OptionsReset).named(name.as_str()).guid(follow_up.guid).profiles(reset_in));
+                }
             }
-            Err(e) => log::error!("Couldn't finish the profiles of {{{}}} yet (the next start tries again): {e:#}", follow_up.guid),
+            Err(e) => {
+                log::error!("Couldn't finish the profiles of {{{}}} yet (the next start tries again): {e:#}", follow_up.guid);
+                notices.push(StartupNotice::new(NoticeKind::ProfilesRetry).named(name.as_str()).guid(follow_up.guid));
+            }
         }
     }
     renames
@@ -2366,6 +2584,28 @@ pub(crate) enum CrashPoint {
 #[cfg(test)]
 thread_local! {
     pub(crate) static CRASH_AT: std::cell::Cell<Option<CrashPoint>> = const { std::cell::Cell::new(None) };
+    pub(crate) static FAIL_AT: std::cell::Cell<Option<FailPoint>> = const { std::cell::Cell::new(None) };
+}
+
+/// Where a test makes one step fail (and DDMM carry on), as a full disk or
+/// a file in use would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailPoint {
+    /// An update can't write "swapped" to its record.
+    SwapNote,
+    /// Reading the mod list fails after the recovery.
+    ModRead,
+}
+
+#[cfg(test)]
+fn fail_point(at: FailPoint) -> bool {
+    FAIL_AT.with(|c| c.get()) == Some(at)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn fail_point(_: FailPoint) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -2560,7 +2800,7 @@ fn same_tree(a: &Path, b: &Path) -> bool {
 }
 
 /// One `.update-backup-<id>` folder; see [`recover_leftover_folders`].
-async fn recover_update_backup(mods_root: &Path, backup: &Path) -> anyhow::Result<()> {
+async fn recover_update_backup(mods_root: &Path, backup: &Path) -> anyhow::Result<BackupOutcome> {
     mod_folder::ensure_mod_folder(mods_root, backup)?;
     let record_file = mod_folder::backup_record_path(backup);
     let mut record = read_backup_record(mods_root, &record_file).await;
@@ -2597,30 +2837,30 @@ async fn recover_update_backup(mods_root: &Path, backup: &Path) -> anyhow::Resul
         if !(record.swapped && record.follow_up.is_some()) {
             let _ = tokio::fs::remove_file(&record_file).await;
         }
-        return Ok(());
+        return Ok(BackupOutcome::Removed);
     }
 
     let keep = |why: &str| log::info!("Keeping {:?} where it is (hidden, not loaded): {why}.", backup);
 
     if record.swapped {
         keep("it's the version an update replaced, or its mod was deleted since");
-        return Ok(());
+        return Ok(BackupOutcome::Replaced);
     }
-    let target = match &record.folder {
+    let (target, where_it_was) = match &record.folder {
         // Stopped between setting the old version aside and moving the new
         // one in: the old version is the only copy. Put it back.
-        Some(folder) if tokio::fs::symlink_metadata(mods_root.join(folder)).await.is_err() => mods_root.join(folder),
+        Some(folder) if tokio::fs::symlink_metadata(mods_root.join(folder)).await.is_err() => (mods_root.join(folder), true),
         _ => {
             let Some(manifest) = &backup_manifest else {
                 keep("it has no manifest.json to tell which mod it is");
-                return Ok(());
+                return Ok(BackupOutcome::Stuck);
             };
             if !same_id.is_empty() {
                 keep("another folder has a mod with the same ID, and restoring it would list two mods with one ID");
-                return Ok(());
+                return Ok(BackupOutcome::Stuck);
             }
             let name = record.folder.as_deref().unwrap_or(manifest_name(manifest));
-            mods_root.join(mod_folder::free_folder_name(mods_root, name, &|_| false))
+            (mods_root.join(mod_folder::free_folder_name(mods_root, name, &|_| false)), false)
         }
     };
 
@@ -2628,7 +2868,7 @@ async fn recover_update_backup(mods_root: &Path, backup: &Path) -> anyhow::Resul
     crate::fs_util::move_path(backup, &target).await?;
     let _ = tokio::fs::remove_file(&record_file).await;
     log::info!("Restored {:?} to {:?} (left over from an update that didn't finish).", backup, target);
-    Ok(())
+    Ok(if where_it_was { BackupOutcome::Restored(target) } else { BackupOutcome::RestoredElsewhere(target) })
 }
 
 /// After the mod in `mod_dir` (ID `guid`) was deleted: find what's left
@@ -5483,7 +5723,7 @@ mod tests {
         let root = base.path().join(MODS_DIRECTORY);
         let backup = root.join(format!(".update-backup-{}", Uuid::new_v4()));
         write_v1_mod(&backup, GUID_A, "Alpha");
-        let follow_up = FollowUp { guid: Uuid::parse_str(GUID_B).unwrap(), moved_from: Some(Uuid::parse_str(GUID_A).unwrap()) };
+        let follow_up = FollowUp { guid: Uuid::parse_str(GUID_B).unwrap(), moved_from: Some(Uuid::parse_str(GUID_A).unwrap()), reset_in: Vec::new() };
         let record = mod_folder::backup_record_path(&backup);
         write_backup_record(&record, &root.join("Beta"), false, Some(&follow_up)).await.unwrap();
         finish_record(&record).await;
@@ -5532,4 +5772,7 @@ mod tests {
         assert_eq!(state.guid_renames(), [(old, Uuid::parse_str(WRAPPED_GUID).unwrap())]);
         assert_eq!(records_in(base.path()).len(), 1, "still to do");
     }
+
+    /// What the startup recovery tells the user.
+    mod startup_notices;
 }

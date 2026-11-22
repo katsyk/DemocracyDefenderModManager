@@ -18,7 +18,7 @@
         loadSettings, deploy, purge, checkSettings, classifyDownloadUrl, checkUpdates, autoDetectAndSaveGamePath,
         resolveBridgeConsent, resolveBridgeInstallCompletion, isGameRunning, forceExit, ackCloseRequested,
         setBridgeFrontendReady, getLastUpdateReport, skipUpdateVersion, browserExtensionActive,
-        detectImportSources, takePendingDeepLinks, getGuidRenames, resolveReplaceRequest, type ImportSource,
+        detectImportSources, takePendingDeepLinks, getGuidRenames, resolveReplaceRequest, takeStartupNotices, type ImportSource,
         type UpdateStatusEntry, type UpdateCheckReport, type BridgeConsentDecision, type BridgeSoftError,
         type ReplaceOffer, type InstalledMod
     } from "$lib/utils/commands";
@@ -41,7 +41,8 @@
         UpdateDownloadPopup,
         BrowserUpdatePopup,
         ImportPopup,
-        ReplacePopup
+        ReplacePopup,
+        StartupNoticesPopup
     } from "$lib/types/popup";
     import type { HandoffResult } from "$lib/types/popup";
     import type { AfterBrowserInstall } from "$lib/models/settings";
@@ -352,6 +353,9 @@
         // mod's ID without getting to profiles.json yet (it was in use):
         // the backend reports it as a rename, so its entries follow here.
         await applyGuidRenames();
+        // Only now: what the startup recovery did is final once the
+        // profiles are loaded (`load_profiles` waits for it).
+        await showStartupNotices();
 
         if (repeated.length > 0) {
             // Saved at once, so the repaired list is what's on disk even if
@@ -446,6 +450,20 @@
         }
         log.info(`Moved the profile entries of ${moved.length} updated mod(s) to their new ID.`);
         await refreshUpdateStatuses();
+    }
+
+    /** What DDMM's startup finished, undid, or had to leave as it is (an
+     * update DDMM was closed in the middle of, a hidden folder it couldn't
+     * put back): one popup, once per session. */
+    async function showStartupNotices() {
+        try {
+            const notices = await takeStartupNotices();
+            if (notices.length === 0) return;
+            log.info(`Showing ${notices.length} startup notice(s): ${notices.map(n => n.kind).join(", ")}`);
+            showPopup(new StartupNoticesPopup(notices));
+        } catch (ex: unknown) {
+            log.warn(`Couldn't get the startup notices: ${errorMessage(ex)}`);
+        }
     }
 
     function updatesFor(guid: UUID): UpdateStatusEntry[] {

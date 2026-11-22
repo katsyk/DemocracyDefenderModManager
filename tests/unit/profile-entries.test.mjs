@@ -38,6 +38,24 @@ test("stale option choices are reset to the defaults, keeping on/off", () => {
     assert.ok(configFits({ For: "Legacy", Guid: "g1", Enabled: true, Selected: 0 }, { ...legacy, Options: undefined }));
 });
 
+test("an entry without choices made loses none when it's fitted (same rules as the backend)", () => {
+    const legacyFirst = { For: "Legacy", Guid: "g1", Enabled: true, Selected: 0 };
+    const empty = { For: "V1", Guid: "g1", Enabled: false, Toggled: [], Selected: [] };
+    // A mod without options (DDMM's own Legacy manifest) updated to an
+    // author's manifest without options: fitted, not reset.
+    const fitted = fitConfig(legacyFirst, v1([]));
+    assert.deepEqual(fitted, { config: { For: "V1", Guid: "g1", Enabled: true, Toggled: [], Selected: [] }, reset: false });
+    assert.equal(fitConfig(legacyFirst, v1(undefined)).reset, false);
+    // ... but to one with options, its first choice is a choice.
+    assert.equal(fitConfig(legacyFirst, v1([opt()])).reset, true);
+    assert.equal(fitConfig({ ...legacyFirst, Selected: 1 }, v1([])).reset, true);
+    // A V1/V2 entry with nothing in it has nothing to lose.
+    assert.equal(fitConfig(empty, v1([opt(2)])).reset, false);
+    assert.equal(fitConfig(empty, { ...v1([]), Version: 2 }).reset, false);
+    assert.equal(fitConfig(empty, { Guid: "g1", Name: "L", Description: "", Options: ["a"] }).reset, false);
+    assert.equal(fitConfig({ ...empty, Toggled: [true], Selected: [0] }, v1([])).reset, true);
+});
+
 test("a deleted mod leaves every profile, all of its entries, in place", () => {
     const entry = (guid) => ({ For: "V1", Guid: guid, Enabled: true, Toggled: [], Selected: [] });
     const configs = [entry("gone"), entry("keep"), entry("gone")];

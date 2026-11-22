@@ -792,6 +792,27 @@
             "cancel_button": {
                 "text": "Cancel"
             }
+        },
+        "startup_notices": {
+            "title": "When DDMM Started",
+            "intro": "DDMM was closed in the middle of something last time, or found something it can't sort out on its own:",
+            "named": "{name}: {text}",
+            "update_finished": "DDMM was closed while updating or replacing this mod. The new version was already in place, so DDMM finished the update.",
+            "update_undone": "DDMM was closed while updating or replacing this mod, before the new version was in place. The mod is still at the version it had; update it again if you want the new one.",
+            "backup_restored": "DDMM put this version back as {folder}: an update had set it aside, and it didn't belong to any installed mod, so it's listed again. If you don't need it, remove it from your mods.",
+            "options_reset": "{name} changed since its options were chosen, so its options were reset to the defaults in {profiles}. Check them before deploying.",
+            "profiles_retry": "DDMM finished an update that was cut short, but couldn't save profiles.json (another program may have it open). It tries again on the next start; until then the list already shows the mod's entries as they will be. Check its options before deploying.",
+            "update_pending": "An update that was cut short can't be finished yet, because the new version's manifest.json in {folder} can't be read. The mod isn't listed and its profile entries are left as they were; DDMM tries again on every start. If this doesn't go away, delete the mod's folder and add the mod again.",
+            "adopt_left": "DDMM was setting up this folder as a mod where it is and couldn't tell how to finish or undo it, so it left the files in the hidden folder {folder}. Nothing was deleted. Move what you need out of it, then delete it.",
+            "backup_kept": "An update that was cut short left the previous version in the hidden folder {folder}, and DDMM couldn't put it back. Nothing was deleted. Move out what you need, then delete the hidden folder.",
+            "staging_kept": "An update that was cut short left its new files in the hidden folder {folder}. DDMM doesn't use them, and the mod keeps the version it had. Delete the folder if you don't need it.",
+            "delete_kept": "The hidden folder {folder} looks like a removed mod's files, but DDMM has no record that it set them aside, so it won't delete them. Check the folder and delete it if you don't need it.",
+            "mod_unreadable": "This mod isn't listed because its manifest.json can't be read. Fix or re-download the mod, or delete its folder {folder}.",
+            "unknown": "Something left over from last time needs a look. See the log for details.",
+            "open_folder_button": {
+                "text": "Open Folder"
+            },
+            "open_folder_failed": "Couldn't open the folder: {error}"
         }
     },
     "toast": {

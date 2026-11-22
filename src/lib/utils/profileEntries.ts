@@ -49,7 +49,17 @@ export function configFits(config: Config, manifest: Manifest): boolean {
  * user can be told. */
 export function fitConfig(config: Config, manifest: Manifest): { config: Config; reset: boolean } {
     if (configFits(config, manifest)) return { config, reset: false };
-    return { config: { ...defaultConfigFor(manifest), Enabled: config.Enabled }, reset: true };
+    return { config: { ...defaultConfigFor(manifest), Enabled: config.Enabled }, reset: madeChoices(config, manifest.Options?.length ?? 0) };
+}
+
+/** Whether resetting `config` for a manifest with `options` options loses
+ * a choice: not for a V1/V2 entry with no choices in it, nor for a Legacy
+ * entry on its first choice (what the page saves for a mod without
+ * options) when the manifest has no options either. The backend's
+ * `fit_config` (profiles.rs) follows the same rules. */
+export function madeChoices(config: Config, options: number): boolean {
+    if (config.For === "Legacy") return !(config.Selected === 0 && options === 0);
+    return config.Toggled.length > 0 || config.Selected.length > 0;
 }
 
 /** What a deploy of `configs` would actually use: the entries whose mod is

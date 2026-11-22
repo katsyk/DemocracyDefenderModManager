@@ -299,6 +299,35 @@ export async function getGuidRenames(): Promise<[UUID, UUID][]> {
     return await invoke<[UUID, UUID][]>("get_guid_renames");
 }
 
+/** What the startup recovery did, or couldn't do, that the user should
+ * know (see `startup_notices.rs` on the Rust side). */
+export type StartupNoticeKind =
+    | "updateFinished" | "updateUndone" | "backupRestored" | "optionsReset" | "profilesRetry" | "updatePending"
+    | "adoptLeft" | "backupKept" | "stagingKept" | "deleteKept" | "modUnreadable";
+
+export type StartupNotice = {
+    kind: StartupNoticeKind,
+    modName?: string,
+    guid?: UUID,
+    /** The folder it's about, in full. */
+    folder?: string,
+    /** Where options were reset (`optionsReset`). */
+    profiles?: string[]
+};
+
+/** This session's startup notices; every later call returns none. Called
+ * only after `loadProfiles` (which waits for the recovery). */
+export async function takeStartupNotices(): Promise<StartupNotice[]> {
+    log.debug("Invoking `take_startup_notices`.");
+    return await invoke<StartupNotice[]>("take_startup_notices") ?? [];
+}
+
+/** Open a folder a startup notice named in the file manager. */
+export async function openStartupNoticeFolder(folder: string): Promise<void> {
+    log.debug("Invoking `open_startup_notice_folder`.");
+    await invoke<void>("open_startup_notice_folder", { folder });
+}
+
 export async function loadSettings(): Promise<Settings> {
     log.debug("Invoking `load_settings`.");
     return await invoke<Settings>("load_settings");

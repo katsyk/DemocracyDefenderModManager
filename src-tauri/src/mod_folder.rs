@@ -321,6 +321,20 @@ pub const IN_PLACE_UNWRAP_RECORD_SUFFIX: &str = ".unwrap";
 
 /// Prefix of the throwaway folder an update is extracted into.
 pub const UPDATE_STAGING_PREFIX: &str = ".update-";
+/// Suffix of the small file written (durably) next to an `.update-<id>`
+/// staging folder before the folder is created, and removed once it was
+/// swapped in or discarded. A staging folder that still has one at startup
+/// is DDMM's own extraction whose swap never happened: deleted, like an
+/// `.unwrap-<id>` folder. One without it (left by an older version) is
+/// only deleted when it's an identical copy of the installed mod.
+pub const UPDATE_STAGING_RECORD_SUFFIX: &str = ".staging";
+
+/// The record file for the update staging folder `dir`.
+pub fn staging_record_path(dir: &Path) -> PathBuf {
+    let mut name = dir.file_name().unwrap_or_default().to_os_string();
+    name.push(UPDATE_STAGING_RECORD_SUFFIX);
+    dir.with_file_name(name)
+}
 /// Prefix of the folder the old version of a mod is set aside in while an
 /// update is swapped in.
 pub const UPDATE_BACKUP_PREFIX: &str = ".update-backup-";
