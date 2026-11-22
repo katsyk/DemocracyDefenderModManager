@@ -182,16 +182,20 @@ example, a patch file the mod claims to include that doesn't actually exist in i
 
 ## Deploy fails with "couldn't write DDMM's deploy record"
 
-Before copying any mod file, deploy writes `.ddmm-deployed.json` into the game's `data` folder, a record of the
-files it is about to copy (see [Deploy & purge](../using/deploy-purge.md#purge)). If it can't, it stops without
-copying anything, so the game has no mods until you deploy again. Check that the `data` folder isn't read-only (or
-blocked by an antivirus's folder protection) and that nothing else is named `.ddmm-deployed.json` there, then click
-**Deploy** again.
+Deploy keeps a record, `.ddmm-deployed.json`, of the files it copies into the game's `data` folder (see
+[Deploy & purge](../using/deploy-purge.md#purge)). It checks that it can write it before changing anything, so
+usually this error means nothing was changed and the mods you deployed before are still in place; the error says
+so. If writing fails only after the old mods were purged, deploy stops without copying anything, and the game has
+no mods until you deploy again. If the error says your mods were deployed, they are in place and Purge still
+removes them. Either way, check that the `data` folder isn't read-only (or blocked by an antivirus's folder
+protection) and that nothing else is named `.ddmm-deployed.json` there, then click **Deploy** again.
 
 ## DDMM closed or crashed while deploying
 
 The game may have only some of your mods. Open DDMM and click **Deploy** again (or **Purge**): it removes every file
-the interrupted deploy wrote, using its record, and never the game's own files.
+the interrupted deploy wrote, using its record. It keeps the game's own files, including a Skip List file that
+Steam put back since, unless that file has exactly the same bytes as the mod's file (then it can't be told apart
+from DDMM's copy, and removing it only removes bytes identical to the mod's).
 
 ## Game files missing after using the Skip List
 

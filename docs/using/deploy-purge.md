@@ -21,18 +21,21 @@ Clicking **Deploy** (tip: "Install the current selection of mods."):
    in the options editor, not what gets deployed. If a mod can't be collected (for example, an option folder its
    manifest names is missing), deploy stops here with an error, before your `data` folder is touched, so the
    mods you deployed last time stay in place.
-4. **Purges** (see below), so every deploy starts from a clean `data` folder rather than layering on top of a
+4. Checks that it can write its record, `.ddmm-deployed.json`, in the `data` folder (see [Purge](#purge)). If it
+   can't (the folder is read-only, or something is in the way of that file), deploy stops here with an error,
+   before your `data` folder is changed, so the mods you deployed last time stay in place.
+5. **Purges** (see below), so every deploy starts from a clean `data` folder rather than layering on top of a
    previous one.
-5. Writes its record of the files it is about to copy, `.ddmm-deployed.json`, into the `data` folder (see
-   [Purge](#purge)). If it can't (the folder is read-only, or something is in the way of that file), deploy stops
-   here with an error and copies nothing, so no mod file ever lands in the game without a record. The mods you
-   deployed before are already purged at this point; fix the folder and deploy again.
-6. Copies each group's patch/`.gpu_resources`/`.stream` files into `<Game Path>/data/`, numbering them
+6. Writes its record of the files it is about to copy. If that fails now, deploy stops with an error and copies
+   nothing, so no mod file ever lands in the game without a record; the mods you deployed before are already
+   purged at this point, so fix the folder and deploy again.
+7. Copies each group's patch/`.gpu_resources`/`.stream` files into `<Game Path>/data/`, numbering them
    `.patch_0`, `.patch_1`, and so on in your profile's mod order. If a triplet is missing its `.gpu_resources` or
    `.stream` file, DDMM writes an empty placeholder for it instead of skipping it, so the numbering for later
    mods touching the same patch name stays consistent. Higher numbers override lower ones in game, so the mod
    lowest in your list wins a conflict (see [Load order and conflicts](profiles.md#load-order-and-conflicts)).
-7. Updates the record with each copied file's size and modification time.
+8. Updates the record with each copied file's size and modification time. If that fails (DDMM tries twice), deploy
+   reports an error although your mods are in place; the record from step 6 still lets Purge remove them.
 
 If DDMM is closed, crashes or loses power partway through a deploy, the game may be left with only some of your
 mods. Deploy again (or Purge) and DDMM removes every file the interrupted deploy wrote, using its record, before
@@ -66,13 +69,17 @@ record shows DDMM wrote it:
 
 - after a finished deploy, only if it is still exactly the file DDMM wrote. If something replaced it since (a
   Steam "Verify integrity of game files" restoring the game's own file, for example), it is kept.
-- after a deploy that was interrupted, only if nothing of that name was there before the deploy and the file
-  isn't bigger than the one DDMM was copying there.
+- after a deploy that was interrupted, only if nothing of that name was there before the deploy and the file's
+  bytes are still DDMM's copy of the mod's file (possibly cut short where the copy stopped). Anything else there
+  (a game file Steam put back, for example) is kept, and so is the file if the mod's own file is gone. A game file
+  with exactly the same bytes as the mod's file can't be told apart from DDMM's copy, and is purged; that only
+  removes bytes identical to the mod's.
 
 With no record (for example after a deploy by an older version), it is kept.
 
 !!! warning "Upgrading from rc.14 or earlier"
     If you used rc.14 or earlier with Skip List entries, verify game files in Steam once, because older versions could delete the game's own files for those names.
 
-Purge only removes files matching that pattern (and its own `.ddmm-deployed.json` record, plus any temporary copy of it, `.ddmm-deployed.json.<id>.tmp`, that a crash left behind); the rest of your `data`
-folder (and your game install as a whole) is left alone.
+Purge only removes files matching that pattern (and its own `.ddmm-deployed.json` record, plus any temporary copy
+of it, `.ddmm-deployed.json.<id>.tmp`, that a crash left behind); the rest of your `data` folder (and your game
+install as a whole) is left alone.
