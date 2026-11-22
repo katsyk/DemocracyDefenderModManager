@@ -561,10 +561,13 @@ pub fn run() {
             }
             tauri::RunEvent::Exit => {
                 tauri::async_runtime::block_on(bridge::server::shutdown(app_handle));
-                // Plugins have already handled `Exit` by now (Tauri runs them
-                // before this callback), so the single-instance lock is
-                // released and the new process won't hand off to this one.
                 if app_handle.state::<AppState>().relaunch_on_exit.load(Ordering::SeqCst) {
+                    // Release the single-instance lock before spawning, so the
+                    // new process doesn't hand off to this one. Since
+                    // tauri-plugin-single-instance 2.5.5 the plugin only
+                    // releases it in `cleanup_before_exit`, after this
+                    // callback returns.
+                    tauri_plugin_single_instance::destroy(app_handle);
                     let unshown_links = app_handle
                         .state::<AppState>()
                         .deep_links
