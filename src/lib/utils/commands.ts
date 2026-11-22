@@ -302,7 +302,7 @@ export async function getGuidRenames(): Promise<[UUID, UUID][]> {
 /** What the startup recovery did, or couldn't do, that the user should
  * know (see `startup_notices.rs` on the Rust side). */
 export type StartupNoticeKind =
-    | "updateFinished" | "updateUndone" | "optionsReset" | "profilesRetry" | "updatePending"
+    | "updateFinished" | "updateUndone" | "backupRestored" | "optionsReset" | "profilesRetry" | "updatePending"
     | "adoptLeft" | "backupKept" | "stagingKept" | "deleteKept" | "modUnreadable";
 
 export type StartupNotice = {

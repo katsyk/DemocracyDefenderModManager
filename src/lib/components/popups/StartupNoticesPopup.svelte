@@ -12,25 +12,18 @@
     /** Why "Open folder" didn't work, per notice. */
     let openErrors = $state<Record<number, string>>({});
 
-    /** Kinds that only say what DDMM did; the rest ask for something. */
+    /** Kinds that only say what DDMM did; the rest ask for something. The
+     * backend lists these first (`NoticeKind::is_info`). */
     const INFO_KINDS = ["updateFinished", "updateUndone"];
-    /** Kinds whose folder is worth opening: one to fix, check or clean up. */
-    const OPENABLE_KINDS = ["updatePending", "adoptLeft", "backupKept", "stagingKept", "deleteKept", "modUnreadable"];
+    /** Kinds whose folder is worth showing: one to fix, check or clean up. */
+    const OPENABLE_KINDS = ["backupRestored", "updatePending", "adoptLeft", "backupKept", "stagingKept", "deleteKept", "modUnreadable"];
 
-    function folderName(folder: string | undefined): string | undefined {
-        return folder?.split(/[\\/]/).filter(Boolean).at(-1);
-    }
-
-    function text(n: StartupNotice): string {
-        const params = {
-            name: n.modName ?? folderName(n.folder) ?? "",
-            folder: n.folder ?? "",
-            profiles: (n.profiles ?? []).join(", "),
-        };
+    /** What it says about the mod (or folder), without the mod's name. */
+    function body(n: StartupNotice, params: Record<string, string>): string {
         switch (n.kind) {
             case "updateFinished": return t("popup.startup_notices.update_finished", params);
             case "updateUndone": return t("popup.startup_notices.update_undone", params);
-            case "optionsReset": return t("popup.startup_notices.options_reset", params);
+            case "backupRestored": return t("popup.startup_notices.backup_restored", params);
             case "profilesRetry": return t("popup.startup_notices.profiles_retry", params);
             case "updatePending": return t("popup.startup_notices.update_pending", params);
             case "adoptLeft": return t("popup.startup_notices.adopt_left", params);
@@ -40,6 +33,18 @@
             case "modUnreadable": return t("popup.startup_notices.mod_unreadable", params);
             default: return t("popup.startup_notices.unknown", params);
         }
+    }
+
+    function text(n: StartupNotice): string {
+        const params = {
+            name: n.modName ?? "",
+            folder: n.folder ?? "",
+            profiles: (n.profiles ?? []).join(", "),
+        };
+        // Its own sentence around the name, which it always has.
+        if (n.kind === "optionsReset") return t("popup.startup_notices.options_reset", params);
+        const text = body(n, params);
+        return n.modName ? t("popup.startup_notices.named", { name: n.modName, text }) : text;
     }
 
     async function openFolder(i: number, folder: string) {

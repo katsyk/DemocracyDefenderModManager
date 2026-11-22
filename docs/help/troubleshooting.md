@@ -38,10 +38,11 @@ again until DDMM is started again.
 | The popup says | What to do |
 |---|---|
 | An update was finished, or the mod is still at the version it had | Nothing; update the mod again if you want the new version. See [Updating mods](../using/updating-mods.md). |
+| A version an update had set aside was put back under another folder name | It's listed again. If you don't need it, remove it from your mods. |
 | A mod's options were reset to the defaults in some profiles | Check that mod's options in those profiles before deploying. |
 | profiles.json couldn't be saved | Close any program that has it open (a cloud sync or backup tool, an editor). DDMM tries again on the next start. |
 | An update is waiting because the new version's manifest.json can't be read | If it stays, delete the mod's folder and add the mod again. |
-| A hidden folder (`.adopt-…`, `.update-…`, `.update-backup-…`, `.delete-…`) was left as it is | Click **Open Folder**, move out anything you need, then delete the folder. DDMM never deletes these by itself. |
+| A hidden folder (`.adopt-…`, `.update-…`, `.update-backup-…`, `.delete-…`) was left as it is | Click **Open Folder**, move out anything you need, then delete the folder. DDMM only deletes leftovers it knows are its own copies (an update's downloaded files, a removed mod it set aside itself); it leaves anything that may be your only copy for you to check. |
 | A mod isn't listed because its manifest.json can't be read | See [below](#a-mods-manifest-cant-be-read). |
 
 Problems that are still there (a hidden folder you haven't dealt with yet) are listed again on every start. The

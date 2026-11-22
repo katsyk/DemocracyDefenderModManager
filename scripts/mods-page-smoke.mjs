@@ -1196,16 +1196,22 @@ const scenarios = {
                 { kind: "optionsReset", modName: "V1 mod", guid: G(1), profiles: ["Default", "Second"] },
                 { kind: "adoptLeft", modName: "Cool", folder: "/data/mods/.adopt-1234" },
                 { kind: "stagingKept", modName: "Beta 2", guid: G(2), folder: "/data/mods/.update-5678" },
+                { kind: "stagingKept", folder: "/data/mods/.update-9abc" },
+                { kind: "backupRestored", modName: "Beta", guid: G(2), folder: "/data/mods/Beta 2" },
             ];
         },
         async check(page, r) {
             const list = page.getByTestId("startup-notices");
-            r.expect(await list.count() === 1, "one popup");            r.expect(await page.getByTestId("startup-notice").count() === 4, "listing every notice");
+            r.expect(await list.count() === 1, "one popup");
+            r.expect(await page.getByTestId("startup-notice").count() === 6, "listing every notice");
             const text = await list.textContent();
             r.expect(text.includes("V1 mod changed since its options were chosen, so its options were reset to the defaults in Default, Second."), `options reset names the profiles (${text})`);
             r.expect(text.includes("/data/mods/.adopt-1234") && text.includes("/data/mods/.update-5678"), "the hidden folders are named in full");
+            const items = await page.getByTestId("startup-notice").allTextContents();
+            r.expect(items[4].trim().startsWith("An update that was cut short left its new files in the hidden folder /data/mods/.update-9abc."), `one without a name reads cleanly (${items[4]})`);
+            r.expect(items[5].includes("Beta: DDMM put this version back as /data/mods/Beta 2"), `a backup put back says where (${items[5]})`);
             const open = list.getByText("Open Folder", { exact: true });
-            r.expect(await open.count() === 2, "Open Folder for the folders to deal with only");
+            r.expect(await open.count() === 4, "Open Folder for the folders to deal with only");
             await open.first().click({ timeout: 2000 });
             await page.waitForTimeout(300);
             const opened = r.calls.filter(c => c.cmd === "open_startup_notice_folder").map(c => c.args?.folder);
