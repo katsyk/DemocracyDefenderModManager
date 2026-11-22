@@ -182,41 +182,56 @@ pub async fn remove_from_saved_profiles(base_path: &std::path::Path, guid: uuid:
     Ok(removed)
 }
 
+/// What [`migrate_saved_profiles`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Migrated {
+    /// How many entries it moved or fitted.
+    pub entries: usize,
+    /// The profiles in which option choices were reset because they no
+    /// longer fit, each once, in the file's order.
+    pub reset_in: Vec<String>,
+}
+
 /// Move every entry of the mod `old` in the saved profiles.json over to
 /// `new` (the ID the mod has after an update), and fit those and the
 /// entries already listing `new` to `manifest`; return how many there
-/// were. On/off and position are kept; option choices that no longer fit
-/// `manifest` are reset to the defaults (see [`fit_config`]). A profile
-/// that already lists `new` keeps whichever entry comes first. Nothing is
-/// written when no profile has either (or there's no file yet). Running it
-/// again changes nothing.
+/// were, and where choices were reset. On/off and position are kept;
+/// option choices that no longer fit `manifest` are reset to the defaults
+/// (see [`fit_config`]). A profile that already lists `new` keeps whichever
+/// entry comes first. Nothing is written when no profile has either (or
+/// there's no file yet). Running it again changes nothing.
 pub async fn migrate_saved_profiles(
     base_path: &std::path::Path,
     old: uuid::Uuid,
     new: uuid::Uuid,
     manifest: &Manifest,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<Migrated> {
     let _saving = PROFILES_WRITE.lock().await;
     if !tokio::fs::try_exists(base_path.join(PROFILES_FILE)).await? {
-        return Ok(0);
+        return Ok(Migrated::default());
     }
     let mut config = do_load_profiles(base_path).await?;
-    let mut moved = 0;
+    let mut migrated = Migrated::default();
     for profile in &mut config.profiles {
+        let name = profile.name().to_string();
         match profile {
             Profile::V1 { configs, .. } => {
                 for c in configs.iter_mut().filter(|c| *c.uuid() == old || *c.uuid() == new) {
-                    *c = fit_config(c, new, manifest);
-                    moved += 1;
+                    let (fitted, reset) = fit_config(c, new, manifest);
+                    *c = fitted;
+                    migrated.entries += 1;
+                    if reset && !migrated.reset_in.contains(&name) {
+                        migrated.reset_in.push(name.clone());
+                    }
                 }
             }
         }
     }
-    if moved > 0 {
+    if migrated.entries > 0 {
         remove_repeated_entries(&mut config);
         write_profiles(base_path, &config).await?;
     }
-    Ok(moved)
+    Ok(migrated)
 }
 
 /// After the mod `guid` was replaced in place by another file with the
@@ -224,14 +239,16 @@ pub async fn migrate_saved_profiles(
 /// `manifest` (see [`fit_config`]), keeping their place and on/off.
 /// Returns how many entries it has.
 pub async fn fit_saved_profiles(base_path: &std::path::Path, guid: uuid::Uuid, manifest: &Manifest) -> anyhow::Result<usize> {
-    migrate_saved_profiles(base_path, guid, guid, manifest).await
+    Ok(migrate_saved_profiles(base_path, guid, guid, manifest).await?.entries)
 }
 
 /// `config` for the mod `guid` whose manifest is `manifest`: its option
 /// choices when they still fit (same manifest version, same number of
 /// options, sub-option choices in range), else every option on and the
-/// first choice everywhere -- like a new entry, but keeping on/off.
-pub(crate) fn fit_config(config: &Config, guid: uuid::Uuid, manifest: &Manifest) -> Config {
+/// first choice everywhere -- like a new entry, but keeping on/off. Also
+/// returns whether choices were reset that way (an entry that had none to
+/// make loses none).
+pub(crate) fn fit_config(config: &Config, guid: uuid::Uuid, manifest: &Manifest) -> (Config, bool) {
     let enabled = config.enabled();
     let in_range = |i: usize, count: usize| i < count.max(1);
     // Sub-option counts per option.
@@ -242,9 +259,9 @@ pub(crate) fn fit_config(config: &Config, guid: uuid::Uuid, manifest: &Manifest)
     };
     match (manifest, config) {
         (Manifest::Legacy(m), Config::Legacy { selected, .. }) if in_range(*selected, m.options.as_ref().map_or(0, Vec::len)) => {
-            Config::Legacy { guid, enabled, selected: *selected }
+            (Config::Legacy { guid, enabled, selected: *selected }, false)
         }
-        (Manifest::Legacy(_), _) => Config::Legacy { guid, enabled, selected: 0 },
+        (Manifest::Legacy(_), _) => (Config::Legacy { guid, enabled, selected: 0 }, true),
         (_, Config::V1 { toggled, selected, .. }) | (_, Config::V2 { toggled, selected, .. }) => {
             let subs = subs.unwrap_or_default();
             let same_version = matches!((manifest, config), (Manifest::V1(_), Config::V1 { .. }) | (Manifest::V2(_), Config::V2 { .. }));
@@ -253,14 +270,16 @@ pub(crate) fn fit_config(config: &Config, guid: uuid::Uuid, manifest: &Manifest)
                 && selected.len() == subs.len()
                 && selected.iter().zip(&subs).all(|(s, n)| in_range(*s, *n));
             if fits {
-                with_version(manifest, guid, enabled, toggled.clone(), selected.clone())
+                (with_version(manifest, guid, enabled, toggled.clone(), selected.clone()), false)
             } else {
-                with_version(manifest, guid, enabled, vec![true; subs.len()], vec![0; subs.len()])
+                // An entry that had no choices to make lost none.
+                let had_choices = !toggled.is_empty() || !selected.is_empty();
+                (with_version(manifest, guid, enabled, vec![true; subs.len()], vec![0; subs.len()]), had_choices)
             }
         }
         (_, Config::Legacy { .. }) => {
             let n = subs.map_or(0, |s| s.len());
-            with_version(manifest, guid, enabled, vec![true; n], vec![0; n])
+            (with_version(manifest, guid, enabled, vec![true; n], vec![0; n]), true)
         }
     }
 }

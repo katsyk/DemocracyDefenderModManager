@@ -354,6 +354,13 @@ fn in_place_record_path(stage: &Path) -> PathBuf {
     stage.with_file_name(name)
 }
 
+/// The mod folder the in-place working folder `stage` belongs to, by its
+/// record (`None` when that can't be read), for telling the user.
+pub(crate) fn in_place_folder_name(stage: &Path) -> Option<String> {
+    let data = std::fs::read(in_place_record_path(stage)).ok()?;
+    serde_json::from_slice::<InPlaceRecord>(&data).ok().filter(InPlaceRecord::is_safe).map(|r| r.folder)
+}
+
 /// `std::fs::rename`, retried a few times a moment apart (on Windows a
 /// virus scanner or the search indexer often has a new file open briefly).
 fn rename_with_retries(from: &Path, to: &Path) -> std::io::Result<()> {

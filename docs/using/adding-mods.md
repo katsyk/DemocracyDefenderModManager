@@ -46,8 +46,9 @@ folder (after following shortcuts/symlinks, `..`, and on Windows and macOS ignor
   one of them and add it again. While moving, DDMM keeps the folder's files in a hidden `.adopt-…` folder in
   `mods/`. If DDMM closes (or a file is in use) partway, the next start either finishes the move or puts the
   folder back as it was. In the rare case it can't tell which is safe (for example, the mod's folder was removed
-  in the meantime), it leaves the hidden `.adopt-…` folder as it is, deletes nothing, and says so in the log on
-  every start; move what you need out of it by hand, then delete it. If moving the files up worked but adding the
+  in the meantime), it leaves the hidden `.adopt-…` folder as it is and deletes nothing. A *When DDMM Started* popup
+  names that folder on every start (with an **Open Folder** button) until it's gone: move what you need out of it by
+  hand, then delete it. If moving the files up worked but adding the
   mod then failed, the folder stays unwrapped: add it again to finish.
 
   A wrapped folder that was added this way by an older DDMM keeps the manifest DDMM generated for it (its inner

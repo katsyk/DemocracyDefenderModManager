@@ -1184,6 +1184,54 @@ const scenarios = {
             r.expect(r.errors.length === 0, "no page error");
         },
     },
+    // What the startup recovery did or couldn't do: one popup listing it
+    // all, after the profiles are loaded; Escape closes it (OK); "Open
+    // Folder" where there's a folder to deal with; not shown again when
+    // the page is loaded again in the session (the backend hands them out
+    // once).
+    startupnotices: {
+        data: (d) => {
+            d.take_startup_notices = [
+                { kind: "updateFinished", modName: "V1 mod", guid: G(1), folder: "/data/mods/V1 mod" },
+                { kind: "optionsReset", modName: "V1 mod", guid: G(1), profiles: ["Default", "Second"] },
+                { kind: "adoptLeft", modName: "Cool", folder: "/data/mods/.adopt-1234" },
+                { kind: "stagingKept", modName: "Beta 2", guid: G(2), folder: "/data/mods/.update-5678" },
+            ];
+        },
+        async check(page, r) {
+            const list = page.getByTestId("startup-notices");
+            r.expect(await list.count() === 1, "one popup");            r.expect(await page.getByTestId("startup-notice").count() === 4, "listing every notice");
+            const text = await list.textContent();
+            r.expect(text.includes("V1 mod changed since its options were chosen, so its options were reset to the defaults in Default, Second."), `options reset names the profiles (${text})`);
+            r.expect(text.includes("/data/mods/.adopt-1234") && text.includes("/data/mods/.update-5678"), "the hidden folders are named in full");
+            const open = list.getByText("Open Folder", { exact: true });
+            r.expect(await open.count() === 2, "Open Folder for the folders to deal with only");
+            await open.first().click({ timeout: 2000 });
+            await page.waitForTimeout(300);
+            const opened = r.calls.filter(c => c.cmd === "open_startup_notice_folder").map(c => c.args?.folder);
+            r.expect(opened.length === 1 && opened[0] === "/data/mods/.adopt-1234", `it opens that folder (${JSON.stringify(opened)})`);
+            const order = r.calls.map(c => c.cmd);
+            r.expect(order.indexOf("load_profiles") >= 0 && order.indexOf("take_startup_notices") > order.indexOf("load_profiles"), "taken after load_profiles");
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(300);
+            r.expect(await list.count() === 0, "Escape closes it");
+            r.expect((await rows(page)).includes("V1 mod"), "the Mods page is there");
+
+            await page.locator("a[href='/settings']").click({ timeout: 2000 });
+            await page.waitForTimeout(800);
+            await page.locator("a[href='/']").click({ timeout: 2000 });
+            await page.waitForTimeout(1500);
+            r.expect((await rows(page)).includes("V1 mod"), "the Mods page loaded again");
+            r.expect(r.calls.filter(c => c.cmd === "take_startup_notices").length === 2, "it asked again");
+            r.expect(await page.getByTestId("startup-notices").count() === 0, "but nothing is shown again");
+            r.expect(r.errors.length === 0, "no page error");
+        },
+    },
+    // No notices: no popup.
+    async nostartupnotices(page, r) {
+        r.expect(r.calls.some(c => c.cmd === "take_startup_notices"), "it asks");
+        r.expect(await page.getByTestId("startup-notices").count() === 0, "nothing shown");
+    },
     // Init itself fails.
     initfail: {
         data: (d) => { d.load_profiles.Profiles = null; },
@@ -1248,6 +1296,12 @@ for (const name of process.argv.length > 2 ? process.argv.slice(2) : Object.keys
                     return new Promise(() => {});
                 }
                 if (cmd === "save_profiles") return void window.__smokeSave(JSON.parse(JSON.stringify(args.config)));
+                // Handed out once per session, like the backend does.
+                if (cmd === "take_startup_notices") {
+                    const notices = responses.take_startup_notices ?? [];
+                    responses.take_startup_notices = [];
+                    return structuredClone(notices);
+                }
                 if (!(cmd in responses)) return null;
                 const result = structuredClone(responses[cmd]);
                 if (cmd === "check_updates" && responses.__poisonInstalledVersion) {

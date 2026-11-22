@@ -132,8 +132,14 @@ results. Either the old version is back with your profiles as they were, or the 
 profile entries handled as described above: kept, moved to the new ID, and option choices that no longer fit reset
 to the defaults. The update doesn't leave entries on an ID that no installed mod has, except where described above
 (an author's own new `Guid`). If profiles.json can't be written at that start (another program has it open), DDMM
-tries again on the next start and meanwhile shows the entries under the mod's new ID. Option choices reset this way
-aren't announced with the usual *options reset* message, so check the mod's options after such a crash.
+tries again on the next start and meanwhile shows the entries under the mod's new ID.
+
+Either way, the Mods page tells you about it once, in a *When DDMM Started* popup: that the update was finished or
+that the mod is still at the version it had, which mods had their options reset to the defaults and in which
+profiles, and whether profiles.json still has to be written. If the update's new files were left in a hidden
+`.update-…` folder, or the version it set aside couldn't be put back (a hidden `.update-backup-…` folder), the popup
+names that folder, with an **Open Folder** button, and keeps saying so on every start until you've dealt with it.
+Nothing in those folders is deleted for you: move out what you need, then delete the folder.
 
 ## Nexus Mods: optional API key (sign-in coming soon) { #nexus-mods-and-the-optional-api-key }
 
