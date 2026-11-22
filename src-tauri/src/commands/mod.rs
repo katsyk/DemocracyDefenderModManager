@@ -144,12 +144,25 @@ async fn create_empty_patch_file(dest: &Path) -> anyhow::Result<()> {
 /// The record of which patch files the last deploy wrote, kept next to
 /// them in the game's `data` folder (so it always describes that folder,
 /// whichever DDMM data folder or game path is in use). Purge removes it.
+///
+/// A deploy writes it twice: before copying anything, as a pending record
+/// of every file it is about to write (see [`PendingFile`]), and after
+/// copying, as the final record of what landed (see [`RecordedFile`]). So
+/// a deploy that is interrupted at any point (a crash, the app killed)
+/// still leaves every file it wrote on record.
 const DEPLOY_RECORD: &str = ".ddmm-deployed.json";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct DeployRecord {
+    /// The files a finished deploy wrote (empty while it is pending).
     files: Vec<RecordedFile>,
+    /// The files a deploy that hasn't finished is writing. A record with
+    /// these was left by a deploy that stopped before it could write its
+    /// final record. Versions without pending records ignore the field and
+    /// see no files, so they keep a skip-listed slot 0 (the safe side).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending: Vec<PendingFile>,
 }
 
 /// One file a deploy wrote, with its length and modification time
@@ -164,6 +177,22 @@ struct RecordedFile {
     modified: u64,
 }
 
+/// One file a deploy is about to write, recorded before it copies
+/// anything.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct PendingFile {
+    name: String,
+    /// The length it will have once written (its source's, or 0 for an
+    /// empty placeholder). A copy that was cut short is shorter, never
+    /// longer, so a longer file there isn't DDMM's.
+    len: u64,
+    /// Whether a file of that name was already there before the deploy
+    /// copied anything (deploy purges first, so normally not). Only a file
+    /// that wasn't there can be DDMM's: one that was is someone else's.
+    existed: bool,
+}
+
 /// A file's length and modification time, as recorded in [`RecordedFile`].
 async fn file_stamp(file: &Path) -> Option<(u64, u64)> {
     let meta = tokio::fs::symlink_metadata(file).await.ok()?;
@@ -174,11 +203,37 @@ async fn file_stamp(file: &Path) -> Option<(u64, u64)> {
     Some((meta.len(), u64::try_from(modified.as_nanos()).ok()?))
 }
 
-/// The files the last deploy recorded writing, by name, or `None` when
-/// there is no usable record (none yet -- including a game folder last
-/// deployed by a version without records -- or an unreadable or damaged
-/// one).
-async fn read_deploy_record(data_dir: &Path) -> Option<HashMap<String, RecordedFile>> {
+/// What the last deploy recorded writing, by file name.
+#[derive(Default)]
+struct Deployed {
+    files: HashMap<String, RecordedFile>,
+    pending: HashMap<String, PendingFile>,
+}
+
+impl Deployed {
+    /// Whether `file` (in the game's `data` folder) is, as far as the
+    /// record shows, a file DDMM wrote and nothing has replaced since: the
+    /// final record lists it with its current length and modification
+    /// time, or a pending record lists it as written by a deploy that
+    /// stopped, where nothing of that name was before and it isn't longer
+    /// than DDMM's would be.
+    async fn wrote(&self, file: &Path) -> bool {
+        let Some(name) = file.file_name().and_then(|n| n.to_str()) else { return false };
+        let Some(stamp) = file_stamp(file).await else { return false };
+        if let Some(r) = self.files.get(name) {
+            return stamp == (r.len, r.modified);
+        }
+        match self.pending.get(name) {
+            Some(p) => !p.existed && stamp.0 <= p.len,
+            None => false,
+        }
+    }
+}
+
+/// The files the last deploy recorded writing, or `None` when there is no
+/// usable record (none yet -- including a game folder last deployed by a
+/// version without records -- or an unreadable or damaged one).
+async fn read_deploy_record(data_dir: &Path) -> Option<Deployed> {
     let file = data_dir.join(DEPLOY_RECORD);
     let data = match tokio::fs::read(&file).await {
         Ok(data) => data,
@@ -189,14 +244,20 @@ async fn read_deploy_record(data_dir: &Path) -> Option<HashMap<String, RecordedF
         }
     };
     match serde_json::from_slice::<DeployRecord>(&data) {
-        Ok(record) => Some(
-            record
+        Ok(record) => Some(Deployed {
+            files: record
                 .files
                 .into_iter()
                 .filter(|f| is_patch_filename(&f.name))
                 .map(|f| (f.name.clone(), f))
                 .collect(),
-        ),
+            pending: record
+                .pending
+                .into_iter()
+                .filter(|f| is_patch_filename(&f.name))
+                .map(|f| (f.name.clone(), f))
+                .collect(),
+        }),
         Err(e) => {
             log::warn!("Ignoring the damaged deploy record {:?}: {}", file, e);
             None
@@ -204,9 +265,47 @@ async fn read_deploy_record(data_dir: &Path) -> Option<HashMap<String, RecordedF
     }
 }
 
+/// Replace the deploy record in `data_dir` with `record`, durably: once
+/// this returns, a crash can't leave the old record (or none) in its place.
+async fn write_deploy_record(data_dir: &Path, record: &DeployRecord) -> anyhow::Result<()> {
+    let file = data_dir.join(DEPLOY_RECORD);
+    let data = serde_json::to_vec_pretty(record)?;
+    tokio::task::spawn_blocking(move || crate::fs_util::replace_file_durably_blocking(&file, &data)).await?
+}
+
+/// Record, before copying anything, every file this deploy is about to
+/// write (`plan`: each file's name and the length it will have), and
+/// whether something of that name is already there. A deploy that can't
+/// write this must not copy anything: the files would be on no record.
+async fn record_pending_files(data_dir: &Path, plan: &[(String, u64)]) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let mut pending = Vec::with_capacity(plan.len());
+    for (name, len) in plan {
+        let existed = match tokio::fs::symlink_metadata(data_dir.join(name)).await {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!("couldn't check {:?} in the game's data folder", name)))
+            }
+        };
+        if existed {
+            log::warn!("{:?} is in the game's data folder although the purge just ran; it is overwritten, but not taken for DDMM's.", name);
+        }
+        pending.push(PendingFile { name: name.clone(), len: *len, existed });
+    }
+    write_deploy_record(data_dir, &DeployRecord { files: Vec::new(), pending })
+        .await
+        .with_context(|| {
+            format!(
+                "couldn't write DDMM's deploy record in the game's data folder {:?}, so nothing was deployed (the mods deployed before were already removed); check that the folder isn't read-only and that nothing is in the way of {}, then deploy again",
+                data_dir, DEPLOY_RECORD
+            )
+        })
+}
+
 /// Record which of `names` (in `data_dir`) are now there, as written by
-/// this deploy. Never fails the deploy: without a record, purge just keeps
-/// a skip-listed slot-0 file it can't prove is DDMM's.
+/// this deploy, replacing its pending record. Never fails the deploy: if
+/// it can't be written, the pending record stays and still covers them.
 async fn record_deployed_files(data_dir: &Path, names: &[String]) {
     let mut files = Vec::with_capacity(names.len());
     for name in names {
@@ -214,13 +313,11 @@ async fn record_deployed_files(data_dir: &Path, names: &[String]) {
             files.push(RecordedFile { name: name.clone(), len, modified });
         }
     }
-    let file = data_dir.join(DEPLOY_RECORD);
-    let written = match serde_json::to_vec_pretty(&DeployRecord { files }) {
-        Ok(data) => crate::fs_util::replace_file(&file, &data).await,
-        Err(e) => Err(e.into()),
-    };
-    if let Err(e) = written {
-        log::warn!("Couldn't write the deploy record {:?} (the deploy itself is fine): {:#}", file, e);
+    if let Err(e) = write_deploy_record(data_dir, &DeployRecord { files, pending: Vec::new() }).await {
+        log::warn!(
+            "Couldn't write the final deploy record in {:?} (the deploy itself is fine, and the pending record still covers its files): {:#}",
+            data_dir, e
+        );
     }
 }
 
@@ -235,22 +332,37 @@ fn is_skip_listed_slot_zero(file: &Path, settings: &Settings) -> bool {
     matches!(rest, ".patch_0" | ".patch_0.gpu_resources" | ".patch_0.stream") && settings.has_skip_entry(prefix)
 }
 
+/// Temporary files a record write interrupted by a crash left behind
+/// (`.ddmm-deployed.json.<id>.tmp`, see [`crate::fs_util::replace_file`]).
+async fn leftover_record_temp_files(data_dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(mut dir) = tokio::fs::read_dir(data_dir).await else { return found };
+    let prefix = format!("{DEPLOY_RECORD}.");
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(&prefix) && name.ends_with(".tmp") && entry.file_type().await.is_ok_and(|t| t.is_file()) {
+            found.push(entry.path());
+        }
+    }
+    found
+}
+
 async fn do_purge(data_dir: &Path, settings: &Settings) -> anyhow::Result<()> {
     use anyhow::Context;
     log::info!("Purging...");
 
     let deployed = read_deploy_record(data_dir).await;
+    if deployed.as_ref().is_some_and(|d| !d.pending.is_empty()) {
+        log::info!("The last deploy didn't finish; removing the files it wrote.");
+    }
     let mut patch_files = Vec::new();
     for f in get_patch_files_from_dir(data_dir).await? {
         if is_skip_listed_slot_zero(&f, settings) {
-            // Only delete it if DDMM wrote it and it is still exactly what
-            // DDMM wrote; otherwise it is (again) the game's own file.
-            let recorded = f
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| deployed.as_ref()?.get(n));
-            let ours = match recorded {
-                Some(r) => file_stamp(&f).await == Some((r.len, r.modified)),
+            // Only delete it if DDMM wrote it and nothing has replaced it
+            // since; otherwise it is (again) the game's own file.
+            let ours = match &deployed {
+                Some(d) => d.wrote(&f).await,
                 None => false,
             };
             if !ours {
@@ -269,6 +381,10 @@ async fn do_purge(data_dir: &Path, settings: &Settings) -> anyhow::Result<()> {
     }))
     .await?;
 
+    if crash_point(DeployCrashPoint::PurgeBeforeRecordRemoved) {
+        anyhow::bail!("simulated crash");
+    }
+
     // Everything DDMM deployed is gone, so the record is too.
     let record = data_dir.join(DEPLOY_RECORD);
     // A record that can't be removed only ever keeps files: its entries
@@ -278,9 +394,45 @@ async fn do_purge(data_dir: &Path, settings: &Settings) -> anyhow::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => log::warn!("Couldn't delete the deploy record {:?}: {}", record, e),
     }
+    for temp in leftover_record_temp_files(data_dir).await {
+        if let Err(e) = tokio::fs::remove_file(&temp).await {
+            log::warn!("Couldn't delete the leftover temporary file {:?}: {}", temp, e);
+        }
+    }
 
     log::info!("Purge complete.");
     Ok(())
+}
+
+/// Where a test stops a deploy or purge, as if DDMM crashed there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeployCrashPoint {
+    /// Purge deleted the files; the record isn't removed yet.
+    PurgeBeforeRecordRemoved,
+    /// Deploy purged; the pending record isn't written yet.
+    BeforePendingRecord,
+    /// The pending record is written; nothing copied yet.
+    BeforeCopy,
+    /// The first file is copied, the rest not.
+    AfterFirstFile,
+    /// Everything is copied; the final record isn't written yet.
+    BeforeFinalRecord,
+}
+
+#[cfg(test)]
+thread_local! {
+    static DEPLOY_CRASH_AT: std::cell::Cell<Option<DeployCrashPoint>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn crash_point(at: DeployCrashPoint) -> bool {
+    DEPLOY_CRASH_AT.with(|c| c.get()) == Some(at)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn crash_point(_: DeployCrashPoint) -> bool {
+    false
 }
 
 /// Pair each config with the installed mod it refers to (by GUID),
@@ -453,11 +605,15 @@ pub async fn deploy(state: State<'_, AppState>, configs: Vec<Config>) -> TAResul
 }
 
 /// Deploy `mods` into the game's `data_dir`: collect every enabled mod's
-/// patch files first, then purge, then copy. Collecting first means a
-/// mod that can't be deployed (an option folder missing from it, an
-/// unreadable folder) stops the deploy before anything in the game folder
-/// is touched, so the previous deploy stays in place instead of the game
-/// being left with no mods at all.
+/// patch files first, then purge, then record what is about to be written,
+/// then copy, then record what was written. Collecting first means a mod
+/// that can't be deployed (an option folder missing from it, an unreadable
+/// folder) stops the deploy before anything in the game folder is touched,
+/// so the previous deploy stays in place instead of the game being left
+/// with no mods at all. Recording before copying means a deploy stopped at
+/// any point (a crash, the app killed) leaves every file it wrote on
+/// record for the next purge; a deploy that can't write that record
+/// copies nothing.
 async fn do_deploy(data_dir: &Path, settings: &Settings, mods: Vec<(&Mod, &Config)>) -> anyhow::Result<()> {
     log::info!("Grouping files...");
     let mut groups: HashMap<String, Vec<PatchFileTriplet>> = HashMap::new();
@@ -472,35 +628,35 @@ async fn do_deploy(data_dir: &Path, settings: &Settings, mods: Vec<(&Mod, &Confi
         }
     }
 
+    let plan = plan_copies(settings, &groups).await?;
+
     do_purge(data_dir, settings).await?;
 
     log::info!("Deploying...");
 
-    if groups.is_empty() {
+    if plan.is_empty() {
         log::info!("Nothing to deploy.");
         return Ok(());
     }
-    
-    // Load order: `configs` is the profile's mod list, top to bottom, and
-    // each group's triplets were collected in that order. The first gets
-    // `<name>.patch_0` (after an optional skip-list offset), the next
-    // `.patch_1`, and so on. Helldivers 2 applies higher patch numbers over
-    // lower ones, so the mod LOWEST in the list wins a conflict.
-    let mut written = Vec::new();
-    for (name, triplets) in &groups {
-        let offset = if settings.has_skip_entry(name) { 1 } else { 0 };
-        for index in offset..triplets.len() + offset {
-            for suffix in ["", ".gpu_resources", ".stream"] {
-                written.push(format!("{}.patch_{}{}", name, index, suffix));
-            }
-        }
+
+    if crash_point(DeployCrashPoint::BeforePendingRecord) {
+        anyhow::bail!("simulated crash");
     }
-    written.sort();
+    let pending: Vec<(String, u64)> = plan.iter().map(|c| (c.name.clone(), c.len)).collect();
+    record_pending_files(data_dir, &pending).await?;
+    if crash_point(DeployCrashPoint::BeforeCopy) {
+        anyhow::bail!("simulated crash");
+    }
 
     log::info!("Copying files...");
-    let copied = copy_groups(data_dir, settings, &groups).await;
+    let copied = copy_files(data_dir, &plan).await;
+    if crash_point(DeployCrashPoint::AfterFirstFile) || crash_point(DeployCrashPoint::BeforeFinalRecord) {
+        return copied.and(Err(anyhow::anyhow!("simulated crash")));
+    }
     // Recorded even when copying stopped partway, so the files that did
     // land are known to be DDMM's.
+    let mut written: Vec<String> = plan.into_iter().map(|c| c.name).collect();
+    written.sort();
     record_deployed_files(data_dir, &written).await;
     copied?;
 
@@ -508,37 +664,58 @@ async fn do_deploy(data_dir: &Path, settings: &Settings, mods: Vec<(&Mod, &Confi
     Ok(())
 }
 
-async fn copy_groups(
-    data_dir: &Path,
-    settings: &Settings,
-    groups: &HashMap<String, Vec<PatchFileTriplet>>,
-) -> anyhow::Result<()> {
+/// One file deploy writes into the game's `data` folder.
+struct PlannedCopy {
+    /// Its name there.
+    name: String,
+    /// The mod file copied there, or `None` for an empty placeholder.
+    src: Option<PathBuf>,
+    /// The length it will have: its source's, or 0.
+    len: u64,
+}
+
+/// Every file deploy writes for `groups`, in the order it writes them.
+///
+/// Load order: `configs` is the profile's mod list, top to bottom, and
+/// each group's triplets were collected in that order. The first gets
+/// `<name>.patch_0` (after an optional skip-list offset), the next
+/// `.patch_1`, and so on. Helldivers 2 applies higher patch numbers over
+/// lower ones, so the mod LOWEST in the list wins a conflict. A triplet
+/// missing its `.gpu_resources` or `.stream` gets an empty placeholder, so
+/// the numbering stays consistent for later mods touching the same name.
+async fn plan_copies(settings: &Settings, groups: &HashMap<String, Vec<PatchFileTriplet>>) -> anyhow::Result<Vec<PlannedCopy>> {
+    use anyhow::Context;
+    let mut plan = Vec::new();
     for (name, triplets) in groups {
         let offset = if settings.has_skip_entry(name) { 1 } else { 0 };
-
         for (i, triplet) in triplets.iter().enumerate() {
             let index = i + offset;
-
-            let patch_dest = data_dir.join(format!("{}.patch_{}", name, index));
-            match &triplet.patch {
-                Some(src) => { copy_patch_file(src, &patch_dest).await?; }
-                None => { create_empty_patch_file(&patch_dest).await?; }
-            }
-            
-            let gpu_dest = data_dir.join(format!("{}.patch_{}.gpu_resources", name, index));
-            match &triplet.gpu_resources {
-                Some(src) => { copy_patch_file(src, &gpu_dest).await?; }
-                None => { create_empty_patch_file(&gpu_dest).await?; }
-            }
-            
-            let stream_dest = data_dir.join(format!("{}.patch_{}.stream", name, index));
-            match &triplet.stream {
-                Some(src) => { copy_patch_file(src, &stream_dest).await?; }
-                None => { create_empty_patch_file(&stream_dest).await?; }
+            for (suffix, src) in [("", &triplet.patch), (".gpu_resources", &triplet.gpu_resources), (".stream", &triplet.stream)] {
+                let len = match src {
+                    Some(src) => tokio::fs::metadata(src)
+                        .await
+                        .with_context(|| format!("can't read {:?}", src))?
+                        .len(),
+                    None => 0,
+                };
+                plan.push(PlannedCopy { name: format!("{}.patch_{}{}", name, index, suffix), src: src.clone(), len });
             }
         }
     }
+    Ok(plan)
+}
 
+async fn copy_files(data_dir: &Path, plan: &[PlannedCopy]) -> anyhow::Result<()> {
+    for (i, copy) in plan.iter().enumerate() {
+        if i == 1 && crash_point(DeployCrashPoint::AfterFirstFile) {
+            return Ok(());
+        }
+        let dest = data_dir.join(&copy.name);
+        match &copy.src {
+            Some(src) => copy_patch_file(src, &dest).await?,
+            None => create_empty_patch_file(&dest).await?,
+        }
+    }
     Ok(())
 }
 
@@ -978,10 +1155,11 @@ mod tests {
         }
     }
 
-    /// The record can't be written (here a folder is in its way): the
-    /// deploy still goes through, and purge still works without it.
+    /// The pending record can't be written (here a folder is in its way):
+    /// the deploy fails with an error saying so, before copying anything,
+    /// so no DDMM file lands in the game folder without a record.
     #[tokio::test]
-    async fn a_deploy_record_that_cant_be_written_doesnt_fail_the_deploy() {
+    async fn a_deploy_record_that_cant_be_written_stops_the_deploy_before_copying() {
         let data = tempfile::tempdir().unwrap();
         tokio::fs::create_dir(data.path().join(DEPLOY_RECORD)).await.unwrap();
         let m = tempfile::tempdir().unwrap();
@@ -990,15 +1168,272 @@ mod tests {
         let mods = vec![r#mod];
         let configs = vec![cfg];
 
-        do_deploy(data.path(), &no_skip_list(), pair_mods_with_configs(&mods, &configs)).await.unwrap();
-        let slot0 = data.path().join(patch_file_name(0));
-        assert_eq!(tokio::fs::read(&slot0).await.unwrap(), b"data");
+        let err = do_deploy(data.path(), &no_skip_list(), pair_mods_with_configs(&mods, &configs))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("nothing was deployed"), "{err:#}");
+        // Only the folder in the record's way is there.
+        assert_eq!(patch_files_in(data.path()), vec![DEPLOY_RECORD.to_string()]);
+    }
 
-        // No usable record: a skip-listed slot 0 is kept, the rest purged.
-        tokio::fs::write(data.path().join(patch_file_name(1)), b"x").await.unwrap();
-        do_purge(data.path(), &skip_list("0123456789abcdef")).await.unwrap();
-        assert!(slot0.exists());
-        assert!(!data.path().join(patch_file_name(1)).exists());
+    /// The game's data folder can't be written to at all: the deploy fails
+    /// clearly and nothing is copied.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_only_game_folder_fails_the_deploy_without_copying() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = tempfile::tempdir().unwrap();
+        let m = tempfile::tempdir().unwrap();
+        write_patch_file(m.path(), 0).await;
+        let (r#mod, cfg) = legacy_mod("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", m.path());
+        let mods = vec![r#mod];
+        let configs = vec![cfg];
+        std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(data.path().join("probe"), b"x").is_ok() {
+            // Running as root: permissions don't apply.
+            std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let result = do_deploy(data.path(), &no_skip_list(), pair_mods_with_configs(&mods, &configs)).await;
+        std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = result.unwrap_err();
+        assert!(format!("{err:#}").contains("nothing was deployed"), "{err:#}");
+        assert_eq!(patch_files_in(data.path()), Vec::<String>::new());
+    }
+
+    /// The names of the patch files (and record leftovers) in `dir`, sorted.
+    fn patch_files_in(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| is_patch_filename(n) || n.starts_with(DEPLOY_RECORD))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Run `f` as if DDMM crashed at `at` in it.
+    async fn crashing_at<T>(at: DeployCrashPoint, f: impl std::future::Future<Output = T>) -> T {
+        DEPLOY_CRASH_AT.with(|c| c.set(Some(at)));
+        let out = f.await;
+        DEPLOY_CRASH_AT.with(|c| c.set(None));
+        out
+    }
+
+    const MOD_NAME: &str = "0123456789abcdef";
+    /// A name whose slot 0 is the game's own file (skip-listed).
+    const GAME_NAME: &str = "1111111111111111";
+
+    fn skip_lists(names: &[&str]) -> Settings {
+        let list = names.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(",");
+        serde_json::from_str(&format!(r#"{{"Version":"V1","GamePath":"","SkipList":[{list}]}}"#)).unwrap()
+    }
+
+    /// A game folder with the game's own files (a skip-listed slot 0
+    /// triplet, and a non-patch file), and a mod with a full triplet for
+    /// [`MOD_NAME`] and a patch for [`GAME_NAME`].
+    struct Fixture {
+        data: tempfile::TempDir,
+        _mod_dir: tempfile::TempDir,
+        mods: Vec<Mod>,
+        configs: Vec<Config>,
+    }
+
+    const GAME_FILES: [&str; 4] = [
+        "1111111111111111.patch_0",
+        "1111111111111111.patch_0.gpu_resources",
+        "1111111111111111.patch_0.stream",
+        "game.bin",
+    ];
+
+    impl Fixture {
+        async fn new() -> Self {
+            let data = tempfile::tempdir().unwrap();
+            for name in GAME_FILES {
+                tokio::fs::write(data.path().join(name), format!("game's own {name}")).await.unwrap();
+            }
+            let mod_dir = tempfile::tempdir().unwrap();
+            for suffix in ["", ".gpu_resources", ".stream"] {
+                tokio::fs::write(mod_dir.path().join(format!("{MOD_NAME}.patch_0{suffix}")), b"mod data").await.unwrap();
+            }
+            tokio::fs::write(mod_dir.path().join(format!("{GAME_NAME}.patch_0")), b"mod data").await.unwrap();
+            let (r#mod, cfg) = legacy_mod("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", mod_dir.path());
+            Fixture { data, _mod_dir: mod_dir, mods: vec![r#mod], configs: vec![cfg] }
+        }
+
+        fn dir(&self) -> &std::path::Path {
+            self.data.path()
+        }
+
+        async fn deploy(&self, settings: &Settings) -> anyhow::Result<()> {
+            do_deploy(self.dir(), settings, pair_mods_with_configs(&self.mods, &self.configs)).await
+        }
+
+        /// Only the game's own files are left, unchanged.
+        fn assert_only_game_files(&self, context: &str) {
+            let mut left: Vec<String> = std::fs::read_dir(self.dir())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            left.sort();
+            assert_eq!(left, GAME_FILES, "{context}");
+            for name in GAME_FILES {
+                assert_eq!(
+                    std::fs::read_to_string(self.dir().join(name)).unwrap(),
+                    format!("game's own {name}"),
+                    "{context}: {name} changed"
+                );
+            }
+        }
+    }
+
+    const DEPLOY_CRASH_POINTS: [DeployCrashPoint; 5] = [
+        DeployCrashPoint::PurgeBeforeRecordRemoved,
+        DeployCrashPoint::BeforePendingRecord,
+        DeployCrashPoint::BeforeCopy,
+        DeployCrashPoint::AfterFirstFile,
+        DeployCrashPoint::BeforeFinalRecord,
+    ];
+
+    /// A deploy stopped at any point, followed by a purge, leaves exactly
+    /// the game's own files -- also when the mod's patch name was added to
+    /// the Skip List in between (so its slot 0 is only purged if the record
+    /// shows DDMM wrote it), and when a file was cut short mid-copy.
+    #[tokio::test]
+    async fn purge_after_a_deploy_stopped_at_any_point_removes_every_ddmm_file() {
+        for at in DEPLOY_CRASH_POINTS {
+            let f = Fixture::new().await;
+            // A finished deploy first, so the stopped one has something to purge.
+            f.deploy(&skip_lists(&[GAME_NAME])).await.unwrap();
+            let result = crashing_at(at, f.deploy(&skip_lists(&[GAME_NAME]))).await;
+            assert!(result.is_err(), "{at:?}");
+            if at == DeployCrashPoint::AfterFirstFile {
+                // The copy that was under way when DDMM stopped is cut short.
+                for name in patch_files_in(f.dir()) {
+                    if name.starts_with(MOD_NAME) {
+                        std::fs::write(f.dir().join(&name), b"mod").unwrap();
+                    }
+                }
+            }
+
+            do_purge(f.dir(), &skip_lists(&[GAME_NAME, MOD_NAME])).await.unwrap();
+            f.assert_only_game_files(&format!("{at:?}"));
+        }
+    }
+
+    /// The next deploy after a stopped one cleans up the same way, and
+    /// deploys normally.
+    #[tokio::test]
+    async fn deploy_after_a_deploy_stopped_at_any_point_replaces_it() {
+        for at in DEPLOY_CRASH_POINTS {
+            let f = Fixture::new().await;
+            f.deploy(&skip_lists(&[GAME_NAME])).await.unwrap();
+            let _ = crashing_at(at, f.deploy(&skip_lists(&[GAME_NAME]))).await;
+
+            let both = skip_lists(&[GAME_NAME, MOD_NAME]);
+            f.deploy(&both).await.unwrap();
+            let mut expected: Vec<String> = [MOD_NAME, GAME_NAME]
+                .iter()
+                .flat_map(|n| ["", ".gpu_resources", ".stream"].map(|s| format!("{n}.patch_1{s}")))
+                .chain(GAME_FILES[..3].iter().map(|n| n.to_string()))
+                .chain([DEPLOY_RECORD.to_string()])
+                .collect();
+            expected.sort();
+            assert_eq!(patch_files_in(f.dir()), expected, "{at:?}");
+
+            do_purge(f.dir(), &both).await.unwrap();
+            f.assert_only_game_files(&format!("{at:?}"));
+        }
+    }
+
+    /// A purge that stops before removing the record is finished by the
+    /// next one.
+    #[tokio::test]
+    async fn a_stopped_purge_is_finished_by_the_next() {
+        let f = Fixture::new().await;
+        f.deploy(&skip_lists(&[GAME_NAME])).await.unwrap();
+        let both = skip_lists(&[GAME_NAME, MOD_NAME]);
+        assert!(crashing_at(DeployCrashPoint::PurgeBeforeRecordRemoved, do_purge(f.dir(), &both)).await.is_err());
+        do_purge(f.dir(), &both).await.unwrap();
+        f.assert_only_game_files("after the second purge");
+    }
+
+    /// After a stopped deploy, something else (a Steam "verify files")
+    /// put a game file in a slot the deploy had claimed, and that name is
+    /// now skip-listed: a file longer than DDMM's would be isn't DDMM's,
+    /// so purge keeps it.
+    #[tokio::test]
+    async fn a_game_file_restored_after_a_stopped_deploy_is_kept() {
+        let f = Fixture::new().await;
+        let _ = crashing_at(DeployCrashPoint::BeforeFinalRecord, f.deploy(&skip_lists(&[GAME_NAME]))).await;
+        let slot0 = f.dir().join(format!("{MOD_NAME}.patch_0"));
+        tokio::fs::write(&slot0, b"the game's own, longer file").await.unwrap();
+
+        do_purge(f.dir(), &skip_lists(&[GAME_NAME, MOD_NAME])).await.unwrap();
+        assert_eq!(tokio::fs::read(&slot0).await.unwrap(), b"the game's own, longer file");
+        // DDMM's files around it are gone.
+        assert!(!f.dir().join(format!("{MOD_NAME}.patch_0.stream")).exists());
+        assert!(!f.dir().join(format!("{GAME_NAME}.patch_1")).exists());
+    }
+
+    /// The pending-record rule: a file DDMM was about to write is DDMM's
+    /// only if nothing of that name was there before and it isn't longer
+    /// than DDMM's would be; the final record's exact match wins over it.
+    #[tokio::test]
+    async fn pending_entries_claim_only_files_that_werent_there_before() {
+        let data = tempfile::tempdir().unwrap();
+        let file = data.path().join(patch_file_name(0));
+        tokio::fs::write(&file, b"data").await.unwrap();
+        let pending = |len, existed| Deployed {
+            files: HashMap::new(),
+            pending: HashMap::from([(patch_file_name(0), PendingFile { name: patch_file_name(0), len, existed })]),
+        };
+        assert!(pending(4, false).wrote(&file).await);
+        assert!(pending(10, false).wrote(&file).await, "a copy cut short is DDMM's");
+        assert!(!pending(3, false).wrote(&file).await, "longer than DDMM's: not DDMM's");
+        assert!(!pending(4, true).wrote(&file).await, "it was there before: not DDMM's");
+        assert!(!Deployed::default().wrote(&file).await);
+        assert!(!pending(4, false).wrote(&data.path().join(patch_file_name(1))).await);
+    }
+
+    /// Deploy and purge cycles, with stopped deploys in between, keep
+    /// working and always end with only the game's files.
+    #[tokio::test]
+    async fn repeated_deploy_and_purge_cycles() {
+        let f = Fixture::new().await;
+        let settings = skip_lists(&[GAME_NAME]);
+        for round in 0..3 {
+            f.deploy(&settings).await.unwrap();
+            f.deploy(&settings).await.unwrap();
+            assert_eq!(
+                std::fs::read(f.dir().join(format!("{MOD_NAME}.patch_0"))).unwrap(),
+                b"mod data",
+                "round {round}"
+            );
+            let _ = crashing_at(DEPLOY_CRASH_POINTS[round + 1], f.deploy(&settings)).await;
+            f.deploy(&settings).await.unwrap();
+            do_purge(f.dir(), &settings).await.unwrap();
+            f.assert_only_game_files(&format!("round {round}"));
+            do_purge(f.dir(), &settings).await.unwrap();
+            f.assert_only_game_files(&format!("round {round}, purged twice"));
+        }
+    }
+
+    /// A finished deploy leaves a final record (no pending entries) with
+    /// every file it wrote.
+    #[tokio::test]
+    async fn a_finished_deploy_leaves_a_final_record() {
+        let f = Fixture::new().await;
+        f.deploy(&skip_lists(&[GAME_NAME])).await.unwrap();
+        let record: DeployRecord =
+            serde_json::from_slice(&std::fs::read(f.dir().join(DEPLOY_RECORD)).unwrap()).unwrap();
+        assert!(record.pending.is_empty());
+        let mut names: Vec<&str> = record.files.iter().map(|f| f.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names.len(), 6, "{names:?}");
+        let raw = std::fs::read_to_string(f.dir().join(DEPLOY_RECORD)).unwrap();
+        assert!(!raw.contains("Pending"), "{raw}");
     }
 
     /// No record (a game folder last deployed by an older version) or a

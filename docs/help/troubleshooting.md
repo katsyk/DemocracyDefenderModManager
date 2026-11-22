@@ -180,6 +180,19 @@ Both refuse to run against an invalid [Game Path](../using/settings.md#game-path
 If the path is valid but deploy still fails partway through, check the log for which file operation failed (for
 example, a patch file the mod claims to include that doesn't actually exist in its folder).
 
+## Deploy fails with "couldn't write DDMM's deploy record"
+
+Before copying any mod file, deploy writes `.ddmm-deployed.json` into the game's `data` folder, a record of the
+files it is about to copy (see [Deploy & purge](../using/deploy-purge.md#purge)). If it can't, it stops without
+copying anything, so the game has no mods until you deploy again. Check that the `data` folder isn't read-only (or
+blocked by an antivirus's folder protection) and that nothing else is named `.ddmm-deployed.json` there, then click
+**Deploy** again.
+
+## DDMM closed or crashed while deploying
+
+The game may have only some of your mods. Open DDMM and click **Deploy** again (or **Purge**): it removes every file
+the interrupted deploy wrote, using its record, and never the game's own files.
+
 ## Game files missing after using the Skip List
 
 If you used rc.14 or earlier with Skip List entries, verify game files in Steam once, because older versions could
