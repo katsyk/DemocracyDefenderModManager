@@ -38,8 +38,8 @@ Clicking **Deploy** (tip: "Install the current selection of mods."):
    reports an error although your mods are in place; the record from step 6 still lets Purge remove them.
 
 If DDMM is closed, crashes or loses power partway through a deploy, the game may be left with only some of your
-mods. Deploy again (or Purge) and DDMM removes every file the interrupted deploy wrote, using its record, before
-doing anything else.
+mods. Deploy again (or Purge) and DDMM removes every file the interrupted deploy wrote, using its record. A new
+deploy does this right after checking that it can write the record (step 4), before copying anything.
 
 Deploying an empty profile (no mods, or none enabled — same list of `Configs`) shows an error instead of purging
 your game folder for nothing: "Can not deploy empty profile!"
@@ -72,8 +72,8 @@ record shows DDMM wrote it:
 - after a deploy that was interrupted, only if nothing of that name was there before the deploy and the file's
   bytes are still DDMM's copy of the mod's file (possibly cut short where the copy stopped). Anything else there
   (a game file Steam put back, for example) is kept, and so is the file if the mod's own file is gone. A game file
-  with exactly the same bytes as the mod's file can't be told apart from DDMM's copy, and is purged; that only
-  removes bytes identical to the mod's.
+  that matches the mod's file (or a cut-short copy of it, or an empty file) can't be told apart from DDMM's copy,
+  and is purged.
 
 With no record (for example after a deploy by an older version), it is kept.
 

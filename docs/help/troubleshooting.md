@@ -192,10 +192,11 @@ protection) and that nothing else is named `.ddmm-deployed.json` there, then cli
 
 ## DDMM closed or crashed while deploying
 
-The game may have only some of your mods. Open DDMM and click **Deploy** again (or **Purge**): it removes every file
+The game may have only some of your mods. Open DDMM and click **Deploy** again (or **Purge**): it removes the files
 the interrupted deploy wrote, using its record. It keeps the game's own files, including a Skip List file that
-Steam put back since, unless that file has exactly the same bytes as the mod's file (then it can't be told apart
-from DDMM's copy, and removing it only removes bytes identical to the mod's).
+Steam put back since, unless that file is empty or matches the mod's file (or a cut-short copy of it): then it
+can't be told apart from DDMM's copy, and is removed. If the mod's own file is gone, DDMM keeps its copy of a Skip
+List file, since it can no longer check it.
 
 ## Game files missing after using the Skip List
 

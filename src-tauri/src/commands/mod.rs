@@ -440,6 +440,9 @@ async fn record_deployed_files(data_dir: &Path, names: &[String]) -> anyhow::Res
             Ok(()) => break,
             Err(e) => log::warn!("Couldn't write the final deploy record in {:?} (attempt {}): {:#}", data_dir, attempt + 1, e),
         }
+        if attempt == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
     }
     result.with_context(|| {
         format!(
@@ -1371,6 +1374,20 @@ mod tests {
         probe_deploy_record(data.path()).await.unwrap();
         assert_eq!(std::fs::read(data.path().join(DEPLOY_RECORD)).unwrap(), existing);
         assert_eq!(patch_files_in(data.path()), vec![DEPLOY_RECORD.to_string()], "no temporary file left");
+    }
+
+    /// The record can't be written before the purge: the deploy stops
+    /// with nothing changed, and the previous deploy is still in place.
+    #[tokio::test]
+    async fn a_record_that_cant_be_written_stops_the_deploy_before_purging() {
+        let f = Fixture::new().await;
+        let settings = skip_lists(&[GAME_NAME]);
+        f.deploy(&settings).await.unwrap();
+        let record_before = std::fs::read(f.dir().join(DEPLOY_RECORD)).unwrap();
+        let err = crashing_at(DeployCrashPoint::ProbeFails, f.deploy(&settings)).await.unwrap_err();
+        assert!(format!("{err:#}").contains("nothing was changed"), "{err:#}");
+        assert_eq!(std::fs::read(f.dir().join(format!("{MOD_NAME}.patch_0"))).unwrap(), b"mod data");
+        assert_eq!(std::fs::read(f.dir().join(DEPLOY_RECORD)).unwrap(), record_before);
     }
 
     /// The record can be written before the purge but not after it: the
